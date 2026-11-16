@@ -47,10 +47,14 @@ The service reference is held with the application record and stops after
 launch cleanup settles; the marked block can remain installed without changing
 later launches. Symlinks, hard links, non-user-owned files, oversized settings
 files, and modified Amaterasu markers are refused rather than replaced. If a
-Proton installation is discovered but none accepts the hook, the Steam handoff
-fails before it is started. On systems with no discovered Proton installation,
-native Steam launches can proceed and the service remains available for the
-stream lifetime.
+Proton installation is discovered but none accepts the hook, an enabled
+compatibility request produces a warning and the Steam handoff continues. A
+helper that is still unconfirmed at its deadline also produces a warning; its
+ownership remains with the application record until cleanup. A request that
+disables compatibility still waits for an older enabled helper to retire, so
+that helper cannot apply the setting against the new request. On systems with
+no discovered Proton installation, native Steam launches can proceed and the
+service remains available for the stream lifetime.
 The optional launch field `detached_cwd` separates that policy from the primary
 process cwd: omission retains inherited cwd for existing direct callers, null
 infers each detached target's directory, and an absolute path selects a common
@@ -82,14 +86,14 @@ any command starts. Optional stdout/stderr paths append child output without a
 shell; omitted streams remain null. Each detached command opens only its own
 files; an explicit stream path overrides the shared application output for that
 stream. Omitted streams inherit shared output when configured, and otherwise
-remain null. A Windows SYSTEM host
-rejects redirected launches with `detached_output_unsupported` before any child
-starts. Its `CreateProcessAsUserW` path cannot safely pass output handles across
-sessions, and temporary inheritable handles could leak to concurrent host
-spawns. Supporting that host requires a broker running as the selected user.
-Failure to obtain the active-user token returns `detached_output_unavailable`.
-A file-open or detached-command spawn failure remains best-effort and does not
-fail the main launch. A typed command's optional `elevated` boolean overrides
+remain null. A Windows SYSTEM host cannot safely pass output handles across
+sessions with its `CreateProcessAsUserW` path. When that path is selected, the
+launch continues with detached output discarded and reports
+`detached_output_unsupported`; an unavailable token check reports
+`detached_output_unavailable`. Supporting redirected output there requires a
+broker running as the selected user.
+A file-open, executable lookup, or detached-command spawn failure remains
+best-effort, produces a warning, and does not fail the main launch. A typed command's optional `elevated` boolean overrides
 the launch-level flag for that detached child alone. Legacy strings and typed
 commands without the field inherit the launch flag. On a Windows SYSTEM host,
 `true` selects the active user's linked elevated token only when one exists;
@@ -202,9 +206,8 @@ after all owed undo settles successfully. Prepare-only output leases may contain
 no commands; they open before the external provider starts and close after it
 stops. They capture their preparation and undo, while external Playnite game
 output is not attached through the current provider ABI. File-open failure
-creates a retained failed launch or preparation lease with no child effects;
-prepared reports identify `output_open_failed`. Unlike the reference's silent
-null fallback when opening fails, this service reports the error. Retrying the
+records `output_open_failed` as a warning and continues with null output.
+Retrying the
 same operation never reopens its file. No output transcript or command/environment
 text is exposed in process reports, and no rotation or size quota is imposed.
 The trusted administrator selects and manages the destination file. Directories,
@@ -212,10 +215,10 @@ devices, sockets, and FIFOs are rejected; Unix opens are nonblocking so replacin
 a pathname with a FIFO cannot stall the module before command deadlines begin.
 This deliberately narrows the reference's unrestricted append-open destination.
 
-Configured shared output fails preflight with `application_output_unsupported`
-on a Windows SYSTEM host because its native user-session creation path cannot
-safely inherit these handles. Failure to obtain the user token reports
-`application_output_unavailable`. No command starts in either case. Ordinary
+Configured shared output is discarded with an `application_output_unsupported`
+warning on a Windows SYSTEM host because its native user-session creation path
+cannot safely inherit these handles. Failure to obtain the user token records
+`application_output_unavailable` and also uses null output. Ordinary
 Windows and Unix use native inherited file handles; live Windows and macOS
 qualification remains pending on the current Linux host.
 
@@ -308,8 +311,6 @@ Limits, measured in UTF-8 bytes unless otherwise stated:
 
 Errors use `{"ok":false,"code":"..."}`. Codes are `invalid_caller`,
 `request_too_large`, `invalid_request`, `invalid_launch`, `invalid_limit`,
-`detached_output_unsupported`, `detached_output_unavailable`,
-`application_output_unsupported`, `application_output_unavailable`,
 `operation_conflict`, `process_limit`, `process_not_found`, `process_wait_failed`,
 `process_kill_failed`, and `process_wait_timeout`. `response_too_large` protects
 a list from an individually oversized record. Missing and foreign process IDs share

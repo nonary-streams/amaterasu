@@ -462,6 +462,43 @@ fn retained_application_resumes_on_another_paired_client_without_relaunch() {
 }
 
 #[test]
+fn resume_keeps_last_proton_policy_when_optional_refresh_is_unavailable() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_display_policy(7, json!({}));
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    assert_eq!(poll_until_reply(&mut controller, &mut broker, now).1.status, 200);
+    controller.reply_delivered(10, now);
+    let record = controller.records.values_mut().next().unwrap();
+    record.lifecycle_required = true;
+    record.lifecycle_prepare_dispatched = true;
+    record.lifecycle_application_bound = true;
+    record.lifecycle_launch_epoch_ready = true;
+    record.lifecycle_session_target = serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).ok();
+    record.application_display_overrides = Some(json!({}));
+    record.state = State::Paused;
+    record.stage = Stage::Live;
+    record.rtsp_requested = false;
+    record.rtsp_ticket = None;
+    record.rtsp_url = None;
+    record.history_release_required = false;
+    assert_eq!(record.global_proton_dualsense_compatibility, Some(true));
+    let application_launch = record.application_launch;
+    broker.input_policy_response = json!({"ok":false});
+    broker.commands.clear();
+    broker.lifecycle_replies.push_back(json!({"status":"ok","host_epoch":"epoch","sessions":[{"session_id":"session","generation":1,"phase":"paused"}]}));
+
+    assert!(controller.resume(11, request(2), &peer(2), now).is_none());
+    assert_eq!(poll_until_reply(&mut controller, &mut broker, now).1.status, 200);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.global_proton_dualsense_compatibility, Some(true));
+    assert_eq!(record.application_launch, application_launch);
+    assert!(!broker.actions().contains(&("amaterasu.launch/1", "launch_export")));
+    assert!(!broker.actions().contains(&("amaterasu.launch/1", "stop")));
+}
+
+#[test]
 fn unauthenticated_client_cannot_resume_a_retained_application() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();

@@ -622,40 +622,47 @@ fn application_output_appends_all_command_phases_and_detached_overrides_take_pre
 }
 
 #[test]
-fn output_open_failure_is_retained_before_any_command_has_effects() {
+fn output_open_failure_warns_and_launches_without_reopening_the_path() {
     let directory = test_directory("failed-application-output");
     let missing_log = directory.join("missing-parent").join("output.log");
     let marker = directory.join("ran");
+    let trace = directory.join("launch-trace");
     let mut request = launch("failed-application-output", "exit");
     request["output"] = json!(missing_log);
     request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
-    request["preparation"] = json!([{"run":lifecycle_command(&marker,"prepare","trace")}]);
-    request["detached"] = json!([format!(
-        "{} --exact tests::controlled_child --ignored",
-        quote_raw_command_argument(std::env::current_exe().unwrap().to_str().unwrap())
-    )]);
+    request["preparation"] = json!([{"run":lifecycle_command(&trace,"prepare","trace")}]);
     let mut manager = ProcessManager::default();
-    let failed = manager.handle("alice", request.clone());
-    assert_eq!(failed["process"]["state"], "launch_failed", "{failed}");
-    assert_eq!(failed["process"]["pid"], Value::Null);
+    let started = manager.handle("alice", request.clone());
+    assert_eq!(started["ok"], true, "{started}");
     assert_eq!(
-        failed["process"]["preparation"]["failure"]["kind"],
+        started["process"]["warnings"][0]["reason"],
         "output_open_failed"
     );
-    assert!(!marker.exists());
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    let finished = wait_for_exit(&mut manager, id);
+    assert_eq!(finished["process"]["success"], true, "{finished}");
+    assert!(marker.exists());
+    assert_eq!(trace_events(&trace), ["prepare"]);
     std::fs::create_dir(missing_log.parent().unwrap()).unwrap();
-    assert_eq!(manager.handle("alice", request), failed);
+    let replay = manager.handle("alice", request);
+    assert_eq!(replay["process"]["process_id"], id);
     assert!(!missing_log.exists(), "retry reopened failed output");
 
-    let prepare = json!({"action":"prepare","operation_id":"failed-prepare-output","output":directory,"preparation":[{"run":lifecycle_command(&marker,"prepare-only","trace")}]});
-    let failed_lease = manager.handle("alice", prepare.clone());
-    assert_eq!(failed_lease["preparation"]["state"], "preparation_failed");
+    let prepare_trace = directory.join("prepare-trace");
+    let prepare = json!({"action":"prepare","operation_id":"failed-prepare-output","output":directory,"preparation":[{"run":lifecycle_command(&prepare_trace,"prepare-only","trace")}]});
+    let lease = manager.handle("alice", prepare.clone());
+    assert_eq!(lease["ok"], true, "{lease}");
     assert_eq!(
-        failed_lease["preparation"]["preparation"]["failure"]["kind"],
+        lease["preparation"]["preparation"]["warnings"][0]["reason"],
         "output_open_failed"
     );
-    assert_eq!(manager.handle("alice", prepare), failed_lease);
-    assert!(!marker.exists());
+    let ready = wait_for_preparation_state(&mut manager, "alice", "failed-prepare-output", "ready");
+    assert_eq!(
+        ready["preparation"]["preparation"]["warnings"][0]["reason"],
+        "output_open_failed"
+    );
+    assert_eq!(trace_events(&prepare_trace), ["prepare-only"]);
+    assert_eq!(manager.handle("alice", prepare)["ok"], true);
     manager.shutdown().unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

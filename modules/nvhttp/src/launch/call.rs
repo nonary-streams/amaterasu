@@ -163,6 +163,12 @@ impl Call {
         self.result = None;
     }
 
+    /// A warning submission has no native effects and is idempotent for its
+    /// exact history identity, so an unconfirmed submission cannot fence launch.
+    pub fn abandon_warning(&mut self, send: &mut Send<'_>) {
+        self.abandon_read(send);
+    }
+
     pub fn shutdown(&mut self, send: &mut Send<'_>) {
         self.cancel();
         for _ in 0..4 {

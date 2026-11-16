@@ -141,6 +141,9 @@ pub struct Record {
     pub history_release_required: bool,
     pub history_reserved: bool,
     pub history_state: &'static str,
+    pub stream_warnings: Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
+    pub history_warnings_attempted: bool,
+    pub launch_warnings_attempted: bool,
     pub connect_data: u32,
     pub global_fec_percentage: u8,
     pub global_stream_audio: bool,
@@ -151,7 +154,7 @@ pub struct Record {
     pub global_preparation: Vec<PreparationStep>,
     pub legacy_global_preparation: Vec<LegacyPreparationStep>,
     pub application_preflight_overrides: Option<ApplicationConfigOverrides>,
-    /// Authoritative global Proton policy read before application preflight.
+    /// Global Proton policy, or an opt-out fallback if its read was unavailable.
     pub global_proton_dualsense_compatibility: Option<bool>,
     /// Client/application/global compatibility policy frozen for this launch.
     pub proton_dualsense_compatibility: bool,
@@ -375,6 +378,9 @@ impl Record {
             history_release_required: false,
             history_reserved: false,
             history_state: "unavailable",
+            stream_warnings: Vec::new(),
+            history_warnings_attempted: false,
+            launch_warnings_attempted: false,
             connect_data,
             global_fec_percentage,
             global_stream_audio,

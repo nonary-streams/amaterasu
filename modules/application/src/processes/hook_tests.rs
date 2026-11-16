@@ -5,13 +5,16 @@ fn hook_launch(operation_id: &str, output: Option<&str>) -> Value {
         "hook-ready" => 0,
         "hook-cancel" => 1,
         "hook-output-failure" => 2,
-        _ => 3,
+        "hook-timeout" => 3,
+        "hook-first" => 4,
+        "hook-enabled-first" => 5,
+        _ => 6,
     };
     json!({
         "action": "launch",
         "operation_id": operation_id,
         "executable": "/bin/true",
-        "steam_id": format!("{}", 4_000_000_000u64 + u64::from(std::process::id()) * 4 + fixture),
+        "steam_id": format!("{}", 4_000_000_000u64 + u64::from(std::process::id()) * 8 + fixture),
         "proton_dualsense_compatibility": true,
         "output": output,
     })
@@ -50,7 +53,7 @@ fn cancellation_while_helper_is_pending_never_spawns_the_application() {
 }
 
 #[test]
-fn output_failure_cannot_resume_after_helper_becomes_ready() {
+fn output_failure_warns_and_launches_after_helper_becomes_ready() {
     let mut manager = ProcessManager::default();
     let missing = format!(
         "/amaterasu-no-such-output-parent-{}/log",
@@ -58,27 +61,68 @@ fn output_failure_cannot_resume_after_helper_becomes_ready() {
     );
     let response = manager.handle("alice", hook_launch("hook-output-failure", Some(&missing)));
     let id = response["process"]["process_id"].as_u64().unwrap();
-    assert!(matches!(
-        manager.records[&id].state,
-        ProcessState::LaunchFailed { .. }
-    ));
-    assert!(!manager.records[&id].hook_pending);
-    for _ in 0..20 {
+    assert_eq!(
+        response["process"]["warnings"][0]["reason"],
+        "output_open_failed"
+    );
+    assert!(manager.records[&id].hook_pending);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while manager.records[&id].pid.is_none() {
         manager.reap_exited().unwrap();
+        assert!(Instant::now() < deadline, "helper did not become ready");
+        std::thread::yield_now();
     }
-    assert!(manager.records[&id].pid.is_none());
+    assert!(!manager.records[&id].hook_pending);
 }
 
 #[test]
-fn pending_hook_launch_fails_after_its_own_deadline() {
+fn pending_optional_hook_warns_and_launches_after_its_own_deadline() {
     let mut manager = ProcessManager::default();
     let response = manager.handle("alice", hook_launch("hook-timeout", None));
     let id = response["process"]["process_id"].as_u64().unwrap();
     manager.records.get_mut(&id).unwrap().hook_deadline = Some(Instant::now());
     manager.refresh_hook_readiness();
-    assert!(matches!(
-        manager.records[&id].state,
-        ProcessState::LaunchFailed { .. }
-    ));
-    assert!(manager.records[&id].pid.is_none());
+    let record = &manager.records[&id];
+    assert!(record.pid.is_some());
+    assert_eq!(record.warnings[0].reason, "proton_hook_unconfirmed");
+    assert!(record.steam_proton_hook_app_id.is_some());
+    let warnings = manager.take_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].0, Some(id));
+    assert_eq!(warnings[0].1.reason, "proton_hook_unconfirmed");
+    assert!(manager.take_warnings().is_empty());
+}
+
+#[test]
+fn enabled_hook_policy_conflict_warns_and_keeps_the_application_launch() {
+    let mut manager = ProcessManager::default();
+    let mut first = hook_launch("hook-first", None);
+    first["proton_dualsense_compatibility"] = json!(false);
+    let steam_id = first["steam_id"].clone();
+    assert_eq!(manager.handle("alice", first)["ok"], true);
+
+    let mut second = hook_launch("hook-second", None);
+    second["steam_id"] = steam_id;
+    let response = manager.handle("alice", second);
+    assert_eq!(response["ok"], true);
+    assert_eq!(
+        response["process"]["warnings"][0]["reason"],
+        "proton_hook_policy_conflict"
+    );
+    assert!(response["process"]["pid"].is_number());
+}
+
+#[test]
+fn disabled_hook_policy_does_not_bypass_an_enabled_owner() {
+    let mut manager = ProcessManager::default();
+    let first = hook_launch("hook-enabled-first", None);
+    let steam_id = first["steam_id"].clone();
+    assert_eq!(manager.handle("alice", first)["ok"], true);
+
+    let mut second = hook_launch("hook-disabled-second", None);
+    second["steam_id"] = steam_id;
+    second["proton_dualsense_compatibility"] = json!(false);
+    let response = manager.handle("alice", second);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "proton_hook_policy_conflict");
 }

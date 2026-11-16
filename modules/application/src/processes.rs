@@ -9,7 +9,7 @@ use crate::command_paths::resolve_command_executable;
 use crate::commands::{DetachedCommandRequest, prepare_detached_requests};
 use crate::containment::{ContainedChild, DetachedChild};
 use crate::lifecycle::ApplicationLifecycle;
-use crate::output::{SharedOutput, check_output_support};
+use crate::output::{SharedOutput, check_output_support, output_warning, push_warning};
 use crate::protocol::{
     Action, LaunchSpec, MAX_EXIT_TIMEOUT_SECONDS, PreparationSpec, ProcessState, TerminalOutcome,
 };
@@ -27,9 +27,38 @@ const MAX_PAYLOAD_BYTES: usize = 16_384;
 const MAX_RECORDS: usize = 128;
 const MAX_CALLER_RECORDS: usize = 32;
 
+fn proton_hook_warning(reason: &str) -> amaterasu_module_sdk::stream_warnings::StreamWarning {
+    use amaterasu_module_sdk::stream_warnings::{StreamWarning, WarningValue};
+    StreamWarning {
+        code: "proton_hook_unavailable".into(),
+        source: "amaterasu.application/1".into(),
+        reason: reason.into(),
+        os_error: None,
+        requested: Some(WarningValue::Boolean(true)),
+        effective: None,
+    }
+}
+
+fn detached_command_warning(
+    reason: &str,
+    os_error: Option<i32>,
+) -> amaterasu_module_sdk::stream_warnings::StreamWarning {
+    use amaterasu_module_sdk::stream_warnings::{StreamWarning, WarningValue};
+    StreamWarning {
+        code: "detached_command_unavailable".into(),
+        source: "amaterasu.application/1".into(),
+        reason: reason.into(),
+        os_error,
+        requested: Some(WarningValue::Label("configured_detached_command".into())),
+        effective: Some(WarningValue::Label("skipped".into())),
+    }
+}
+
 fn spawn_detached_commands_with(
     spec: &LaunchSpec,
     output: Option<&SharedOutput>,
+    redirect_detached: bool,
+    warnings: &mut Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
     mut spawn: impl FnMut(
         &mut Command,
         bool,
@@ -43,12 +72,19 @@ fn spawn_detached_commands_with(
             .cwd
             .as_deref()
             .or_else(|| spec.detached_cwd.configured_directory(spec.cwd.as_deref()));
-        let Ok(executable) = resolve_command_executable(
+        let executable = match resolve_command_executable(
             &detached.executable,
             &detached.environment,
             working_directory,
-        ) else {
-            continue;
+        ) {
+            Ok(executable) => executable,
+            Err(error) => {
+                push_warning(
+                    warnings,
+                    detached_command_warning("executable_unavailable", error.raw_os_error()),
+                );
+                continue;
+            }
         };
         let mut command = Command::new(&executable);
         command
@@ -59,9 +95,13 @@ fn spawn_detached_commands_with(
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if let Some(output) = output
-            && output.attach(&mut command).is_err()
+            && let Err(error) = output.attach(&mut command)
         {
-            continue;
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+            push_warning(
+                warnings,
+                output_warning("output_attach_failed", error.raw_os_error()),
+            );
         }
         if let Some(cwd) = working_directory {
             command.current_dir(cwd);
@@ -74,13 +114,21 @@ fn spawn_detached_commands_with(
 
         // Detached launchers are best-effort. Their failure cannot prevent the
         // primary application or a later detached command from starting.
-        if let Ok(child) = spawn(
+        match spawn(
             &mut command,
             detached.elevated.unwrap_or(spec.elevated),
-            detached.stdout.as_deref(),
-            detached.stderr.as_deref(),
+            redirect_detached
+                .then_some(detached.stdout.as_deref())
+                .flatten(),
+            redirect_detached
+                .then_some(detached.stderr.as_deref())
+                .flatten(),
         ) {
-            children.push(child);
+            Ok(child) => children.push(child),
+            Err(error) => push_warning(
+                warnings,
+                detached_command_warning("spawn_failed", error.raw_os_error()),
+            ),
         }
     }
     children
@@ -144,6 +192,13 @@ struct ProcessRecord {
     state: ProcessState,
     #[serde(skip_serializing_if = "Option::is_none")]
     cleanup_error: Option<&'static str>,
+    /// Optional launch features that could not be confirmed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
+    #[serde(skip)]
+    warnings_reported: usize,
+    #[serde(skip)]
+    lifecycle_warnings_reported: usize,
     #[serde(flatten)]
     lifecycle: Option<ApplicationLifecycle>,
     #[serde(skip)]
@@ -212,6 +267,9 @@ impl ProcessRecord {
             pid: None,
             state: ProcessState::Preparing,
             cleanup_error: None,
+            warnings: Vec::new(),
+            warnings_reported: 0,
+            lifecycle_warnings_reported: 0,
             lifecycle,
             owner: caller.into(),
             spec,
@@ -232,24 +290,20 @@ impl ProcessRecord {
                 .then(|| Instant::now() + crate::proton_hook::SERVER_READY_TIMEOUT),
             steam_game_liveness: None,
         };
-        match SharedOutput::open(record.spec.output.as_deref()) {
-            Ok(output) => {
-                if let Some(lifecycle) = &mut record.lifecycle {
-                    lifecycle.set_output(output.clone());
+        match check_output_support(record.spec.output.as_deref(), record.spec.elevated) {
+            Err(reason) => push_warning(&mut record.warnings, output_warning(reason, None)),
+            Ok(()) => match SharedOutput::open(record.spec.output.as_deref()) {
+                Ok(output) => {
+                    if let Some(lifecycle) = &mut record.lifecycle {
+                        lifecycle.set_output(output.clone());
+                    }
+                    record.output = output;
                 }
-                record.output = output;
-            }
-            Err(error) => {
-                record.hook_pending = false;
-                record.hook_deadline = None;
-                if let Some(lifecycle) = &mut record.lifecycle {
-                    lifecycle.output_open_failed(&error);
-                }
-                record.state = ProcessState::LaunchFailed {
-                    os_error: error.raw_os_error(),
-                };
-                return record;
-            }
+                Err(error) => push_warning(
+                    &mut record.warnings,
+                    output_warning("output_open_failed", error.raw_os_error()),
+                ),
+            },
         }
         if record.lifecycle.is_none() && !record.hook_pending {
             record.spawn_application();
@@ -288,10 +342,11 @@ impl ProcessRecord {
         if let Some(output) = &self.output
             && let Err(error) = output.attach(&mut command)
         {
-            self.complete_or_clean(Completion::LaunchFailed {
-                os_error: error.raw_os_error(),
-            });
-            return;
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+            push_warning(
+                &mut self.warnings,
+                output_warning("output_attach_failed", error.raw_os_error()),
+            );
         }
         if self.is_steam_metadata_launch() {
             self.steam_tracker = self
@@ -344,9 +399,16 @@ impl ProcessRecord {
     }
 
     fn spawn_detached_commands(&mut self) {
+        let supported =
+            check_detached_output_support(&self.spec, DetachedChild::output_redirection_supported);
+        if let Err(reason) = supported {
+            push_warning(&mut self.warnings, output_warning(reason, None));
+        }
         self.detached_children.extend(spawn_detached_commands_with(
             &self.spec,
             self.output.as_ref(),
+            supported.is_ok(),
+            &mut self.warnings,
             DetachedChild::spawn_with_output,
         ));
     }
@@ -838,6 +900,7 @@ struct PreparationLease {
     spec: PreparationSpec,
     lifecycle: ApplicationLifecycle,
     stopping: bool,
+    warnings_reported: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -855,9 +918,18 @@ impl PreparationLease {
             spec.cwd.clone(),
             spec.exit_timeout_seconds,
         );
-        match SharedOutput::open(spec.output.as_deref()) {
-            Ok(output) => lifecycle.set_output(output),
-            Err(error) => lifecycle.output_open_failed(&error),
+        match check_output_support(spec.output.as_deref(), false) {
+            Err(reason) => push_warning(
+                &mut lifecycle.preparation.warnings,
+                output_warning(reason, None),
+            ),
+            Ok(()) => match SharedOutput::open(spec.output.as_deref()) {
+                Ok(output) => lifecycle.set_output(output),
+                Err(error) => push_warning(
+                    &mut lifecycle.preparation.warnings,
+                    output_warning("output_open_failed", error.raw_os_error()),
+                ),
+            },
         }
         Self {
             operation_id,
@@ -865,6 +937,7 @@ impl PreparationLease {
             spec,
             lifecycle,
             stopping: false,
+            warnings_reported: 0,
         }
     }
 
@@ -1051,17 +1124,6 @@ impl ProcessManager {
                     preparation: preparation.into_vec(),
                 };
                 spec.validate(&operation_id).map_err(|_| "invalid_launch")?;
-                if !self
-                    .records
-                    .values()
-                    .any(|record| record.owner == caller && record.operation_id == operation_id)
-                {
-                    check_output_support(spec.output.as_deref(), spec.elevated)?;
-                    check_detached_output_support(
-                        &spec,
-                        DetachedChild::output_redirection_supported,
-                    )?;
-                }
                 self.launch(caller, operation_id, spec, detached_requests)
             }
             Action::Lookup { operation_id } => {
@@ -1149,7 +1211,18 @@ impl ProcessManager {
         }
         self.ensure_capacity(caller)?;
         let process_id = self.next_id.checked_add(1).ok_or("process_limit")?;
-        let proton_hook_app_id = self.proton_hooks.acquire(&spec)?;
+        let (proton_hook_app_id, hook_warning) = match self.proton_hooks.acquire(&spec) {
+            Ok(app_id) => (app_id, None),
+            // This compatibility hook is an enhancement to the Steam launch.
+            // A disabled policy still waits for an older enabled hook to retire:
+            // otherwise that older owner could apply a setting the user disabled.
+            Err(code @ ("proton_hook_unavailable" | "proton_hook_policy_conflict"))
+                if spec.proton_dualsense_compatibility =>
+            {
+                (None, Some(code))
+            }
+            Err(code) => return Err(code),
+        };
         let hook_pending = proton_hook_app_id.as_deref().is_some_and(|app_id| {
             self.proton_hooks.readiness(app_id) != crate::proton_hook::HookReadiness::Ready
         });
@@ -1162,6 +1235,9 @@ impl ProcessManager {
             hook_pending,
         );
         record.steam_proton_hook_app_id = proton_hook_app_id;
+        if let Some(reason) = hook_warning {
+            push_warning(&mut record.warnings, proton_hook_warning(reason));
+        }
         let response = json!({"ok":true,"process":record});
         self.records.insert(process_id, record);
         self.next_id = process_id;
@@ -1187,7 +1263,6 @@ impl ProcessManager {
         if self.shutdown_deadline.is_some() {
             return Err("host_stopping");
         }
-        check_output_support(spec.output.as_deref(), false)?;
         if self
             .records
             .values()
@@ -1314,6 +1389,46 @@ impl ProcessManager {
         failure.map_or(Ok(()), Err)
     }
 
+    /// Return each process warning once for the module's bounded host log.
+    pub(crate) fn take_warnings(
+        &mut self,
+    ) -> Vec<(
+        Option<u64>,
+        amaterasu_module_sdk::stream_warnings::StreamWarning,
+    )> {
+        let mut warnings = Vec::new();
+        for record in self.records.values_mut() {
+            warnings.extend(
+                record.warnings[record.warnings_reported..]
+                    .iter()
+                    .cloned()
+                    .map(|warning| (Some(record.process_id), warning)),
+            );
+            record.warnings_reported = record.warnings.len();
+            if let Some(lifecycle) = &record.lifecycle {
+                let pending = &lifecycle.preparation.warnings;
+                warnings.extend(
+                    pending[record.lifecycle_warnings_reported..]
+                        .iter()
+                        .cloned()
+                        .map(|warning| (Some(record.process_id), warning)),
+                );
+                record.lifecycle_warnings_reported = pending.len();
+            }
+        }
+        for lease in self.preparations.values_mut() {
+            let pending = &lease.lifecycle.preparation.warnings;
+            warnings.extend(
+                pending[lease.warnings_reported..]
+                    .iter()
+                    .cloned()
+                    .map(|warning| (None, warning)),
+            );
+            lease.warnings_reported = pending.len();
+        }
+        warnings
+    }
+
     fn refresh_hook_readiness(&mut self) {
         self.proton_hooks.reap();
         for record in self
@@ -1351,7 +1466,20 @@ impl ProcessManager {
                 crate::proton_hook::HookReadiness::Failed => {
                     record.hook_pending = false;
                     record.hook_deadline = None;
-                    record.complete_or_clean(Completion::LaunchFailed { os_error: None });
+                    if record.spec.proton_dualsense_compatibility {
+                        // Keep the hook reference until ordinary application cleanup:
+                        // the helper may still be retiring or become ready late.
+                        push_warning(
+                            &mut record.warnings,
+                            proton_hook_warning("proton_hook_unconfirmed"),
+                        );
+                        if record.lifecycle.is_none() {
+                            record.spawn_application();
+                        }
+                    } else {
+                        // A disabled policy must not race an older enabled hook.
+                        record.complete_or_clean(Completion::LaunchFailed { os_error: None });
+                    }
                 }
             }
         }
@@ -1711,10 +1839,16 @@ mod detached_elevation_tests {
     fn detached_spawner_receives_inherited_and_explicit_elevation_per_child() {
         let spec = launch_spec(true, &[None, Some(false), Some(true)]);
         let mut forwarded = Vec::new();
-        let children = spawn_detached_commands_with(&spec, None, |_, elevated, _, _| {
-            forwarded.push(elevated);
-            Err(std::io::Error::other("mock spawn"))
-        });
+        let children = spawn_detached_commands_with(
+            &spec,
+            None,
+            true,
+            &mut Vec::new(),
+            |_, elevated, _, _| {
+                forwarded.push(elevated);
+                Err(std::io::Error::other("mock spawn"))
+            },
+        );
         assert!(children.is_empty());
         assert_eq!(forwarded, [true, false, true]);
         assert!(spec.elevated);
@@ -1723,6 +1857,8 @@ mod detached_elevation_tests {
         spawn_detached_commands_with(
             &launch_spec(false, &[None, Some(true)]),
             None,
+            true,
+            &mut Vec::new(),
             |_, elevated, _, _| {
                 forwarded.push(elevated);
                 Err(std::io::Error::other("mock spawn"))
@@ -1747,5 +1883,28 @@ mod detached_elevation_tests {
             check_detached_output_support(&spec, |_| Ok(false)),
             Err("detached_output_unsupported")
         );
+    }
+
+    #[test]
+    fn unsupported_detached_output_is_omitted_and_spawn_failure_is_reported() {
+        let mut spec = launch_spec(false, &[None]);
+        spec.detached[0].stdout = Some("output".into());
+        spec.detached[0].stderr = Some("error".into());
+        let mut warnings = Vec::new();
+        let children = spawn_detached_commands_with(
+            &spec,
+            None,
+            false,
+            &mut warnings,
+            |_, _, stdout, stderr| {
+                assert_eq!((stdout, stderr), (None, None));
+                Err(std::io::Error::from_raw_os_error(2))
+            },
+        );
+        assert!(children.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "detached_command_unavailable");
+        assert_eq!(warnings[0].reason, "spawn_failed");
+        assert_eq!(warnings[0].os_error, Some(2));
     }
 }

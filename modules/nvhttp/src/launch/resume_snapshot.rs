@@ -193,6 +193,11 @@ impl ResumeSnapshot {
     /// resources and obtain a fresh display-admission token before opening RTSP.
     pub(super) fn apply(self, retained: &mut Record) {
         let stream = self.stream;
+        // Re-query the retained application after delivery, including warnings
+        // from replacement providers. Stream-specific policy is evaluated anew.
+        retained.stream_warnings.clear();
+        retained.history_warnings_attempted = false;
+        retained.launch_warnings_attempted = false;
         macro_rules! move_fields { ($($field:ident),+ $(,)?) => { $(retained.$field = stream.$field;)+ }; }
         move_fields!(
             shared_capture,

@@ -753,6 +753,8 @@ pub struct Controller {
     admitting_deferred: bool,
     management_replies: Vec<(u64, Reply)>,
     job: Option<Job>,
+    /// Optional diagnostics never occupy the critical launch/monitor job slot.
+    diagnostic_jobs: BTreeMap<u64, (String, Job)>,
     nonce: [u8; 16],
     next_id: u64,
     sequence: u64,
@@ -823,6 +825,7 @@ impl Controller {
             admitting_deferred: false,
             management_replies: Vec::new(),
             job: None,
+            diagnostic_jobs: BTreeMap::new(),
             nonce,
             next_id: 0,
             sequence: 0,
@@ -1866,6 +1869,7 @@ impl Controller {
                 }
             });
         }
+        self.poll_diagnostic_jobs(now, send);
         self.recover_failed_cleanup(now, send);
         self.stamp_ended(now);
         self.keep_launch_capacity(send);
@@ -1877,6 +1881,7 @@ impl Controller {
         if self.job.is_none() {
             self.schedule(now);
         }
+        self.schedule_diagnostic_jobs(now);
         // A replaced Desktop record that is still retrying failed cleanup has
         // not settled; the resume waits for it to stop or be abandoned.
         let resume_ready = self.pending_resume.as_ref().is_some_and(|pending| {
@@ -2230,6 +2235,9 @@ impl Controller {
     pub fn shutdown(&mut self, send: &mut Send<'_>) {
         for job in self.jobs_mut() {
             job.call.shutdown(send);
+        }
+        for (_, mut job) in std::mem::take(&mut self.diagnostic_jobs).into_values() {
+            job.call.abandon_warning(send);
         }
         self.restart_sweep.shutdown(send);
         for record in self.records.values_mut() {

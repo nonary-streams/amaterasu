@@ -121,3 +121,40 @@ test("native initialization fallback includes its reason without trusting other 
   assert.match(view.target.textContent, /nvenc_open_failed/);
   assert.equal(streamCompatibilityAlerts(line.replace("amaterasu.stream-session", "untrusted")).length, 0);
 });
+
+test("invalid optional hints are shown without exposing their raw values", () => {
+  const record = {event:"stream_adjustment", stream:"rtsp-0000000000000003", code:"invalid_optional_hints", requested:3, effective:0};
+  const line = `[2026-11-15 12:00:00]: Warning: amaterasu.rtsp::rtsp.compatibility: ${JSON.stringify(record)}\n`;
+  const view = page();
+  view.observer.snapshot(line);
+  assert.match(view.target.textContent, /Invalid optional client hints were ignored/);
+  assert.match(view.target.textContent, /Ignored hint mask: 0x3/);
+});
+
+test("structured feature warnings remain visible without a history plugin", () => {
+  const record = {event:"stream_warning", stream:"rtsp-0000000000000004", warning:{code:"proton_policy_unavailable",source:"amaterasu.nvhttp/1",reason:"read_unavailable",effective:false}};
+  const line = `[2026-11-15 12:00:00]: Warning: amaterasu.nvhttp::stream.warning: ${JSON.stringify(record)}\n`;
+  const view = page();
+  view.observer.snapshot(line);
+  assert.match(view.target.textContent, /controller compatibility preference was unavailable/);
+  assert.match(view.target.textContent, /Used: false/);
+  assert.equal(streamCompatibilityAlerts(line.replace("amaterasu.nvhttp", "untrusted")).length, 0);
+});
+
+test("application output warnings include a bounded OS error", () => {
+  const record = {event:"stream_warning", stream:"rtsp-0000000000000005", warning:{code:"application_output_unavailable",source:"example.application/1",reason:"output_open_failed",os_error:13,effective:"discarded"}};
+  const line = `[2026-11-15 12:00:00]: Warning: amaterasu.nvhttp::stream.warning: ${JSON.stringify(record)}\n`;
+  const view = page();
+  view.observer.snapshot(line);
+  assert.match(view.target.textContent, /application continued without that output/);
+  assert.match(view.target.textContent, /OS error: 13/);
+});
+
+test("invalid client hint alerts identify the ignored field", () => {
+  const record = {event:"stream_warning",stream:"rtsp-0000000000000006",warning:{code:"invalid_client_hint",source:"amaterasu.nvhttp/1",reason:"clientVrrRequested",requested:2,effective:"ignored"}};
+  const view = page();
+  view.observer.snapshot(`[2026-11-15 12:00:00]: Warning: amaterasu.nvhttp::stream.warning: ${JSON.stringify(record)}\n`);
+  assert.match(view.target.textContent, /invalid optional client hint was ignored/i);
+  assert.match(view.target.textContent, /clientVrrRequested/);
+  assert.match(view.target.textContent, /Requested: 2/);
+});

@@ -213,6 +213,9 @@ impl Broker {
                         "failure": null,
                         "cleanup_error": null
                     }),
+                    ("amaterasu.launch/1", "warnings") => {
+                        json!({"ok":false,"code":"unsupported"})
+                    }
                     ("amaterasu.launch/1", "stop" | "status") => {
                         let mut launch = self.launch_template.clone().expect("exported launch");
                         launch["state"] = json!(if self.cleanup_started {

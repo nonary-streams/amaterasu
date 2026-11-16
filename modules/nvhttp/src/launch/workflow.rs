@@ -15,8 +15,8 @@ use amaterasu_contracts::virtual_display::{
     VirtualDisplayLayout, VirtualDisplayMode, VirtualDisplayModePolicy,
     VirtualDisplayRefreshRateOption, VirtualDisplayResolutionOption, VirtualDisplayResolverContext,
 };
-use amaterasu_module_sdk::LogLevel;
 use amaterasu_module_sdk::retirement::{self, Contract};
+use amaterasu_module_sdk::{Command, LogLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -26,6 +26,7 @@ const LAUNCH_SERVICE: &str = "amaterasu.launch/1";
 const INPUT_SERVICE: &str = "amaterasu.input/1";
 const RTSP_SERVICE: &str = "amaterasu.rtsp/1";
 const DISPLAY_SERVICE: &str = "amaterasu.display/1";
+const OPTIONAL_READ_BUDGET: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -47,6 +48,8 @@ pub enum Phase {
     VerifyResumeApplication,
     RefreshResumePolicy,
     ReserveHistory,
+    ReadLaunchWarnings,
+    RecordHistoryWarnings,
     ReadProtonPolicy,
     PreflightApplication,
     SnapshotDisplay,
@@ -70,6 +73,11 @@ pub enum Phase {
 impl Phase {
     fn routine_monitor(self) -> bool {
         matches!(self, Self::MonitorApplication | Self::MonitorRtsp)
+    }
+
+    /// This read selects an optional compatibility enhancement and has no effects.
+    fn optional_proton_policy_read(self) -> bool {
+        matches!(self, Self::ReadProtonPolicy | Self::RefreshResumePolicy)
     }
 
     /// Status reads that only observe an existing stream or application.
@@ -181,7 +189,127 @@ fn log_monitor_problem(
     }
 }
 
+fn log_proton_policy_fallback(
+    logger: Option<&amaterasu_module_sdk::LogEmitter>,
+    phase: Phase,
+    fallback: bool,
+    payload: &Value,
+) {
+    if let Some(logger) = logger {
+        let code = safe_rtsp_provider_code(&payload["code"]);
+        let _ = logger.emit(
+            LogLevel::Warning,
+            "launch",
+            &format!(
+                "phase={phase:?} event=optional_policy_unavailable fallback={fallback} code={code}"
+            ),
+        );
+    }
+}
+
+pub(super) fn add_stream_warning(
+    record: &mut Record,
+    logger: Option<&amaterasu_module_sdk::LogEmitter>,
+    warning: amaterasu_module_sdk::stream_warnings::StreamWarning,
+) {
+    if !warning.valid() || record.stream_warnings.contains(&warning) {
+        return;
+    }
+    if let Some(logger) = logger {
+        let message = json!({"event":"stream_warning", "stream":record.rtsp_operation,
+            "warning":warning});
+        let _ = logger.emit(LogLevel::Warning, "stream.warning", &message.to_string());
+    }
+    if record.stream_warnings.len() < amaterasu_module_sdk::stream_warnings::MAX_WARNINGS {
+        record.stream_warnings.push(warning);
+        // A later warning must also be offered to the existing stream history.
+        record.history_warnings_attempted = false;
+    }
+}
+
+fn proton_policy_warning(
+    payload: &Value,
+    fallback: bool,
+) -> amaterasu_module_sdk::stream_warnings::StreamWarning {
+    use amaterasu_module_sdk::stream_warnings::{StreamWarning, WarningValue};
+    StreamWarning {
+        code: "proton_policy_unavailable".into(),
+        source: "amaterasu.nvhttp/1".into(),
+        reason: safe_rtsp_provider_code(&payload["code"]).into(),
+        os_error: None,
+        requested: None,
+        effective: Some(WarningValue::Boolean(fallback)),
+    }
+}
+
 impl Controller {
+    /// Advance optional warning queries independently of launch and monitoring.
+    pub(super) fn poll_diagnostic_jobs(&mut self, now: Instant, send: &mut Send<'_>) {
+        let ids: Vec<_> = self.diagnostic_jobs.keys().copied().collect();
+        for id in ids {
+            let Some((stream_operation, mut job)) = self.diagnostic_jobs.remove(&id) else {
+                continue;
+            };
+            let still_current = self.records.get(&id).is_some_and(|record| {
+                record.state == State::Ready && record.rtsp_operation == stream_operation
+            });
+            if !still_current {
+                job.call.abandon_warning(send);
+                continue;
+            }
+            let foreground = self.job.take();
+            self.advance(&mut job, now, send, &mut Vec::new());
+            if let Some(pending) = self.job.take() {
+                self.diagnostic_jobs.insert(id, (stream_operation, pending));
+            }
+            self.job = foreground;
+        }
+    }
+
+    /// Dispatch diagnostics only after the successful response is delivered.
+    pub(super) fn schedule_diagnostic_jobs(&mut self, now: Instant) {
+        let ids: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| {
+                record.state == State::Ready
+                    && record.stage == Stage::Live
+                    && !self.diagnostic_jobs.contains_key(&record.id)
+                    && ((record.application_launch.is_some() && !record.launch_warnings_attempted)
+                        || (record.history_reserved
+                            && !record.history_warnings_attempted
+                            && !record.stream_warnings.is_empty()))
+            })
+            .map(|record| record.id)
+            .collect();
+        for id in ids {
+            let Some(mut record) = self.records.remove(&id) else {
+                continue;
+            };
+            let phase = if record.application_launch.is_some() && !record.launch_warnings_attempted
+            {
+                Phase::ReadLaunchWarnings
+            } else {
+                Phase::RecordHistoryWarnings
+            };
+            let call = self.make_call(&mut record, phase);
+            let operation = record.rtsp_operation.clone();
+            self.diagnostic_jobs.insert(
+                id,
+                (
+                    operation,
+                    Job {
+                        record: id,
+                        phase,
+                        call,
+                        deadline: now + OPTIONAL_READ_BUDGET,
+                    },
+                ),
+            );
+            self.records.insert(id, record);
+        }
+    }
+
     /// Whether a step of this record's workflow can start now.
     pub(super) fn has_schedulable_work(&self, record: &Record, now: Instant) -> bool {
         needs_work(record, now) && !self.application_cleanup_waits_for_clients(record)
@@ -275,7 +403,13 @@ impl Controller {
             self.log_phase(LogLevel::Debug, phase, "start");
         }
         let call = self.make_call(&mut record, phase);
-        let deadline = if matches!(
+        let deadline = if phase.optional_proton_policy_read()
+            || matches!(
+                phase,
+                Phase::RecordHistoryWarnings | Phase::ReadLaunchWarnings
+            ) {
+            now + OPTIONAL_READ_BUDGET
+        } else if matches!(
             phase,
             Phase::AwaitApplication | Phase::MonitorApplication | Phase::MonitorRtsp
         ) {
@@ -302,7 +436,22 @@ impl Controller {
         if now >= job.deadline {
             job.call.cancel();
         }
-        match job.call.poll(send) {
+        let outcome = job.call.poll(send);
+        if job.phase.optional_proton_policy_read()
+            && !matches!(outcome, Outcome::Waiting)
+            && let Some(started) = job.deadline.checked_sub(OPTIONAL_READ_BUDGET)
+            && let Some(record) = self.records.get_mut(&job.record)
+            && record.state == State::Starting
+            && record.deadline > started
+            && (now >= job.deadline || now >= record.deadline)
+        {
+            // Only time actually spent on this optional read is excluded from
+            // the critical startup budget, up to its own bounded timeout.
+            record.deadline += now
+                .saturating_duration_since(started)
+                .min(OPTIONAL_READ_BUDGET);
+        }
+        match outcome {
             Outcome::Waiting => self.job = Some(take_job(job)),
             Outcome::Result(payload) => {
                 let expired_start = job.phase != Phase::AwaitApplication
@@ -337,8 +486,61 @@ impl Controller {
             Outcome::Rejected | Outcome::Settled if job.phase.routine_monitor() => {
                 self.status_read_lost(job, now, send, replies);
             }
+            Outcome::Rejected | Outcome::Settled
+                if matches!(
+                    job.phase,
+                    Phase::RecordHistoryWarnings | Phase::ReadLaunchWarnings
+                ) =>
+            {
+                self.consume(
+                    job,
+                    json!({"ok":false,"code":"history_warning_unavailable"}),
+                    now,
+                    replies,
+                );
+            }
+            Outcome::Uncertain
+                if matches!(
+                    job.phase,
+                    Phase::RecordHistoryWarnings | Phase::ReadLaunchWarnings
+                ) =>
+            {
+                if job.phase == Phase::ReadLaunchWarnings {
+                    job.call.abandon_read(send);
+                } else {
+                    job.call.abandon_warning(send);
+                }
+                self.consume(
+                    job,
+                    json!({"ok":false,"code":"history_warning_unconfirmed"}),
+                    now,
+                    replies,
+                );
+            }
+            Outcome::Rejected if job.phase.optional_proton_policy_read() => {
+                self.consume(
+                    job,
+                    json!({"ok":false,"code":"read_rejected"}),
+                    now,
+                    replies,
+                );
+            }
+            Outcome::Settled if job.phase.optional_proton_policy_read() => {
+                self.consume(job, json!({"ok":false,"code":"read_settled"}), now, replies);
+            }
             Outcome::Rejected => self.rejected(job, now, replies),
             Outcome::Settled => self.settled(job, now, replies),
+            Outcome::Uncertain if job.phase.optional_proton_policy_read() => {
+                // The settings read cannot have changed provider state. Do not
+                // retain it as an uncertain mutation or stop the stream.
+                job.call.abandon_read(send);
+                self.consume(
+                    job,
+                    json!({"ok":false,"code":"read_unconfirmed"}),
+                    now,
+                    replies,
+                );
+            }
             Outcome::Uncertain => {
                 self.log_phase(LogLevel::Warning, job.phase, "uncertain");
                 if job.phase.status_read() {
@@ -414,7 +616,10 @@ impl Controller {
                         self.finish_or_retain(job.record, now, replies);
                         return;
                     }
-                    Phase::ReserveHistory | Phase::ReleaseHistory => {}
+                    Phase::ReserveHistory
+                    | Phase::ReleaseHistory
+                    | Phase::RecordHistoryWarnings
+                    | Phase::ReadLaunchWarnings => {}
                     Phase::OpenRtsp | Phase::StopRtsp | Phase::LookupRtsp => {
                         record.rtsp_cleanup_blocked = true;
                     }
@@ -562,6 +767,54 @@ impl Controller {
     }
 
     fn make_call(&mut self, record: &mut Record, phase: Phase) -> Call {
+        if phase == Phase::ReadLaunchWarnings {
+            record.launch_warnings_attempted = true;
+            let operation = self.next_operation(record, phase.name());
+            let launch_id = record.application_launch.unwrap_or(0);
+            let command = amaterasu_module_sdk::stream_warnings::read_launch_warnings(
+                amaterasu_module_sdk::requests::RequestOptions {
+                    service: LAUNCH_SERVICE,
+                    timeout_ms: 1_000,
+                    operation_id: &operation,
+                    parent: None,
+                },
+                launch_id,
+            )
+            .unwrap_or_else(|_| Command::Request {
+                service: LAUNCH_SERVICE.into(),
+                payload: json!({"action":"warnings","launch_id":launch_id}),
+                timeout_ms: 1,
+                operation_id: operation,
+                parent: None,
+            });
+            return Call::from_command(command);
+        }
+        if phase == Phase::RecordHistoryWarnings {
+            record.history_warnings_attempted = true;
+            let operation = self.next_operation(record, phase.name());
+            let request = amaterasu_module_sdk::stream_warnings::RecordHistoryWarnings {
+                activity_id: record.rtsp_operation.clone(),
+                rtsp_operation_id: record.rtsp_operation.clone(),
+                warnings: record.stream_warnings.clone(),
+            };
+            let command = amaterasu_module_sdk::stream_warnings::record_history_warnings(
+                amaterasu_module_sdk::requests::RequestOptions {
+                    service: &self.stream_service,
+                    timeout_ms: 1_000,
+                    operation_id: &operation,
+                    parent: None,
+                },
+                &request,
+            ).unwrap_or_else(|_| Command::Request {
+                service: self.stream_service.clone(),
+                payload: json!({"action":"record_history_warnings", "activity_id":record.rtsp_operation,
+                    "rtsp_operation_id":record.rtsp_operation, "warnings":[]}),
+                timeout_ms: 1,
+                operation_id: operation,
+                parent: None,
+            });
+            return Call::from_command(command);
+        }
         if matches!(phase, Phase::ReadRtspRuntimeEpoch | Phase::ReadLaunchEpoch) {
             let contract = if phase == Phase::ReadRtspRuntimeEpoch {
                 Contract::Transport
@@ -689,6 +942,8 @@ impl Controller {
             Phase::BindPresentationApplication => {
                 unreachable!("handled before ordinary broker calls")
             }
+            Phase::RecordHistoryWarnings => unreachable!("handled by the warning SDK adapter"),
+            Phase::ReadLaunchWarnings => unreachable!("handled by the warning SDK adapter"),
             Phase::ReadRtspRuntimeEpoch | Phase::ReadLaunchEpoch => {
                 unreachable!("handled by the public retirement adapter")
             }
@@ -1140,8 +1395,17 @@ impl Controller {
                     .pending_resume
                     .take()
                     .filter(|pending| pending.record == job.record);
+                let (proton, warning) = match proton_policy_response(&payload) {
+                    Ok(value) => (value, None),
+                    Err(_) => {
+                        let fallback = record
+                            .global_proton_dualsense_compatibility
+                            .unwrap_or(false);
+                        log_proton_policy_fallback(logger.as_ref(), job.phase, fallback, &payload);
+                        (fallback, Some(proton_policy_warning(&payload, fallback)))
+                    }
+                };
                 let candidate = pending.and_then(|pending| {
-                    let proton = proton_policy_response(&payload).ok()?;
                     let connect_data = super::random_nonzero_u32().ok()?;
                     super::resume_snapshot::ResumeSnapshot::build(
                         self,
@@ -1160,6 +1424,9 @@ impl Controller {
                         || self.retire_stream_key(record.request.remote_input_key)
                     {
                         candidate.apply(&mut record);
+                        if let Some(warning) = warning {
+                            add_stream_warning(&mut record, logger.as_ref(), warning);
+                        }
                         record.stage = Stage::ReserveHistory;
                     } else {
                         reject_resume(&mut record, replies);
@@ -1411,6 +1678,23 @@ impl Controller {
                 }
             }
             Phase::RefreshResumePolicy => unreachable!("handled before borrowing the record"),
+            Phase::ReadLaunchWarnings => {
+                if let Some(warnings) = record.application_launch.and_then(|id| {
+                    amaterasu_module_sdk::stream_warnings::parse_launch_warnings(
+                        &payload,
+                        id,
+                        &record.application_operation,
+                    )
+                }) {
+                    for warning in warnings {
+                        add_stream_warning(record, logger.as_ref(), warning);
+                    }
+                }
+            }
+            Phase::RecordHistoryWarnings => {
+                // The optional history provider can decline or lose this
+                // diagnostic update without changing the stream outcome.
+            }
             Phase::ReserveHistory => {
                 if record.cleanup_error == Some("broker_settlement_unconfirmed") {
                     record.cleanup_error = None;
@@ -1441,13 +1725,17 @@ impl Controller {
             }
             Phase::ReadProtonPolicy => {
                 if record.state == State::Starting {
-                    match proton_policy_response(&payload) {
-                        Ok(value) => {
-                            record.global_proton_dualsense_compatibility = Some(value);
-                            Self::advance_after_history(self.config.as_ref(), record, now);
-                        }
-                        Err(code) => fail_record(record, code, now),
-                    }
+                    let value = proton_policy_response(&payload).unwrap_or_else(|_| {
+                        log_proton_policy_fallback(logger.as_ref(), job.phase, false, &payload);
+                        add_stream_warning(
+                            record,
+                            logger.as_ref(),
+                            proton_policy_warning(&payload, false),
+                        );
+                        false
+                    });
+                    record.global_proton_dualsense_compatibility = Some(value);
+                    Self::advance_after_history(self.config.as_ref(), record, now);
                 }
             }
             Phase::PreflightApplication => match application_preflight_response(record, &payload) {
@@ -1991,6 +2279,8 @@ impl Controller {
                     }
                 }
             }
+            Phase::RecordHistoryWarnings => {}
+            Phase::ReadLaunchWarnings => {}
             Phase::ReadProtonPolicy => {
                 fail_record(record, "input_policy_unavailable", now);
             }
@@ -2117,6 +2407,8 @@ impl Controller {
                     }
                 }
             }
+            Phase::RecordHistoryWarnings => {}
+            Phase::ReadLaunchWarnings => {}
             Phase::ReleaseHistory => {
                 if releasing_paused_history {
                     record.request_cleanup(Some("history_release_unavailable"), now);
@@ -2382,6 +2674,8 @@ impl Phase {
             Self::VerifyResumeApplication => "verify-resume-application",
             Self::RefreshResumePolicy => "refresh-resume-policy",
             Self::ReserveHistory => "reserve-history",
+            Self::RecordHistoryWarnings => "record-history-warnings",
+            Self::ReadLaunchWarnings => "read-launch-warnings",
             Self::ReadProtonPolicy => "read-proton-policy",
             Self::PreflightApplication => "preflight-launch",
             Self::SnapshotDisplay => "snapshot-display",

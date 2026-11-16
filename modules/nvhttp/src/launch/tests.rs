@@ -1316,8 +1316,16 @@ struct Broker {
     history_release_unavailable: bool,
     history_release_in_use_once: bool,
     history_reserved: bool,
+    history_warning_rejected: bool,
+    history_warning_result_lost: bool,
+    history_warning_pending: bool,
+    history_warning_request_ids: BTreeSet<u64>,
     input_policy_response: Value,
     input_policy_requests: usize,
+    input_policy_rejected: bool,
+    input_policy_result_lost: bool,
+    input_policy_pending: bool,
+    input_policy_request_ids: BTreeSet<u64>,
     lose_history_reserve_once: bool,
     lost_history_reserve: bool,
     lose_history_release_result_once: bool,
@@ -1336,6 +1344,7 @@ struct Broker {
     lost_rtsp_open: bool,
     application_operation: String,
     application_id: String,
+    application_warnings: Vec<Value>,
     fail_rtsp_settlement: bool,
     fail_application_settlement: bool,
     unavailable_output: Option<String>,
@@ -1401,6 +1410,10 @@ impl Default for Broker {
             history_release_unavailable: false,
             history_release_in_use_once: false,
             history_reserved: false,
+            history_warning_rejected: false,
+            history_warning_result_lost: false,
+            history_warning_pending: false,
+            history_warning_request_ids: BTreeSet::new(),
             input_policy_response: json!({
                 "ok":true,
                 "persisted":true,
@@ -1408,6 +1421,10 @@ impl Default for Broker {
                 "values":{"proton_dualsense_compatibility":true}
             }),
             input_policy_requests: 0,
+            input_policy_rejected: false,
+            input_policy_result_lost: false,
+            input_policy_pending: false,
+            input_policy_request_ids: BTreeSet::new(),
             lose_history_reserve_once: false,
             lost_history_reserve: false,
             lose_history_release_result_once: false,
@@ -1426,6 +1443,7 @@ impl Default for Broker {
             lost_rtsp_open: false,
             application_operation: String::new(),
             application_id: "app-0000000000000001".into(),
+            application_warnings: Vec::new(),
             fail_rtsp_settlement: false,
             fail_application_settlement: false,
             unavailable_output: None,
@@ -1490,6 +1508,19 @@ impl Broker {
                 if service == "amaterasu.session-lifecycle/1" && self.lifecycle_unavailable {
                     return Ok(Response::error("unavailable", "fixture"));
                 }
+                if service == "amaterasu.input/1"
+                    && payload["action"] == "settings_get"
+                    && self.input_policy_rejected
+                {
+                    self.input_policy_requests += 1;
+                    return Ok(Response::error("unavailable", "fixture"));
+                }
+                if service == "amaterasu.stream-session/1"
+                    && payload["action"] == "record_history_warnings"
+                    && self.history_warning_rejected
+                {
+                    return Ok(Response::error("unavailable", "fixture"));
+                }
                 if self.lose_history_reserve_once
                     && !self.lost_history_reserve
                     && service == "amaterasu.stream-session/1"
@@ -1516,6 +1547,12 @@ impl Broker {
                 }
                 self.next += 1;
                 let request = self.next;
+                if service == "amaterasu.input/1" && payload["action"] == "settings_get" {
+                    self.input_policy_request_ids.insert(request);
+                }
+                if service == "amaterasu.stream-session/1" && payload["action"] == "record_history_warnings" {
+                    self.history_warning_request_ids.insert(request);
+                }
                 if service == "amaterasu.session-lifecycle/1" {
                     self.lifecycle_requests.insert(request);
                 }
@@ -1581,6 +1618,26 @@ impl Broker {
             Command::TakeResult { request }
                 if self.hold_launch_export_result
                     && self.held_launch_export_request == Some(request) =>
+            {
+                Ok(Response::Pending)
+            }
+            Command::TakeResult { request }
+                if self.history_warning_result_lost && self.history_warning_request_ids.contains(&request) =>
+            {
+                Err("lost best-effort warning result".into())
+            }
+            Command::TakeResult { request }
+                if self.history_warning_pending && self.history_warning_request_ids.contains(&request) =>
+            {
+                Ok(Response::Pending)
+            }
+            Command::TakeResult { request }
+                if self.input_policy_result_lost && self.input_policy_request_ids.contains(&request) =>
+            {
+                Err("lost read-only input policy result".into())
+            }
+            Command::TakeResult { request }
+                if self.input_policy_pending && self.input_policy_request_ids.contains(&request) =>
             {
                 Ok(Response::Pending)
             }
@@ -1657,6 +1714,7 @@ impl Broker {
                             "rtsp_operation_id":payload["rtsp_operation_id"]})
                     }
                 }
+                "record_history_warnings" => json!({"ok":true}),
                 _ => panic!("unexpected stream-session action: {action}"),
             };
         }
@@ -1746,6 +1804,10 @@ impl Broker {
             return json!({"ok":false,"code":"ticket_not_found"});
         }
         if service == "amaterasu.launch/1" {
+            if action == "warnings" {
+                return json!({"ok":true,"launch_id":payload["launch_id"],
+                    "operation_id":self.application_operation,"warnings":self.application_warnings});
+            }
             if action == "launch_export" && self.reject_launch_export {
                 return json!({"ok":false,"code":"display_admission_denied"});
             }
@@ -1985,7 +2047,7 @@ fn poll_until_reply(
     broker: &mut Broker,
     now: Instant,
 ) -> (u64, Reply) {
-    for _ in 0..32 {
+    for _ in 0..64 {
         let replies = controller.poll(now, &mut |command| broker.send(command));
         if let Some(reply) = replies.into_iter().next() {
             return reply;
@@ -2008,6 +2070,13 @@ fn poll_until_reply_with_trust(
         }
     }
     panic!("trusted lifecycle did not produce a bounded reply")
+}
+
+fn poll_after_delivery(controller: &mut Controller, broker: &mut Broker, connection: u64, now: Instant) {
+    controller.reply_delivered(connection, now);
+    for step in 0..32 {
+        controller.poll(now + Duration::from_millis(step * 25), &mut |command| broker.send(command));
+    }
 }
 
 fn poll_until_stopped(controller: &mut Controller, broker: &mut Broker, now: Instant, id: u64) {
@@ -3671,7 +3740,7 @@ fn proton_compatibility_freezes_client_application_global_precedence() {
 }
 
 #[test]
-fn invalid_proton_policy_snapshot_fails_before_application_preflight() {
+fn unavailable_proton_policy_uses_a_disabled_default_and_keeps_launching() {
     let malformed = [
         json!({"ok":false,"persisted":false}),
         json!({"ok":true,"persisted":false,"values":{"proton_dualsense_compatibility":true}}),
@@ -3688,25 +3757,169 @@ fn invalid_proton_policy_snapshot_fails_before_application_preflight() {
         };
 
         assert!(controller.launch(10, request(1), peer(1), now).is_none());
-        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
 
-        assert_ne!(reply.status, 200);
+        assert_eq!(reply.status, 200);
+        assert_eq!(launch_export_payload(&broker)["proton_dualsense_compatibility"], false);
         assert!(
             broker
                 .actions()
                 .contains(&("amaterasu.input/1", "settings_get"))
         );
         assert!(
-            !broker
+            broker
                 .actions()
                 .contains(&("amaterasu.launch/1", "preflight_export"))
         );
         assert!(
-            !broker
+            broker
                 .actions()
                 .contains(&("amaterasu.launch/1", "launch_export"))
         );
-        assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+        assert!(broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+        assert!(!broker.actions().contains(&("amaterasu.stream-session/1", "record_history_warnings")));
+        poll_after_delivery(&mut controller, &mut broker, connection, now);
+        let warnings = broker.commands.iter().find_map(|command| match command {
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.stream-session/1" && payload["action"] == "record_history_warnings" => Some(payload),
+            _ => None,
+        }).expect("optional stream history warning");
+        assert_eq!(warnings["warnings"][0]["code"], "proton_policy_unavailable");
+        assert_eq!(warnings["warnings"][0]["effective"], false);
+    }
+}
+
+#[test]
+fn unavailable_optional_history_warning_delivery_never_blocks_launch() {
+    for (history_absent, rejected, lost) in [(true, false, false), (false, true, false), (false, false, true)] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            input_policy_response: json!({"ok":false}),
+            history_reserve_unavailable: history_absent,
+            history_warning_rejected: rejected,
+            history_warning_result_lost: lost,
+            ..Broker::default()
+        };
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+        assert!(!broker.actions().contains(&("amaterasu.stream-session/1", "record_history_warnings")));
+        poll_after_delivery(&mut controller, &mut broker, connection, now);
+        assert_eq!(controller.records[&1].state, State::Ready);
+        assert!(controller.records[&1].uncertain.is_empty());
+        assert_eq!(broker.actions().contains(&("amaterasu.stream-session/1", "record_history_warnings")), !history_absent);
+    }
+}
+
+#[test]
+fn application_warnings_are_forwarded_to_the_exact_stream_history() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_warnings: vec![json!({"code":"proton_hook_unavailable",
+            "source":"amaterasu.application/1","reason":"proton_hook_unconfirmed",
+            "requested":true})],
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    poll_after_delivery(&mut controller, &mut broker, connection, now);
+    let history = broker.commands.iter().find_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.stream-session/1" && payload["action"] == "record_history_warnings" => Some(payload),
+        _ => None,
+    }).expect("history warning request");
+    assert_eq!(history["activity_id"], controller.records[&1].rtsp_operation);
+    assert_eq!(history["warnings"][0]["reason"], "proton_hook_unconfirmed");
+}
+
+#[test]
+fn pending_history_warning_does_not_block_stream_monitoring() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        input_policy_response: json!({"ok":false}),
+        history_warning_pending: true,
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    controller.reply_delivered(connection, now);
+    for _ in 0..32 {
+        controller.poll(now, &mut |command| broker.send(command));
+        if !broker.history_warning_request_ids.is_empty() { break; }
+    }
+    assert!(!broker.history_warning_request_ids.is_empty());
+    assert!(controller.diagnostic_jobs.contains_key(&1));
+    broker.wrong_application_id = true;
+    let record = controller.records.get_mut(&1).unwrap();
+    record.next_monitor = now;
+    record.monitor_application_next = true;
+    for _ in 0..8 {
+        controller.poll(now, &mut |command| broker.send(command));
+    }
+    assert_ne!(controller.records[&1].state, State::Ready);
+}
+
+#[test]
+fn rejected_or_lost_proton_policy_read_does_not_block_launch() {
+    for lost in [false, true] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            input_policy_rejected: !lost,
+            input_policy_result_lost: lost,
+            ..Broker::default()
+        };
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+        assert_eq!(launch_export_payload(&broker)["proton_dualsense_compatibility"], false);
+        assert!(controller.records[&1].uncertain.is_empty());
+        if lost {
+            assert!(broker.commands.iter().any(|command| matches!(command,
+                Command::Cancel { request } if broker.input_policy_request_ids.contains(request))));
+        }
+    }
+}
+
+#[test]
+fn pending_optional_policy_read_has_its_own_bounded_budget() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker { input_policy_pending: true, ..Broker::default() };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    controller.records.get_mut(&1).unwrap().deadline = now + Duration::from_millis(200);
+    for _ in 0..32 {
+        controller.poll(now, &mut |command| broker.send(command));
+        if !broker.input_policy_request_ids.is_empty() { break; }
+    }
+    assert!(!broker.input_policy_request_ids.is_empty());
+    let later = now + Duration::from_millis(260);
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, later);
+    assert_eq!(reply.status, 200);
+    assert_eq!(launch_export_payload(&broker)["proton_dualsense_compatibility"], false);
+    assert!(controller.records[&1].uncertain.is_empty());
+    assert!(broker.commands.iter().any(|command| matches!(command,
+        Command::Cancel { request } if broker.input_policy_request_ids.contains(request))));
+}
+
+#[test]
+fn unavailable_global_proton_policy_still_honors_explicit_overrides() {
+    for (application, client, expected) in [(Some(true), None, true), (Some(true), Some(false), false)] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            input_policy_response: json!({"ok":false}),
+            application_input_overrides: application.map(|value| json!({"proton_dualsense_compatibility":value})),
+            ..Broker::default()
+        };
+        assert!(controller.launch(10, request(1), peer_with_proton_override(1, client), now).is_none());
+        assert_eq!(poll_until_reply(&mut controller, &mut broker, now).1.status, 200);
+        assert_eq!(launch_export_payload(&broker)["proton_dualsense_compatibility"], expected);
     }
 }
 

@@ -3,7 +3,7 @@
 use crate::command_paths::resolve_command_executable;
 use crate::commands::parse_detached_commands;
 use crate::containment::ContainedChild;
-use crate::output::SharedOutput;
+use crate::output::{SharedOutput, output_warning, push_warning};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -439,7 +439,6 @@ pub(crate) fn validate_environment(
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CommandFailureKind {
-    OutputOpenFailed,
     Cancelled,
     SpawnFailed,
     ExitFailed,
@@ -537,6 +536,7 @@ impl CommandTask {
         application_working_directory: Option<&str>,
         execution_timeout: Option<Duration>,
         output: Option<&SharedOutput>,
+        warnings: &mut Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
         now: Instant,
     ) -> Result<Self, TaskSpawnError> {
         let (mut command, elevated) = match spec {
@@ -581,8 +581,14 @@ impl CommandTask {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(output) = output {
-            output.attach(&mut command)?;
+        if let Some(output) = output
+            && let Err(error) = output.attach(&mut command)
+        {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+            push_warning(
+                warnings,
+                output_warning("output_attach_failed", error.raw_os_error()),
+            );
         }
         match ContainedChild::spawn(&mut command, elevated) {
             Ok(child) => Ok(Self {
@@ -788,6 +794,8 @@ pub(crate) struct PreparationReport {
     pub last_command: Option<CommandOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<CommandFailure>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
 }
 
 #[derive(Debug, Serialize)]
@@ -920,6 +928,7 @@ impl ApplicationLifecycle {
                 completed: 0,
                 last_command: None,
                 failure: None,
+                warnings: Vec::new(),
             },
             cleanup: CleanupReport {
                 state: CleanupState::Deferred,
@@ -1057,6 +1066,7 @@ impl ApplicationLifecycle {
                 // structured commands carry an explicit per-command timeout.
                 command.execution_timeout(None),
                 self.output.as_ref(),
+                &mut self.preparation.warnings,
                 now,
             ) {
                 Ok(task) => {
@@ -1112,6 +1122,7 @@ impl ApplicationLifecycle {
             self.preparation_working_directory.as_deref(),
             command.execution_timeout(Some(self.raw_undo_timeout)),
             self.output.as_ref(),
+            &mut self.preparation.warnings,
             now,
         ) {
             Ok(task) => {
@@ -1276,19 +1287,6 @@ impl ApplicationLifecycle {
 
     pub(crate) fn set_output(&mut self, output: Option<SharedOutput>) {
         self.output = output;
-    }
-
-    pub(crate) fn output_open_failed(&mut self, error: &std::io::Error) {
-        self.preparation.failure = Some(CommandFailure {
-            phase: "output",
-            step: 0,
-            kind: CommandFailureKind::OutputOpenFailed,
-            exit_code: None,
-            os_error: error.raw_os_error(),
-        });
-        self.cleanup.state = CleanupState::Complete;
-        self.phase = Phase::Complete;
-        self.output = None;
     }
 
     /// Budget only owed work. Shutdown cancels an active preparation command,

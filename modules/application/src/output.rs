@@ -10,6 +10,31 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
+pub(crate) fn output_warning(
+    reason: &str,
+    os_error: Option<i32>,
+) -> amaterasu_module_sdk::stream_warnings::StreamWarning {
+    use amaterasu_module_sdk::stream_warnings::{StreamWarning, WarningValue};
+    StreamWarning {
+        code: "application_output_unavailable".into(),
+        source: "amaterasu.application/1".into(),
+        reason: reason.into(),
+        os_error,
+        requested: Some(WarningValue::Label("configured_output".into())),
+        effective: Some(WarningValue::Label("discarded".into())),
+    }
+}
+
+pub(crate) fn push_warning(
+    warnings: &mut Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
+    warning: amaterasu_module_sdk::stream_warnings::StreamWarning,
+) {
+    use amaterasu_module_sdk::stream_warnings::MAX_WARNINGS;
+    if warning.valid() && warnings.len() < MAX_WARNINGS && !warnings.contains(&warning) {
+        warnings.push(warning);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SharedOutput(Arc<File>);
 
