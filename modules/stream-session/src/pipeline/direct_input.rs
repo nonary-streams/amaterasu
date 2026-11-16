@@ -7,8 +7,8 @@
 //! decline any batch; the queued request then carries the identical payload,
 //! so ordering and lifecycle sequence numbers are the same on both paths.
 use super::input::{
-    accept_acknowledged_input_batch, accept_controller_batch_failure, input_batch_payload,
-    next_input_batch_size, stop_for_input_failure,
+    accept_acknowledged_input_batch, accept_controller_batch_failure, drop_refused_input_batch,
+    input_batch_payload, next_input_batch_size, stop_for_input_failure,
 };
 use super::record::{Record, State};
 use super::{Pipeline, Step};
@@ -106,5 +106,5 @@ fn accept_direct_reply(record: &mut Record, reply: &Value) -> Result<(), &'stati
         record.session_effects.vigem_missing(record.id);
         return accept_controller_batch_failure(record, reply);
     }
-    Err("dependency_rejected")
+    drop_refused_input_batch(record, reply)
 }

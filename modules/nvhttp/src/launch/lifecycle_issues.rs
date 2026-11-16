@@ -144,6 +144,22 @@ impl Record {
         self.issues.push(issue);
     }
 
+    /// Record a failure with an explicit reason, such as the code a provider
+    /// reported in a status rather than as its reply's `code`.
+    #[track_caller]
+    pub(super) fn record_failure_because(&mut self, code: &str, reason: &str) {
+        let mut issue = self.attributed(StreamIssue::critical(
+            self.rtsp_operation.clone(),
+            LifecycleLayer::Nvhttp,
+            "unattributed",
+            code,
+        ));
+        if plain_code(reason) {
+            reason.clone_into(&mut issue.reason);
+        }
+        self.issues.push(issue);
+    }
+
     /// Record a failure this launch survived by using `fallback`.
     #[track_caller]
     pub(super) fn record_demotion(&mut self, code: &str, reason: &str, fallback: &str) {

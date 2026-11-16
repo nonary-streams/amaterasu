@@ -1130,6 +1130,11 @@ impl Pipeline {
                 }
                 return true;
             }
+            if job.step == Step::InputBatch
+                && super::input::drop_refused_input_batch(record, &payload).is_ok()
+            {
+                return false;
+            }
             eprintln!(
                 "amaterasu session dependency rejected step={:?} code={}",
                 job.step,

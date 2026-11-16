@@ -26,6 +26,11 @@ FRAMER = "amaterasu.encode.pyrowave-framing/1"
 UNITS = "amaterasu.video.pyrowave-units/1"
 TRANSPORT = "amaterasu.media-transport.pyrowave-plan/1"
 PROFILE = json.loads((Path(__file__).parent / "pyrowave/profile.json").read_text())
+# The same extension for SDR clients: Moonlight requests 8-bit 4:2:0 PyroWave
+# whenever HDR is off, and the encoder's 8-bit codec serves it.
+SDR_PROFILE = deepcopy(PROFILE)
+SDR_PROFILE["codec"]["value"] = 1
+SDR_PROFILE["media_format"] = {"bit_depth": 8, "dynamic_range": "sdr", "chroma_sampling": "yuv420"}
 LEGACY_PROFILE = deepcopy(PROFILE)
 LEGACY_PROFILE["wire_attributes"] = [attribute for attribute in PROFILE["wire_attributes"]
                                      if attribute["phase"] == "describe"]
@@ -57,12 +62,12 @@ def compose(bootstrap, manifest, approved):
     settings["amaterasu.linux-session-video"].update({
         "unit_service": UNITS,
         "source_encoder_providers": {"pyrowave": {"control_service": CONTROL,
-            "native_service": PROVIDER, "source_ids": [1], "extension_profiles": [PROFILE], "submitted": True}},
+            "native_service": PROVIDER, "source_ids": [1], "extension_profiles": [PROFILE, SDR_PROFILE], "submitted": True}},
         "external_encoder_consumers": {"pyrowave": CONSUMER},
     })
-    settings["amaterasu.media-transport"].update({"plan_service": TRANSPORT, "extension_profiles": [PROFILE]})
+    settings["amaterasu.media-transport"].update({"plan_service": TRANSPORT, "extension_profiles": [PROFILE, SDR_PROFILE]})
     settings["amaterasu.stream-session"]["extension_route"] = {
-        "profile": PROFILE, "source_id": 1, "submitted": True, "encoder_provider": "pyrowave",
+        "profile": PROFILE, "alternate_profiles": [SDR_PROFILE], "source_id": 1, "submitted": True, "encoder_provider": "pyrowave",
         "encoder": {"clsid": "pyrowave", "friendly_name": "PyroWave", "hardware_url": None},
         "video_unit_service": UNITS, "framer_service": FRAMER, "plan_transport_service": TRANSPORT,
     }

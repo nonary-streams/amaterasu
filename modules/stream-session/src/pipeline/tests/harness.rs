@@ -345,6 +345,8 @@ pub struct Broker {
     pub gamepad_poll_error: Option<String>,
     pub gamepad_admission_error: Option<String>,
     pub fail_input_batch: bool,
+    /// Refuse the next input batch with this batch-scoped code, keeping the lease.
+    pub refuse_input_batch: Option<String>,
     pub fail_controller_input: bool,
     pub input_cleanup_required: bool,
     pub input_expires_in_ms: Option<u64>,
@@ -1673,6 +1675,10 @@ impl Broker {
                         "accepted":events.len().saturating_sub(1),
                         "partial_event_possible":true,
                         "error":{"code":"controller_unavailable","message":"virtual gamepad unavailable"}});
+                }
+                if let Some(code) = self.refuse_input_batch.take() {
+                    return json!({"ok":false,"lease":self.input_lease,"accepted":0,
+                        "partial_event_possible":false,"error":{"code":code}});
                 }
                 if self.fail_input_batch {
                     self.input_lease = None;

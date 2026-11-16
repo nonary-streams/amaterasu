@@ -2346,6 +2346,10 @@ impl Controller {
                                 safe_rtsp_provider_code(&payload["cleanup_error"])
                             );
                             log_monitor_problem(logger.as_ref(), job.phase, "stream_failed");
+                            record.record_failure_because(
+                                "rtsp_stream_failed",
+                                safe_rtsp_provider_code(&payload["failure"]),
+                            );
                         } else if let Some(logger) = logger.as_ref() {
                             let _ = logger.emit(
                                 LogLevel::Info,

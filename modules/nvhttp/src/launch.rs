@@ -2355,10 +2355,24 @@ fn private_error(status: u16, message: &str) -> Reply {
     reply.requires_paired_tls = true;
     reply.rejection = Some(crate::wire::Rejection {
         status,
-        code: reason.replace(' ', "_"),
+        code: rejection_code(message),
         site: std::panic::Location::caller(),
     });
     reply
+}
+
+/// A refusal's message as a lifecycle code: `Desktop session is unavailable`
+/// becomes `desktop_session_is_unavailable`. A message with anything but
+/// letters, digits, spaces and underscores is redacted.
+fn rejection_code(message: &str) -> String {
+    let plain = message.len() <= 64
+        && message
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b' '));
+    if !plain || message.is_empty() {
+        return "redacted".to_owned();
+    }
+    message.to_ascii_lowercase().replace(' ', "_")
 }
 
 fn success_reply(record: &Record) -> Reply {

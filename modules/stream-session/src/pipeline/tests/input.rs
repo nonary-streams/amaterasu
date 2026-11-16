@@ -1985,6 +1985,46 @@ fn a_direct_call_with_an_unknown_outcome_stops_the_stream_without_replaying_inpu
 }
 
 #[test]
+fn a_batch_scoped_refusal_drops_the_batch_and_keeps_streaming() {
+    for served_directly in [false, true] {
+        for code in ["invalid_sequence", "shortcut_unavailable"] {
+            let direct = served_directly.then_some(DirectInput::Serve);
+            let (mut host, id) = active_input_stream(direct);
+            host.broker.refuse_input_batch = Some(code.into());
+            host.plane.borrow_mut().controls.push(relative(1));
+            host.idle();
+            let record = &host.pipeline.records[&id];
+            assert_eq!(
+                record.state,
+                State::Active,
+                "{code}, direct: {served_directly}"
+            );
+            assert!(
+                record.input_events.is_empty(),
+                "the refused batch is dropped"
+            );
+            assert_eq!(record.input_inflight, 0);
+
+            // Later input still reaches the provider.
+            host.plane.borrow_mut().controls.push(relative(2));
+            host.idle();
+            let record = &host.pipeline.records[&id];
+            assert_eq!(record.state, State::Active);
+            assert!(record.input_events.is_empty());
+        }
+    }
+}
+
+#[test]
+fn a_refusal_that_ends_the_lease_still_ends_the_stream() {
+    let (mut host, id) = active_input_stream(None);
+    host.broker.refuse_input_batch = Some("binding_unavailable".into());
+    host.plane.borrow_mut().controls.push(relative(1));
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Failed);
+}
+
+#[test]
 fn a_rejected_direct_batch_fails_the_stream_like_a_rejected_request() {
     let (mut host, id) = active_input_stream(Some(DirectInput::Serve));
     host.broker.fail_input_batch = true;

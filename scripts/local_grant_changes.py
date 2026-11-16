@@ -6,10 +6,12 @@ installation's package activation policy approves, and only to the grants
 each component requests in the signed manifest. This updates both from one
 reviewed change file:
 
-    {"amaterasu.rtsp": {"publish": {"add": ["topic/1"], "remove": []}}, ...}
+    {"amaterasu.rtsp": {"publish": {"add": ["topic/1"], "remove": []}}, ...,
+     "/policy/settings/amaterasu.media-transport/extension_profiles": [...]}
 
-Principals absent from the installed policy are skipped: the set does not
-contain them.
+A key that is a `/policy/settings/...` pointer sets that settings value; it
+must name a principal the installed policy already configures. Principals
+absent from the installed policy are skipped: the set does not contain them.
 """
 from copy import deepcopy
 
@@ -24,7 +26,12 @@ def apply_grant_changes(bootstrap, manifest, approved, changes):
     principals = candidate["policy"]["principals"]
     components = {component["id"]: component for component in manifest["components"]}
     skipped = []
+    settings = {path: value for path, value in changes.items() if path.startswith("/")}
+    for path, value in sorted(settings.items()):
+        set_setting(candidate, path, value)
     for principal, kinds in sorted(changes.items()):
+        if principal in settings:
+            continue
         if principal not in principals or principal not in components:
             skipped.append(principal)
             continue
@@ -40,8 +47,8 @@ def apply_grant_changes(bootstrap, manifest, approved, changes):
             raise ValueError(f"existing approval is not applied: {path}")
     delta = differences(bootstrap, candidate)
     for path, change in delta.items():
-        if not path.startswith("/policy/principals/"):
-            raise ValueError(f"grant changes may only touch principals: {path}")
+        if not path.startswith(("/policy/principals/", "/policy/settings/")):
+            raise ValueError(f"changes may only touch principals and settings: {path}")
         if any(old != path and (old.startswith(path + "/") or path.startswith(old + "/"))
                for old in allowlist["changes"]):
             raise ValueError(f"overlapping prior approval: {path}")
@@ -49,3 +56,16 @@ def apply_grant_changes(bootstrap, manifest, approved, changes):
     if len(allowlist["changes"]) > 256:
         raise ValueError("policy change limit exceeded")
     return candidate, allowlist, delta, skipped
+
+
+def set_setting(document, path, value):
+    """Set one `/policy/settings/<principal>/...` value the policy configures."""
+    keys = [key.replace("~1", "/").replace("~0", "~") for key in path.split("/")[1:]]
+    if keys[:2] != ["policy", "settings"] or len(keys) < 4:
+        raise ValueError(f"not a settings path: {path}")
+    parent = document
+    for key in keys[:-1]:
+        if not isinstance(parent, dict) or key not in parent:
+            raise ValueError(f"settings path is not configured: {path}")
+        parent = parent[key]
+    parent[keys[-1]] = value

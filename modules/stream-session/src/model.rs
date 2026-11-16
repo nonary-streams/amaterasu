@@ -191,6 +191,11 @@ impl ProcessingPlanProvider {
 #[serde(deny_unknown_fields)]
 pub struct ExtensionRoute {
     pub profile: amaterasu_contracts::media_profile::VideoProfile,
+    /// The same extension at other media formats, such as 8-bit SDR beside
+    /// 10-bit HDR. A session uses the one matching the format its launch
+    /// probes, so an SDR client can stream or resume the extension too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternate_profiles: Vec<amaterasu_contracts::media_profile::VideoProfile>,
     pub source_id: u64,
     #[serde(default)]
     pub submitted: bool,
@@ -207,7 +212,10 @@ impl ExtensionRoute {
             &self.framer_service,
             &self.plan_transport_service,
         ];
-        self.profile.is_valid()
+        (amaterasu_contracts::media_profile::VideoProfileSnapshot {
+            profiles: self.profiles().cloned().collect(),
+        })
+        .validate()
             && self.source_id != 0
             && !self.encoder_provider.is_empty()
             && self.encoder_provider.len() <= 64
@@ -223,6 +231,29 @@ impl ExtensionRoute {
                 .iter()
                 .enumerate()
                 .all(|(i, service)| !services[..i].contains(service))
+    }
+
+    fn profiles(&self) -> impl Iterator<Item = &amaterasu_contracts::media_profile::VideoProfile> {
+        std::iter::once(&self.profile).chain(&self.alternate_profiles)
+    }
+
+    /// This route for one session: the profile whose media format matches
+    /// the format the launch probes. `None` when no offered format matches.
+    pub fn for_format(&self, format: &amaterasu_module_sdk::VideoStreamFormat) -> Option<Self> {
+        let wanted = serde_json::json!({
+            "bit_depth": format.bit_depth,
+            "dynamic_range": format.dynamic_range,
+            "chroma_sampling": format.chroma_sampling,
+        });
+        let profile = self.profiles().find(|profile| {
+            serde_json::to_value(profile.media_format.unwrap_or_default()).ok()
+                == Some(wanted.clone())
+        })?;
+        Some(Self {
+            profile: profile.clone(),
+            alternate_profiles: Vec::new(),
+            ..self.clone()
+        })
     }
 }
 
@@ -2621,5 +2652,44 @@ mod fractional_cadence_tests {
                 .get("fps_milli")
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod extension_route_tests {
+    use super::ExtensionRoute;
+    use serde_json::json;
+
+    fn route() -> ExtensionRoute {
+        let profile = |value: u32, format: serde_json::Value| {
+            json!({"codec":{"namespace_id":7,"value":value,"schema":1},
+                "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":3,
+                "payload_type":99,"encoding_name":"PYROWAVE","media_format":format})
+        };
+        serde_json::from_value(json!({
+            "profile": profile(4, json!({"bit_depth":10,"dynamic_range":"hdr","chroma_sampling":"yuv420"})),
+            "alternate_profiles": [profile(1, json!({"bit_depth":8,"dynamic_range":"sdr","chroma_sampling":"yuv420"}))],
+            "source_id":1,"encoder_provider":"pyrowave",
+            "encoder":{"clsid":"pyrowave","friendly_name":"PyroWave","hardware_url":null},
+            "video_unit_service":"example.units/1","framer_service":"example.framer/1",
+            "plan_transport_service":"example.plan/1"}))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_session_uses_the_profile_matching_its_launch_format() {
+        let route = route();
+        assert!(route.valid());
+        let format = |bit_depth: u8, dynamic_range: &str| {
+            serde_json::from_value(json!({"codec":"hevc","bit_depth":bit_depth,
+                "dynamic_range":dynamic_range}))
+            .unwrap()
+        };
+        let sdr = route.for_format(&format(8, "sdr")).unwrap();
+        assert_eq!(sdr.profile.codec.value, 1);
+        assert!(sdr.alternate_profiles.is_empty());
+        let hdr = route.for_format(&format(10, "hdr")).unwrap();
+        assert_eq!(hdr.profile.codec.value, 4);
+        assert!(route.for_format(&format(10, "sdr")).is_none());
     }
 }

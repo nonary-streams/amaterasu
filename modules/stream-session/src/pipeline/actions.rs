@@ -369,7 +369,10 @@ impl Pipeline {
                     && record.config.virtual_display_intent.is_none()
                     && record.config.lifecycle_session_target.is_none()))
         {
-            record.extension_route = self.settings.extension_route.clone();
+            record.extension_route = self.settings.extension_route.as_ref().and_then(|route| {
+                let probe = record.config.extension_probe.as_ref()?;
+                route.for_format(&probe.video_stream_format)
+            });
         }
         record.lifecycle_input_required = lifecycle_input_required;
         self.records.insert(id, record);

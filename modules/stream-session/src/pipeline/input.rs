@@ -718,6 +718,56 @@ pub(super) fn accept_acknowledged_input_batch(
     Ok(())
 }
 
+/// Refusals scoped to one batch. The input lease survives them, so the
+/// session drops the refused events and keeps streaming; the input provider
+/// reports each refusal itself. A refusal that ends or never reached the
+/// lease stays fatal.
+const BATCH_SCOPED_REFUSALS: [&str; 7] = [
+    "invalid_sequence",
+    "invalid_event",
+    "unsupported_event",
+    "resource_exhausted",
+    "unknown_pointer",
+    "shortcut_unavailable",
+    "stale_batch",
+];
+
+/// Drop the in-flight batch the provider refused without ending the stream.
+/// These refusals all follow sequence admission, so a lifecycle-bound
+/// session advances its sequence exactly as for an accepted batch.
+pub(super) fn drop_refused_input_batch(
+    record: &mut Record,
+    payload: &Value,
+) -> Result<(), &'static str> {
+    let code = payload["error"]["code"].as_str().unwrap_or_default();
+    if !BATCH_SCOPED_REFUSALS.contains(&code)
+        || payload["recovery_required"] == true
+        || record.input_inflight == 0
+    {
+        return Err("dependency_rejected");
+    }
+    eprintln!(
+        "amaterasu session input batch dropped code={code} events={}",
+        record.input_inflight
+    );
+    let refused = record.input_inflight;
+    for _ in 0..refused {
+        record.input_events.pop_front();
+        record.input_timing.pop_front();
+    }
+    // A refused batch had no effect, so its events settle like accepted ones.
+    record.contribution_barrier.accepted(refused);
+    record.input_inflight = 0;
+    record.input_timing.acknowledge(true);
+    if record.lifecycle_input_epoch.is_some() {
+        record.lifecycle_input_sequence = record
+            .lifecycle_input_sequence
+            .checked_add(1)
+            .ok_or("lifecycle_sequence_exhausted")?;
+    }
+    Ok(())
+}
+
 pub(super) fn accept_controller_batch_failure(
     record: &mut Record,
     payload: &Value,

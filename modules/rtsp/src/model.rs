@@ -1378,11 +1378,19 @@ impl Open {
             }
         }
         object.insert("max_reference_frames".into(), serde_json::json!(0));
+        // A client that launched in SDR asks for the extension's 8-bit
+        // profile, as Moonlight does for PyroWave without HDR. Only an HDR
+        // launch uses the configured higher bit depth.
         if bit_depth == 10 {
+            let (bit_depth, dynamic_range) = if self.profile.hdr {
+                (10, "hdr")
+            } else {
+                (8, "sdr")
+            };
             object.insert(
                 "video_stream_format".into(),
-                serde_json::json!({"codec":"hevc", "bit_depth":10,
-                "dynamic_range":if self.profile.hdr {"hdr"}else{"sdr"}}),
+                serde_json::json!({"codec":"hevc", "bit_depth":bit_depth,
+                    "dynamic_range":dynamic_range}),
             );
         }
         configuration

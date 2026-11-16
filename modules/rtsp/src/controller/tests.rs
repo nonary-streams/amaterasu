@@ -4533,7 +4533,7 @@ fn authenticated_play_requests_source_readiness_before_releasing_negotiation() {
 }
 
 #[test]
-fn ten_bit_extensions_keep_sdr_and_hdr_output_distinct() {
+fn extension_bit_depth_follows_the_launch_dynamic_range() {
     use amaterasu_contracts::media_profile::{FormatId, VideoProfile, VideoProfileSnapshot};
     for hdr in [false, true] {
         let (mut record, _) = announced_profile_record();
@@ -4606,7 +4606,8 @@ fn ten_bit_extensions_keep_sdr_and_hdr_output_distinct() {
         );
         assert_eq!(
             payload["configuration"]["configuration"]["video_stream_format"]["bit_depth"],
-            10
+            if hdr { 10 } else { 8 },
+            "an SDR client negotiates the extension's 8-bit profile"
         );
         assert_eq!(
             payload["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],
