@@ -63,6 +63,7 @@ pub(super) struct DeferredLaunch {
     pub(super) deadline: Instant,
     /// The latest this launch waits for an ended application's cleanup.
     pub(super) takeover_at: Instant,
+    pub(super) resume_application: Option<u64>,
 }
 
 /// Whether the host's single application slot can take a new root launch.
@@ -164,6 +165,7 @@ impl Controller {
             response,
             deadline: now + INITIAL_DEADLINE,
             takeover_at: now + SUCCESSOR_GRACE,
+            resume_application: None,
         });
         None
     }
@@ -179,6 +181,19 @@ impl Controller {
         let Some(deferred) = self.deferred_launch.as_ref() else {
             return;
         };
+        if let Some(application) = deferred.resume_application
+            && !self.reconnect_ready(application, &deferred.peer)
+        {
+            if now >= deferred.deadline {
+                let connection = deferred.connection;
+                self.deferred_launch = None;
+                replies.push((
+                    connection,
+                    private_error(503, "previous stream is still closing"),
+                ));
+            }
+            return;
+        }
         match self.launch_hold(now) {
             Some(LaunchHold::Settling) => {
                 if now >= deferred.deadline {
@@ -208,13 +223,23 @@ impl Controller {
             ));
             return;
         }
-        let reply = self.launch_for_route(
-            deferred.connection,
-            deferred.request,
-            deferred.peer,
-            deferred.response,
-            now,
-        );
+        let reply = if deferred.resume_application.is_some() {
+            self.resume_for_route(
+                deferred.connection,
+                deferred.request,
+                &deferred.peer,
+                deferred.response,
+                now,
+            )
+        } else {
+            self.launch_for_route(
+                deferred.connection,
+                deferred.request,
+                deferred.peer,
+                deferred.response,
+                now,
+            )
+        };
         self.admitting_deferred = false;
         if let Some(reply) = reply {
             replies.push((deferred.connection, reply));

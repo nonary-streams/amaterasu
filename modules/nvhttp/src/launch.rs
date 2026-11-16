@@ -9,6 +9,7 @@ use amaterasu_module_sdk::{
 mod auxiliary;
 mod call;
 mod cleanup_recovery;
+mod reconnect;
 mod record;
 mod restart_sweep;
 mod resume_snapshot;
@@ -1639,11 +1640,27 @@ impl Controller {
                 return Some(private_error(409, "launch key was already used"));
             }
         }
-        if self
-            .shared_application(request.app_id)
-            .is_some_and(|root| self.application_has_live_stream(root))
-        {
-            return self.join_stream(connection, request, peer.clone(), response, now);
+        if let Some(record) = self.records.values_mut().find(|record| {
+            record.lifecycle_required
+                && record.lifecycle_session_target.is_some()
+                && record.request.remote_input_key == request.remote_input_key
+                && record.peer == *peer
+                && record.request == request
+                && record.state == State::Ready
+        }) {
+            record.launch_connection = Some(connection);
+            record.response_kind = response;
+            return Some(success_reply(record));
+        }
+        if let Some(root) = self.reconnect_application(request.app_id) {
+            match self.defer_reconnect_if_needed(root, connection, &request, peer, response, now) {
+                Ok(true) => return None,
+                Err(reply) => return Some(reply),
+                Ok(false) => {}
+            }
+            if self.application_has_live_stream(root) {
+                return self.join_stream(connection, request, peer.clone(), response, now);
+            }
         }
         if self.package_activation_pending {
             return Some(private_error(503, "plugin activation is pending"));
@@ -1755,6 +1772,8 @@ impl Controller {
                 .expect("retained session remains available");
             record.rtsp_operation = operation;
             record.authenticated_client_disconnected = false;
+            record.rtsp_stream_ending = false;
+            record.late_monitor_since = None;
             record.rtsp_closing_deadline = None;
             record.stop_application_after_stream_retirement = false;
             record.revoked = false;
@@ -1806,7 +1825,8 @@ impl Controller {
             .find(|record| {
                 (!record.revoked || record.state == State::Paused)
                     && record.auxiliary.is_none()
-                    && matches!(record.state, State::Ready | State::Paused)
+                    && (matches!(record.state, State::Ready | State::Paused)
+                        || (record.state.closing() && record.retains_application()))
             })
             .map_or(0, |record| record.request.app_id)
     }

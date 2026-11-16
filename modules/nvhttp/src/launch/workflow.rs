@@ -1747,73 +1747,94 @@ impl Controller {
                     fail_record(record, code, now)
                 }
             },
-            Phase::MonitorRtsp => match rtsp_response(record, &payload) {
-                Ok((_, _, "ready" | "arming" | "playing", true)) => {
-                    record.rtsp_closing_deadline = None;
-                    record.monitored(now);
-                }
-                Ok((_, _, "closing", true)) => {
-                    let closing_deadline = record.cleanup_deadline(now);
-                    let deadline = *record.rtsp_closing_deadline.get_or_insert(closing_deadline);
-                    if now < deadline {
+            Phase::MonitorRtsp => {
+                record.rtsp_stream_ending = payload["state"] == "closing"
+                    || matches!(
+                        payload["stream_state"].as_str(),
+                        Some("stopping" | "stopped" | "failed" | "cancelled" | "cleanup_failed")
+                    );
+                match rtsp_response(record, &payload) {
+                    Ok((_, _, "ready" | "arming" | "playing", true)) => {
+                        record.rtsp_closing_deadline = None;
                         record.monitored(now);
-                    } else if record.lifecycle_session_target.is_some() {
-                        record.request_monitored_transport_cleanup(None, now);
-                    } else {
-                        record.request_cleanup(None, now);
                     }
-                }
-                Ok((_, _, "closed" | "failed", true))
-                    if record.lifecycle_required
-                        && rtsp_stream_consumers_retired(record, &payload) =>
-                {
-                    observe_authenticated_disconnect(record, &payload);
-                    if payload["state"] == "failed" {
-                        log_monitor_problem(logger.as_ref(), job.phase, "stream_failed");
-                    } else if let Some(logger) = logger.as_ref() {
-                        let _ =
-                            logger.emit(LogLevel::Info, "launch", "phase=MonitorRtsp event=closed");
-                    }
-                    record.rtsp_requested = false;
-                    record.rtsp_ticket = None;
-                    record.rtsp_url = None;
-                    if record.stop_on_stream_end {
-                        record.request_cleanup(None, now);
-                    } else {
-                        record.transport_only_cleanup = true;
-                        if record.application_session.is_some() {
-                            record.request_transport_cleanup(None, now);
+                    Ok((_, _, "closing", true)) => {
+                        let closing_deadline = record.cleanup_deadline(now);
+                        let deadline =
+                            *record.rtsp_closing_deadline.get_or_insert(closing_deadline);
+                        if now < deadline {
+                            record.monitored(now);
+                        } else if record.lifecycle_session_target.is_some() {
+                            record.request_monitored_transport_cleanup(None, now);
                         } else {
-                            record.stage = if record.history_release_required {
-                                Stage::ReleasePausedHistory
-                            } else {
-                                Stage::VerifyPaused
-                            };
+                            record.request_cleanup(None, now);
                         }
-                        record.deadline = now + INITIAL_DEADLINE;
+                    }
+                    Ok((_, _, "closed" | "failed", true))
+                        if record.lifecycle_required
+                            && rtsp_stream_consumers_retired(record, &payload) =>
+                    {
+                        observe_authenticated_disconnect(record, &payload);
+                        if payload["state"] == "failed" {
+                            eprintln!(
+                                "amaterasu launch observed RTSP failure={} stream_state={} cleanup_error={}",
+                                safe_rtsp_provider_code(&payload["failure"]),
+                                safe_rtsp_provider_code(&payload["stream_state"]),
+                                safe_rtsp_provider_code(&payload["cleanup_error"])
+                            );
+                            log_monitor_problem(logger.as_ref(), job.phase, "stream_failed");
+                        } else if let Some(logger) = logger.as_ref() {
+                            let _ = logger.emit(
+                                LogLevel::Info,
+                                "launch",
+                                "phase=MonitorRtsp event=closed",
+                            );
+                        }
+                        record.rtsp_requested = false;
+                        record.rtsp_stream_ending = false;
+                        record.rtsp_closing_deadline = None;
+                        record.rtsp_ticket = None;
+                        record.rtsp_url = None;
+                        if record.stop_on_stream_end {
+                            record.request_cleanup(None, now);
+                        } else {
+                            record.transport_only_cleanup = true;
+                            if record.application_session.is_some() {
+                                record.request_transport_cleanup(None, now);
+                            } else {
+                                record.stage = if record.history_release_required {
+                                    Stage::ReleasePausedHistory
+                                } else {
+                                    Stage::VerifyPaused
+                                };
+                            }
+                            record.deadline = now + INITIAL_DEADLINE;
+                        }
+                    }
+                    Ok(_) => {
+                        log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
+                        if record.lifecycle_session_target.is_some() {
+                            record.request_monitored_transport_cleanup(Some("stream_ended"), now);
+                        } else {
+                            record.request_cleanup(Some("stream_ended"), now);
+                        }
+                    }
+                    Err(code) => {
+                        log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
+                        if record.lifecycle_session_target.is_some() {
+                            record.request_monitored_transport_cleanup(Some(code), now);
+                        } else {
+                            fail_record(record, code, now);
+                        }
                     }
                 }
-                Ok(_) => {
-                    log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
-                    if record.lifecycle_session_target.is_some() {
-                        record.request_monitored_transport_cleanup(Some("stream_ended"), now);
-                    } else {
-                        record.request_cleanup(Some("stream_ended"), now);
-                    }
-                }
-                Err(code) => {
-                    log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
-                    if record.lifecycle_session_target.is_some() {
-                        record.request_monitored_transport_cleanup(Some(code), now);
-                    } else {
-                        fail_record(record, code, now);
-                    }
-                }
-            },
+            }
             Phase::StopRtsp | Phase::VerifyRtspStopped => {
                 if clean_rtsp_terminal(record, &payload) {
                     observe_authenticated_disconnect(record, &payload);
                     record.rtsp_requested = false;
+                    record.rtsp_stream_ending = false;
+                    record.rtsp_closing_deadline = None;
                     record.rtsp_ticket = None;
                     record.rtsp_url = None;
                     if record.stop_application_after_stream_retirement {

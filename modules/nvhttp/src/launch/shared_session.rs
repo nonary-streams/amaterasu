@@ -141,7 +141,10 @@ impl Controller {
         self.records.values().any(|record| {
             record.application_root() == application
                 && (matches!(record.state, State::Starting | State::AwaitingDelivery)
-                    || (record.state == State::Ready && record.rtsp_requested))
+                    || (record.state == State::Ready
+                        && record.rtsp_requested
+                        && !record.rtsp_stream_ending
+                        && record.rtsp_closing_deadline.is_none()))
         })
     }
 
@@ -153,12 +156,7 @@ impl Controller {
         response: StreamResponse,
         now: Instant,
     ) -> Option<Reply> {
-        let application = self.shared_application(request.app_id)?;
-        if self.application_has_live_stream(application) {
-            self.join_stream(connection, request, peer, response, now)
-        } else {
-            self.resume_for_route(connection, request, &peer, response, now)
-        }
+        self.resume_for_route(connection, request, &peer, response, now)
     }
 
     pub(super) fn join_stream(
