@@ -25,6 +25,8 @@ struct Reservation {
     release_requested: bool,
     release_requested_at: Option<u64>,
     completed_at: Option<u64>,
+    warnings: Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
+    warnings_delivered: usize,
 }
 
 #[derive(Default)]
@@ -112,6 +114,8 @@ impl HistoryActivities {
                 release_requested: false,
                 release_requested_at: None,
                 completed_at: None,
+                warnings: Vec::new(),
+                warnings_delivered: 0,
             },
         );
     }
@@ -186,6 +190,47 @@ impl HistoryActivities {
                 && now.saturating_sub(entry.began_at) < RESERVATION_MS
                 && matches!(entry.phase, Phase::Reserved)
         })
+    }
+
+    /// Keep warning delivery idempotent under a lost broker response.
+    pub(super) fn record_warnings(
+        &mut self,
+        activity_id: &str,
+        rtsp_operation_id: &str,
+        warnings: &[amaterasu_module_sdk::stream_warnings::StreamWarning],
+    ) -> Result<(), &'static str> {
+        let entry = self
+            .entries
+            .get_mut(activity_id)
+            .ok_or("history_activity_not_found")?;
+        if entry.rtsp_operation_id != rtsp_operation_id
+            || matches!(entry.phase, Phase::Ended | Phase::Unavailable)
+        {
+            return Err("history_activity_unavailable");
+        }
+        let mut merged = entry.warnings.clone();
+        for warning in warnings {
+            if !merged.contains(warning) {
+                if merged.len() >= amaterasu_module_sdk::stream_warnings::MAX_WARNINGS {
+                    return Err("warning_capacity_exceeded");
+                }
+                merged.push(warning.clone());
+            }
+        }
+        entry.warnings = merged;
+        Ok(())
+    }
+
+    pub(super) fn take_warnings(
+        &mut self,
+        activity_id: &str,
+    ) -> Vec<amaterasu_module_sdk::stream_warnings::StreamWarning> {
+        let Some(entry) = self.entries.get_mut(activity_id) else {
+            return Vec::new();
+        };
+        let warnings = entry.warnings[entry.warnings_delivered..].to_vec();
+        entry.warnings_delivered = entry.warnings.len();
+        warnings
     }
 
     pub(super) fn progress(
@@ -474,6 +519,8 @@ mod tests {
                 release_requested: true,
                 release_requested_at: Some(0),
                 completed_at: None,
+                warnings: Vec::new(),
+                warnings_delivered: 0,
             },
         );
         let mut send = |command| match command {

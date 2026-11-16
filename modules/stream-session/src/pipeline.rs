@@ -144,6 +144,12 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    fn record_pending_history_warnings(&mut self, record: &mut Record) {
+        if let Some(activity) = record.config.history_activity_id.as_deref() {
+            let warnings = self.history_activities.take_warnings(activity);
+            record.history.record_warnings(&warnings);
+        }
+    }
     pub fn new(settings: Settings, service: String) -> Result<Self, &'static str> {
         settings.validate()?;
         settings.providers.validate_for_owner(&service)?;

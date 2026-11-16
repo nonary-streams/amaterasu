@@ -1576,6 +1576,11 @@ pub enum Operation {
         activity_id: String,
         rtsp_operation_id: String,
     },
+    RecordHistoryWarnings {
+        activity_id: String,
+        rtsp_operation_id: String,
+        warnings: Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
+    },
     Prepare(Box<PrepareConfig>),
     Start {
         session: u64,

@@ -123,6 +123,10 @@ pub enum Operation {
     Status {
         launch_id: u64,
     },
+    /// Optional warning query, separate from the v1 launch-status shape.
+    Warnings {
+        launch_id: u64,
+    },
     List {
         #[serde(default)]
         offset: usize,

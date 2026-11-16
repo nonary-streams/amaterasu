@@ -43,6 +43,8 @@ pub struct Record {
     pub process_id: Option<u64>,
     pub failure: Option<&'static str>,
     pub cleanup_error: Option<&'static str>,
+    #[serde(skip)]
+    pub warnings: Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
     /// Conservative cleanup pass budget frozen before any child or lease effect.
     pub cleanup_budget_ms: u64,
     #[serde(skip)]
@@ -157,6 +159,10 @@ impl Record {
         let mut response = json!({"ok":true,"launch":self});
         response["launch"]["stop_on_stream_end"] = json!(self.stop_on_stream_end());
         response
+    }
+    pub fn warnings_response(&self) -> Value {
+        json!({"ok":true,"launch_id":self.launch_id,"operation_id":self.operation_id,
+            "warnings":self.warnings})
     }
     fn stop_on_stream_end(&self) -> bool {
         // A transport disconnect suspends streaming, including for Steam games.
@@ -348,6 +354,7 @@ impl Records {
                 process_id: None,
                 failure: None,
                 cleanup_error: None,
+                warnings: Vec::new(),
                 cleanup_budget_ms: 20_000,
                 owner: caller.into(),
                 catalog_principal,

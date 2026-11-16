@@ -830,6 +830,7 @@ impl Pipeline {
                 Step::StartLifecycle => {
                     record.state = State::Active;
                     record.history.activated(now);
+                    self.record_pending_history_warnings(record);
                     if let Some(start) = &record.start {
                         record.history.record_adjustments(&start.stream_adjustments);
                         record
@@ -1359,6 +1360,7 @@ impl Pipeline {
                 } else {
                     record.state = State::Active;
                     record.history.activated(now);
+                    self.record_pending_history_warnings(record);
                     if let Some(start) = &record.start {
                         record.history.record_adjustments(&start.stream_adjustments);
                         record
@@ -1421,6 +1423,7 @@ impl Pipeline {
                 }
                 record.state = State::Active;
                 record.history.activated(now);
+                self.record_pending_history_warnings(record);
                 if let Some(start) = &record.start {
                     record.history.record_adjustments(&start.stream_adjustments);
                     record

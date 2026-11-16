@@ -19,6 +19,7 @@ struct TestProcess {
     preparing_statuses: usize,
     stopping_statuses: usize,
     fail_stopping_cleanup_once: bool,
+    warning: Option<&'static str>,
 }
 struct TestPreparation {
     operation: String,
@@ -93,6 +94,7 @@ struct Harness {
     provider_stop_failure_once: bool,
     provider_recovery_failure_once: bool,
     application_preparing_statuses: usize,
+    application_warning: Option<&'static str>,
     preparation_terminal: Option<&'static str>,
     application_stopping_statuses: usize,
     fail_application_cleanup_once: bool,
@@ -170,6 +172,7 @@ impl Harness {
             provider_stop_failure_once: false,
             provider_recovery_failure_once: false,
             application_preparing_statuses: 0,
+            application_warning: None,
             preparation_terminal: None,
             application_stopping_statuses: 0,
             fail_application_cleanup_once: false,
@@ -252,6 +255,15 @@ impl Harness {
     }
     fn process_reply(process: &TestProcess) -> Value {
         let mut reply = json!({"ok":true,"process":{"process_id":process.id,"operation_id":process.operation,"state":process.state}});
+        if let Some(warning) = process.warning {
+            let source = if warning == "replacement_provider_unavailable" {
+                "example.application/1"
+            } else {
+                "amaterasu.application/1"
+            };
+            reply["process"]["warnings"] = json!([{"code":"proton_hook_unavailable",
+                "source":source,"reason":warning,"requested":true}]);
+        }
         if process.state == "cleanup_failed" {
             reply["process"]["outcome"] = json!(process.pending_terminal);
         }
@@ -302,6 +314,7 @@ impl Harness {
                 preparing_statuses: self.application_preparing_statuses,
                 stopping_statuses: self.application_stopping_statuses,
                 fail_stopping_cleanup_once: self.fail_automatic_cleanup_once,
+                warning: self.application_warning,
             });
             return Self::process_reply(self.processes.last().unwrap());
         }
@@ -881,6 +894,29 @@ fn launch(operation: &str) -> Value {
 }
 fn launch_export(operation: &str) -> Value {
     json!({"action":"launch_export","operation_id":operation,"app_id":"app-0000000000000001"})
+}
+
+#[test]
+fn optional_application_warnings_are_owner_bound_and_do_not_change_launch_status() {
+    for (reason, source) in [
+        ("proton_hook_unconfirmed", "amaterasu.application/1"),
+        ("replacement_provider_unavailable", "example.application/1"),
+    ] {
+        let mut harness = Harness::new();
+        harness.application_warning = Some(reason);
+        let mut pipeline = pipeline();
+        let launched = harness.request(&mut pipeline, "alice", launch("optional-warning"));
+        assert_eq!(launched["launch"]["state"], "active");
+        assert!(launched["launch"].get("warnings").is_none());
+        let launch_id = launched["launch"]["launch_id"].as_u64().unwrap();
+        let request = json!({"action":"warnings","launch_id":launch_id});
+        let response = harness.request(&mut pipeline, "alice", request.clone());
+        assert_eq!(response["operation_id"], "optional-warning");
+        assert_eq!(response["warnings"][0]["reason"], reason);
+        assert_eq!(response["warnings"][0]["source"], source);
+        assert_eq!(response["warnings"][0]["requested"], true);
+        assert_eq!(harness.request(&mut pipeline, "bob", request)["ok"], false);
+    }
 }
 
 #[test]

@@ -119,6 +119,17 @@ impl SessionHistory {
         }
     }
 
+    pub(super) fn record_warnings(
+        &mut self,
+        warnings: &[amaterasu_module_sdk::stream_warnings::StreamWarning],
+    ) {
+        // Each SDK record has bounded scalar fields. Four maximal records fit
+        // under the history provider's 4096-byte event-payload limit.
+        for batch in warnings.chunks(4) {
+            self.queue_event("stream_warnings", json!({"warnings":batch}));
+        }
+    }
+
     pub(super) fn observe_media(
         &mut self,
         accepted_video_access_units: u64,
@@ -791,6 +802,44 @@ mod tests {
         }
 
         assert_eq!(history.updates.len(), MAX_QUEUED_UPDATES);
+    }
+
+    #[test]
+    fn maximal_warning_records_fit_history_events_without_losing_the_batch() {
+        use amaterasu_module_sdk::stream_warnings::{MAX_WARNINGS, StreamWarning, WarningValue};
+        let warning = StreamWarning {
+            code: "c".repeat(64),
+            source: "s".repeat(128),
+            reason: "r".repeat(64),
+            os_error: Some(i32::MIN),
+            requested: Some(WarningValue::Label("q".repeat(64))),
+            effective: Some(WarningValue::Label("e".repeat(64))),
+        };
+        assert!(warning.valid());
+        let mut history = SessionHistory::new(7, Some("rtsp-1".into()));
+        history.activated(0);
+        history.record_warnings(&vec![warning; MAX_WARNINGS]);
+        let events: Vec<_> = history
+            .updates
+            .iter()
+            .filter_map(|update| {
+                let event = &update.request.payload["event"];
+                (event["event_type"] == "stream_warnings").then_some(&event["payload"])
+            })
+            .collect();
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["warnings"].as_array().unwrap().len())
+                .sum::<usize>(),
+            MAX_WARNINGS
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| serde_json::to_vec(event).unwrap().len() <= 4096)
+        );
     }
 
     #[test]

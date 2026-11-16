@@ -19,6 +19,33 @@ use std::{
 };
 
 type Transport = ModuleResult<Response>;
+
+fn record_application_warning(record: &mut crate::records::Record, process: &Value) {
+    record_warning_list(record, &process["warnings"]);
+    record_warning_list(record, &process["preparation"]["warnings"]);
+}
+
+fn record_warning_list(record: &mut crate::records::Record, values: &Value) {
+    use amaterasu_module_sdk::stream_warnings::{MAX_WARNINGS, StreamWarning};
+    let Some(values) = values
+        .as_array()
+        .filter(|values| values.len() <= MAX_WARNINGS)
+    else {
+        return;
+    };
+    for value in values {
+        let Ok(warning) = serde_json::from_value::<StreamWarning>(value.clone()) else {
+            continue;
+        };
+        if warning.valid()
+            && record.warnings.len() < MAX_WARNINGS
+            && !record.warnings.contains(&warning)
+        {
+            record.warnings.push(warning);
+        }
+    }
+}
+
 enum Settlement {
     Ready,
     Waiting,
@@ -575,6 +602,14 @@ impl Pipeline {
                     .unwrap_or_else(error);
                 complete(send, id, response)?;
             }
+            Ok(Operation::Warnings { launch_id }) => {
+                let response = self
+                    .records
+                    .owned(&caller, launch_id)
+                    .map(|record| record.warnings_response())
+                    .unwrap_or_else(error);
+                complete(send, id, response)?;
+            }
             Ok(Operation::Lookup { operation_id }) => {
                 let response = self
                     .records
@@ -1114,6 +1149,14 @@ impl Pipeline {
                     .unwrap_or_else(error);
                 complete(send, request, response)
             }
+            Operation::Warnings { launch_id } => {
+                let response = self
+                    .records
+                    .owned(caller, launch_id)
+                    .map(|record| record.warnings_response())
+                    .unwrap_or_else(error);
+                complete(send, request, response)
+            }
             Operation::List { offset, limit } => {
                 complete(send, request, self.records.list(caller, offset, limit))
             }
@@ -1622,10 +1665,11 @@ impl Pipeline {
                 };
             }
             Step::PrepareApplication | Step::AwaitPreparation => {
-                let (_, state) = match responses::preparation(&payload, record) {
+                let (preparation, state) = match responses::preparation(&payload, record) {
                     Ok(preparation) => preparation,
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
+                record_warning_list(record, &preparation["preparation"]["warnings"]);
                 match state {
                     responses::PreparationState::Preparing
                     | responses::PreparationState::Cleaning => {
@@ -1663,6 +1707,7 @@ impl Pipeline {
                     Ok(process) => process,
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
+                record_application_warning(record, process);
                 if job.step == Step::Spawn {
                     record.process_id = process["process_id"].as_u64();
                 }
@@ -1832,10 +1877,11 @@ impl Pipeline {
                 return self.deliver_activation(job, send);
             }
             Step::Monitor => {
-                let (_, state) = match responses::process(&payload, record) {
+                let (process, state) = match responses::process(&payload, record) {
                     Ok(process) => process,
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
+                record_application_warning(record, process);
                 match state {
                     ApplicationState::Running | ApplicationState::Stopping => return Ok(()),
                     ApplicationState::Exited => job.begin_cleanup(record, Outcome::Completed, None),

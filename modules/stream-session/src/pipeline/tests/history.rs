@@ -1216,3 +1216,75 @@ fn compatibility_adjustments_do_not_require_history_and_are_recorded_when_availa
         assert_eq!(host.pipeline.records[&session].state, State::Active);
     }
 }
+
+#[test]
+fn reserved_stream_warning_records_are_owner_bound_and_idempotent() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let reserve = json!({"action":"reserve_history_activity", "activity_id":"warning-stream",
+        "rtsp_operation_id":"warning-stream"});
+    assert_eq!(
+        host.response_from(1, "amaterasu.nvhttp", reserve)["reserved"],
+        true
+    );
+    let warning = json!({"code":"proton_policy_unavailable", "source":"amaterasu.nvhttp/1",
+        "reason":"read_unavailable", "effective":false});
+    let request = json!({"action":"record_history_warnings", "activity_id":"warning-stream",
+        "rtsp_operation_id":"warning-stream", "warnings":[warning]});
+    assert_eq!(
+        host.response_from(2, "other", request.clone())["code"],
+        "permission_denied"
+    );
+    assert_eq!(
+        host.response_from(3, "amaterasu.nvhttp", request.clone())["ok"],
+        true
+    );
+    assert_eq!(
+        host.response_from(4, "amaterasu.nvhttp", request.clone())["ok"],
+        true
+    );
+    let mut tagged = prepare();
+    tagged["history_activity_id"] = json!("warning-stream");
+    tagged["rtsp_operation_id"] = json!("warning-stream");
+    let session = host.response_from(5, "amaterasu.rtsp", tagged)["session"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        host.response_from(6, "amaterasu.rtsp", start(session))["state"],
+        "active"
+    );
+    host.idle();
+    let events: Vec<_> = host
+        .broker
+        .history_events
+        .iter()
+        .filter(|event| event["event_type"] == "stream_warnings")
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["session_id"], "warning-stream");
+    assert_eq!(
+        events[0]["payload"]["warnings"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        events[0]["payload"]["warnings"][0]["code"],
+        "proton_policy_unavailable"
+    );
+    assert_eq!(
+        host.response_from(7, "amaterasu.nvhttp", request)["ok"],
+        true
+    );
+    host.idle();
+    assert_eq!(
+        host.broker
+            .history_events
+            .iter()
+            .filter(|event| event["event_type"] == "stream_warnings")
+            .count(),
+        1
+    );
+}

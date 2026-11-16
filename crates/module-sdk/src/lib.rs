@@ -36,6 +36,7 @@ pub mod retained_options;
 pub mod retirement;
 pub mod service_worker;
 pub mod session_presentation;
+pub mod stream_warnings;
 pub mod threading;
 pub mod trace;
 pub mod transport;

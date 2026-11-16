@@ -113,6 +113,41 @@ impl Pipeline {
                     );
                 }
             }
+            Operation::RecordHistoryWarnings {
+                activity_id,
+                rtsp_operation_id,
+                warnings,
+            } => {
+                let warning_request =
+                    amaterasu_module_sdk::stream_warnings::RecordHistoryWarnings {
+                        activity_id,
+                        rtsp_operation_id,
+                        warnings,
+                    };
+                if !self.settings.history_owners.contains(&input.owner) || !self.settings.enabled {
+                    rpc::complete(send, input.request, error("permission_denied"));
+                } else if !warning_request.valid() {
+                    rpc::complete(send, input.request, error("invalid_history_warnings"));
+                } else if let Err(code) = self.history_activities.record_warnings(
+                    &warning_request.activity_id,
+                    &warning_request.rtsp_operation_id,
+                    &warning_request.warnings,
+                ) {
+                    rpc::complete(send, input.request, error(code));
+                } else {
+                    if let Some(record) = self.records.values_mut().find(|record| {
+                        record.state == State::Active
+                            && record.config.history_activity_id.as_deref()
+                                == Some(warning_request.activity_id.as_str())
+                    }) {
+                        let warnings = self
+                            .history_activities
+                            .take_warnings(&warning_request.activity_id);
+                        record.history.record_warnings(&warnings);
+                    }
+                    rpc::complete(send, input.request, json!({"ok":true}));
+                }
+            }
             Operation::Prepare(config) => self.prepare(input, *config, send),
             Operation::Start {
                 session,

@@ -220,6 +220,15 @@ operation. Shutdown makes a bounded cancellation and result-release attempt; if
 teardown was already confirmed, it also makes a bounded best-effort flush of
 queued updates in order followed by the stable session_end operation.
 
+The stream owner can submit bounded `stream_warnings` records against an exact
+reserved activity and RTSP operation through `record_history_warnings`. The
+caller must have the history-owner grant. Duplicate records are idempotent;
+warnings received before activation are attached when that session activates,
+and warnings received after activation are queued immediately. Delivery uses
+the same best-effort history queue and retention as other events, with batches
+that fit the history provider's event-size limit. An absent,
+older, or unavailable history provider does not decide whether a stream starts.
+
 Sample frame counts are complete non-EOS video access units accepted by the
 media transport's bounded local queue. bytes_sent counts encoded video and
 audio payload bytes accepted at that same boundary; it excludes wire framing,
