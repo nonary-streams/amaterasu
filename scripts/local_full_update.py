@@ -159,9 +159,19 @@ def prepare(arguments) -> None:
     active = root / "sets" / selection["active"]
     manifest = read_json(active / "manifest.json")
     target = Path(arguments.target_dir).resolve() if arguments.target_dir else None
+    allowlist = None
     if arguments.bound_input:
         from local_bound_input import prepare_bound_input
         allowlist = prepare_bound_input(bootstrap, manifest, read_json(root / "package-activation-policy.json"))
+    if arguments.grant_changes:
+        from local_grant_changes import apply_grant_changes
+        approved = allowlist or read_json(root / "package-activation-policy.json")
+        candidate, allowlist, delta, skipped = apply_grant_changes(
+            bootstrap, manifest, approved, read_json(Path(arguments.grant_changes)))
+        (work / "candidate-bootstrap.json").write_text(json.dumps(candidate, indent=2) + "\n")
+        (work / "policy-delta.json").write_text(json.dumps(delta, indent=2) + "\n")
+        print(f"grant changes: {len(delta)} policy paths; not in this set: {', '.join(skipped) or 'none'}")
+    if allowlist is not None:
         (work / "package-activation-policy.json").write_bytes(compact(allowlist))
 
     problems = foreign_artifacts(tree, manifest["components"], target)
@@ -215,7 +225,7 @@ def prepare(arguments) -> None:
         "digest": digest,
         "catalog_digest": sha256(work / "bundle/catalog.json"),
         "repository": REPOSITORY,
-        "activation_policy_candidate_sha256": sha256(work / "package-activation-policy.json") if arguments.bound_input else None,
+        "activation_policy_candidate_sha256": sha256(work / "package-activation-policy.json") if allowlist is not None else None,
     }))
     (work / PROVENANCE).write_text(json.dumps({
         "tree": str(tree),
@@ -417,6 +427,7 @@ def main() -> None:
         prepare_parser.add_argument(name)
     prepare_parser.add_argument("--target-dir")
     prepare_parser.add_argument("--bound-input", action="store_true", help="prepare exact external-capture input grants for review and activation")
+    prepare_parser.add_argument("--grant-changes", help="JSON of reviewed grant additions and removals per principal (see local_grant_changes.py)")
     prepare_parser.set_defaults(run=prepare)
     activate_parser = commands.add_parser("activate")
     activate_parser.add_argument("root")
