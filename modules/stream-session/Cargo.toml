@@ -25,3 +25,5 @@ workspace = true
 [dev-dependencies]
 libloading.workspace = true
 amaterasu-runtime = { path = "../../crates/runtime" }
+amaterasu-media-transport = { path = "../media-transport", features = ["test-support"] }
+amaterasu-video = { path = "../encode-video/video", features = ["test-support"] }

@@ -43,6 +43,7 @@ struct EncoderEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EncoderSnapshot {
     entries: Vec<EncoderEntry>,
+    transport_codec_mask: u32,
 }
 
 /// The codecs one launch may negotiate, in Moonlight's preference order.
@@ -103,14 +104,34 @@ impl EncoderSnapshot {
             .iter()
             .map(encoder_entry)
             .collect::<Result<_, _>>()?;
-        Ok(Self { entries })
+        let mut transport_codec_mask = 0;
+        if let Some(extensions) = payload.get("transport_extensions") {
+            let extensions = extensions
+                .as_array()
+                .filter(|list| list.len() <= 16)
+                .ok_or("invalid_transport_extensions")?;
+            for extension in extensions {
+                let mask = extension["codec_mode_mask"]
+                    .as_u64()
+                    .filter(|mask| *mask <= u32::MAX as u64)
+                    .ok_or("invalid_transport_extensions")? as u32;
+                if mask & !0x07800000 != 0 {
+                    return Err("invalid_transport_extensions");
+                }
+                transport_codec_mask |= mask;
+            }
+        }
+        Ok(Self {
+            entries,
+            transport_codec_mask,
+        })
     }
 
     /// The serverinfo codec mask. H.264 is always present while streaming is
     /// enabled: Moonlight refuses to start against a zero mask, and a host
     /// without an H.264 encoder refuses the launch with a clear error instead.
     pub fn advertisement(&self) -> CodecAdvertisement {
-        let mut codec_mode_support = SCM_H264;
+        let mut codec_mode_support = SCM_H264 | self.transport_codec_mask;
         if self.has(VideoCodec::Hevc) {
             codec_mode_support |= SCM_HEVC;
         }

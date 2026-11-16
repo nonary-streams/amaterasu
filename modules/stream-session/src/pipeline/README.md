@@ -42,6 +42,40 @@ The initial arm checks that its caller request is active and requires confirmed 
 The action does not implement a network RTSP listener or claim that a PLAY response proves successful capture. A transport coordinator can acknowledge its scheduling decision and observe subsequent `armed`, `starting`, `active`, or failure states independently.
 
 
+## Source readiness before PLAY
+
+The optional `prepare_video_before_play:true` field on
+`start_when_authenticated` is restricted to the trusted RTSP lifecycle admitter.
+RTSP requests it after authenticated negotiation and lifecycle preparation. The
+source output lease, capture and encoder are prepared before replying to PLAY;
+no native media plane, audio capture, input lease, lifecycle consumer start or
+remote delivery is authorized by this warmup.
+
+Warmup uses the selected Video v1 provider's additive status capability
+`startup_frame_readiness:true`, and waits for `startup_frame_ready:true` on the
+exact owned stream in `running` state with no error. Allocation, submitted frames
+and placeholder configuration values do not establish readiness. The video
+provider reports this proof only after retaining a complete non-EOS keyframe AU.
+An unsupported or failed provider fails startup rather than claiming readiness.
+Legacy callers omitting the field retain auth-before-capture behavior.
+
+The readiness read settles and yields the shared workflow slot between polls,
+so another active stream can renew leases and submit input. The original caller
+and absolute deadline remain owned across waits; retries cannot extend the
+budget or reopen capture. Stop/cancellation/shutdown retire the pending source
+through normal cleanup. Preparation is bounded by the caller's remaining time
+and ten seconds, within the RTSP router's fifteen-second waiting budget. The
+existing RTSP ping-window deadline still applies to its whole arm transition.
+
+Only after readiness and confirmed arm completion does PLAY succeed and the
+normal authentication/ping window begin. The client may then connect control and
+send UDP discovery. Stream-session reuses the prepared video stream, and performs
+lifecycle observation, audio and input activation after authentication and peer
+readiness. Waiting for those client-dependent states before PLAY would deadlock
+clients that complete the RTSP handshake first. Warmup moves capture/encoder
+preparation before PLAY; it does not claim to eliminate its duration or prove
+client-side presentation.
+
 ## Owned Linux displays
 
 A PipeWire or external-provider start targeting `amaterasu-owned-display` allocates a unique monitor

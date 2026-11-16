@@ -12,9 +12,11 @@ pub(super) enum Step {
     ProbeAudio(Resource),
     ProbeAudioReconfiguration(Resource),
     ApplyAudioReconfiguration(Resource),
+    ProbeExtensionSource,
     Authenticate,
     ConfirmControlDisconnect,
     MediaReady,
+    WaitVideoReady,
     ConfigureMediaVideoFormat,
     CreateVirtualDisplay,
     StatusVirtualDisplay,
@@ -569,6 +571,29 @@ impl Job {
             Step::ConfirmControlDisconnect => (
                 record.service(Resource::Control),
                 json!({"action":"status","stream":record.resources[&Resource::Control]}),
+            ),
+            Step::ProbeExtensionSource => {
+                let route = record
+                    .extension_route
+                    .as_ref()
+                    .expect("selected extension route");
+                let mut configuration = json!(
+                    record
+                        .config
+                        .extension_probe
+                        .as_ref()
+                        .expect("selected probe")
+                );
+                configuration["extension_profile"] = json!(route.profile);
+                (
+                    record.service(Resource::Video),
+                    json!({"action":"probe_source", "source_id":route.source_id,
+                    "encoder_provider":route.encoder_provider,"encoder":route.encoder,"configuration":configuration}),
+                )
+            }
+            Step::WaitVideoReady => (
+                record.service(Resource::Video),
+                json!({"action":"status", "stream":record.resources[&Resource::Video]}),
             ),
             Step::MediaReady => (
                 record.service(Resource::Media),

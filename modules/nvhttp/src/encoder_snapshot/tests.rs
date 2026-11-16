@@ -220,3 +220,16 @@ fn hdr_offers_require_explicit_ten_bit_capability_and_preserve_indices() {
             .is_err()
     );
 }
+
+#[test]
+fn transport_extensions_add_only_explicit_extension_bits() {
+    let snapshot = EncoderSnapshot::parse(&json!({"ok":true,"encoders":[],
+        "transport_extensions":[{"codec_mode_mask":8388608,"bitstream":"186f0393"}]}))
+    .unwrap();
+    assert_eq!(snapshot.advertisement().codec_mode_support, 0x00800001);
+    assert!(
+        EncoderSnapshot::parse(&json!({"ok":true,"encoders":[],
+        "transport_extensions":[{"codec_mode_mask":256}]}))
+        .is_err()
+    );
+}

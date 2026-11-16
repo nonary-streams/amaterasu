@@ -7,6 +7,9 @@ mod native;
 mod opus_packet;
 mod stream;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use amaterasu_module_sdk::{
     Command, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
 };
@@ -24,6 +27,7 @@ struct MediaTransportModule {
     latency_window_started: Instant,
     _factory: Box<native::Factory>,
     shutdown_announced: bool,
+    _plan_factory: Option<Box<native::plan::Factory>>,
 }
 
 impl ManagedModule for MediaTransportModule {
@@ -163,8 +167,12 @@ impl MediaTransportModule {
             Some(network) => network,
             None => Network::from_settings(&runtime, &payload)?,
         };
+        let plan_service = settings.plan_service.clone();
         let controller = Arc::new(Mutex::new(Controller::with_network(settings, network)));
         let factory = native::Factory::new(controller.clone());
+        let plan_factory = plan_service
+            .as_ref()
+            .map(|_| native::plan::Factory::new(controller.clone()));
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -174,12 +182,23 @@ impl MediaTransportModule {
         unsafe {
             amaterasu_module_sdk::transport::register_media(&runtime, SERVICE, &factory.api)?;
         }
+        if let (Some(service), Some(factory)) = (plan_service, &plan_factory) {
+            // SAFETY: factory is retained for module lifetime and callbacks borrow synchronously.
+            unsafe {
+                amaterasu_module_sdk::video_framing::register_plan_transport_v2(
+                    &runtime,
+                    &service,
+                    &factory.api,
+                )
+            }?;
+        }
         Ok(Self {
             runtime,
             controller,
             latency_window_started: Instant::now(),
             _factory: factory,
             shutdown_announced: false,
+            _plan_factory: plan_factory,
         })
     }
 }
@@ -193,6 +212,7 @@ impl Drop for MediaTransportModule {
     }
 }
 
+#[cfg(not(feature = "test-support"))]
 amaterasu_module_sdk::export_module!(MediaTransportModule);
 
 #[cfg(test)]

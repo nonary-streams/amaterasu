@@ -59,6 +59,10 @@ pub(super) struct Record {
     pub client_feature_flags: Option<u32>,
     pub negotiated_color: Option<amaterasu_gamestream::sdp::ColorMode>,
     pub negotiated_video: Option<crate::model::NegotiatedVideo>,
+    pub extension_offer: Option<amaterasu_contracts::media_profile::VideoProfile>,
+    pub extension_announce: Option<
+        amaterasu_gamestream::sdp::Announce<amaterasu_gamestream::sdp::NegotiatedVideoFormat>,
+    >,
     pub url: String,
     pub session_token: String,
     pub udp_discovery: Option<UdpDiscovery>,
@@ -68,6 +72,7 @@ pub(super) struct Record {
     pub media_binds: Option<crate::model::MediaBinds>,
     pub expires: u64,
     pub next_status: u64,
+    pub observation_stale_at: u64,
     pub failure: Option<&'static str>,
     pub cleanup_error: Option<&'static str>,
     pub cleanup_retry_count: u8,
@@ -101,6 +106,26 @@ pub(super) struct Record {
 }
 
 impl Record {
+    pub(super) fn accept_extension_announce(
+        &mut self,
+        announce: &amaterasu_gamestream::sdp::Announce<
+            amaterasu_gamestream::sdp::NegotiatedVideoFormat,
+        >,
+    ) -> bool {
+        self.extension_announce = None;
+        let amaterasu_gamestream::sdp::NegotiatedVideoFormat::Extension(profile) =
+            &announce.video.format
+        else {
+            return false;
+        };
+        if self.extension_offer.as_ref() != Some(profile)
+            || !self.config.accepts_extension_announce(announce)
+        {
+            return false;
+        }
+        self.extension_announce = Some(announce.clone());
+        true
+    }
     pub(super) fn begin_arm(&mut self, now: u64) -> u64 {
         self.state = State::Arming;
         self.expires = now.saturating_add(u64::from(self.config.ping_timeout_ms));
@@ -157,6 +182,19 @@ impl Record {
     }
 
     pub(super) fn authenticated_start_payload(&self, session: u64) -> Option<Value> {
+        if let Some(announce) = &self.extension_announce {
+            let amaterasu_gamestream::sdp::NegotiatedVideoFormat::Extension(profile) =
+                &announce.video.format
+            else {
+                return None;
+            };
+            let mut payload = self.config.arm(session);
+            payload["configuration"]["encrypt_video"] = json!(announce.encryption.video);
+            payload["configuration"]["encrypt_audio"] = json!(announce.encryption.audio);
+            payload["configuration"]["client_feature_flags"] = json!(announce.client_feature_flags);
+            payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
+            return Some(payload);
+        }
         let encryption = self.negotiated_encryption?;
         let color = self.negotiated_color?;
         let video = self.negotiated_video?;
@@ -262,6 +300,9 @@ impl Record {
 
     pub fn close(&mut self, reason: Option<&'static str>) {
         if let Some(reason) = reason {
+            if self.state == State::Playing {
+                eprintln!("amaterasu rtsp closing playing stream reason={reason}");
+            }
             self.failure.get_or_insert(reason);
         }
         self.state = State::Closing;

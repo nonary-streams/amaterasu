@@ -10,6 +10,8 @@ fn first_revision_audio_unit_reaches_the_gamestream_transport() {
     let (video, audio) = receivers();
     let mut controller = Controller::new(Settings {
         network_provider: None,
+        plan_service: None,
+        extension_profiles: Vec::new(),
         enabled: true,
         allow_remote: false,
         allowed_principals: vec!["owner".into()],
@@ -59,6 +61,8 @@ fn bound_native_tables_isolate_owners_and_remain_closed_after_shutdown() {
     let (video, audio) = receivers();
     let shared = Arc::new(Mutex::new(Controller::new(Settings {
         network_provider: None,
+        plan_service: None,
+        extension_profiles: Vec::new(),
         enabled: true,
         allow_remote: false,
         allowed_principals: vec!["owner".into()],
@@ -122,6 +126,8 @@ fn timed_table_preserves_legacy_prefix_and_checks_owner() {
     let (video, audio) = receivers();
     let shared = Arc::new(Mutex::new(Controller::new(Settings {
         network_provider: None,
+        plan_service: None,
+        extension_profiles: Vec::new(),
         enabled: true,
         allow_remote: false,
         allowed_principals: vec!["owner".into()],

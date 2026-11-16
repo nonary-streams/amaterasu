@@ -756,7 +756,7 @@ typedef struct {
  * invalid. Buffers are borrowed synchronously and BUSY consumes nothing. */
 #define AMATERASU_NEGOTIATED_VIDEO_CONTRACT "amaterasu.video-unit.native/1"
 #define AMATERASU_NEGOTIATED_VIDEO_TRANSPORT_CONTRACT "amaterasu.video-unit-transport.native/1"
-#define AMATERASU_VIDEO_FRAMING_CONTRACT "amaterasu.video-framing.native/1"
+#define AMATERASU_VIDEO_FRAMING_CONTRACT "amaterasu.video-framing.native/2"
 #define AMATERASU_VIDEO_UNIT_VERSION 1u
 #define AMATERASU_VIDEO_UNIT_KEYFRAME 1u
 #define AMATERASU_VIDEO_UNIT_DISCONTINUITY 2u
@@ -765,6 +765,10 @@ typedef struct {
 #define AMATERASU_VIDEO_FRAME_MAX_DATAGRAMS 2048u
 #define AMATERASU_VIDEO_FRAME_RECORD_START 1u
 #define AMATERASU_VIDEO_FRAME_CRITICAL_PREFIX 2u
+#define AMATERASU_VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED 1u
+#define AMATERASU_VIDEO_FRAMING_LIMITS_VERSION 2u
+#define AMATERASU_VIDEO_FRAMING_INTERFACE_MAJOR 2u
+#define AMATERASU_VIDEO_FRAMING_INTERFACE_MINOR 1u
 typedef struct { uint64_t namespace_id, value, schema; } AmaterasuVideoFormatId;
 typedef struct {
     uint32_t size, version;
@@ -796,6 +800,8 @@ typedef struct {
     uint32_t allowed_extensions, max_datagrams, max_queue_bytes;
     uint32_t min_parity_shards, max_fec_percentage;
     uint64_t max_wire_bytes;
+    /* V2 tail; the distinct framing v2 contract is required. */
+    uint32_t min_fec_percentage, max_fec_blocks, fec_policy_flags, reserved;
 } AmaterasuVideoFramingLimits;
 typedef struct {
     uint32_t size, version;
@@ -803,6 +809,35 @@ typedef struct {
     uint32_t critical_prefix_shards, block_count;
     AmaterasuVideoFecBlock blocks[AMATERASU_VIDEO_FRAME_MAX_BLOCKS];
 } AmaterasuVideoFramePlan;
+/* Host-authorized source selection. V1 requires metadata_required = 0. */
+typedef struct {
+    uint32_t size, version;
+    uint64_t stream, generation, offer_id, source_id, config_generation;
+    AmaterasuVideoFormatId codec, framing;
+    uint8_t clock_epoch[16];
+    uint64_t clock_origin_us;
+    uint32_t metadata_required, reserved;
+} AmaterasuVideoPlanSelection;
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*probe)(void *, uint64_t, const AmaterasuVideoPlanSelection *, AmaterasuVideoFramingLimits *);
+    AmaterasuStatus (*prepare)(void *, uint64_t, const AmaterasuVideoPlanSelection *, AmaterasuVideoFramingLimits *);
+    AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *, const AmaterasuVideoFramePlan *);
+    AmaterasuStatus (*drain)(void *, uint64_t);
+} AmaterasuNegotiatedVideoPlanTransportApi;
+/* V2 carries the exact negotiated payload and encoding name inline. */
+typedef struct {
+    AmaterasuVideoPlanSelection base;
+    uint32_t payload_type, encoding_name_len;
+    uint8_t encoding_name[32];
+} AmaterasuVideoPlanSelectionV2;
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*probe)(void *, uint64_t, const AmaterasuVideoPlanSelectionV2 *, AmaterasuVideoFramingLimits *);
+    AmaterasuStatus (*prepare)(void *, uint64_t, const AmaterasuVideoPlanSelectionV2 *, AmaterasuVideoFramingLimits *);
+    AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *, const AmaterasuVideoFramePlan *);
+    AmaterasuStatus (*drain)(void *, uint64_t);
+} AmaterasuNegotiatedVideoPlanTransportApiV2;
 typedef struct {
     void *context;
     AmaterasuStatus (*write)(void *, const AmaterasuVideoFramePlan *);
@@ -815,6 +850,10 @@ typedef struct {
     AmaterasuStatus (*plan)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *,
                             const AmaterasuVideoFramingLimits *, AmaterasuVideoFramePlanSink);
 } AmaterasuVideoFramingApi;
+typedef struct {
+    AmaterasuVideoFramingApi base;
+    AmaterasuStatus (*probe)(void *, const AmaterasuVideoFormatId *, const AmaterasuVideoFormatId *, const AmaterasuVideoFramingLimits *);
+} AmaterasuVideoFramingApiV2_1;
 
 /* HDR metadata is tied to a completed capture presentation. Fields: RGB xy,
  * white xy (1/50000), max nits, min 1/10000 nit, MaxCLL and MaxFALL. */

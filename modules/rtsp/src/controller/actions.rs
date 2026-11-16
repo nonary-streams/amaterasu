@@ -298,6 +298,8 @@ impl Controller {
             client_feature_flags: None,
             negotiated_color: None,
             negotiated_video: None,
+            extension_offer: None,
+            extension_announce: None,
             url,
             session_token,
             udp_discovery,
@@ -305,6 +307,7 @@ impl Controller {
             media_binds,
             expires,
             next_status: expires,
+            observation_stale_at: expires.saturating_add(OBSERVATION_STALE_MS),
             failure: None,
             cleanup_error: None,
             cleanup_retry_count: 0,
@@ -333,6 +336,15 @@ impl Controller {
             record.udp_discovery.as_ref(),
             media_binds,
         );
+        if self.settings.extension_enabled
+            && !record.config.profile.hdr
+            && record.config.profile.max_reference_frames == 0
+            && record.config.min_threads == 2
+            && record.config.qp == 28
+        {
+            payload["extension_probe"] =
+                record.config.arm(1)["configuration"]["configuration"].clone();
+        }
         if record.config.display_admission_required() {
             // Stream-session starts its prepared timer after Apply/readback. Reserve
             // the whole Prepare budget so an orphaned lease cannot outlive Launch's

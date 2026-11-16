@@ -1,6 +1,7 @@
 use crate::controller::Controller;
 #[cfg(test)]
 use amaterasu_media::INTERFACE_MINOR;
+pub mod plan;
 use amaterasu_media::{
     AudioUnit, EncodedPacket, INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED,
     MediaTransportApi, MediaTransportApiV1_1, TimedEncodedPacket,

@@ -114,6 +114,22 @@ impl Controller {
             }
             Ok(NegotiationStep::Action {
                 ticket: action_ticket,
+                action: Action::ExtensionAnnounce(announce),
+            }) => {
+                let success = record.accept_extension_announce(&announce);
+                let completed = self.finish_immediate_action(
+                    &mut record,
+                    connection,
+                    action_ticket,
+                    success,
+                    "unsupported_video_format",
+                );
+                if !completed {
+                    record.extension_announce = None;
+                }
+            }
+            Ok(NegotiationStep::Action {
+                ticket: action_ticket,
                 action: Action::Play,
             }) => {
                 let Some(session) = record.session else {
@@ -239,6 +255,8 @@ impl Controller {
         action_ticket: u64,
         deadline: u64,
     ) {
+        let mut payload = payload;
+        payload["prepare_video_before_play"] = json!(true);
         let operation = self.operation_id(record, "arm");
         self.job = Some(Job {
             ticket: record.id,

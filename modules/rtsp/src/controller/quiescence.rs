@@ -141,6 +141,7 @@ impl Controller {
         self.advance_retiring_jobs(runtime, now);
         self.close_quiescing_records();
         self.advance_display_cleanup(runtime);
+        self.advance_late_observations(runtime);
         self.advance_shutdown_settlement(runtime);
         // Every closing ticket retires on its own; none waits for another.
         let closing: Vec<u64> = self
@@ -280,6 +281,7 @@ impl Controller {
             && self.display_admission.is_none()
             && self.display_cleanup.is_empty()
             && self.shutdown_settlement.is_empty()
+            && self.late_observations.is_empty()
             && self.startup_recovery.ready()
             && self.startup_recovery.call.is_none()
             && self.records.values().all(|record| {

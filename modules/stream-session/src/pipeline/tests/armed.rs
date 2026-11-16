@@ -1062,3 +1062,308 @@ fn cleanup_binding_adoption_waits_for_durable_journal_confirmation() {
             .is_null()
     );
 }
+
+fn warmup_host() -> (Harness, u64, Value) {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.authenticated = false;
+    let id = host.response_from(1, "amaterasu.rtsp", prepare_discovery())["session"]
+        .as_u64()
+        .unwrap();
+    let mut request = arm(id);
+    request["prepare_video_before_play"] = json!(true);
+    (host, id, request)
+}
+
+#[test]
+fn play_warmup_waits_for_output_without_authentication_or_discovered_peers() {
+    let (mut host, id, request) = warmup_host();
+    host.broker.video_startup_delayed = true;
+    host.broker.enqueue(2, "amaterasu.rtsp", request.clone());
+    host.idle();
+    assert!(!host.broker.replies.contains_key(&2));
+    assert_eq!(host.pipeline.records[&id].state, State::Starting);
+    assert!(
+        host.pipeline.records[&id]
+            .resources
+            .contains_key(&Resource::Video)
+    );
+    assert!(
+        !host.pipeline.records[&id]
+            .resources
+            .contains_key(&Resource::AudioCapture)
+    );
+    assert!(host.pipeline.records[&id].plane.is_none());
+    assert!(host.pipeline.records[&id].input_lease.is_none());
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|c| c.service == Resource::Control.service() && c.payload["action"] == "status")
+    );
+    let polls = host
+        .broker
+        .calls
+        .iter()
+        .filter(|c| c.service == Resource::Video.service() && c.payload["action"] == "status")
+        .count();
+    assert!(
+        polls > 0 && polls < 10,
+        "readiness polling is bounded: {polls}"
+    );
+    host.broker.video_startup_delayed = false;
+    host.idle();
+    let reply = host
+        .broker
+        .replies
+        .remove(&2)
+        .expect("ready PLAY completion");
+    assert_eq!(reply["state"], "armed");
+    assert_eq!(reply["video_startup_ready"], true);
+    let opened = host
+        .broker
+        .calls
+        .iter()
+        .filter(|c| c.service == Resource::Video.service() && c.payload["action"] == "open")
+        .count();
+    assert_eq!(opened, 1);
+    assert_eq!(
+        host.response_from(3, "amaterasu.rtsp", request)["state"],
+        "armed"
+    );
+    host.broker.authenticated = true;
+    host.broker.discovered_video_port = Some(51001);
+    host.broker.discovered_audio_port = Some(51002);
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|c| c.service == Resource::Video.service() && c.payload["action"] == "open")
+            .count(),
+        1
+    );
+    assert_eq!(
+        host.response_from(4, "amaterasu.rtsp", json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+}
+
+#[test]
+fn play_warmup_failure_unsupported_and_timeout_retire_source() {
+    for failure in ["provider", "unsupported", "timeout"] {
+        let (mut host, id, request) = warmup_host();
+        host.broker.video_startup_failure = failure == "provider";
+        host.broker.video_startup_unsupported = failure == "unsupported";
+        host.broker.video_startup_delayed = failure == "timeout";
+        host.broker.enqueue(2, "amaterasu.rtsp", request.clone());
+        host.idle();
+        if failure == "timeout" {
+            host.now += 10_001;
+            host.idle();
+        }
+        let reply = host
+            .broker
+            .replies
+            .remove(&2)
+            .expect("failed warmup settled");
+        assert_eq!(reply["state"], "failed", "{failure}: {reply}");
+        assert_eq!(reply["video_startup_ready"], false);
+        assert!(host.pipeline.records[&id].resources.is_empty());
+        assert_eq!(host.broker.leases(), 0);
+        assert!(host.pipeline.records[&id].plane.is_none());
+        let opens = host
+            .broker
+            .calls
+            .iter()
+            .filter(|call| {
+                call.service == Resource::Video.service() && call.payload["action"] == "open"
+            })
+            .count();
+        assert_eq!(
+            host.response_from(3, "amaterasu.rtsp", request)["code"],
+            "invalid_state"
+        );
+        assert_eq!(
+            host.broker
+                .calls
+                .iter()
+                .filter(|call| call.service == Resource::Video.service()
+                    && call.payload["action"] == "open")
+                .count(),
+            opens
+        );
+    }
+}
+
+#[test]
+fn play_warmup_cancelled_or_lost_completion_never_arms() {
+    for lost_completion in [false, true] {
+        let (mut host, id, request) = warmup_host();
+        host.broker.video_startup_delayed = true;
+        host.broker.enqueue(2, "amaterasu.rtsp", request);
+        host.idle();
+        if lost_completion {
+            host.broker.fail_completion = true;
+            host.broker.video_startup_delayed = false;
+        } else {
+            host.broker.cancel_parent(2);
+        }
+        host.idle();
+        assert!(!host.pipeline.records[&id].armed_accepted);
+        assert!(host.pipeline.records[&id].state.terminal());
+        assert!(host.pipeline.records[&id].resources.is_empty());
+        assert_eq!(host.broker.leases(), 0);
+    }
+}
+
+#[test]
+fn play_warmup_requires_rtsp_authority_and_explicit_opt_in() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut request = arm(id);
+    request["prepare_video_before_play"] = json!(true);
+    assert_eq!(host.response(2, request)["code"], "permission_denied");
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|c| c.service == Resource::Video.service() && c.payload["action"] == "open")
+    );
+    host.broker.authenticated = false;
+    assert_eq!(host.response(3, arm(id))["state"], "armed");
+    host.idle();
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|c| c.service == Resource::Video.service() && c.payload["action"] == "open")
+    );
+}
+
+#[test]
+fn resumed_source_gets_fresh_readiness_and_keeps_lifecycle_acks_after_play() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    for generation in [1u64, 2] {
+        host.broker.authenticated = false;
+        host.broker.video_startup_delayed = true;
+        let mut prepare = prepare();
+        prepare["operation_id"] = json!(format!("resume-{generation}"));
+        prepare["lifecycle_session_target"] = json!({"kind":"session","host_epoch":"epoch","session_id":"parent-session","generation":1});
+        let id = host.response_from(generation * 10, "amaterasu.rtsp", prepare)["session"]
+            .as_u64()
+            .unwrap();
+        let mut request = arm(id);
+        request["prepare_video_before_play"] = json!(true);
+        request["configuration"]["capture_provider"] = json!("pipewire");
+        request["configuration"]["lifecycle_target"] = json!({"kind":"stream","host_epoch":"epoch","session_id":"parent-session","stream_id":format!("stream-{generation}"),"generation":generation});
+        request["configuration"]["lifecycle_candidate"] = json!({"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","selector":{"output":"kwin:Virtual-12"},"resource":{"provider":"provider","resource_id":"r","incarnation":"i","revision":generation,"execution_domain":"seat","mutation_domain":null},"mode":{"width":1280,"height":720,"refresh_millihz":60000,"hdr":false},"plan_revision":generation,"geometry_revision":generation,"generation":generation});
+        let calls_before = host.broker.calls.len();
+        host.broker
+            .enqueue(generation * 10 + 1, "amaterasu.rtsp", request);
+        host.idle();
+        assert!(!host.broker.replies.contains_key(&(generation * 10 + 1)));
+        assert!(!host.broker.calls[calls_before..].iter().any(|c| c.service
+            == "amaterasu.session-lifecycle/1"
+            && matches!(
+                c.payload["operation"].as_str(),
+                Some("acknowledge" | "start")
+            )));
+        host.broker.video_startup_delayed = false;
+        host.idle();
+        assert_eq!(
+            host.broker.replies.remove(&(generation * 10 + 1)).unwrap()["video_startup_ready"],
+            true
+        );
+        host.broker.authenticated = true;
+        host.idle();
+        assert_eq!(host.pipeline.records[&id].state, State::Active);
+        assert_eq!(
+            host.response_from(
+                generation * 10 + 2,
+                "amaterasu.rtsp",
+                json!({"action":"stop","session":id})
+            )["state"],
+            "stopped"
+        );
+        assert_eq!(host.broker.leases(), 0);
+    }
+}
+
+#[test]
+fn delayed_play_warmup_yields_to_an_existing_stream_renewal_and_input() {
+    let mut host = Harness::new();
+    host.pipeline.settings.enable_input = true;
+    host.pipeline.settings.input_lease_ttl_ms = 1000;
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let existing = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(existing))["state"], "active");
+    let mut preparation = prepare_discovery();
+    preparation["operation_id"] = json!("second-warming-source");
+    let warming = host.response_from(3, "amaterasu.rtsp", preparation)["session"]
+        .as_u64()
+        .unwrap();
+    let mut request = arm(warming);
+    request["prepare_video_before_play"] = json!(true);
+    host.broker.video_startup_delayed = true;
+    host.broker.enqueue(4, "amaterasu.rtsp", request);
+    host.idle();
+    assert!(host.pipeline.records[&warming].video_warmup_wait.is_some());
+    assert!(!host.broker.replies.contains_key(&4));
+    host.pipeline
+        .records
+        .get_mut(&existing)
+        .unwrap()
+        .input_renew_at = 0;
+    let renewals = host
+        .broker
+        .calls
+        .iter()
+        .filter(|c| c.service == "amaterasu.input/1" && c.payload["action"] == "renew")
+        .count();
+    let events_before = host.broker.input_events.len();
+    let ticks_before = host.plane.borrow().media_ticks;
+    host.plane
+        .borrow_mut()
+        .controls
+        .push(super::input::keyboard(true, 65));
+    for _ in 0..2500 {
+        host.tick();
+    }
+    assert_eq!(host.pipeline.records[&existing].state, State::Active);
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|c| c.service == "amaterasu.input/1" && c.payload["action"] == "renew")
+            .count()
+            > renewals
+    );
+    assert_eq!(host.broker.input_events.len(), events_before + 1);
+    assert!(host.plane.borrow().media_ticks > ticks_before);
+    assert!(!host.broker.replies.contains_key(&4));
+    let stopped = host.response_from(
+        5,
+        "amaterasu.rtsp",
+        json!({"action":"stop","session":warming}),
+    );
+    assert_eq!(stopped["state"], "stopped");
+    assert!(host.pipeline.records[&warming].video_warmup_wait.is_none());
+    assert!(host.broker.replies.contains_key(&4));
+    assert_eq!(host.pipeline.records[&existing].state, State::Active);
+}

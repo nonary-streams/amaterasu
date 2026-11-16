@@ -18,20 +18,20 @@ static NEXT_TEST_BASE_PORT: AtomicU16 = AtomicU16::new(0);
 const TEST_BASE_PORT: u16 = 47_989;
 
 #[derive(Default)]
-struct Endpoint {
-    commands: Vec<Command>,
-    completions: Vec<(u64, Value)>,
-    active_request: bool,
-    verifier_reply: Option<Value>,
-    verifier_pending: bool,
-    deny_launch: bool,
-    deny_settlement: bool,
-    deny_settlement_requests: BTreeSet<u64>,
-    lifecycle_results: VecDeque<Option<Value>>,
-    lifecycle_requests: BTreeMap<u64, Option<Value>>,
-    recovery_results: VecDeque<Option<Value>>,
-    recovery_requests: BTreeMap<u64, Option<Value>>,
-    next_recovery_request: u64,
+pub(super) struct Endpoint {
+    pub(super) commands: Vec<Command>,
+    pub(super) completions: Vec<(u64, Value)>,
+    pub(super) active_request: bool,
+    pub(super) verifier_reply: Option<Value>,
+    pub(super) verifier_pending: bool,
+    pub(super) deny_launch: bool,
+    pub(super) deny_settlement: bool,
+    pub(super) deny_settlement_requests: BTreeSet<u64>,
+    pub(super) lifecycle_results: VecDeque<Option<Value>>,
+    pub(super) lifecycle_requests: BTreeMap<u64, Option<Value>>,
+    pub(super) recovery_results: VecDeque<Option<Value>>,
+    pub(super) recovery_requests: BTreeMap<u64, Option<Value>>,
+    pub(super) next_recovery_request: u64,
 }
 
 impl Endpoint {
@@ -123,7 +123,7 @@ unsafe extern "C" fn invoke(
     abi::STATUS_OK
 }
 
-fn client(endpoint: &mut Endpoint) -> RuntimeClient {
+pub(super) fn client(endpoint: &mut Endpoint) -> RuntimeClient {
     let api = HostApi {
         header: AbiHeader::of::<HostApi>(),
         context: (endpoint as *mut Endpoint).cast(),
@@ -1085,6 +1085,8 @@ pub(super) fn record(state: State) -> Record {
         client_feature_flags: None,
         negotiated_color: None,
         negotiated_video: None,
+        extension_offer: None,
+        extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -1092,6 +1094,7 @@ pub(super) fn record(state: State) -> Record {
         media_binds: None,
         expires: 5_000,
         next_status: 5_000,
+        observation_stale_at: OBSERVATION_STALE_MS,
         failure: None,
         cleanup_error: None,
         cleanup_retry_count: 0,
@@ -1795,6 +1798,8 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         client_feature_flags: None,
         negotiated_color: None,
         negotiated_video: None,
+        extension_offer: None,
+        extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -1802,6 +1807,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         media_binds: None,
         expires: 5_000,
         next_status: 5_000,
+        observation_stale_at: OBSERVATION_STALE_MS,
         failure: None,
         cleanup_error: None,
         cleanup_retry_count: 0,
@@ -2894,7 +2900,7 @@ fn unavailable_play_response_never_marks_the_ticket_playing() {
     controller.armed(
         &mut record,
         job,
-        &json!({"ok":true,"session":23,"state":"armed","cleanup_error":null}),
+        &json!({"ok":true,"session":23,"state":"armed","video_startup_ready":true,"cleanup_error":null}),
         10,
     );
 
@@ -4296,4 +4302,151 @@ fn accepted_fractional_announce_reaches_the_video_configuration_without_rounding
         payload["configuration"]["configuration"]["fps_milli"],
         59_940
     );
+}
+
+#[test]
+fn accepted_extension_announce_preserves_profile_and_rejects_changed_probe_parameters() {
+    use amaterasu_contracts::media_profile::{FormatId, VideoProfile, VideoProfileSnapshot};
+    let (mut record, _) = announced_profile_record();
+    record.config.profile.max_reference_frames = 0;
+    let profile = VideoProfile {
+        codec: FormatId {
+            namespace_id: 7,
+            value: 8,
+            schema: 1,
+        },
+        framing: FormatId {
+            namespace_id: 7,
+            value: 9,
+            schema: 1,
+        },
+        wire_selector: 4,
+        payload_type: 100,
+        encoding_name: "EXAMPLE".into(),
+        media_format: None,
+        wire_attributes: Vec::new(),
+    };
+    let snapshot = VideoProfileSnapshot {
+        profiles: vec![profile.clone()],
+    };
+    let announcement =
+        include_str!("../../../../crates/gamestream/src/sdp/fixtures/moonlight-h264.sdp")
+            .replace(
+                "x-ss-general.encryptionEnabled:0",
+                "x-ss-general.encryptionEnabled:7",
+            )
+            .replace(
+                "x-nv-vqos[0].bitStreamFormat:0",
+                "x-nv-vqos[0].bitStreamFormat:4",
+            )
+            .replace(
+                "x-nv-video[0].maxNumReferenceFrames:1",
+                "x-nv-video[0].maxNumReferenceFrames:0",
+            );
+    let mut announce =
+        amaterasu_gamestream::sdp::parse_profile_announce(announcement.as_bytes(), &snapshot)
+            .unwrap();
+    assert!(!record.accept_extension_announce(&announce));
+    record.extension_offer = Some(profile.clone());
+    assert!(record.accept_extension_announce(&announce));
+    let payload = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(
+        payload["configuration"]["configuration"]["extension_profile"],
+        json!(profile)
+    );
+    assert_eq!(
+        payload["configuration"]["client_feature_flags"],
+        announce.client_feature_flags
+    );
+    announce.video.width += 2;
+    assert!(!record.accept_extension_announce(&announce));
+    assert!(record.authenticated_start_payload(23).is_none());
+}
+
+#[test]
+fn prepared_controller_advertises_only_the_preflighted_extension() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
+        "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
+        "payload_type":100,"encoding_name":"EXAMPLE"});
+    for (offered, reference_frames, expected) in
+        [(false, 0, false), (true, 0, true), (true, 1, false)]
+    {
+        let settings: Settings = serde_json::from_value(json!({"enabled":true,"extension_enabled":true,"bind":"127.0.0.1:0","allowed_principals":["caller"]})).unwrap();
+        let mut controller = Controller::new(settings).unwrap();
+        let (mut record, _) = announced_profile_record();
+        record.config.profile.max_reference_frames = reference_frames;
+        record.state = State::Preparing;
+        let job = Job {
+            ticket: record.id,
+            phase: Phase::Prepare,
+            call: Call::new(json!({"action":"prepare"}), "prepare".into(), Some(19)),
+            caller: Some(19),
+            network: None,
+            deadline: 5000,
+        };
+        let prepared = json!({"ok":true,"state":"prepared","session":23,
+            "audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002","control_local":"127.0.0.1:51004",
+            "extension_profile":if offered { profile.clone() } else { Value::Null }});
+        let mut endpoint = Endpoint {
+            active_request: true,
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.prepared(&mut record, job, &prepared, 10, &runtime);
+        assert_eq!(record.state, State::Ready);
+        let target = record.url.clone();
+        let negotiation = record.negotiation.as_mut().unwrap();
+        negotiation
+            .handle(record.id, &request(Method::Options, &target, 1, false))
+            .unwrap();
+        let mut describe = request(Method::Describe, &target, 2, false);
+        describe
+            .headers
+            .push(("accept".into(), "application/sdp".into()));
+        let NegotiationStep::Reply(description) = negotiation.handle(record.id, &describe).unwrap()
+        else {
+            panic!("describe")
+        };
+        assert_eq!(
+            String::from_utf8(description)
+                .unwrap()
+                .contains("EXAMPLE/90000"),
+            expected
+        );
+        assert_eq!(record.extension_offer.is_some(), expected);
+    }
+}
+
+#[test]
+fn authenticated_play_requests_source_readiness_before_releasing_negotiation() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let mut endpoint = Endpoint {
+        active_request: true,
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    let mut record = record(State::Arming);
+    record.config.profile.bitrate_kbps = 20_000;
+    record.config.profile.packet_size = 1_392;
+    record.config.profile.packet_ms = 5;
+    record.config.profile.encrypt_video = false;
+    record.config.profile.encrypt_audio = false;
+    controller.schedule_actual_arm(
+        &mut record,
+        json!({"action":"start_when_authenticated","session":23,"configuration":{}}),
+        999,
+        1,
+        10000,
+    );
+    let mut job = controller.job.take().unwrap();
+    assert!(matches!(job.call.poll(&runtime), Outcome::Waiting));
+    assert!(endpoint.commands.iter().any(|c| matches!(c,Command::Request{payload,..} if payload["prepare_video_before_play"]==true && payload["action"]=="start_when_authenticated")));
+    // A provider that only admits startup has not satisfied this PLAY request.
+    let (negotiation, ticket) = pending_play(&record);
+    record.negotiation = Some(negotiation);
+    job.network = Some((999, ticket));
+    controller.armed(&mut record,job,&json!({"ok":true,"session":23,"state":"armed","video_startup_ready":false,"cleanup_error":null}),5);
+    assert!(record.state == State::Closing);
+    assert_eq!(record.failure, Some("start_rejected"));
 }
