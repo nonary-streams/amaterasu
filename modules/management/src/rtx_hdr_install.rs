@@ -465,6 +465,13 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    fn missing_runtime_parent() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "amaterasu-rtx-missing-{}",
+            amaterasu_package::random_identifier().unwrap()
+        ))
+    }
+
     fn retire(installer: &mut Installer) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while installer.job.is_some() {
@@ -487,11 +494,8 @@ mod tests {
             ..Default::default()
         };
         amaterasu_package::write_json_atomically(&root.join("selection.json"), &selection).unwrap();
-        let mut installer = Installer::new(
-            PathBuf::from("/tmp/rtx-test-nonexistent"),
-            Network::test_provider(),
-        )
-        .unwrap();
+        let mut installer =
+            Installer::new(missing_runtime_parent(), Network::test_provider()).unwrap();
         installer.package_roots = Some((root.join("repositories"), root.clone()));
         assert!(installer.activation_request().is_err());
         installer.runtime_ready = true;
@@ -545,11 +549,8 @@ mod tests {
 
     #[test]
     fn reports_ready_only_after_verified_worker_completes() {
-        let mut installer = Installer::new(
-            PathBuf::from("/tmp/rtx-test-nonexistent"),
-            Network::test_provider(),
-        )
-        .unwrap();
+        let mut installer =
+            Installer::new(missing_runtime_parent(), Network::test_provider()).unwrap();
         let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
         installer.phase = "verifying";
         installer.job = Some(Job {
@@ -575,11 +576,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn runtime_and_candidate_readiness_are_reported_independently() {
-        let mut installer = Installer::new(
-            PathBuf::from("/tmp/rtx-test-nonexistent"),
-            Network::test_provider(),
-        )
-        .unwrap();
+        let mut installer =
+            Installer::new(missing_runtime_parent(), Network::test_provider()).unwrap();
         installer.runtime_ready = true;
         installer.phase = "installing";
         let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
@@ -614,11 +612,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn package_work_covers_preparation_and_activation_but_not_runtime_checks() {
-        let mut installer = Installer::new(
-            PathBuf::from("/tmp/rtx-test-nonexistent"),
-            Network::test_provider(),
-        )
-        .unwrap();
+        let mut installer =
+            Installer::new(missing_runtime_parent(), Network::test_provider()).unwrap();
         assert!(!installer.package_work_in_progress());
 
         // Verifying the NVIDIA runtime touches neither the cache nor the host.
@@ -665,11 +660,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn missing_candidate_configuration_reports_failure_without_claiming_activation() {
-        let mut installer = Installer::new(
-            PathBuf::from("/tmp/rtx-test-nonexistent"),
-            Network::test_provider(),
-        )
-        .unwrap();
+        let mut installer =
+            Installer::new(missing_runtime_parent(), Network::test_provider()).unwrap();
         installer.runtime_ready = true;
         let status = installer.request("rtx_hdr_install");
         assert_eq!(status["phase"], "failed");
@@ -681,11 +673,8 @@ mod tests {
 
     #[test]
     fn cancellation_waits_for_worker_retirement_before_restart() {
-        let mut installer = Installer::new(
-            PathBuf::from("/tmp/rtx-test-nonexistent"),
-            Network::test_provider(),
-        )
-        .unwrap();
+        let mut installer =
+            Installer::new(missing_runtime_parent(), Network::test_provider()).unwrap();
         let cancel = installer.cancelled.clone();
         let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
         installer.phase = "downloading";
@@ -709,11 +698,8 @@ mod tests {
 
     #[test]
     fn shutdown_waits_nonblocking_for_installer_worker_and_closes_admission() {
-        let mut installer = Installer::new(
-            PathBuf::from("/tmp/rtx-test-nonexistent"),
-            Network::test_provider(),
-        )
-        .unwrap();
+        let mut installer =
+            Installer::new(missing_runtime_parent(), Network::test_provider()).unwrap();
         let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
         let cancel = installer.cancelled.clone();
         installer.job = Some(Job {
@@ -750,11 +736,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_retires_candidate_without_starting_a_followup_job() {
-        let mut installer = Installer::new(
-            PathBuf::from("/tmp/rtx-test-nonexistent"),
-            Network::test_provider(),
-        )
-        .unwrap();
+        let mut installer =
+            Installer::new(missing_runtime_parent(), Network::test_provider()).unwrap();
         let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
         installer.runtime_ready = true;
         installer.install_requested = true;
