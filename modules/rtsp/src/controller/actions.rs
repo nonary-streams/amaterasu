@@ -111,7 +111,13 @@ impl Controller {
         verified: bool,
     ) {
         if self.quiescence.is_some() || self.shutdown_deadline.is_some() {
-            rpc::complete(runtime, input.request, error("module_quiescing"));
+            self.refuse_open(
+                runtime,
+                input.request,
+                &input.caller,
+                &input.config.operation_id,
+                "module_quiescing",
+            );
             return;
         }
         let OpenRequest {
@@ -126,18 +132,30 @@ impl Controller {
             .as_deref()
             .is_some_and(|epoch| epoch != self.runtime_epoch)
         {
-            rpc::complete(runtime, request, error("runtime_epoch_changed"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "runtime_epoch_changed",
+            );
             return;
         }
         // Reconciling the previous runtime's sessions is cleanup of ended
         // work. A ticket waits for it briefly after start, because those
         // sessions may still hold the media ports; it is never refused by it.
         if !self.startup_admission_open(now) {
-            rpc::complete(runtime, request, error("startup_reconciliation_pending"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "startup_reconciliation_pending",
+            );
             return;
         }
         if !self.settings.enabled {
-            rpc::complete(runtime, request, error("disabled"));
+            self.refuse_open(runtime, request, &caller, &config.operation_id, "disabled");
             return;
         }
         if !self
@@ -153,15 +171,27 @@ impl Controller {
             .retired_operations
             .contains(&(caller.clone(), config.operation_id.clone()))
         {
-            rpc::complete(runtime, request, error("operation_retired"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "operation_retired",
+            );
             return;
         }
         if let Err(code) = config.validate(self.settings.allow_remote) {
-            rpc::complete(runtime, request, error(code));
+            self.refuse_open(runtime, request, &caller, &config.operation_id, code);
             return;
         }
         if config.lifecycle_session_target.is_some() && self.settings.lifecycle_service.is_none() {
-            rpc::complete(runtime, request, error("lifecycle_provider_not_selected"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "lifecycle_provider_not_selected",
+            );
             return;
         }
         if config.lifecycle_session_target.is_some() && caller != self.settings.launch_owner {
@@ -175,19 +205,31 @@ impl Controller {
                 caller != self.settings.launch_owner || activity_id != config.operation_id
             })
         {
-            rpc::complete(runtime, request, error("history_activity_denied"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "history_activity_denied",
+            );
             return;
         }
         if display_preflight_deadline
             .is_some_and(|expiry| expiry.saturating_sub(now) <= PREPARE_BUDGET_MS)
         {
-            rpc::complete(runtime, request, error("display_admission_expired"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "display_admission_expired",
+            );
             return;
         }
         let local = match self.advertised_local_for_peer(config.peer_ip) {
             Ok(local) => local,
             Err(code) => {
-                rpc::complete(runtime, request, error(code));
+                self.refuse_open(runtime, request, &caller, &config.operation_id, code);
                 return;
             }
         };
@@ -210,12 +252,24 @@ impl Controller {
                 self.settings.max_live_tickets,
             )
         {
-            rpc::complete(runtime, request, error("capacity_exceeded"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "capacity_exceeded",
+            );
             return;
         }
         if config.display_admission_required() && !verified {
             if self.display_cleanup.len() >= MAX_DISPLAY_CLEANUP {
-                rpc::complete(runtime, request, error("display_admission_unavailable"));
+                self.refuse_open(
+                    runtime,
+                    request,
+                    &caller,
+                    &config.operation_id,
+                    "display_admission_unavailable",
+                );
                 return;
             }
             if caller != self.settings.launch_owner {
@@ -269,7 +323,7 @@ impl Controller {
         {
             Ok(identity) => identity,
             Err(code) => {
-                rpc::complete(runtime, request, error(code));
+                self.refuse_open(runtime, request, &caller, &config.operation_id, code);
                 return;
             }
         };
@@ -282,7 +336,13 @@ impl Controller {
                 .or(self.listener_base_port)
                 .is_some()
         {
-            rpc::complete(runtime, request, error("media_port_capacity_exhausted"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "media_port_capacity_exhausted",
+            );
             return;
         }
         let mut record = Record {
@@ -331,6 +391,7 @@ impl Controller {
             revoke_after: None,
             cleanup_confirmed: false,
             ended_at: None,
+            issues: Default::default(),
         };
         let mut payload = record.config.prepare_with_media_binds(
             &record.operation(),
@@ -365,6 +426,7 @@ impl Controller {
             }
             record.display_lease_ready_until = Some(now.saturating_add(effective_timeout));
         }
+        record.bind_stream_operations();
         let operation = self.operation_id(&record, "prepare");
         self.records.insert(ticket, record);
         self.job = Some(Job {
@@ -403,11 +465,7 @@ impl Controller {
                     true,
                 );
             } else {
-                rpc::complete(
-                    runtime,
-                    admission.request,
-                    error("display_admission_unavailable"),
-                );
+                self.refuse_display_admission(runtime, &admission, "display_admission_unavailable");
             }
             return;
         }
@@ -420,10 +478,10 @@ impl Controller {
         match admission.call.poll(runtime) {
             Outcome::Waiting => {
                 if now >= admission.deadline || !rpc::active(runtime, admission.request) {
-                    rpc::complete(
+                    self.refuse_display_admission(
                         runtime,
-                        admission.request,
-                        error("display_admission_unavailable"),
+                        &admission,
+                        "display_admission_unavailable",
                     );
                     self.display_cleanup.push(DisplayCleanup {
                         owner: admission.caller,
@@ -455,27 +513,15 @@ impl Controller {
                     admission.display_preflight_deadline = preflight_deadline;
                     self.display_admission = Some(admission);
                 } else {
-                    rpc::complete(
-                        runtime,
-                        admission.request,
-                        error("display_admission_denied"),
-                    );
+                    self.refuse_display_admission(runtime, &admission, "display_admission_denied");
                 }
             }
             Outcome::SettledFailure => {
-                rpc::complete(
-                    runtime,
-                    admission.request,
-                    error("display_admission_unavailable"),
-                );
+                self.refuse_display_admission(runtime, &admission, "display_admission_unavailable");
             }
             Outcome::Uncertain => {
                 admission.call.cancel_read_only();
-                rpc::complete(
-                    runtime,
-                    admission.request,
-                    error("display_admission_unavailable"),
-                );
+                self.refuse_display_admission(runtime, &admission, "display_admission_unavailable");
                 self.display_cleanup.push(DisplayCleanup {
                     owner: admission.caller,
                     operation_id: admission.config.operation_id,

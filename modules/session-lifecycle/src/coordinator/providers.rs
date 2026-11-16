@@ -2104,6 +2104,7 @@ impl Coordinator {
                 continue;
             }
             let state = self.drivers[&runtime_key].state().clone();
+            self.bind_provider_operation(&key, &state.request.operation_id);
             if matches!(
                 state.phase,
                 PreparePhase::Prepared | PreparePhase::CleanupSettled

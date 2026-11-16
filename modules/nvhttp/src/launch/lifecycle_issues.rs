@@ -11,7 +11,7 @@ use super::{
 };
 use crate::wire::Reply;
 use amaterasu_module_sdk::stream_lifecycle::{
-    LifecycleLayer, StreamIssue, StreamIssueFeed, StreamLifecycleSnapshot,
+    LifecycleLayer, StreamIssue, StreamIssueFeed, StreamLifecycleSnapshot, StreamReport,
 };
 use std::fmt::Debug;
 
@@ -43,7 +43,7 @@ impl FailureContext {
     }
 }
 
-/// The layer a job phase talks to.
+/// The layer a job phase depends on.
 pub(super) fn phase_layer(phase: Phase) -> LifecycleLayer {
     use Phase::*;
     match phase {
@@ -180,23 +180,29 @@ impl Record {
         self.issues.push(issue);
     }
 
-    /// Credit an issue to the job that was being handled, or else to the
-    /// stage the record was waiting in.
+    /// NVHTTP reports only under its own layer. When the failure is its
+    /// reaction to the job it was handling, or to the stage it was waiting
+    /// in, it names that dependency in `caused_by`; the dependency reports
+    /// its own failure itself.
     fn attributed(&self, mut issue: StreamIssue) -> StreamIssue {
-        match &self.failure_context {
+        issue.layer = LifecycleLayer::Nvhttp;
+        let dependency = match &self.failure_context {
             Some(context) => {
-                issue.layer = phase_layer(context.phase);
                 issue.phase = label(context.phase);
                 if let Some(code) = &context.provider_code
                     && *code != issue.code
                 {
                     issue.reason.clone_from(code);
                 }
+                phase_layer(context.phase)
             }
             None => {
-                issue.layer = stage_layer(self.stage);
                 issue.phase = label(self.stage);
+                stage_layer(self.stage)
             }
+        };
+        if dependency != LifecycleLayer::Nvhttp {
+            issue = issue.caused_by(dependency);
         }
         issue
     }
@@ -223,9 +229,19 @@ impl Controller {
             self.stream_lifecycle
                 .alias(key, &record.application_operation);
             self.stream_lifecycle.enter_phase(key, &label(record.stage));
-            for issue in record.issues.drain() {
-                self.stream_lifecycle
-                    .commit_logged(self.logger.as_ref(), NVHTTP_PUBLISHER, issue);
+            for report in record.issues.drain() {
+                match report {
+                    StreamReport::Issue(issue) => {
+                        self.stream_lifecycle.commit_logged(
+                            self.logger.as_ref(),
+                            NVHTTP_PUBLISHER,
+                            issue,
+                        );
+                    }
+                    StreamReport::Binding(binding) => {
+                        self.stream_lifecycle.bind(&binding.stream, &binding.alias);
+                    }
+                }
             }
             if record.state.terminal() {
                 self.stream_lifecycle.end(key);

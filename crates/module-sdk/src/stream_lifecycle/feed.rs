@@ -1,5 +1,5 @@
 //! The launch owner's subscription to reported stream issues.
-use super::{STREAM_ISSUES, StreamIssue, StreamLifecycleStore};
+use super::{STREAM_REPORTS, StreamLifecycleStore, StreamReport};
 use crate::LogEmitter;
 use crate::control_error::ControlResult;
 use crate::events::{Backlog, Delivery, Subscription};
@@ -10,14 +10,15 @@ const FEED_CAPACITY: usize = 64;
 /// Polls to wait before trying a refused subscription again.
 const RESUBSCRIBE_AFTER_POLLS: u32 = 512;
 
-/// Moves reported issues from the [`STREAM_ISSUES`] topic into a store.
+/// Moves reported issues and bindings from the [`STREAM_REPORTS`] topic into
+/// a store.
 ///
 /// Every read is a non-blocking broker command, and a poll reads at most the
 /// limit it is given, so the owner's tick stays bounded. Missed events mark
 /// the open streams as having an audit gap.
 #[derive(Debug, Default)]
 pub struct StreamIssueFeed {
-    subscription: Option<Subscription<StreamIssue>>,
+    subscription: Option<Subscription<StreamReport>>,
     retry_in: u32,
     malformed: u64,
     unavailable: Option<String>,
@@ -28,7 +29,7 @@ impl StreamIssueFeed {
         Self::default()
     }
 
-    /// Events from a publisher that did not match [`StreamIssue`] or failed
+    /// Events from a publisher that did not match [`StreamReport`] or failed
     /// its bounds. They are logged and counted, never committed.
     pub fn malformed(&self) -> u64 {
         self.malformed
@@ -74,7 +75,7 @@ impl StreamIssueFeed {
         &mut self,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
         logger: Option<&LogEmitter>,
-    ) -> Option<Subscription<StreamIssue>> {
+    ) -> Option<Subscription<StreamReport>> {
         if let Some(subscription) = self.subscription.take() {
             return Some(subscription);
         }
@@ -83,7 +84,7 @@ impl StreamIssueFeed {
             return None;
         }
         let opened: ControlResult<_> =
-            Subscription::open_with(send, &STREAM_ISSUES, Backlog::Complete(FEED_CAPACITY));
+            Subscription::open_with(send, &STREAM_REPORTS, Backlog::Complete(FEED_CAPACITY));
         match opened {
             Ok(subscription) => {
                 self.unavailable = None;
@@ -114,14 +115,17 @@ impl StreamIssueFeed {
 
     fn receive(
         &mut self,
-        delivery: Delivery<StreamIssue>,
+        delivery: Delivery<StreamReport>,
         store: &mut StreamLifecycleStore,
         logger: Option<&LogEmitter>,
     ) {
         match delivery {
-            Delivery::Event(event) if event.payload.valid() => {
-                store.commit(&event.publisher, event.payload);
-            }
+            Delivery::Event(event) if event.payload.valid() => match event.payload {
+                StreamReport::Issue(issue) => {
+                    store.commit(&event.publisher, issue);
+                }
+                StreamReport::Binding(binding) => store.bind(&binding.stream, &binding.alias),
+            },
             Delivery::Event(event) => {
                 self.reject(&event.publisher, "invalid_stream_issue", logger);
             }

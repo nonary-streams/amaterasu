@@ -1,7 +1,9 @@
 use super::*;
 use super::call::{Call, Outcome};
 use super::workflow::Phase;
-use amaterasu_module_sdk::stream_lifecycle::{IssueDisposition, LifecycleLayer, StreamIssue};
+use amaterasu_module_sdk::stream_lifecycle::{
+    IssueDisposition, LifecycleLayer, StreamBinding, StreamIssue, StreamReport,
+};
 use amaterasu_module_sdk::{Command, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -5940,7 +5942,8 @@ fn cooperative_shutdown_does_not_wait_on_unconfirmed_history_release() {
     assert_eq!(lifecycle.warnings().len(), 1);
     let warning = &lifecycle.warnings()[0];
     assert_eq!(warning.issue.code, "history_release_unconfirmed");
-    assert_eq!(warning.issue.layer, LifecycleLayer::History);
+    assert_eq!(warning.issue.layer, LifecycleLayer::Nvhttp);
+    assert_eq!(warning.issue.caused_by, Some(LifecycleLayer::History));
     assert_eq!(warning.publisher, "amaterasu.nvhttp");
     let shutdown_at = now + Duration::from_secs(3_600);
     assert!(controller.quiesce(shutdown_at));
@@ -6068,7 +6071,8 @@ fn a_rejected_rtsp_open_is_the_root_cause_with_its_provider_code_and_line() {
     let lifecycle = lifecycle_of(&controller, id);
     let root = lifecycle.root_cause().expect("a failed launch has a root cause");
     assert_eq!(root.publisher, "amaterasu.nvhttp");
-    assert_eq!(root.issue.layer, LifecycleLayer::Rtsp);
+    assert_eq!(root.issue.layer, LifecycleLayer::Nvhttp);
+    assert_eq!(root.issue.caused_by, Some(LifecycleLayer::Rtsp));
     assert_eq!(root.issue.phase, "open_rtsp");
     assert_eq!(root.issue.reason, "not_found");
     assert_eq!(root.issue.disposition, IssueDisposition::CriticalFailure);
@@ -6077,7 +6081,7 @@ fn a_rejected_rtsp_open_is_the_root_cause_with_its_provider_code_and_line() {
     let reference = management_reference(&controller.records[&id]);
     let status = controller.management_status(Some(&reference));
     assert_eq!(
-        status["launch"]["lifecycle"]["root_cause"]["issue"]["layer"],
+        status["launch"]["lifecycle"]["root_cause"]["issue"]["caused_by"],
         "rtsp"
     );
     assert_eq!(status["launch"]["lifecycle"]["healthy"], false);
@@ -6119,7 +6123,8 @@ fn a_demoted_input_policy_failure_is_a_warning_not_a_failure() {
         .iter()
         .find(|warning| warning.issue.code == "proton_policy_unavailable")
         .expect("the fallback is recorded");
-    assert_eq!(warning.issue.layer, LifecycleLayer::Input);
+    assert_eq!(warning.issue.layer, LifecycleLayer::Nvhttp);
+    assert_eq!(warning.issue.caused_by, Some(LifecycleLayer::Input));
     assert_eq!(warning.issue.phase, "read_proton_policy");
     assert_eq!(warning.issue.disposition, IssueDisposition::AdvisoryWarning);
 }
@@ -6127,7 +6132,7 @@ fn a_demoted_input_policy_failure_is_a_warning_not_a_failure() {
 /// Answers the stream-issue subscription with scripted reports and passes
 /// every other command to the launch broker.
 struct IssueReports {
-    events: std::collections::VecDeque<(String, StreamIssue)>,
+    events: std::collections::VecDeque<(String, StreamReport)>,
     sequence: u64,
 }
 
@@ -6135,19 +6140,19 @@ impl IssueReports {
     fn send(&mut self, broker: &mut Broker, command: Command) -> Transport {
         match command {
             Command::Subscribe { topic, .. } => {
-                assert_eq!(topic, "amaterasu.stream.issue/1");
+                assert_eq!(topic, "amaterasu.stream.report/1");
                 Ok(Response::Accepted { id: 77 })
             }
             Command::NextEvent { subscription } => {
                 assert_eq!(subscription, 77);
                 Ok(match self.events.pop_front() {
-                    Some((publisher, issue)) => {
+                    Some((publisher, report)) => {
                         self.sequence += 1;
                         Response::Event {
                             publisher,
-                            topic: "amaterasu.stream.issue/1".into(),
+                            topic: "amaterasu.stream.report/1".into(),
                             sequence: self.sequence,
-                            payload: serde_json::to_value(issue).unwrap(),
+                            payload: serde_json::to_value(report).unwrap(),
                         }
                     }
                     None => Response::Pending,
@@ -6159,7 +6164,7 @@ impl IssueReports {
 }
 
 #[test]
-fn a_layer_reported_failure_is_the_root_cause_ahead_of_nvhttp_cleanup() {
+fn the_failing_provider_is_the_root_cause_through_each_callers_binding() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     controller.enable_stream_issue_feed();
@@ -6174,26 +6179,45 @@ fn a_layer_reported_failure_is_the_root_cause_ahead_of_nvhttp_cleanup() {
     let rtsp_operation = controller.records[&id].rtsp_operation.clone();
     let application_operation = controller.records[&id].application_operation.clone();
 
-    reports.events.push_back((
-        "amaterasu.stream-session".into(),
-        StreamIssue::critical(
-            rtsp_operation.clone(),
-            LifecycleLayer::EncodeVideo,
-            "wait_video_ready",
-            "video_startup_failed",
-        )
-        .because("encoder_unavailable"),
-    ));
-    reports.events.push_back((
-        "amaterasu.session-lifecycle".into(),
-        StreamIssue::demoted(
-            format!("{application_operation}-lifecycle"),
-            LifecycleLayer::FrameLimiter,
-            "resource_plan",
-            "optional_provider_skipped",
-            "skip_optional_provider",
+    // The stream session reacts first; the video service's own report and
+    // the bindings that place it arrive afterwards.
+    let reaction = StreamIssue::critical(
+        "ss-2a-wait",
+        LifecycleLayer::StreamSession,
+        "wait_video_ready",
+        "video_startup_failed",
+    )
+    .caused_by(LifecycleLayer::EncodeVideo);
+    let origin = StreamIssue::critical(
+        "video-e-7-capture-0",
+        LifecycleLayer::EncodeVideo,
+        "running",
+        "encoder_unavailable",
+    );
+    for (publisher, report) in [
+        ("amaterasu.stream-session", StreamReport::Issue(reaction)),
+        ("amaterasu.video", StreamReport::Issue(origin)),
+        (
+            "amaterasu.stream-session",
+            StreamReport::Binding(StreamBinding::new(rtsp_operation.clone(), "ss-2a")),
         ),
-    ));
+        (
+            "amaterasu.video",
+            StreamReport::Binding(StreamBinding::new("ss-2a-video", "video-e-7")),
+        ),
+        (
+            "amaterasu.session-lifecycle",
+            StreamReport::Issue(StreamIssue::demoted(
+                format!("{application_operation}-lifecycle"),
+                LifecycleLayer::SessionLifecycle,
+                "stream_prepare",
+                "optional_provider_skipped",
+                "skip_optional_provider",
+            )),
+        ),
+    ] {
+        reports.events.push_back((publisher.into(), report));
+    }
     controller.poll(now, &mut |command| reports.send(&mut broker, command));
     controller
         .records
@@ -6204,17 +6228,22 @@ fn a_layer_reported_failure_is_the_root_cause_ahead_of_nvhttp_cleanup() {
 
     let lifecycle = lifecycle_of(&controller, id);
     let root = lifecycle.root_cause().unwrap();
-    assert_eq!(root.publisher, "amaterasu.stream-session");
-    assert_eq!(root.issue.layer, LifecycleLayer::EncodeVideo);
-    assert_eq!(root.issue.reason, "encoder_unavailable");
-    assert!(
-        lifecycle
-            .entries()
-            .any(|entry| entry.issue.code == "monitor_unavailable"),
-        "later failures are kept beside the root cause"
+    assert_eq!(root.publisher, "amaterasu.video");
+    assert_eq!(root.issue.code, "encoder_unavailable");
+    assert!(root.issue.is_origin());
+    let publishers: BTreeSet<_> = lifecycle
+        .entries()
+        .map(|entry| entry.publisher.as_str())
+        .collect();
+    assert_eq!(
+        publishers,
+        BTreeSet::from([
+            "amaterasu.nvhttp",
+            "amaterasu.session-lifecycle",
+            "amaterasu.stream-session",
+            "amaterasu.video",
+        ])
     );
-    let warning = &lifecycle.warnings()[0];
-    assert_eq!(warning.publisher, "amaterasu.session-lifecycle");
-    assert_eq!(warning.issue.code, "optional_provider_skipped");
+    assert_eq!(controller.stream_lifecycle.unattributed().count(), 0);
     assert!(!lifecycle.audit_gap());
 }

@@ -265,8 +265,7 @@ impl Controller {
                 record.cleanup_confirmed = true;
                 finish_record(record);
             } else {
-                record.state = State::CleanupFailed;
-                record.cleanup_error = Some("quiescence_deadline");
+                record.fail_cleanup("quiescence_deadline");
             }
         }
         for (ticket, caller) in callers {

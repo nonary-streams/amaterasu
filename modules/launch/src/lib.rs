@@ -93,6 +93,7 @@ impl ManagedModule for LaunchModule {
             .resolved_environment(|name| std::env::var(name).ok())
             .map_err(str::to_owned)?;
         let mut pipeline = Pipeline::new(environment).map_err(str::to_owned)?;
+        pipeline.enable_stream_issue_reports();
         pipeline.set_retirement_observers(settings.retirement_observers);
         pipeline.set_application_retirement_observers(settings.application_retirement_observers);
         pipeline.set_provider_routes(settings.provider_routes);

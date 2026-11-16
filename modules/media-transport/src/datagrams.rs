@@ -5,6 +5,7 @@ mod udp_batch;
 use crate::diagnostics::DeliveryTiming;
 use amaterasu_module_sdk::audio::ClientAudioChannel;
 use amaterasu_module_sdk::network::{Network, UdpSocket};
+use std::panic::Location;
 use std::{
     collections::VecDeque,
     io,
@@ -140,7 +141,16 @@ pub struct Delivery {
     pub sent_datagrams: u64,
     pub discarded_datagrams: u64,
     pub failure: Option<&'static str>,
+    /// The first failure and the line that raised it. Later failures may
+    /// replace `failure`; this one is what ended delivery.
+    pub first_failure: Option<FailureOrigin>,
     timing: DeliveryTiming,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FailureOrigin {
+    pub code: &'static str,
+    pub site: &'static Location<'static>,
 }
 
 impl Delivery {
@@ -231,6 +241,7 @@ impl Delivery {
             sent_datagrams: 0,
             discarded_datagrams: 0,
             failure: None,
+            first_failure: None,
             timing: DeliveryTiming::default(),
         }
     }
@@ -609,9 +620,14 @@ impl Delivery {
         }
     }
 
+    #[track_caller]
     pub fn fail(&mut self, code: &'static str) {
         if self.failure.is_none() {
             eprintln!("amaterasu media transport failed code={code}");
+            self.first_failure = Some(FailureOrigin {
+                code,
+                site: Location::caller(),
+            });
         }
         self.failure = Some(code);
         self.discarded_datagrams = self

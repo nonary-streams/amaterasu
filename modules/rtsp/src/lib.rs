@@ -63,7 +63,8 @@ impl ManagedModule for RtspModule {
                 })
                 .transpose()?;
         }
-        let controller = Controller::with_network(settings, network)?;
+        let mut controller = Controller::with_network(settings, network)?;
+        controller.enable_stream_issue_reports();
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;

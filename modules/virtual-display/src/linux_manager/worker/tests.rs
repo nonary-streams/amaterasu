@@ -1608,6 +1608,7 @@ fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
     let (sender, receiver) = std::sync::mpsc::sync_channel(2);
     let key = ("owner".to_owned(), FIRST.to_owned());
     let mut manager = Manager {
+        stream_issues: Default::default(),
         settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
         monitors: BTreeMap::from([(
             key.clone(),
@@ -1719,6 +1720,7 @@ fn reference_persistence_drains_full_completion_queue() {
         Ok(())
     });
     let mut manager = Manager {
+        stream_issues: Default::default(),
         settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
         monitors: BTreeMap::from([(
             key.clone(),
@@ -1784,6 +1786,7 @@ fn manager_releases_parks_and_reuses_output_through_public_operations() {
         )
     });
     let mut manager = Manager {
+        stream_issues: Default::default(),
         settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
         monitors: Default::default(),
         parked: Default::default(),
@@ -1935,6 +1938,7 @@ fn manager_with_fake_worker(
         )
     });
     let mut manager = super::super::Manager {
+        stream_issues: Default::default(),
         settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
         monitors: Default::default(),
         parked: Default::default(),
@@ -2067,6 +2071,30 @@ fn manager_failed_creation_before_journaling_releases_its_admission() {
     remove_failed_creation(&mut manager);
     assert!(broker.effects.lock().unwrap().is_empty());
     assert!(broker.connected("Virtual-1").unwrap());
+    drop(manager);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn manager_reports_a_failed_creation_under_the_monitor_identity() {
+    use amaterasu_module_sdk::stream_lifecycle::{IssueDisposition, LifecycleLayer, StreamReport};
+    let (root, controller) = fixture();
+    *controller.connectors.0.lock().unwrap() = Err("DRM sysfs is unavailable".into());
+    let mut manager = manager_with_fake_worker(controller);
+    admit_failed_creation(&mut manager);
+    let reports: Vec<_> = manager.drain_stream_issues().collect();
+    let [StreamReport::Issue(issue)] = reports.as_slice() else {
+        panic!("one issue: {reports:?}")
+    };
+    assert_eq!(issue.operation, FIRST);
+    assert_eq!(issue.layer, LifecycleLayer::VirtualDisplay);
+    assert_eq!(issue.phase, "create");
+    assert_eq!(issue.code, "virtual_display_create_failed");
+    assert_eq!(issue.disposition, IssueDisposition::CriticalFailure);
+    assert!(issue.site.contains("linux_manager.rs:"), "{}", issue.site);
+    assert!(manager.drain_stream_issues().next().is_none());
+
+    remove_failed_creation(&mut manager);
     drop(manager);
     fs::remove_dir_all(root).unwrap();
 }
@@ -2206,6 +2234,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         )
     });
     let mut manager = Manager {
+        stream_issues: Default::default(),
         settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
         monitors: Default::default(),
         parked: Default::default(),

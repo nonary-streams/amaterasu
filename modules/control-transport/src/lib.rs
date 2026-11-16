@@ -1,6 +1,7 @@
 //! Owned, encrypted GameStream control transport. No product code in the shell.
 mod controller;
 mod diagnostics;
+mod lifecycle_issues;
 mod model;
 mod native;
 mod stream;
@@ -26,7 +27,9 @@ struct ControlTransport {
 
 impl ManagedModule for ControlTransport {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        Self::start_configured(runtime, None)
+        let module = Self::start_configured(runtime, None)?;
+        module.cleanup_controller().enable_stream_issue_reports();
+        Ok(module)
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -39,6 +42,7 @@ impl ManagedModule for ControlTransport {
             Err(TryLockError::Poisoned(_)) => return Err("control state unavailable".into()),
         };
         controller.tick();
+        controller.publish_stream_issues(&mut |command| self.runtime.send(command));
         let now = Instant::now();
         if now.saturating_duration_since(self.last_timing_log) >= Duration::from_secs(10) {
             let elapsed = now

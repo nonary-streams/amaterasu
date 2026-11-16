@@ -1,10 +1,12 @@
 use crate::{
     backend::{Backend, CaptureSession, NativeBackend},
+    lifecycle_issues,
     model::{
         CaptureError, CaptureResult, Frame, MAX_OUTPUTS, MAX_STREAMS, Operation, Output,
         validate_operation_id,
     },
 };
+use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Instant};
 
@@ -16,6 +18,7 @@ struct Stream {
     opened_at: Instant,
     sequence: u64,
     last_timestamp_us: u64,
+    read_failure_reported: bool,
 }
 
 pub struct Controller<B: Backend = NativeBackend> {
@@ -23,6 +26,7 @@ pub struct Controller<B: Backend = NativeBackend> {
     enabled: bool,
     streams: BTreeMap<u64, Stream>,
     opened_stream: Option<u64>,
+    issues: StreamIssueOutbox,
 }
 
 impl<B: Backend> Controller<B> {
@@ -32,6 +36,7 @@ impl<B: Backend> Controller<B> {
             enabled,
             streams: BTreeMap::new(),
             opened_stream: None,
+            issues: StreamIssueOutbox::default(),
         }
     }
 
@@ -48,11 +53,34 @@ impl<B: Backend> Controller<B> {
             Operation::Open {
                 output,
                 operation_id,
-            } => self.open(caller, output, operation_id, guard),
+            } => {
+                let reporting = operation_id.clone();
+                let result = self.open(caller, output, operation_id, guard);
+                if let (Err(error), Some(operation)) = (&result, reporting) {
+                    self.report_open_failure(&operation, error);
+                }
+                result
+            }
             Operation::Lookup { operation_id } => self.lookup(caller, &operation_id),
             Operation::Close { stream } => self.close(caller, stream).map(|()| json!({"ok":true})),
         };
         result.unwrap_or_else(CaptureError::payload)
+    }
+
+    /// A refused or failed open the consumer still waits for. A cancelled
+    /// request has no stream left to report to.
+    fn report_open_failure(&mut self, operation: &str, error: &CaptureError) {
+        if error.code == "cancelled" {
+            return;
+        }
+        self.issues.push(lifecycle_issues::capture_failure(
+            operation, "x11.open", error.code,
+        ));
+    }
+
+    /// Move queued stream issues to the module's tick for publication.
+    pub fn take_stream_issues(&mut self, outbox: &mut StreamIssueOutbox) {
+        lifecycle_issues::transfer(&mut self.issues, outbox);
     }
 
     pub fn take_opened_stream(&mut self) -> Option<u64> {
@@ -66,6 +94,7 @@ impl<B: Backend> Controller<B> {
             enabled: self.enabled,
             streams: self.streams,
             opened_stream: self.opened_stream,
+            issues: self.issues,
         }
     }
 
@@ -83,7 +112,22 @@ impl<B: Backend> Controller<B> {
     pub fn read(&mut self, caller: &str, id: u64) -> CaptureResult<Frame> {
         self.authorize(caller, id)?;
         let stream = self.streams.get_mut(&id).expect("authorized X11 stream");
-        let mut frame = stream.session.read()?;
+        let mut frame = match stream.session.read() {
+            Ok(frame) => frame,
+            Err(error) => {
+                // The consumer sees every failed read; the stream's record
+                // needs only the first.
+                if !stream.read_failure_reported
+                    && let Some(operation) = &stream.operation_id
+                {
+                    stream.read_failure_reported = true;
+                    self.issues.push(lifecycle_issues::capture_failure(
+                        operation, "x11.read", error.code,
+                    ));
+                }
+                return Err(error);
+            }
+        };
         stream.sequence = stream.sequence.checked_add(1).ok_or_else(|| {
             CaptureError::new("sequence_exhausted", "X11 capture frame sequence exhausted")
         })?;
@@ -186,6 +230,7 @@ impl<B: Backend> Controller<B> {
                 opened_at: Instant::now(),
                 sequence: 0,
                 last_timestamp_us: 0,
+                read_failure_reported: false,
             },
         );
         self.opened_stream = Some(id);

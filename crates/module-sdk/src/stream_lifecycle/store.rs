@@ -32,6 +32,8 @@ pub struct StreamLifecycle {
     root_cause: Option<LifecycleEntry>,
     warnings: Vec<LifecycleEntry>,
     entries: VecDeque<LifecycleEntry>,
+    /// Critical failures their own reporter later recovered from.
+    recovered: Vec<LifecycleEntry>,
     committed: u64,
     audit_gap: bool,
 }
@@ -45,6 +47,7 @@ impl StreamLifecycle {
             root_cause: None,
             warnings: Vec::new(),
             entries: VecDeque::new(),
+            recovered: Vec::new(),
             committed: 0,
             audit_gap: false,
         }
@@ -86,11 +89,14 @@ impl StreamLifecycle {
         self.committed = self.committed.saturating_add(1);
         match entry.issue.disposition {
             IssueDisposition::CriticalFailure => {
-                if self.root_cause.is_none() {
+                if outranks(&entry, self.root_cause.as_ref()) {
                     self.root_cause = Some(entry.clone());
                 }
             }
             IssueDisposition::DemotedWarning | IssueDisposition::AdvisoryWarning => {
+                if entry.issue.disposition == IssueDisposition::DemotedWarning {
+                    self.recover(&entry);
+                }
                 let repeated = self.warnings.iter().any(|existing| {
                     existing.issue.code == entry.issue.code
                         && existing.issue.layer == entry.issue.layer
@@ -101,10 +107,58 @@ impl StreamLifecycle {
                 }
             }
         }
-        if self.entries.len() >= MAX_LIFECYCLE_ENTRIES {
+        let position = self
+            .entries
+            .iter()
+            .rposition(|existing| existing.seq < entry.seq)
+            .map_or(0, |index| index + 1);
+        self.entries.insert(position, entry);
+        if self.entries.len() > MAX_LIFECYCLE_ENTRIES {
             self.entries.pop_front();
         }
-        self.entries.push_back(entry);
+    }
+
+    /// A demoted issue says an earlier critical failure was recovered from
+    /// and the stream continued: either the same reporter recovered (same
+    /// operation and code), or a caller fell back from it (`caused_by` its
+    /// layer, with its code as the reason). It stops being the root cause, and the next
+    /// unrecovered failure, if any, takes its place.
+    fn recover(&mut self, demotion: &LifecycleEntry) {
+        let recovers = |failure: &LifecycleEntry| {
+            let own_recovery = failure.publisher == demotion.publisher
+                && failure.issue.operation == demotion.issue.operation
+                && failure.issue.code == demotion.issue.code;
+            // A caller that fell back from a dependency's failure says so
+            // with `caused_by` that layer and the dependency's code.
+            let callers_fallback = failure.issue.is_origin()
+                && demotion.issue.caused_by == Some(failure.issue.layer)
+                && demotion.issue.reason == failure.issue.code;
+            failure.issue.is_critical()
+                && failure.seq < demotion.seq
+                && (own_recovery || callers_fallback)
+        };
+        if !self.root_cause.as_ref().is_some_and(recovers) {
+            return;
+        }
+        if let Some(root) = self.root_cause.take() {
+            self.recovered.push(root);
+        }
+        let mut root: Option<&LifecycleEntry> = None;
+        for failure in self
+            .entries
+            .iter()
+            .filter(|entry| entry.issue.is_critical())
+        {
+            let superseded = recovers(failure)
+                || self
+                    .recovered
+                    .iter()
+                    .any(|recovered| recovered.seq == failure.seq);
+            if !superseded && outranks(failure, root) {
+                root = Some(failure);
+            }
+        }
+        self.root_cause = root.cloned();
     }
 
     pub fn snapshot(&self) -> StreamLifecycleSnapshot {
@@ -119,6 +173,21 @@ impl StreamLifecycle {
             audit_gap: self.audit_gap,
             entries: self.entries.iter().cloned().collect(),
         }
+    }
+}
+
+/// The root cause is the earliest failure that originated in its reporter.
+/// A caller's reaction to a dependency (`caused_by`) stands in only until the
+/// dependency's own report arrives. Commit order, not arrival, decides, so an
+/// earlier report filed late by a binding still wins.
+fn outranks(entry: &LifecycleEntry, root: Option<&LifecycleEntry>) -> bool {
+    let Some(root) = root else {
+        return true;
+    };
+    match (entry.issue.is_origin(), root.issue.is_origin()) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => entry.seq < root.seq,
     }
 }
 
@@ -181,6 +250,28 @@ impl StreamLifecycleStore {
             return;
         }
         self.aliases.insert(alias.to_owned(), key.to_owned());
+    }
+
+    /// Let issues naming `alias`, or an ID derived from it, reach the stream
+    /// `stream` resolves to. Issues already kept as unattributed that now
+    /// resolve are moved to that stream, so a provider's report may arrive
+    /// before the binding that names its stream.
+    pub fn bind(&mut self, stream: &str, alias: &str) {
+        let Some(key) = self.resolve(stream).map(str::to_owned) else {
+            return;
+        };
+        self.alias(&key, alias);
+        let waiting = std::mem::take(&mut self.unattributed);
+        for entry in waiting {
+            match self.resolve(&entry.issue.operation).map(str::to_owned) {
+                Some(key) => {
+                    if let Some(stream) = self.streams.get_mut(&key) {
+                        stream.apply(entry);
+                    }
+                }
+                None => self.unattributed.push_back(entry),
+            }
+        }
     }
 
     pub fn enter_phase(&mut self, key: &str, phase: &str) {

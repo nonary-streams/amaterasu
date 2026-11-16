@@ -4,11 +4,13 @@ use crate::{
     admission::Admission,
     backend::{Backend, SourceSession},
     buffers::Mailbox,
+    lifecycle_issues,
     model::{
         CaptureResult, Operation, Settings, SourceDiagnostics, SourceState, SourceType, new_id,
         validate_operation_id,
     },
 };
+use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -85,6 +87,7 @@ pub struct Controller<B: Backend> {
     opened: u64,
     frames_copied: u64,
     frames_accepted: u64,
+    issues: StreamIssueOutbox,
 }
 
 impl<B: Backend> Controller<B> {
@@ -103,6 +106,7 @@ impl<B: Backend> Controller<B> {
             opened: self.opened,
             frames_copied: self.frames_copied,
             frames_accepted: self.frames_accepted,
+            issues: self.issues,
         }
     }
 
@@ -120,6 +124,7 @@ impl<B: Backend> Controller<B> {
             opened: 0,
             frames_copied: 0,
             frames_accepted: 0,
+            issues: StreamIssueOutbox::default(),
         }
     }
 
@@ -447,6 +452,7 @@ impl<B: Backend> Controller<B> {
         self.poll_retired_selection();
         self.direct
             .refresh(now, self.settings.selection_timeout_seconds);
+        self.direct.report_lost_sources(&mut self.issues);
         let Some(selection) = self.selection.as_mut() else {
             return;
         };
@@ -475,8 +481,33 @@ impl<B: Backend> Controller<B> {
             state,
             SourceState::Denied | SourceState::Failed(_) | SourceState::Revoked
         ) {
+            self.report_lost_portal_source(state);
             self.stop_selection(state);
         }
+    }
+
+    /// The portal source a stream was reading stopped. A selection no stream
+    /// had opened yet affects no stream.
+    fn report_lost_portal_source(&mut self, state: SourceState) {
+        let Some(operation) = self
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.operation.as_ref())
+        else {
+            return;
+        };
+        if let Some(code) = lifecycle_issues::lost_source_code(state) {
+            self.issues.push(lifecycle_issues::capture_failure(
+                operation,
+                "pipewire.portal_source",
+                code,
+            ));
+        }
+    }
+
+    /// Move queued stream issues to the module's tick for publication.
+    pub fn take_stream_issues(&mut self, outbox: &mut StreamIssueOutbox) {
+        lifecycle_issues::transfer(&mut self.issues, outbox);
     }
 
     pub fn cancel_pending_open(&mut self, caller: &str, operation: &Operation) {

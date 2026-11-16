@@ -14,6 +14,7 @@ mod model;
 mod protocol;
 mod retained_mode;
 mod scale;
+mod stream_issues;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 #[cfg(not(amaterasu_libvirtualdisplay))]
@@ -32,6 +33,7 @@ struct VirtualDisplayModule {
     manager: Manager<NativeDriver>,
     #[cfg(amaterasu_libvirtualdisplay)]
     manager: linux_manager::Manager,
+    stream_issues: stream_issues::StreamIssues,
 }
 
 impl ManagedModule for VirtualDisplayModule {
@@ -57,11 +59,29 @@ impl ManagedModule for VirtualDisplayModule {
         } else {
             Manager::new(settings, NativeDriver::new())
         };
-        Ok(Self { runtime, manager })
+        let mut stream_issues = stream_issues::StreamIssues::default();
+        stream_issues.enable();
+        Ok(Self {
+            runtime,
+            manager,
+            stream_issues,
+        })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
         self.manager.tick();
+        #[cfg(amaterasu_libvirtualdisplay)]
+        self.stream_issues.adopt(self.manager.drain_stream_issues());
+        let result = self.serve();
+        let runtime = &self.runtime;
+        self.stream_issues
+            .publish(&mut |command| runtime.send(command));
+        result
+    }
+}
+
+impl VirtualDisplayModule {
+    fn serve(&mut self) -> ModuleResult<()> {
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -71,6 +91,10 @@ impl ManagedModule for VirtualDisplayModule {
                 ..
             } => {
                 let operation = serde_json::from_value::<Operation>(payload);
+                let stream = operation
+                    .as_ref()
+                    .ok()
+                    .and_then(stream_issues::StreamOperation::of);
                 let (response, admission) = match operation {
                     Ok(operation) => {
                         // Check the provider-owned request immediately before native effects.
@@ -85,6 +109,7 @@ impl ManagedModule for VirtualDisplayModule {
                     }
                     Err(_) => (failure("invalid_request"), None),
                 };
+                self.stream_issues.admitted(stream, &response);
                 let completion = self.runtime.send(Command::Complete {
                     request: id,
                     payload: response,

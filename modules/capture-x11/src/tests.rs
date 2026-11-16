@@ -24,11 +24,14 @@ impl Backend for FakeBackend {
     }
 
     fn enumerate(&self) -> CaptureResult<(Vec<Output>, DesktopRect)> {
-        let output = output("screen-one");
-        Ok((vec![output], DesktopRect::new(0, 0, 2, 2).unwrap()))
+        let outputs = vec![output("screen-one"), output("screen-broken")];
+        Ok((outputs, DesktopRect::new(0, 0, 2, 2).unwrap()))
     }
 
     fn open(&self, output_id: &str) -> CaptureResult<Box<dyn CaptureSession>> {
+        if output_id == "screen-broken" {
+            return Ok(Box::new(BrokenSession));
+        }
         if output_id != "screen-one" {
             return Err(CaptureError::new(
                 "output_unavailable",
@@ -151,6 +154,8 @@ fn module(controller: Controller<FakeBackend>) -> super::CaptureModule {
         controller,
         _factory: factory,
         shutting_down: false,
+        stream_issues: Default::default(),
+        report_stream_issues: false,
     }
 }
 
@@ -302,4 +307,103 @@ fn disabled_policy_rejects_open_without_allocating_resources() {
     );
     assert_eq!(reply["error"]["code"], "capture_disabled");
     assert_eq!(opened.load(Ordering::SeqCst), 0);
+}
+
+/// A session whose server readback always fails.
+struct BrokenSession;
+
+impl CaptureSession for BrokenSession {
+    fn read(&mut self) -> CaptureResult<Frame> {
+        Err(CaptureError::new("capture_read_failed", "test readback"))
+    }
+
+    fn geometry(&self) -> DesktopGeometry {
+        FakeSession {
+            dropped: Arc::default(),
+        }
+        .geometry()
+    }
+}
+
+fn stream_reports(controller: &mut Controller<FakeBackend>) -> Vec<serde_json::Value> {
+    use amaterasu_module_sdk::{Command, Response, stream_lifecycle::StreamIssueOutbox};
+    let mut outbox = StreamIssueOutbox::default();
+    controller.take_stream_issues(&mut outbox);
+    let mut reports = Vec::new();
+    outbox
+        .flush_with(&mut |command| {
+            if let Command::Publish { topic, payload } = command {
+                assert_eq!(topic, "amaterasu.stream.report/1");
+                reports.push(payload);
+            }
+            Ok(Response::Ok)
+        })
+        .unwrap();
+    reports
+}
+
+#[test]
+fn a_failed_read_is_reported_once_under_the_opening_operation() {
+    let (mut controller, _, _) = controller(true);
+    let reply = controller.handle(
+        "video",
+        Operation::Open {
+            output: "screen-broken".into(),
+            operation_id: Some("video-4-2-capture-0".into()),
+        },
+        &mut || Ok(()),
+    );
+    let stream = reply["stream"].as_u64().unwrap();
+    assert!(controller.read("video", stream).is_err());
+    assert!(controller.read("video", stream).is_err());
+
+    let reports = stream_reports(&mut controller);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert_eq!(report["kind"], "issue");
+    assert_eq!(report["operation"], "video-4-2-capture-0");
+    assert_eq!(report["layer"], "capture");
+    assert_eq!(report["phase"], "x11.read");
+    assert_eq!(report["code"], "capture_read_failed");
+    assert_eq!(report["disposition"], "critical_failure");
+    assert!(report.get("caused_by").is_none());
+    let site = report["site"].as_str().unwrap();
+    assert!(site.contains("controller.rs:"), "{site}");
+}
+
+#[test]
+fn a_missing_output_is_reported_as_caused_by_the_display() {
+    let (mut controller, _, _) = controller(true);
+    controller.handle(
+        "video",
+        Operation::Open {
+            output: "screen-gone".into(),
+            operation_id: Some("video-4-2-capture-1".into()),
+        },
+        &mut || Ok(()),
+    );
+    let reports = stream_reports(&mut controller);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0]["phase"], "x11.open");
+    assert_eq!(reports[0]["code"], "capture_output_lost");
+    assert_eq!(reports[0]["caused_by"], "display");
+    assert_eq!(reports[0]["reason"], "output_unavailable");
+}
+
+#[test]
+fn a_module_with_reports_off_discards_queued_issues() {
+    let (mut controller, _, _) = controller(false);
+    controller.handle(
+        "video",
+        Operation::Open {
+            output: "screen-one".into(),
+            operation_id: Some("video-4-2-capture-2".into()),
+        },
+        &mut || Ok(()),
+    );
+    let mut module = module(controller);
+    // The fixture runtime fails every command, so a publication would be
+    // logged and kept rather than discarded.
+    module.publish_stream_issues();
+    assert!(module.stream_issues.is_empty());
 }

@@ -14,7 +14,9 @@ use crate::{
         valid_reference_id,
     },
     scale::ScaleSetting,
+    stream_issues,
 };
+use amaterasu_module_sdk::stream_lifecycle::{StreamIssueOutbox, StreamReport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -310,6 +312,8 @@ pub struct Manager {
     topology_revision: u64,
     pending_mutations: usize,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Worker failures after admission, handed to the module tick.
+    stream_issues: StreamIssueOutbox,
 }
 impl Manager {
     pub fn start(settings: Settings) -> Result<Self, String> {
@@ -341,6 +345,7 @@ impl Manager {
             topology_revision: 0,
             pending_mutations: 0,
             stopped: Default::default(),
+            stream_issues: StreamIssueOutbox::default(),
         };
         if manager.settings.enabled {
             let journal = journal::Journal::for_user()?;
@@ -450,6 +455,11 @@ impl Manager {
                                 if let Some(monitor) = self.monitors.get_mut(&key) {
                                     monitor.state = "cleanup_failed";
                                 }
+                                self.stream_issues.push(stream_issues::worker_failure(
+                                    &change.transition.operation_id,
+                                    "reconfigure",
+                                    "virtual_display_reconfigure_failed",
+                                ));
                             }
                         }
                     }
@@ -506,6 +516,20 @@ impl Manager {
                                 monitor.error = Some(failure.error);
                                 monitor.creation_cleanup_complete = failure.cleanup_complete;
                                 monitor.state = "cleanup_failed";
+                                self.stream_issues.push(
+                                    stream_issues::worker_failure(
+                                        &key.1,
+                                        "create",
+                                        "virtual_display_create_failed",
+                                    )
+                                    .because(
+                                        if failure.cleanup_complete {
+                                            "cleanup_complete"
+                                        } else {
+                                            "cleanup_incomplete"
+                                        },
+                                    ),
+                                );
                             }
                         }
                         if self.cleanup_pending.contains(&key) {
@@ -539,6 +563,11 @@ impl Manager {
                                 monitor.state = "cleanup_failed";
                                 monitor.error = Some(error);
                             }
+                            self.stream_issues.push(stream_issues::worker_failure(
+                                &key.1,
+                                "remove",
+                                "virtual_display_remove_failed",
+                            ));
                         }
                     }
                 }
@@ -550,6 +579,10 @@ impl Manager {
                 }
             }
         }
+    }
+    /// Worker failures recorded since the last tick, oldest first.
+    pub fn drain_stream_issues(&mut self) -> impl Iterator<Item = StreamReport> + '_ {
+        self.stream_issues.drain()
     }
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {

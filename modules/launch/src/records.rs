@@ -45,6 +45,10 @@ pub struct Record {
     pub cleanup_error: Option<&'static str>,
     #[serde(skip)]
     pub warnings: Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
+    /// Stream failures and warnings this launch saw, published from the tick
+    /// under `operation_id` on the stream report topic.
+    #[serde(skip)]
+    pub issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
     /// Conservative cleanup pass budget frozen before any child or lease effect.
     pub cleanup_budget_ms: u64,
     #[serde(skip)]
@@ -355,6 +359,7 @@ impl Records {
                 failure: None,
                 cleanup_error: None,
                 warnings: Vec::new(),
+                issues: Default::default(),
                 cleanup_budget_ms: 20_000,
                 owner: caller.into(),
                 catalog_principal,

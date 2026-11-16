@@ -1,3 +1,4 @@
+use crate::lifecycle_issues::StreamIssueReports;
 use crate::opus_packet::OpusPacket;
 use crate::{model::*, stream::Stream};
 use amaterasu_media::{
@@ -30,6 +31,7 @@ pub struct Controller {
     used_discoveries: Vec<DiscoveryTokens>,
     tick_cursor: usize,
     shutting_down: bool,
+    pub(crate) issue_reports: StreamIssueReports,
 }
 
 impl Controller {
@@ -49,6 +51,7 @@ impl Controller {
             used_discoveries: Vec::new(),
             tick_cursor: 0,
             shutting_down: false,
+            issue_reports: StreamIssueReports::default(),
         }
     }
 
@@ -97,7 +100,7 @@ impl Controller {
                 json!({"ok":true,"supported":false,"audio_profile":audio_profile}),
                 None,
             ),
-            Operation::Open(request) => self.open(owner, request)?,
+            Operation::Open(request) => self.open_reported(owner, request)?,
             Operation::ConfigureVideoFormat {
                 stream,
                 video_stream_format,
@@ -120,6 +123,32 @@ impl Controller {
             Operation::Status { stream } => (self.status(owner, stream), None),
         };
         Ok(ControlReply { payload, created })
+    }
+
+    /// Open a stream, reporting a refusal or a demoted option under the
+    /// caller's operation.
+    fn open_reported(
+        &mut self,
+        owner: &str,
+        request: Open,
+    ) -> TransportResult<(Value, Option<u64>)> {
+        let operation = request.operation_id.clone();
+        let requested_batch_size_kb = request.video.max_batch_size_kb;
+        let result = self.open(owner, request);
+        let Some(operation) = operation else {
+            return result;
+        };
+        match &result {
+            Err(code) => self.issue_reports.open_refused(&operation, code),
+            Ok((_, Some(id))) => {
+                if let Some(stream) = self.streams.get(id) {
+                    self.issue_reports
+                        .open_demoted(&operation, requested_batch_size_kb, stream);
+                }
+            }
+            Ok(_) => {}
+        }
+        result
     }
 
     fn open(&mut self, owner: &str, request: Open) -> TransportResult<(Value, Option<u64>)> {
@@ -243,7 +272,9 @@ impl Controller {
 
     pub fn close(&mut self, owner: &str, id: u64) -> TransportResult<Value> {
         self.owned(owner, id)?;
-        self.streams.remove(&id);
+        if let Some(mut stream) = self.streams.remove(&id) {
+            self.issue_reports.delivery_failed(&mut stream);
+        }
         Ok(json!({"ok":true}))
     }
 
@@ -277,6 +308,15 @@ impl Controller {
             if let Some(stream) = self.streams.get_mut(&stream_ids[index]) {
                 stream.delivery.tick_with_limit(budget);
             }
+        }
+        self.collect_delivery_failures();
+    }
+
+    /// Note streams whose delivery failed since the last tick, including
+    /// failures raised while media was submitted between ticks.
+    fn collect_delivery_failures(&mut self) {
+        for stream in self.streams.values_mut() {
+            self.issue_reports.delivery_failed(stream);
         }
     }
 

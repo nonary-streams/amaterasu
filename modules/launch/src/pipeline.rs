@@ -20,12 +20,16 @@ use std::{
 
 type Transport = ModuleResult<Response>;
 
-fn record_application_warning(record: &mut crate::records::Record, process: &Value) {
-    record_warning_list(record, &process["warnings"]);
-    record_warning_list(record, &process["preparation"]["warnings"]);
+#[track_caller]
+fn record_application_warning(record: &mut crate::records::Record, step: Step, process: &Value) {
+    record_warning_list(record, step, &process["warnings"]);
+    record_warning_list(record, step, &process["preparation"]["warnings"]);
 }
 
-fn record_warning_list(record: &mut crate::records::Record, values: &Value) {
+/// Keep each new launch warning for the `warnings` readback and report it
+/// to the stream's lifecycle store.
+#[track_caller]
+fn record_warning_list(record: &mut crate::records::Record, step: Step, values: &Value) {
     use amaterasu_module_sdk::stream_warnings::{MAX_WARNINGS, StreamWarning};
     let Some(values) = values
         .as_array()
@@ -41,7 +45,48 @@ fn record_warning_list(record: &mut crate::records::Record, values: &Value) {
             && record.warnings.len() < MAX_WARNINGS
             && !record.warnings.contains(&warning)
         {
+            record.report_warning(step, &warning);
             record.warnings.push(warning);
+        }
+    }
+}
+
+/// What a launch export asks of the preflight it names.
+struct PreflightedLaunch<'a> {
+    preflight_token: Option<&'a str>,
+    display_admission_token: Option<&'a str>,
+    application_display_overrides: &'a Option<BTreeMap<String, Value>>,
+    application_display_settings: &'a Option<ApplicationDisplaySettings>,
+    virtual_display_intent: &'a Option<VirtualDisplayIntent>,
+}
+
+impl PreflightedLaunch<'_> {
+    /// The refusal code when this launch does not match its preflight.
+    fn mismatch(&self, record: &crate::records::Record) -> Option<&'static str> {
+        if record.preflight_token.as_deref() != self.preflight_token
+            || (record.preflight_token.is_some() && !record.preflight_ready)
+        {
+            return Some("preflight_mismatch");
+        }
+        if record.application_display_overrides
+            != self
+                .application_display_overrides
+                .clone()
+                .unwrap_or_default()
+        {
+            return Some("application_display_policy_mismatch");
+        }
+        if &record.application_display_settings != self.application_display_settings {
+            return Some("application_display_settings_mismatch");
+        }
+        if &record.virtual_display_intent != self.virtual_display_intent {
+            return Some("display_admission_denied");
+        }
+        match (&record.display_admission, self.display_admission_token) {
+            (Some(admission), Some(token)) if admission.token == token => None,
+            (Some(admission), None) if !admission.launch_token_required => None,
+            (None, None) => None,
+            _ => Some("display_admission_denied"),
         }
     }
 }
@@ -52,6 +97,7 @@ enum Settlement {
     Unconfirmed,
 }
 mod retirement;
+mod stream_issues;
 
 fn display_admission_eligible(record: &crate::records::Record, now: Instant) -> bool {
     record.catalog_selection == CatalogSelection::Exported
@@ -129,6 +175,10 @@ pub struct Pipeline {
     display_admission_verifier: String,
     quiescing: bool,
     shutdown_deadline: Option<Instant>,
+    /// Whether the tick publishes stream issues or discards them.
+    report_stream_issues: bool,
+    /// Refusals that left no launch record to carry their report.
+    refusals: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
 }
 impl Pipeline {
     pub fn new(environment: BTreeMap<String, String>) -> Result<Self, &'static str> {
@@ -150,6 +200,8 @@ impl Pipeline {
             display_admission_verifier: "amaterasu.rtsp".into(),
             quiescing: false,
             shutdown_deadline: None,
+            report_stream_issues: false,
+            refusals: Default::default(),
         })
     }
     pub fn set_retirement_observers(&mut self, observers: BTreeSet<String>) {
@@ -375,6 +427,7 @@ impl Pipeline {
     }
 
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
+        self.publish_stream_issues(&mut send);
         self.schedule_shutdown_cleanup();
         self.move_ended_job_to_its_own_lane();
         for launch in self.retiring_jobs.keys().copied().collect::<Vec<_>>() {
@@ -393,6 +446,8 @@ impl Pipeline {
                 return Ok(());
             }
         }
+        // A new request can evict an ended launch; publish what it saw first.
+        self.publish_stream_issues(&mut send);
         match send(Command::Poll {})? {
             Response::Request {
                 id,
@@ -691,7 +746,13 @@ impl Pipeline {
                     .get(&application.library)
                     .filter(|route| caller == initiator && route.callers.contains(caller))
                 else {
-                    return complete(send, request, error("permission_denied"));
+                    return self.refuse_launch(
+                        send,
+                        request,
+                        &operation_id,
+                        "admit_launch",
+                        "permission_denied",
+                    );
                 };
                 let selection = crate::library::Selection {
                     application,
@@ -704,6 +765,7 @@ impl Pipeline {
                 {
                     return complete(send, request, error("operation_conflict"));
                 }
+                let reported_operation = operation_id.clone();
                 match self.records.start(
                     caller,
                     initiator,
@@ -724,7 +786,13 @@ impl Pipeline {
                         Ok(())
                     }
                     Ok((id, false)) => complete(send, request, self.records.values[&id].response()),
-                    Err(code) => complete(send, request, error(code)),
+                    Err(code) => self.refuse_admission(
+                        send,
+                        request,
+                        &reported_operation,
+                        "admit_launch",
+                        code,
+                    ),
                 }
             }
             Operation::EpochRead {} => complete(
@@ -774,7 +842,7 @@ impl Pipeline {
             } => match self.records.start(
                 caller,
                 initiator,
-                operation_id,
+                operation_id.clone(),
                 app_id,
                 CatalogSelection::Exported,
                 GlobalPreparation {
@@ -791,8 +859,16 @@ impl Pipeline {
                 Ok((id, false)) if self.records.values[&id].preflight_ready => {
                     complete(send, request, self.records.values[&id].preflight_response())
                 }
-                Ok(_) => complete(send, request, error("preflight_unavailable")),
-                Err(code) => complete(send, request, error(code)),
+                Ok(_) => self.refuse_launch(
+                    send,
+                    request,
+                    &operation_id,
+                    "admit_preflight",
+                    "preflight_unavailable",
+                ),
+                Err(code) => {
+                    self.refuse_admission(send, request, &operation_id, "admit_preflight", code)
+                }
             },
             Operation::Launch {
                 operation_id,
@@ -802,7 +878,7 @@ impl Pipeline {
             } => match self.records.start(
                 caller,
                 initiator,
-                operation_id,
+                operation_id.clone(),
                 app_id,
                 CatalogSelection::Initiator,
                 GlobalPreparation {
@@ -815,7 +891,9 @@ impl Pipeline {
                     Ok(())
                 }
                 Ok((id, false)) => complete(send, request, self.records.values[&id].response()),
-                Err(code) => complete(send, request, error(code)),
+                Err(code) => {
+                    self.refuse_admission(send, request, &operation_id, "admit_launch", code)
+                }
             },
             Operation::LaunchExport {
                 operation_id,
@@ -831,41 +909,43 @@ impl Pipeline {
                 proton_dualsense_compatibility,
                 return_on_admission,
             } => {
+                let refuse = "admit_launch";
                 if preparation_context.is_some() && self.prepared_context_service.is_none() {
-                    return complete(send, request, error("preparation_context_not_configured"));
+                    let code = "preparation_context_not_configured";
+                    return self.refuse_launch(send, request, &operation_id, refuse, code);
                 }
                 if (application_display_overrides.is_some()
                     || application_display_settings.is_some())
                     && preflight_token.is_none()
                 {
-                    return complete(send, request, error("preflight_required"));
+                    let code = "preflight_required";
+                    return self.refuse_launch(send, request, &operation_id, refuse, code);
                 }
                 if (virtual_display_intent.is_some()
                     || proton_dualsense_compatibility
                     || return_on_admission)
                     && preflight_token.is_none()
                 {
-                    return complete(send, request, error("preflight_required"));
+                    let code = "preflight_required";
+                    return self.refuse_launch(send, request, &operation_id, refuse, code);
                 }
                 if (virtual_display_intent.is_some() || application_display_settings.is_some())
                     && display_admission_token.is_none()
                 {
-                    return complete(send, request, error("display_admission_denied"));
+                    let code = "display_admission_denied";
+                    return self.refuse_launch(send, request, &operation_id, refuse, code);
                 }
                 if application_display_overrides
                     .as_ref()
                     .is_some_and(|overrides| !valid_application_display_overrides(overrides))
                 {
-                    return complete(
-                        send,
-                        request,
-                        error("invalid_application_display_overrides"),
-                    );
+                    let code = "invalid_application_display_overrides";
+                    return self.refuse_launch(send, request, &operation_id, refuse, code);
                 }
                 match self.records.start(
                     caller,
                     initiator,
-                    operation_id,
+                    operation_id.clone(),
                     app_id,
                     CatalogSelection::Exported,
                     GlobalPreparation {
@@ -876,7 +956,8 @@ impl Pipeline {
                     Ok((id, true)) => {
                         if preflight_token.is_some() || display_admission_token.is_some() {
                             self.records.values.remove(&id);
-                            return complete(send, request, error("preflight_not_found"));
+                            let code = "preflight_not_found";
+                            return self.refuse_launch(send, request, &operation_id, refuse, code);
                         }
                         let record = self.records.values.get_mut(&id).expect("launch record");
                         record.launch_started = true;
@@ -887,38 +968,15 @@ impl Pipeline {
                     }
                     Ok((id, false)) => {
                         let record = self.records.values.get_mut(&id).expect("launch record");
-                        if record.preflight_token.as_deref() != preflight_token.as_deref()
-                            || (record.preflight_token.is_some() && !record.preflight_ready)
-                        {
-                            return complete(send, request, error("preflight_mismatch"));
-                        }
-                        if record.application_display_overrides
-                            != application_display_overrides.clone().unwrap_or_default()
-                        {
-                            return complete(
-                                send,
-                                request,
-                                error("application_display_policy_mismatch"),
-                            );
-                        }
-                        if record.application_display_settings != application_display_settings {
-                            return complete(
-                                send,
-                                request,
-                                error("application_display_settings_mismatch"),
-                            );
-                        }
-                        if record.virtual_display_intent != virtual_display_intent {
-                            return complete(send, request, error("display_admission_denied"));
-                        }
-                        match (
-                            &record.display_admission,
-                            display_admission_token.as_deref(),
-                        ) {
-                            (Some(admission), Some(token)) if admission.token == token => {}
-                            (Some(admission), None) if !admission.launch_token_required => {}
-                            (None, None) => {}
-                            _ => return complete(send, request, error("display_admission_denied")),
+                        let requested = PreflightedLaunch {
+                            preflight_token: preflight_token.as_deref(),
+                            display_admission_token: display_admission_token.as_deref(),
+                            application_display_overrides: &application_display_overrides,
+                            application_display_settings: &application_display_settings,
+                            virtual_display_intent: &virtual_display_intent,
+                        };
+                        if let Some(code) = requested.mismatch(record) {
+                            return self.refuse_launch(send, request, &operation_id, refuse, code);
                         }
                         if record.launch_started {
                             if record.proton_dualsense_compatibility
@@ -945,7 +1003,7 @@ impl Pipeline {
                         self.job = Some(workflow);
                         Ok(())
                     }
-                    Err(code) => complete(send, request, error(code)),
+                    Err(code) => self.refuse_admission(send, request, &operation_id, refuse, code),
                 }
             }
             Operation::PrepareDisplayAdmission {
@@ -1405,7 +1463,7 @@ impl Pipeline {
                 "amaterasu launch dependency rejected step={:?} code={code}",
                 job.step
             );
-            return self.dependency_failed(job, "dependency_rejected", send);
+            return self.dependency_failed_because(job, "dependency_rejected", Some(code), send);
         }
         let record = self
             .records
@@ -1669,7 +1727,7 @@ impl Pipeline {
                     Ok(preparation) => preparation,
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
-                record_warning_list(record, &preparation["preparation"]["warnings"]);
+                record_warning_list(record, job.step, &preparation["preparation"]["warnings"]);
                 match state {
                     responses::PreparationState::Preparing
                     | responses::PreparationState::Cleaning => {
@@ -1707,7 +1765,7 @@ impl Pipeline {
                     Ok(process) => process,
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
-                record_application_warning(record, process);
+                record_application_warning(record, job.step, process);
                 if job.step == Step::Spawn {
                     record.process_id = process["process_id"].as_u64();
                 }
@@ -1728,17 +1786,18 @@ impl Pipeline {
                         job.step = Step::AwaitApplication;
                     }
                     ApplicationState::Running => job.step = Step::Activate,
-                    ApplicationState::Exited => job.begin_cleanup(record, Outcome::Completed, None),
-                    ApplicationState::LaunchFailed => job.begin_cleanup(
+                    ApplicationState::Exited => job.begin_cleanup_after_exit(record, Some(process)),
+                    ApplicationState::LaunchFailed => job.begin_cleanup_because(
                         record,
                         Outcome::Failed,
                         Some("application_launch_failed"),
+                        stream_issues::application_failure_kind(process),
                     ),
                     ApplicationState::Cancelled => {
                         job.begin_cleanup(record, Outcome::Cancelled, Some("application_cancelled"))
                     }
                     ApplicationState::CleanupFailed(outcome) => {
-                        apply_application_outcome(record, outcome);
+                        apply_application_outcome(record, job.step, outcome);
                         return self.cleanup_failed(job, "application_cleanup_failed", send);
                     }
                 }
@@ -1782,17 +1841,13 @@ impl Pipeline {
                         job.step = Step::Activate;
                     }
                     ProviderState::Running => return Ok(()),
-                    ProviderState::Stopped | ProviderState::LaunchFailed if evidence.retired => {
+                    ProviderState::Stopped if evidence.retired => {
                         record.provider_stopped = true;
-                        job.begin_cleanup(
-                            record,
-                            if evidence.state == ProviderState::Stopped {
-                                Outcome::Completed
-                            } else {
-                                Outcome::Failed
-                            },
-                            None,
-                        );
+                        job.begin_cleanup_after_exit(record, None);
+                    }
+                    ProviderState::LaunchFailed if evidence.retired => {
+                        record.provider_stopped = true;
+                        job.begin_cleanup(record, Outcome::Failed, None);
                     }
                     _ => job.begin_cleanup(
                         record,
@@ -1822,11 +1877,11 @@ impl Pipeline {
                     responses::ProviderState::Starting => job.step = Step::AwaitPlayniteStart,
                     responses::ProviderState::Running => job.step = Step::Activate,
                     responses::ProviderState::Stopping => {
-                        job.begin_cleanup(record, Outcome::Completed, None);
+                        job.begin_cleanup_after_exit(record, None);
                     }
                     responses::ProviderState::Stopped => {
                         record.provider_stopped = true;
-                        job.begin_cleanup(record, Outcome::Completed, None);
+                        job.begin_cleanup_after_exit(record, None);
                     }
                     responses::ProviderState::LaunchFailed => {
                         record.provider_stopped = true;
@@ -1851,11 +1906,11 @@ impl Pipeline {
                         return Ok(());
                     }
                     responses::ProviderState::Stopping => {
-                        job.begin_cleanup(record, Outcome::Completed, None);
+                        job.begin_cleanup_after_exit(record, None);
                     }
                     responses::ProviderState::Stopped => {
                         record.provider_stopped = true;
-                        job.begin_cleanup(record, Outcome::Completed, None);
+                        job.begin_cleanup_after_exit(record, None);
                     }
                     responses::ProviderState::LaunchFailed => {
                         record.provider_stopped = true;
@@ -1881,20 +1936,21 @@ impl Pipeline {
                     Ok(process) => process,
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
-                record_application_warning(record, process);
+                record_application_warning(record, job.step, process);
                 match state {
                     ApplicationState::Running | ApplicationState::Stopping => return Ok(()),
-                    ApplicationState::Exited => job.begin_cleanup(record, Outcome::Completed, None),
-                    ApplicationState::LaunchFailed => job.begin_cleanup(
+                    ApplicationState::Exited => job.begin_cleanup_after_exit(record, Some(process)),
+                    ApplicationState::LaunchFailed => job.begin_cleanup_because(
                         record,
                         Outcome::Failed,
                         Some("application_launch_failed"),
+                        stream_issues::application_failure_kind(process),
                     ),
                     ApplicationState::Cancelled => {
                         job.begin_cleanup(record, Outcome::Cancelled, Some("application_cancelled"))
                     }
                     ApplicationState::CleanupFailed(outcome) => {
-                        apply_application_outcome(record, outcome);
+                        apply_application_outcome(record, job.step, outcome);
                         return self.cleanup_failed(job, "application_cleanup_failed", send);
                     }
                     ApplicationState::Preparing => {
@@ -2082,14 +2138,12 @@ impl Pipeline {
             Step::StopSession => {
                 // Process termination is still attempted if the session provider
                 // fails. Finish-stop must independently acknowledge lease release.
+                let fallback = record.session_stop_fallback();
                 if payload["ok"] != true {
                     record.cleanup_error = Some("session_stop_failed");
+                    record.report_cleanup_fallback(job.step, "session_stop_failed", fallback);
                 }
-                job.step = if record.process_id.is_some() {
-                    Step::Terminate
-                } else {
-                    Step::Finish
-                };
+                job.step = fallback;
             }
             Step::Terminate | Step::AwaitTermination => {
                 if payload["ok"] != true {
@@ -2167,10 +2221,24 @@ impl Pipeline {
         self.retain(job)
     }
 
+    #[track_caller]
     fn dependency_failed(
         &mut self,
         job: &mut Workflow,
         code: &'static str,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        self.dependency_failed_because(job, code, None, send)
+    }
+
+    /// A dependency call failed. `reason` is the dependency's own code when
+    /// it gave a usable one.
+    #[track_caller]
+    fn dependency_failed_because(
+        &mut self,
+        job: &mut Workflow,
+        code: &'static str,
+        reason: Option<&str>,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         if job.cleanup {
@@ -2181,11 +2249,9 @@ impl Pipeline {
                     .get_mut(&job.launch_id)
                     .expect("workflow record");
                 record.cleanup_error = Some(code);
-                job.step = if record.process_id.is_some() {
-                    Step::Terminate
-                } else {
-                    Step::Finish
-                };
+                let fallback = record.session_stop_fallback();
+                record.report_cleanup_fallback(job.step, code, fallback);
+                job.step = fallback;
                 return self.retain(job);
             }
             return self.cleanup_failed(job, code, send);
@@ -2197,7 +2263,7 @@ impl Pipeline {
         let cancelled = job.request.is_some_and(|request| {
             !matches!(send(Command::CheckRequest { request }), Ok(Response::Ok))
         });
-        job.begin_cleanup(
+        job.begin_cleanup_because(
             self.records
                 .values
                 .get_mut(&job.launch_id)
@@ -2208,9 +2274,11 @@ impl Pipeline {
                 Outcome::Failed
             },
             Some(if cancelled { "request_cancelled" } else { code }),
+            reason,
         );
         self.retain(job)
     }
+    #[track_caller]
     fn cleanup_failed(
         &mut self,
         job: &Workflow,
@@ -2222,6 +2290,7 @@ impl Pipeline {
             .values
             .get_mut(&job.launch_id)
             .expect("workflow record");
+        record.report_cleanup_failure(job.step, code);
         record.state = State::CleanupFailed;
         record.cleanup_error = Some(code);
         self.reply(job, send)
@@ -2305,11 +2374,25 @@ fn is_monitored(record: &crate::records::Record) -> bool {
             .is_some_and(LaunchTarget::is_monitored_after_activation)
 }
 
-fn apply_application_outcome(record: &mut crate::records::Record, outcome: ApplicationOutcome) {
+/// Record how an application ended when its own cleanup failed, and report
+/// an exit or failed launch the launch had not yet seen.
+#[track_caller]
+fn apply_application_outcome(
+    record: &mut crate::records::Record,
+    step: Step,
+    outcome: ApplicationOutcome,
+) {
     record.cleanup_outcome = outcome.launch_outcome();
+    let unreported = matches!(record.state, State::Starting | State::Active);
     match outcome {
+        ApplicationOutcome::Exited if unreported => record.report_application_exit(step, None),
         ApplicationOutcome::Exited => {}
-        ApplicationOutcome::LaunchFailed => record.failure = Some("application_launch_failed"),
+        ApplicationOutcome::LaunchFailed => {
+            if unreported {
+                record.report_launch_failure(step, "application_launch_failed", None);
+            }
+            record.failure = Some("application_launch_failed");
+        }
         ApplicationOutcome::Cancelled => record.failure = Some("application_cancelled"),
     }
 }

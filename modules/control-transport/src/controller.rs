@@ -1,3 +1,4 @@
+use crate::lifecycle_issues::StreamIssueReports;
 use crate::{model::*, stream::Stream};
 use amaterasu_media::{ControlMessage, ControlMessageSink, MEDIA_CLOSED};
 use amaterasu_module_sdk::{abi::Status, network::Network};
@@ -24,6 +25,7 @@ pub struct Controller {
     used_keys: Vec<[u8; 16]>,
     epoch: Instant,
     flow_trace: Option<crate::diagnostics::FlowTrace>,
+    pub(crate) issue_reports: StreamIssueReports,
 }
 
 impl Controller {
@@ -42,12 +44,13 @@ impl Controller {
             used_keys: Vec::new(),
             epoch: Instant::now(),
             flow_trace: None,
+            issue_reports: StreamIssueReports::default(),
         }
     }
 
     pub fn handle(&mut self, owner: &str, operation: Operation) -> ControlResult<Reply> {
         let (payload, created) = match operation {
-            Operation::Open(request) => return self.open(owner, request),
+            Operation::Open(request) => return self.open_reported(owner, request),
             Operation::Close { stream } => (self.close(owner, stream)?, None),
             Operation::Lookup { operation_id } => {
                 if !valid_name(&operation_id) {
@@ -65,6 +68,16 @@ impl Controller {
             Operation::Status { stream } => (self.status(owner, stream), None),
         };
         Ok(Reply { payload, created })
+    }
+
+    /// Open a stream, reporting a refusal under the caller's operation.
+    fn open_reported(&mut self, owner: &str, request: Open) -> ControlResult<Reply> {
+        let operation = request.operation_id.clone();
+        let result = self.open(owner, request);
+        if let (Err(code), Some(operation)) = (&result, operation) {
+            self.issue_reports.open_refused(&operation, code);
+        }
+        result
     }
 
     fn open(&mut self, owner: &str, request: Open) -> ControlResult<Reply> {
@@ -171,7 +184,9 @@ impl Controller {
 
     pub fn close(&mut self, owner: &str, id: u64) -> ControlResult<Value> {
         self.owned(owner, id)?;
-        self.streams.remove(&id);
+        if let Some(mut stream) = self.streams.remove(&id) {
+            self.issue_reports.stream_failed(&mut stream);
+        }
         Ok(json!({"ok": true}))
     }
 
@@ -200,6 +215,7 @@ impl Controller {
         let now = self.now();
         for stream in self.streams.values_mut() {
             stream.tick(now);
+            self.issue_reports.stream_failed(stream);
         }
     }
 

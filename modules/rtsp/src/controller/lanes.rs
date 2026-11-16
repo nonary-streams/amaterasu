@@ -173,6 +173,7 @@ impl Controller {
                 record.cleanup_error.unwrap_or("none")
             );
             self.revoke_ticket(ticket);
+            self.keep_dropped_record_issues(&mut record);
             let retained = self
                 .retiring_jobs
                 .remove(&ticket)

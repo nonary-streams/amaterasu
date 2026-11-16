@@ -7,7 +7,7 @@
 use super::{Pipeline, Send, record::Record, record::Resource, workflow::Step};
 use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
 
-/// The layer a session step was talking to.
+/// The layer a session step depends on.
 pub(super) fn step_layer(step: Step) -> LifecycleLayer {
     use Step::*;
     match step {
@@ -52,6 +52,7 @@ pub(super) fn step_layer(step: Step) -> LifecycleLayer {
         | NotifyCaptureInvalidated
         | IssueLifecycleInputBinding
         | AckLifecycleInput => LifecycleLayer::SessionLifecycle,
+        ProbeExtensionSource | WaitVideoReady => LifecycleLayer::EncodeVideo,
         AcquireAudio | RecoverAudio => LifecycleLayer::Audio,
         AcquireInput | FindInput | ReleaseInput | RenewInput | InputBatch | FeedbackPeek
         | FeedbackAck | PollGamepadFeedback | RumbleDrain => LifecycleLayer::Input,
@@ -72,7 +73,7 @@ fn resource_layer(resource: Resource) -> LifecycleLayer {
     }
 }
 
-/// The layer a media plane failure code names.
+/// The layer whose failure a media plane code reports.
 pub(super) fn media_layer(code: &str) -> LifecycleLayer {
     if code.starts_with("audio_encoder") {
         LifecycleLayer::AudioEncode
@@ -107,14 +108,21 @@ pub(super) fn step_label(step: Step) -> String {
 }
 
 impl Record {
-    /// Record a failure that stops this session. Sessions that no launch owner
-    /// named have nowhere to report and record nothing.
+    /// Record a failure that stops this session, under this module's own
+    /// layer. `dependency` names the layer it was reacting to; that layer
+    /// reports its own failure. Sessions no launch owner named have nowhere
+    /// to report and record nothing.
     #[track_caller]
-    pub(super) fn report_failure(&mut self, layer: LifecycleLayer, phase: &str, code: &str) {
-        if let Some(operation) = self.config.rtsp_operation_id.clone() {
-            self.issues
-                .push(StreamIssue::critical(operation, layer, phase, code));
+    pub(super) fn report_failure(&mut self, dependency: LifecycleLayer, phase: &str, code: &str) {
+        let Some(operation) = self.config.rtsp_operation_id.clone() else {
+            return;
+        };
+        let mut issue =
+            StreamIssue::critical(operation, LifecycleLayer::StreamSession, phase, code);
+        if dependency != LifecycleLayer::StreamSession {
+            issue = issue.caused_by(dependency);
         }
+        self.issues.push(issue);
     }
 }
 

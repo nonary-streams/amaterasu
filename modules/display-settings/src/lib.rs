@@ -2,6 +2,7 @@
 mod engine;
 #[cfg(target_os = "linux")]
 mod native;
+mod stream_issues;
 use amaterasu_module_sdk::{
     Command, ManagedModule, ModuleResult, Response, RuntimeClient,
     display_settings::{self, Operation},
@@ -42,6 +43,9 @@ struct Provider {
     results: Receiver<(u64, Value)>,
     worker: Option<JoinHandle<()>>,
     pending: Option<u64>,
+    /// The stream operation the pending request serves, if any.
+    pending_stream: Option<stream_issues::StreamOperation>,
+    stream_issues: stream_issues::StreamIssues,
 }
 impl ManagedModule for Provider {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
@@ -116,18 +120,26 @@ impl ManagedModule for Provider {
                 results,
                 worker: Some(worker),
                 pending: None,
+                pending_stream: None,
+                stream_issues: enabled_stream_issues(),
             })
         }
     }
     fn tick(&mut self) -> ModuleResult<()> {
         if let Ok((request, payload)) = self.results.try_recv() {
             self.pending = None;
+            if let Some(stream) = self.pending_stream.take() {
+                self.stream_issues.completed(stream, &payload);
+            }
             match self.runtime.send(Command::Complete { request, payload })? {
                 Response::Ok => {}
                 Response::Error { code, .. } if code == "request_ended" || code == "not_found" => {}
                 _ => return Err("display_completion_failed".into()),
             }
         }
+        let runtime = &self.runtime;
+        self.stream_issues
+            .publish(&mut |command| runtime.send(command));
         if self.pending.is_some() || self.work.is_none() {
             return Ok(());
         }
@@ -151,6 +163,7 @@ impl ManagedModule for Provider {
                         Response::Ok
                     ) =>
                 {
+                    let stream = stream_issues::StreamOperation::of(&operation);
                     self.work
                         .as_ref()
                         .ok_or("display_worker_closed")?
@@ -161,6 +174,7 @@ impl ManagedModule for Provider {
                         })
                         .map_err(|_| "display_worker_closed")?;
                     self.pending = Some(id);
+                    self.pending_stream = stream;
                 }
                 _ => {
                     self.runtime.send(Command::Complete {
@@ -177,6 +191,12 @@ impl ManagedModule for Provider {
         self.tick()?;
         Ok(self.pending.is_none() && self.worker.as_ref().is_none_or(|w| w.is_finished()))
     }
+}
+#[cfg(target_os = "linux")]
+fn enabled_stream_issues() -> stream_issues::StreamIssues {
+    let mut issues = stream_issues::StreamIssues::default();
+    issues.enable();
+    issues
 }
 impl Drop for Provider {
     fn drop(&mut self) {

@@ -1,10 +1,12 @@
 use crate::{
     backend::{Backend, CaptureSession, NativeBackend},
+    lifecycle_issues,
     model::{
         CaptureError, CaptureResult, Frame, MAX_OUTPUTS, MAX_STREAMS, Operation, Output,
         validate_operation_id,
     },
 };
+use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Instant};
 
@@ -17,6 +19,7 @@ struct Stream {
     sequence: u64,
     last_timestamp_us: u64,
     frame_readback_verified: bool,
+    read_failure_reported: bool,
 }
 
 pub struct Controller<B: Backend = NativeBackend> {
@@ -24,6 +27,7 @@ pub struct Controller<B: Backend = NativeBackend> {
     enabled: bool,
     streams: BTreeMap<u64, Stream>,
     opened_stream: Option<u64>,
+    issues: StreamIssueOutbox,
 }
 
 impl<B: Backend> Controller<B> {
@@ -33,6 +37,7 @@ impl<B: Backend> Controller<B> {
             enabled,
             streams: BTreeMap::new(),
             opened_stream: None,
+            issues: StreamIssueOutbox::default(),
         }
     }
 
@@ -49,11 +54,34 @@ impl<B: Backend> Controller<B> {
             Operation::Open {
                 output,
                 operation_id,
-            } => self.open(caller, output, operation_id, guard),
+            } => {
+                let reporting = operation_id.clone();
+                let result = self.open(caller, output, operation_id, guard);
+                if let (Err(error), Some(operation)) = (&result, reporting) {
+                    self.report_open_failure(&operation, error);
+                }
+                result
+            }
             Operation::Lookup { operation_id } => self.lookup(caller, &operation_id),
             Operation::Close { stream } => self.close(caller, stream).map(|()| json!({"ok":true})),
         };
         result.unwrap_or_else(CaptureError::payload)
+    }
+
+    /// A refused or failed open the consumer still waits for. A cancelled
+    /// request has no stream left to report to.
+    fn report_open_failure(&mut self, operation: &str, error: &CaptureError) {
+        if error.code == "cancelled" {
+            return;
+        }
+        self.issues.push(lifecycle_issues::capture_failure(
+            operation, "kms.open", error.code,
+        ));
+    }
+
+    /// Move queued stream issues to the module's tick for publication.
+    pub fn take_stream_issues(&mut self, outbox: &mut StreamIssueOutbox) {
+        lifecycle_issues::transfer(&mut self.issues, outbox);
     }
 
     pub fn take_opened_stream(&mut self) -> Option<u64> {
@@ -67,6 +95,7 @@ impl<B: Backend> Controller<B> {
             enabled: self.enabled,
             streams: self.streams,
             opened_stream: self.opened_stream,
+            issues: self.issues,
         }
     }
 
@@ -84,7 +113,22 @@ impl<B: Backend> Controller<B> {
     pub fn read(&mut self, caller: &str, id: u64) -> CaptureResult<Frame> {
         self.authorize(caller, id)?;
         let stream = self.streams.get_mut(&id).expect("authorized DRM stream");
-        let mut frame = stream.session.read()?;
+        let mut frame = match stream.session.read() {
+            Ok(frame) => frame,
+            Err(error) => {
+                // The consumer sees every failed read; the stream's record
+                // needs only the first.
+                if !stream.read_failure_reported
+                    && let Some(operation) = &stream.operation_id
+                {
+                    stream.read_failure_reported = true;
+                    self.issues.push(lifecycle_issues::capture_failure(
+                        operation, "kms.read", error.code,
+                    ));
+                }
+                return Err(error);
+            }
+        };
         stream.sequence = stream.sequence.checked_add(1).ok_or_else(|| {
             CaptureError::new("sequence_exhausted", "DRM capture sequence exhausted")
         })?;
@@ -200,6 +244,7 @@ impl<B: Backend> Controller<B> {
                 sequence: 0,
                 last_timestamp_us: 0,
                 frame_readback_verified: false,
+                read_failure_reported: false,
             },
         );
         self.opened_stream = Some(id);
@@ -910,6 +955,8 @@ mod tests {
             controller,
             _factory: factory,
             shutting_down: false,
+            stream_issues: Default::default(),
+            report_stream_issues: false,
         };
 
         module.prepare_shutdown(20_000).unwrap();
@@ -974,6 +1021,8 @@ mod tests {
             controller: controller.clone(),
             _factory: factory,
             shutting_down: false,
+            stream_issues: Default::default(),
+            report_stream_issues: false,
         };
         let (locked, ready) = std::sync::mpsc::channel();
         let (release, wait) = std::sync::mpsc::channel::<()>();
@@ -1072,5 +1121,145 @@ mod tests {
         assert_eq!(status["display_composition"], "active_primary_plane_only");
         assert_eq!(status["cursor_and_overlay_planes_captured"], false);
         assert_eq!(status["crtc_color_pipeline_captured"], false);
+    }
+
+    fn stream_reports(commands: &[amaterasu_module_sdk::Command]) -> Vec<Value> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                amaterasu_module_sdk::Command::Publish { topic, payload }
+                    if topic == "amaterasu.stream.report/1" =>
+                {
+                    Some(payload.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn publish(controller: &mut Controller<MetadataBackend>) -> Vec<Value> {
+        let mut outbox = amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox::default();
+        controller.take_stream_issues(&mut outbox);
+        let mut commands = Vec::new();
+        outbox
+            .flush_with(&mut |command| {
+                commands.push(command);
+                Ok(amaterasu_module_sdk::Response::Ok)
+            })
+            .unwrap();
+        stream_reports(&commands)
+    }
+
+    #[test]
+    fn a_failed_read_is_reported_once_under_the_opening_operation() {
+        let (mut controller, _, _) = controller(true);
+        let reply = request(
+            &mut controller,
+            Operation::Open {
+                output: output().id,
+                operation_id: Some("video-3-9-capture-0".into()),
+            },
+        );
+        let stream = reply["stream"].as_u64().unwrap();
+        assert!(controller.read("console.one", stream).is_err());
+        assert!(controller.read("console.one", stream).is_err());
+
+        let reports = publish(&mut controller);
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        let report = &reports[0];
+        assert_eq!(report["kind"], "issue");
+        assert_eq!(report["operation"], "video-3-9-capture-0");
+        assert_eq!(report["layer"], "capture");
+        assert_eq!(report["phase"], "kms.read");
+        assert_eq!(report["code"], "capture_unavailable");
+        assert_eq!(report["disposition"], "critical_failure");
+        assert!(report.get("caused_by").is_none());
+        let site = report["site"].as_str().unwrap();
+        assert!(site.contains("controller.rs:"), "{site}");
+    }
+
+    #[test]
+    fn a_missing_output_is_reported_as_caused_by_the_display() {
+        let (mut controller, _, _) = controller(true);
+        request(
+            &mut controller,
+            Operation::Open {
+                output: "kms:card0/conn=9/crtc=9/plane=9".into(),
+                operation_id: Some("video-3-9-capture-1".into()),
+            },
+        );
+        let reports = publish(&mut controller);
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0]["phase"], "kms.open");
+        assert_eq!(reports[0]["code"], "capture_output_lost");
+        assert_eq!(reports[0]["caused_by"], "display");
+        assert_eq!(reports[0]["reason"], "output_unavailable");
+    }
+
+    #[test]
+    fn unnamed_streams_report_nothing() {
+        let (mut controller, _, _) = controller(false);
+        request(
+            &mut controller,
+            Operation::Open {
+                output: output().id,
+                operation_id: None,
+            },
+        );
+        assert!(publish(&mut controller).is_empty());
+    }
+
+    #[test]
+    fn a_module_with_reports_off_discards_queued_issues_without_publishing() {
+        use amaterasu_module_sdk::{RuntimeClient, abi::*};
+        use std::{ffi::c_void, sync::Mutex};
+
+        unsafe extern "C" fn no_commands(
+            _context: *mut c_void,
+            _request: BorrowedBytes,
+            _reply: ReplySink,
+        ) -> Status {
+            panic!("a module with reports off sends nothing")
+        }
+
+        let (mut controller, _, _) = controller(true);
+        request(
+            &mut controller,
+            Operation::Open {
+                output: "kms:card0/conn=9/crtc=9/plane=9".into(),
+                operation_id: Some("video-3-9-capture-2".into()),
+            },
+        );
+        let controller = Arc::new(Mutex::new(
+            controller.with_backend(crate::backend::NativeBackend::new()),
+        ));
+        let factory = crate::native::Factory::new(controller.clone());
+        // SAFETY: the stateless endpoint stays live through this fixture.
+        let runtime = unsafe {
+            RuntimeClient::from_endpoint(HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::null_mut(),
+                invoke: no_commands,
+            })
+        };
+        let mut module = crate::CaptureModule {
+            runtime,
+            controller,
+            _factory: factory,
+            shutting_down: false,
+            stream_issues: Default::default(),
+            report_stream_issues: false,
+        };
+        module.publish_stream_issues();
+        assert!(module.stream_issues.is_empty());
+        assert!(publish_from(&module.controller).is_empty());
+    }
+
+    fn publish_from<B: Backend>(
+        controller: &std::sync::Mutex<Controller<B>>,
+    ) -> Vec<amaterasu_module_sdk::stream_lifecycle::StreamReport> {
+        let mut outbox = amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox::default();
+        controller.lock().unwrap().take_stream_issues(&mut outbox);
+        outbox.drain().collect()
     }
 }

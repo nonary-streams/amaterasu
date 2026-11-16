@@ -4583,6 +4583,7 @@ mod admission_completion;
 mod application_retirement;
 mod desktop;
 mod prepared_context;
+mod stream_issues;
 
 #[test]
 fn retirement_observer_requires_exact_owned_clean_terminal_launch() {

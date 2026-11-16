@@ -102,7 +102,45 @@ impl Workflow {
             cleanup: false,
         }
     }
+    #[track_caller]
     pub fn begin_cleanup(
+        &mut self,
+        record: &mut Record,
+        outcome: Outcome,
+        failure: Option<&'static str>,
+    ) {
+        self.begin_cleanup_because(record, outcome, failure, None);
+    }
+
+    /// Begin cleanup. A launch that fails while starting or running reports
+    /// the failure, with the dependency's own code as `reason`; a stop retry
+    /// after failed cleanup does not report it again.
+    #[track_caller]
+    pub fn begin_cleanup_because(
+        &mut self,
+        record: &mut Record,
+        outcome: Outcome,
+        failure: Option<&'static str>,
+        reason: Option<&str>,
+    ) {
+        if matches!(outcome, Outcome::Failed)
+            && matches!(record.state, State::Starting | State::Active)
+        {
+            let code = failure.or(record.failure).unwrap_or("launch_failed");
+            record.report_launch_failure(self.step, code, reason);
+        }
+        self.begin_cleanup_after_reporting(record, outcome, failure);
+    }
+
+    /// The application ended on its own while the launch was starting or
+    /// running. Its exit ends the stream.
+    #[track_caller]
+    pub fn begin_cleanup_after_exit(&mut self, record: &mut Record, process: Option<&Value>) {
+        record.report_application_exit(self.step, process);
+        self.begin_cleanup_after_reporting(record, Outcome::Completed, None);
+    }
+
+    fn begin_cleanup_after_reporting(
         &mut self,
         record: &mut Record,
         outcome: Outcome,

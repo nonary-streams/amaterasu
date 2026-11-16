@@ -1183,6 +1183,24 @@ pub struct Coordinator {
     /// Stream failures and skipped providers for the launch owner's store.
     stream_issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
     report_stream_issues: bool,
+    /// Provider operations already bound to their transition's stream.
+    bound_operations: BTreeSet<String>,
+}
+
+const MAX_BOUND_OPERATIONS: usize = 512;
+
+/// The layer of a lifecycle provider, for naming it as a dependency.
+fn provider_layer(provider: &str) -> amaterasu_module_sdk::stream_lifecycle::LifecycleLayer {
+    use amaterasu_module_sdk::stream_lifecycle::LifecycleLayer;
+    if provider.contains("frame-limiter") {
+        LifecycleLayer::FrameLimiter
+    } else if provider.contains("rtx-hdr") {
+        LifecycleLayer::RtxHdr
+    } else if provider.contains("display") {
+        LifecycleLayer::Display
+    } else {
+        LifecycleLayer::Other
+    }
 }
 
 impl Coordinator {
@@ -1250,6 +1268,7 @@ impl Coordinator {
         Ok(Self {
             stream_issues: Default::default(),
             report_stream_issues: false,
+            bound_operations: BTreeSet::new(),
             shared: Rc::new(RefCell::new(SharedJournal {
                 store,
                 value: journal,
@@ -1513,8 +1532,40 @@ impl Coordinator {
         self.report_stream_issues = true;
     }
 
-    /// A provider failure attributed to the transition it belongs to. The
-    /// transition key is the launch owner's operation ID, or derived from it.
+    /// The operation ID the transition's caller chose: the launch owner's,
+    /// or one it derived from its stream key. Receipt keys are not IDs.
+    fn transition_operation(&self, key: &str) -> Option<String> {
+        self.shared
+            .borrow()
+            .value
+            .receipts
+            .get(key)
+            .and_then(|receipt| receipt.request["operation_id"].as_str())
+            .map(str::to_owned)
+    }
+
+    /// Providers report first-hand under the operation this coordinator gave
+    /// them. Bind it to the transition once so the store files it there.
+    pub(super) fn bind_provider_operation(&mut self, key: &str, provider_operation: &str) {
+        if provider_operation.is_empty() || self.bound_operations.contains(provider_operation) {
+            return;
+        }
+        let Some(operation) = self.transition_operation(key) else {
+            return;
+        };
+        if self.bound_operations.len() >= MAX_BOUND_OPERATIONS {
+            self.bound_operations.clear();
+        }
+        self.bound_operations.insert(provider_operation.to_owned());
+        self.stream_issues.push_binding(
+            amaterasu_module_sdk::stream_lifecycle::StreamBinding::new(
+                operation,
+                provider_operation,
+            ),
+        );
+    }
+
+    /// A provider failure attributed to the transition it belongs to.
     #[track_caller]
     fn record_provider_issue(
         &mut self,
@@ -1525,6 +1576,10 @@ impl Coordinator {
         fallback: Option<&str>,
     ) {
         use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+        let Some(key) = self.transition_operation(key) else {
+            return;
+        };
+        let key = key.as_str();
         let phase = format!("{phase:?}")
             .chars()
             .enumerate()
@@ -1541,13 +1596,17 @@ impl Coordinator {
             }
             None => StreamIssue::critical(key, LifecycleLayer::SessionLifecycle, phase, code),
         };
-        // Name the provider, which may be a plugin, in the identifier alphabet.
+        // The provider reports its own failure; this is the coordinator's
+        // reaction. Name the provider, which may be a plugin, in the
+        // identifier alphabet.
+        let dependency = provider_layer(provider);
         let provider: String = provider
             .chars()
             .map(|character| if character == '/' { ':' } else { character })
             .take(64)
             .collect();
-        self.stream_issues.push(issue.because(provider));
+        self.stream_issues
+            .push(issue.because(provider).caused_by(dependency));
     }
 
     fn publish_stream_issues(&mut self, send: &mut dyn FnMut(Command) -> ModuleResult<Response>) {

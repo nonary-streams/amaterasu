@@ -1,5 +1,7 @@
 use super::*;
-use amaterasu_module_sdk::stream_lifecycle::{IssueDisposition, LifecycleLayer, StreamIssue};
+use amaterasu_module_sdk::stream_lifecycle::{
+    IssueDisposition, LifecycleLayer, StreamIssue, StreamReport,
+};
 
 fn record_for(rtsp_operation: Option<&str>) -> Record {
     let mut payload = prepare();
@@ -13,8 +15,11 @@ fn published(commands: &[Command]) -> Vec<StreamIssue> {
     commands
         .iter()
         .filter_map(|command| match command {
-            Command::Publish { topic, payload } if topic == "amaterasu.stream.issue/1" => {
-                Some(serde_json::from_value(payload.clone()).unwrap())
+            Command::Publish { topic, payload } if topic == "amaterasu.stream.report/1" => {
+                match serde_json::from_value(payload.clone()).unwrap() {
+                    StreamReport::Issue(issue) => Some(issue),
+                    StreamReport::Binding(_) => None,
+                }
             }
             _ => None,
         })
@@ -39,7 +44,8 @@ fn a_session_failure_is_published_under_the_launch_owners_stream_key() {
     assert_eq!(issues.len(), 1);
     let issue = &issues[0];
     assert_eq!(issue.operation, "launch-7");
-    assert_eq!(issue.layer, LifecycleLayer::EncodeVideo);
+    assert_eq!(issue.layer, LifecycleLayer::StreamSession);
+    assert_eq!(issue.caused_by, Some(LifecycleLayer::EncodeVideo));
     assert_eq!(issue.phase, "open_video");
     assert_eq!(issue.code, "dependency_rejected");
     assert_eq!(issue.disposition, IssueDisposition::CriticalFailure);

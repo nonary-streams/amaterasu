@@ -1,3 +1,4 @@
+use super::lifecycle_issues::Cause;
 use super::*;
 
 impl Controller {
@@ -99,7 +100,10 @@ impl Controller {
                 }
             }
             Phase::LifecyclePrepare | Phase::LifecycleLookup => {
-                record.close(Some("dependency_unavailable"));
+                record.close_with_cause(
+                    Some("dependency_unavailable"),
+                    Some(Cause::of_phase(job.phase)),
+                );
                 if let Some((connection, action_ticket)) = job.network {
                     self.fail_network_action(
                         record,
@@ -121,8 +125,7 @@ impl Controller {
                         self.cleanup_deadline(now),
                     );
                 } else {
-                    record.state = State::CleanupFailed;
-                    record.cleanup_error = Some("lifecycle_prepare_lookup_unavailable");
+                    record.fail_cleanup("lifecycle_prepare_lookup_unavailable");
                     complete_caller(record, job.caller, runtime);
                 }
             }
@@ -146,8 +149,7 @@ impl Controller {
                 record.next_status = now.saturating_add(STATUS_INTERVAL_MS);
             }
             Phase::Find | Phase::Observe | Phase::Status => {
-                record.state = State::CleanupFailed;
-                record.cleanup_error = Some("dependency_unavailable");
+                record.fail_cleanup("dependency_unavailable");
                 complete_caller(record, job.caller, runtime);
             }
         }
@@ -246,8 +248,7 @@ impl Controller {
             );
         } else {
             record.close(Some("lifecycle_prepare_rejected"));
-            record.state = State::CleanupFailed;
-            record.cleanup_error = Some("lifecycle_prepare_unconfirmed");
+            record.fail_cleanup("lifecycle_prepare_unconfirmed");
             complete_caller(record, caller, runtime);
         }
     }
@@ -422,7 +423,12 @@ impl Controller {
         })();
         if let Err(code) = prepared {
             eprintln!("amaterasu rtsp prepare failed code={code}");
-            record.close(Some(code));
+            let cause = if code == "prepare_rejected" {
+                Some(Cause::stream_session(provider_code(payload)))
+            } else {
+                Cause::of_close(code)
+            };
+            record.close_with_cause(Some(code), cause);
             self.revoke_ticket(record.id);
             self.schedule_cleanup(record, job.caller, now);
             return;
@@ -454,8 +460,7 @@ impl Controller {
             return;
         }
         let Some(session) = response_session(payload) else {
-            record.state = State::CleanupFailed;
-            record.cleanup_error = Some("invalid_lookup_response");
+            record.fail_cleanup("invalid_lookup_response");
             complete_caller(record, job.caller, runtime);
             return;
         };
@@ -509,7 +514,10 @@ impl Controller {
             record.observation_stale_at = now.saturating_add(OBSERVATION_STALE_MS);
             record.next_status = now.saturating_add(STATUS_INTERVAL_MS);
         } else {
-            record.close(Some("start_rejected"));
+            // A refused start is stream-session's verdict; a reply RTSP could
+            // not deliver is RTSP's own failure.
+            let cause = (!valid).then(|| Cause::stream_session(provider_code(payload)));
+            record.close_with_cause(Some("start_rejected"), cause);
             record.revoke_after = replied.then_some(connection);
         }
     }
@@ -530,8 +538,7 @@ impl Controller {
         } else if response_session(payload) == record.session {
             self.schedule_status_until(record, job.caller, job.network, job.deadline);
         } else {
-            record.state = State::CleanupFailed;
-            record.cleanup_error = Some("invalid_stop_response");
+            record.fail_cleanup("invalid_stop_response");
             complete_caller(record, job.caller, runtime);
         }
     }
@@ -548,8 +555,7 @@ impl Controller {
         if response_session(payload) != record.session || payload["ok"] != true || state.is_none() {
             record.close(Some("stream_status_unavailable"));
             if job.network.is_some() || job.caller.is_some() {
-                record.state = State::CleanupFailed;
-                record.cleanup_error = Some("invalid_status_response");
+                record.fail_cleanup("invalid_status_response");
                 complete_caller(record, job.caller, runtime);
             } else {
                 self.schedule_stop(record, None, now);
@@ -569,8 +575,7 @@ impl Controller {
             || !payload["cleanup_error"].is_null()
         {
             if record.state == State::Closing {
-                record.state = State::CleanupFailed;
-                record.cleanup_error = Some("stream_cleanup_failed");
+                record.fail_cleanup("stream_cleanup_failed");
                 complete_caller(record, job.caller, runtime);
             } else {
                 record.close(Some("stream_failed"));
@@ -627,9 +632,11 @@ impl Controller {
         code: &'static str,
         runtime: &RuntimeClient,
     ) {
-        record.close(Some("dependency_unavailable"));
-        record.state = State::CleanupFailed;
-        record.cleanup_error = Some(code);
+        record.close_with_cause(
+            Some("dependency_unavailable"),
+            Some(Cause::of_phase(job.phase)),
+        );
+        record.fail_cleanup(code);
         record.uncertain_phase = Some(job.phase);
         record.uncertain = Some(job.call);
         self.revoke_ticket(record.id);
@@ -867,4 +874,9 @@ fn safe_provider_code(value: &Value) -> &str {
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         })
         .unwrap_or("unavailable")
+}
+
+/// A provider's own failure code, when it gave a well-formed one.
+fn provider_code(payload: &Value) -> Option<&str> {
+    Some(safe_provider_code(&payload["code"])).filter(|code| *code != "unavailable")
 }

@@ -8,11 +8,15 @@
 //! - **Mutations** are [`StreamIssue`]s. A layer builds one with
 //!   [`StreamIssue::critical`], [`StreamIssue::demoted`] or
 //!   [`StreamIssue::advisory`]; the constructor records the calling `file:line`.
-//! - **Commits** travel on the [`STREAM_ISSUES`] event topic. The runtime
+//! - **Commits** travel on the [`STREAM_REPORTS`] event topic. The runtime
 //!   stamps each event with the publishing module's authenticated identity, so
 //!   the store records who reported an issue without trusting the payload.
-//!   A layer that cannot publish at the point of failure queues issues in a
+//!   A layer that cannot publish at the point of failure queues reports in a
 //!   [`StreamIssueOutbox`] and flushes it from its tick.
+//! - **Bindings** let every provider report first-hand under the operation ID
+//!   it was called with. A consumer that calls providers for a stream
+//!   publishes a [`StreamBinding`] from its own operation prefix to the stream,
+//!   and the store files the providers' reports, earlier or later, under it.
 //! - **State** is the [`StreamLifecycleStore`] the launch owner keeps: one
 //!   [`StreamLifecycle`] per stream, with the first critical failure kept as
 //!   the root cause and every demoted fallback kept as a warning.
@@ -41,9 +45,72 @@ use serde_json::json;
 use std::collections::VecDeque;
 use std::panic::Location;
 
-/// The topic every layer reports stream issues on. Publishing needs the
-/// topic's `publish` grant; the launch owner holds its `subscribe` grant.
-pub const STREAM_ISSUES: Topic<StreamIssue> = Topic::new("amaterasu.stream.issue/1");
+/// The topic every layer reports stream issues and bindings on. Publishing
+/// needs the topic's `publish` grant; the launch owner holds its `subscribe`
+/// grant.
+pub const STREAM_REPORTS: Topic<StreamReport> = Topic::new("amaterasu.stream.report/1");
+
+/// One event on [`STREAM_REPORTS`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StreamReport {
+    Issue(StreamIssue),
+    Binding(StreamBinding),
+}
+
+impl StreamReport {
+    pub fn valid(&self) -> bool {
+        match self {
+            Self::Issue(issue) => issue.valid(),
+            Self::Binding(binding) => binding.valid(),
+        }
+    }
+
+    /// Publish this report on [`STREAM_REPORTS`] through `send`.
+    pub fn report_with(
+        &self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ControlResult<()> {
+        if !self.valid() {
+            return Err(ControlError::Payload("invalid stream report".to_owned()));
+        }
+        publish_with(send, &STREAM_REPORTS, self)
+    }
+}
+
+/// Operations named `alias`, or derived from it (`<alias>-…`, `<alias>.…`,
+/// `<alias>:…`), belong to `stream`. `stream` is the launch owner's stream
+/// key or any operation that already resolves to it.
+///
+/// A module publishes one before, or soon after, it calls providers for a
+/// stream under its own operation IDs, so those providers can report
+/// first-hand with the IDs they were given.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamBinding {
+    pub stream: String,
+    pub alias: String,
+}
+
+impl StreamBinding {
+    pub fn new(stream: impl Into<String>, alias: impl Into<String>) -> Self {
+        Self {
+            stream: stream.into(),
+            alias: alias.into(),
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        // Both are operation IDs, validated as an issue's operation is.
+        bounded(&self.stream, MAX_IDENTIFIER)
+            && bounded(&self.alias, MAX_IDENTIFIER)
+            && self.stream != self.alias
+    }
+
+    pub fn report(&self, runtime: &RuntimeClient) -> ControlResult<()> {
+        StreamReport::Binding(self.clone()).report_with(&mut |command| runtime.send(command))
+    }
+}
 
 /// Entries kept for one stream before the oldest are dropped.
 pub const MAX_LIFECYCLE_ENTRIES: usize = 64;
@@ -143,6 +210,12 @@ pub struct StreamIssue {
     pub fallback: Option<String>,
     /// The `file:line` that reported the issue.
     pub site: String,
+    /// Set when this is the reporter's own reaction to a dependency's
+    /// failure, such as a caller ending a stream because a provider refused.
+    /// The dependency reports its failure itself; this issue never outranks
+    /// that report as the root cause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caused_by: Option<LifecycleLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_error: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,6 +302,7 @@ impl StreamIssue {
             disposition,
             fallback,
             site: format!("{}:{}", site.file(), site.line()),
+            caused_by: None,
             os_error: None,
             requested: None,
             effective: None,
@@ -238,6 +312,18 @@ impl StreamIssue {
     pub fn because(mut self, reason: impl Into<String>) -> Self {
         self.reason = reason.into();
         self
+    }
+
+    /// Mark this as the reporter's reaction to `dependency` failing.
+    pub fn caused_by(mut self, dependency: LifecycleLayer) -> Self {
+        self.caused_by = Some(dependency);
+        self
+    }
+
+    /// A failure in the reporter itself rather than a reaction to another
+    /// layer's failure.
+    pub fn is_origin(&self) -> bool {
+        self.caused_by.is_none()
     }
 
     pub fn with_os_error(mut self, os_error: i32) -> Self {
@@ -296,12 +382,12 @@ impl StreamIssue {
         }
     }
 
-    /// Publish this issue on [`STREAM_ISSUES`] through `runtime`.
+    /// Publish this issue on [`STREAM_REPORTS`] through `runtime`.
     pub fn report(&self, runtime: &RuntimeClient) -> ControlResult<()> {
         self.report_with(&mut |command| runtime.send(command))
     }
 
-    /// Publish this issue on [`STREAM_ISSUES`] through `send`.
+    /// Publish this issue on [`STREAM_REPORTS`] through `send`.
     pub fn report_with(
         &self,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
@@ -309,7 +395,7 @@ impl StreamIssue {
         if !self.valid() {
             return Err(ControlError::Payload("invalid stream issue".to_owned()));
         }
-        publish_with(send, &STREAM_ISSUES, self)
+        publish_with(send, &STREAM_REPORTS, &StreamReport::Issue(self.clone()))
     }
 
     /// Write this issue to the reporter's own log. This is the durable record
@@ -327,23 +413,32 @@ impl StreamIssue {
     }
 }
 
-/// Issues a layer recorded where it could not publish, such as inside a
+/// Reports a layer recorded where it could not publish, such as inside a
 /// record method with no runtime access. The layer flushes it from its tick.
 #[derive(Debug, Default)]
 pub struct StreamIssueOutbox {
-    issues: VecDeque<StreamIssue>,
+    issues: VecDeque<StreamReport>,
     dropped: u64,
 }
 
 impl StreamIssueOutbox {
-    /// Queue `issue`. When the outbox is full the oldest issue is dropped and
-    /// counted; its log line, written by [`Self::push_logged`], remains.
+    /// Queue `issue`. When the outbox is full the oldest report is dropped
+    /// and counted; its log line, written by [`Self::push_logged`], remains.
     pub fn push(&mut self, issue: StreamIssue) {
+        self.push_report(StreamReport::Issue(issue));
+    }
+
+    /// Queue a binding. It is published in order with the issues around it.
+    pub fn push_binding(&mut self, binding: StreamBinding) {
+        self.push_report(StreamReport::Binding(binding));
+    }
+
+    fn push_report(&mut self, report: StreamReport) {
         if self.issues.len() >= MAX_OUTBOX_ISSUES {
             self.issues.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
-        self.issues.push_back(issue);
+        self.issues.push_back(report);
     }
 
     /// Log `issue` now and queue it for publication.
@@ -365,8 +460,8 @@ impl StreamIssueOutbox {
         self.dropped
     }
 
-    /// Hand every queued issue to an owner that keeps the store itself.
-    pub fn drain(&mut self) -> impl Iterator<Item = StreamIssue> + '_ {
+    /// Hand every queued report to an owner that keeps the store itself.
+    pub fn drain(&mut self) -> impl Iterator<Item = StreamReport> + '_ {
         self.issues.drain(..)
     }
 
@@ -378,13 +473,13 @@ impl StreamIssueOutbox {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> ControlResult<usize> {
         let mut published = 0;
-        while let Some(issue) = self.issues.front() {
-            if !issue.valid() {
+        while let Some(report) = self.issues.front() {
+            if !report.valid() {
                 self.issues.pop_front();
                 self.dropped = self.dropped.saturating_add(1);
                 continue;
             }
-            issue.report_with(send)?;
+            report.report_with(send)?;
             self.issues.pop_front();
             published += 1;
         }

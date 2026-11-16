@@ -209,8 +209,11 @@ fn log_proton_policy_fallback(
     }
 }
 
-/// Keep a stream warning for history and clients, and record it in the
-/// stream's lifecycle store.
+/// The `source` NVHTTP's own stream warnings carry.
+const NVHTTP_WARNING_SOURCE: &str = "amaterasu.nvhttp/1";
+
+/// Keep a stream warning for history and clients, and record NVHTTP's own
+/// warnings in the stream's lifecycle store.
 #[track_caller]
 pub(super) fn add_stream_warning(
     record: &mut Record,
@@ -220,7 +223,11 @@ pub(super) fn add_stream_warning(
     if !warning.valid() || record.stream_warnings.contains(&warning) {
         return;
     }
-    record.record_warning(&warning);
+    // A warning another module raised was reported by that module itself;
+    // NVHTTP only keeps it for history and clients.
+    if warning.source == NVHTTP_WARNING_SOURCE {
+        record.record_warning(&warning);
+    }
     push_stream_warning(record, logger, warning);
 }
 
@@ -279,14 +286,21 @@ const MAX_HISTORY_RELEASE_ATTEMPTS: u8 = 8;
 pub(super) fn demote_record_warning(
     record: &mut Record,
     logger: Option<&amaterasu_module_sdk::LogEmitter>,
-    layer: LifecycleLayer,
+    dependency: LifecycleLayer,
     phase: &str,
     code: &str,
     reason: &str,
     fallback: &str,
 ) {
-    let issue = StreamIssue::demoted(record.rtsp_operation.clone(), layer, phase, code, fallback)
-        .because(reason);
+    let issue = StreamIssue::demoted(
+        record.rtsp_operation.clone(),
+        LifecycleLayer::Nvhttp,
+        phase,
+        code,
+        fallback,
+    )
+    .because(reason)
+    .caused_by(dependency);
     push_stream_warning(
         record,
         logger,

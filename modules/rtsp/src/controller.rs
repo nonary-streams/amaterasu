@@ -5,6 +5,7 @@ mod lanes;
 #[cfg(test)]
 mod lanes_tests;
 mod lifecycle_binding;
+mod lifecycle_issues;
 mod network;
 #[cfg(test)]
 mod ownership_tests;
@@ -32,6 +33,7 @@ use amaterasu_gamestream::rtsp::{
     serialize_response,
 };
 use amaterasu_module_sdk::lifecycle_ledger::{Admission, Live, Owner, Retirement, make_room};
+use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient, network::Network};
 use record::{Job, Phase, Record, State};
 use retirement::{clean_terminal, confirm_terminal, preparation_source};
@@ -236,6 +238,9 @@ pub struct Controller {
     retired_operations: BTreeSet<(String, String)>,
     sequence: u64,
     status_after: u64,
+    /// Open refusals, and reports kept from tickets dropped for capacity.
+    stream_issues: StreamIssueOutbox,
+    report_stream_issues: bool,
 }
 
 impl Controller {
@@ -306,13 +311,22 @@ impl Controller {
             retired_operations: BTreeSet::new(),
             sequence: 0,
             status_after: 0,
+            stream_issues: StreamIssueOutbox::default(),
+            report_stream_issues: false,
         })
     }
 
     pub fn tick(&mut self, runtime: &RuntimeClient, now: u64) -> ModuleResult<()> {
-        if self.quiescence.is_some() {
-            return self.tick_quiescing(runtime, now);
-        }
+        let result = if self.quiescence.is_some() {
+            self.tick_quiescing(runtime, now)
+        } else {
+            self.tick_running(runtime, now)
+        };
+        self.publish_stream_issues(&mut |command| runtime.send(command));
+        result
+    }
+
+    fn tick_running(&mut self, runtime: &RuntimeClient, now: u64) -> ModuleResult<()> {
         self.cap_announced_cleanup_deadline();
         self.poll_transport(now);
         let ignored = std::mem::take(&mut self.pending_ignored_client_features);
@@ -426,6 +440,7 @@ impl Controller {
             }
         }
         self.stop_owned_sessions_on_shutdown(runtime, cleanup_deadline);
+        self.publish_stream_issues(&mut |command| runtime.send(command));
     }
 
     fn stop_owned_sessions_on_shutdown(&mut self, runtime: &RuntimeClient, deadline: Instant) {
@@ -465,8 +480,7 @@ impl Controller {
                     .push(record.uncertain.take().expect("retained call"));
                 record.uncertain_phase = None;
             } else {
-                record.state = State::CleanupFailed;
-                record.cleanup_error = Some("shutdown_settlement_unconfirmed");
+                record.fail_cleanup("shutdown_settlement_unconfirmed");
                 return;
             }
         }
@@ -482,14 +496,12 @@ impl Controller {
                 Ok(payload) if payload["ok"] == true => {
                     record.session = response_session(&payload);
                     if record.session.is_none() {
-                        record.state = State::CleanupFailed;
-                        record.cleanup_error = Some("shutdown_lookup_invalid");
+                        record.fail_cleanup("shutdown_lookup_invalid");
                         return;
                     }
                 }
                 Ok(payload) if payload["code"] == "session_not_found" => {
-                    record.state = State::CleanupFailed;
-                    record.cleanup_error = Some("shutdown_lookup_not_found");
+                    record.fail_cleanup("shutdown_lookup_not_found");
                     return;
                 }
                 Err(failure) => {
@@ -497,8 +509,7 @@ impl Controller {
                     return;
                 }
                 Ok(_) => {
-                    record.state = State::CleanupFailed;
-                    record.cleanup_error = Some("shutdown_lookup_unconfirmed");
+                    record.fail_cleanup("shutdown_lookup_unconfirmed");
                     return;
                 }
             }
@@ -530,8 +541,7 @@ impl Controller {
                 finish_record(record);
             }
             Ok(_) => {
-                record.state = State::CleanupFailed;
-                record.cleanup_error = Some("shutdown_stop_rejected");
+                record.fail_cleanup("shutdown_stop_rejected");
             }
             Err(failure) => retain_shutdown_failure(record, Phase::Stop, failure),
         }
@@ -563,8 +573,7 @@ impl Controller {
                         }
                     }
                     preparation::PreparationResolution::Unconfirmed => {
-                        record.state = State::CleanupFailed;
-                        record.cleanup_error = Some("shutdown_lifecycle_unconfirmed");
+                        record.fail_cleanup("shutdown_lifecycle_unconfirmed");
                         return false;
                     }
                 },
@@ -574,8 +583,7 @@ impl Controller {
                 }
             }
         }
-        record.state = State::CleanupFailed;
-        record.cleanup_error = Some("shutdown_lifecycle_deadline");
+        record.fail_cleanup("shutdown_lifecycle_deadline");
         false
     }
 
@@ -1253,8 +1261,7 @@ fn apply_undispatched_shutdown_proof(record: &mut Record, phase: Phase, call: &C
 }
 
 fn retain_shutdown_failure(record: &mut Record, phase: Phase, failure: ShutdownFailure) {
-    record.state = State::CleanupFailed;
-    record.cleanup_error = Some(failure.code);
+    record.fail_cleanup(failure.code);
     record.uncertain_phase = Some(phase);
     record.uncertain = Some(*failure.call);
 }
@@ -1321,8 +1328,7 @@ fn finish_record(record: &mut Record) {
         || (record.lifecycle_target.is_some() && !record.cleanup_confirmed)
     {
         record.cleanup_confirmed = false;
-        record.state = State::CleanupFailed;
-        record.cleanup_error = Some("lifecycle_retirement_unconfirmed");
+        record.fail_cleanup("lifecycle_retirement_unconfirmed");
         return;
     }
     record.display_applied = false;

@@ -1,4 +1,6 @@
+use super::lifecycle_issues::Cause;
 use super::*;
+use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +106,8 @@ pub(super) struct Record {
     /// When this ticket was first seen ended. A later ticket prefers the
     /// media ports of the ticket that ended longest ago.
     pub ended_at: Option<u64>,
+    /// Failures this ticket recorded for the launch owner's lifecycle store.
+    pub issues: StreamIssueOutbox,
 }
 
 impl Record {
@@ -399,12 +403,25 @@ impl Record {
         response
     }
 
+    /// Close this ticket. The first reason given is its failure, reported
+    /// with the dependency the reason itself names, if any.
+    #[track_caller]
     pub fn close(&mut self, reason: Option<&'static str>) {
+        let cause = reason.and_then(Cause::of_close);
+        self.close_with_cause(reason, cause);
+    }
+
+    /// Close this ticket; `cause` is the dependency whose failure ended it.
+    #[track_caller]
+    pub fn close_with_cause(&mut self, reason: Option<&'static str>, cause: Option<Cause<'_>>) {
         if let Some(reason) = reason {
             if self.state == State::Playing {
                 eprintln!("amaterasu rtsp closing playing stream reason={reason}");
             }
-            self.failure.get_or_insert(reason);
+            if self.failure.is_none() {
+                self.failure = Some(reason);
+                self.report_failure(reason, cause);
+            }
         }
         self.state = State::Closing;
     }

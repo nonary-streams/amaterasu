@@ -103,6 +103,8 @@ fn module(controller: Controller<FakeBackend>) -> crate::CaptureModule {
         pending_opens: Vec::new(),
         polled_request: None,
         shutting_down: false,
+        stream_issues: Default::default(),
+        report_stream_issues: false,
     }
 }
 
@@ -1170,4 +1172,117 @@ fn named_capture_reports_only_observed_live_output() {
         .lookup("amaterasu.video", "test-observation")
         .unwrap();
     assert!(lookup.get("observed_capture").is_none());
+}
+
+fn stream_reports(controller: &mut Controller<FakeBackend>) -> Vec<Value> {
+    use amaterasu_module_sdk::{Command, Response};
+    let mut outbox = StreamIssueOutbox::default();
+    controller.take_stream_issues(&mut outbox);
+    let mut reports = Vec::new();
+    outbox
+        .flush_with(&mut |command| {
+            if let Command::Publish { topic, payload } = command {
+                assert_eq!(topic, "amaterasu.stream.report/1");
+                reports.push(payload);
+            }
+            Ok(Response::Ok)
+        })
+        .unwrap();
+    reports
+}
+
+#[test]
+fn a_revoked_portal_source_is_reported_under_the_reading_streams_operation() {
+    let (mut controller, driver) = setup(settings());
+    let output = ready(&mut controller, &driver);
+    open(
+        &mut controller,
+        &output,
+        "amaterasu.video",
+        "video-5-1-capture-0",
+    );
+    *driver.state.lock().unwrap() = SourceState::Revoked;
+    controller.refresh(50);
+    controller.refresh(60);
+
+    let reports = stream_reports(&mut controller);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert_eq!(report["kind"], "issue");
+    assert_eq!(report["operation"], "video-5-1-capture-0");
+    assert_eq!(report["layer"], "capture");
+    assert_eq!(report["phase"], "pipewire.portal_source");
+    assert_eq!(report["code"], "source_revoked");
+    assert_eq!(report["disposition"], "critical_failure");
+    let site = report["site"].as_str().unwrap();
+    assert!(site.contains("controller.rs:"), "{site}");
+}
+
+#[test]
+fn a_failed_named_source_is_reported_once_while_its_lease_stays_open() {
+    let mut settings = settings();
+    settings.allow_named_outputs = true;
+    let (mut controller, driver) = setup(settings);
+    *driver.state.lock().unwrap() = SourceState::Ready {
+        node: 1,
+        width: 2,
+        height: 2,
+    };
+    let opened = open(
+        &mut controller,
+        "kwin:Virtual-2",
+        "amaterasu.video",
+        "video-5-1-capture-1",
+    );
+    assert!(opened.payload["stream"].is_u64());
+    *driver.state.lock().unwrap() = SourceState::Failed("pipewire_stream_error");
+    controller.refresh(20);
+    controller.refresh(30);
+
+    let reports = stream_reports(&mut controller);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0]["operation"], "video-5-1-capture-1");
+    assert_eq!(reports[0]["phase"], "pipewire.named_source");
+    assert_eq!(reports[0]["code"], "pipewire_stream_error");
+    assert!(reports[0]["site"].as_str().unwrap().contains("direct.rs:"));
+}
+
+#[test]
+fn a_selection_no_stream_opened_reports_nothing() {
+    let (mut controller, driver) = setup(settings());
+    ready(&mut controller, &driver);
+    *driver.state.lock().unwrap() = SourceState::Revoked;
+    controller.refresh(50);
+    assert!(stream_reports(&mut controller).is_empty());
+}
+
+#[test]
+fn a_refused_open_is_reported_by_the_module_and_discarded_when_reports_are_off() {
+    let (controller, _driver) = setup(settings());
+    let mut module = module(controller);
+    let refused = Operation::Open {
+        output: "portal-selected-session-source".into(),
+        operation_id: Some("video-5-1-capture-2".into()),
+        constant_rate: None,
+    };
+    // The fixture runtime refuses completion; the open is still refused.
+    let _ = module.dispatch(7, "amaterasu.video".into(), refused, 0);
+    assert_eq!(module.stream_issues.len(), 1);
+    let issue = match module.stream_issues.drain().next() {
+        Some(amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue)) => issue,
+        other => panic!("unexpected report {other:?}"),
+    };
+    assert_eq!(issue.operation, "video-5-1-capture-2");
+    assert_eq!(issue.phase, "pipewire.open");
+    assert_eq!(issue.code, "source_selection_required");
+    assert!(issue.site.contains("lib.rs:"), "{}", issue.site);
+
+    let refused = Operation::Open {
+        output: "portal-selected-session-source".into(),
+        operation_id: Some("video-5-1-capture-3".into()),
+        constant_rate: None,
+    };
+    let _ = module.dispatch(8, "amaterasu.video".into(), refused, 0);
+    module.publish_stream_issues();
+    assert!(module.stream_issues.is_empty(), "discarded, not kept");
 }

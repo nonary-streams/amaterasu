@@ -21,6 +21,11 @@ use std::{
 
 pub struct Stream {
     pub owner: String,
+    /// The caller's operation for this stream, under which its failures
+    /// are reported to the launch owner's lifecycle store.
+    pub operation_id: Option<String>,
+    /// Set once this stream's delivery failure has been reported.
+    pub failure_reported: bool,
     pub peer: IpAddr,
     pub video_settings: VideoSettings,
     pub video_batch_size_fallback: bool,
@@ -192,6 +197,8 @@ impl Stream {
         let (video_local, audio_local) = delivery.addresses().map_err(|_| "udp_bind_failed")?;
         let mut stream = Self {
             owner: owner.into(),
+            operation_id: request.operation_id.clone(),
+            failure_reported: false,
             peer: request.peer_ip,
             video_settings,
             video_batch_size_fallback: request.video.batch_size_fallback(),
@@ -889,6 +896,7 @@ impl Stream {
             .collect()
     }
 
+    #[track_caller]
     fn fail(&mut self, code: &'static str) -> Status {
         self.delivery.fail(code);
         MEDIA_BACKEND_ERROR

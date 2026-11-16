@@ -2,10 +2,14 @@
 //! Native modules are trusted code; runtime API grants are not a native-code sandbox.
 mod backend;
 mod controller;
+mod lifecycle_issues;
 mod model;
 mod native;
 
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, LogLevel, ManagedModule, ModuleResult, Response, RuntimeClient,
+    stream_lifecycle::StreamIssueOutbox,
+};
 use backend::NativeBackend;
 use controller::Controller;
 use model::{CaptureError, Operation};
@@ -27,6 +31,10 @@ struct CaptureModule {
     controller: SharedController,
     _factory: Box<native::Factory<NativeBackend>>,
     shutting_down: bool,
+    stream_issues: StreamIssueOutbox,
+    /// Off unless started by the runtime, so scripted fixtures see only the
+    /// commands they expect.
+    report_stream_issues: bool,
 }
 
 impl ManagedModule for CaptureModule {
@@ -58,6 +66,8 @@ impl ManagedModule for CaptureModule {
             controller,
             _factory: factory,
             shutting_down: false,
+            stream_issues: StreamIssueOutbox::default(),
+            report_stream_issues: true,
         })
     }
 
@@ -83,6 +93,7 @@ impl ManagedModule for CaptureModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.publish_stream_issues();
         for _ in 0..8 {
             // A native read can be in progress on another worker. Do not
             // dequeue a request unless it can be handled without blocking the
@@ -151,6 +162,30 @@ impl ManagedModule for CaptureModule {
             }
         }
         Ok(())
+    }
+}
+
+impl CaptureModule {
+    /// Publish what opens and native reads reported. A native read holding
+    /// the controller defers this to a later tick rather than waiting.
+    fn publish_stream_issues(&mut self) {
+        if let Ok(mut controller) = self.controller.try_lock() {
+            controller.take_stream_issues(&mut self.stream_issues);
+        }
+        if !self.report_stream_issues {
+            self.stream_issues.drain().for_each(drop);
+            return;
+        }
+        if self.stream_issues.is_empty() {
+            return;
+        }
+        if let Err(error) = self.stream_issues.flush(&self.runtime) {
+            let _ = self.runtime.log(
+                LogLevel::Warning,
+                "capture.stream_issues",
+                &format!("stream issue report failed error={error}"),
+            );
+        }
     }
 }
 

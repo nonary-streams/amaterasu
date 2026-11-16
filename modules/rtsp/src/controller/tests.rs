@@ -1118,6 +1118,7 @@ pub(super) fn record(state: State) -> Record {
         revoke_after: None,
         cleanup_confirmed: false,
         ended_at: None,
+        issues: Default::default(),
     }
 }
 
@@ -1832,6 +1833,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         revoke_after: None,
         cleanup_confirmed: false,
         ended_at: None,
+        issues: Default::default(),
     };
     let payload = record.config.prepare(&record.operation(), None);
     controller.records.insert(record.id, record);
@@ -4631,3 +4633,4 @@ fn extension_projection_preserves_explicit_software_requirements() {
 }
 
 mod extension_start;
+mod lifecycle_issues;

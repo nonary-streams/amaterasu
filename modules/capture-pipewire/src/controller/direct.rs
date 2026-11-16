@@ -3,8 +3,10 @@ use super::{Created, Reader, Reply};
 use crate::{
     admission::Admission,
     backend::{Backend, SourceSession},
+    lifecycle_issues,
     model::{CaptureResult, SourceState, new_id, validate_operation_id},
 };
+use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc};
 struct Source {
@@ -15,6 +17,7 @@ struct Source {
     admission: Arc<Admission>,
     id: Option<u64>,
     started: u64,
+    loss_reported: bool,
 }
 #[derive(Default)]
 pub(super) struct DirectSources {
@@ -64,6 +67,7 @@ impl DirectSources {
                     admission: Arc::new(Admission::default()),
                     id: None,
                     started: now,
+                    loss_reported: false,
                 },
             );
         }
@@ -171,6 +175,24 @@ impl DirectSources {
         }
         self.poll_retired();
     }
+    /// Report each opened source that stopped delivering frames, once. The
+    /// consumer still owns the lease and closes it.
+    pub fn report_lost_sources(&mut self, issues: &mut StreamIssueOutbox) {
+        for source in self.sources.values_mut() {
+            if source.id.is_none() || source.loss_reported {
+                continue;
+            }
+            if let Some(code) = lifecycle_issues::lost_source_code(source.session.state()) {
+                source.loss_reported = true;
+                issues.push(lifecycle_issues::capture_failure(
+                    &source.operation,
+                    "pipewire.named_source",
+                    code,
+                ));
+            }
+        }
+    }
+
     pub fn streams(&self, caller: &str) -> Vec<Value> {
         self.sources
             .values()

@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     net::{IpAddr, SocketAddr},
+    panic::Location,
     time::Instant,
 };
 
@@ -35,6 +36,11 @@ struct Received {
 
 pub struct Stream {
     pub owner: String,
+    /// The caller's operation for this stream, under which its failure is
+    /// reported to the launch owner's lifecycle store.
+    pub operation_id: Option<String>,
+    /// Set once this stream's failure has been reported.
+    pub failure_reported: bool,
     socket: Option<UdpSocket>,
     local: SocketAddr,
     authorized_ip: IpAddr,
@@ -50,6 +56,8 @@ pub struct Stream {
     ping_timeout_ms: u64,
     authenticated_at: Option<u64>,
     failure: Option<&'static str>,
+    /// The line that raised `failure`.
+    failure_site: Option<&'static Location<'static>>,
     sent_messages: u64,
     received_messages: u64,
     rejected_datagrams: u64,
@@ -107,6 +115,8 @@ impl Stream {
             .map_err(|_| "udp_configuration_failed")?;
         Ok(Self {
             owner: owner.into(),
+            operation_id: request.operation_id.clone(),
+            failure_reported: false,
             socket: Some(socket),
             local,
             authorized_ip: request.peer_ip,
@@ -122,6 +132,7 @@ impl Stream {
             ping_timeout_ms,
             authenticated_at: None,
             failure: None,
+            failure_site: None,
             sent_messages: 0,
             received_messages: 0,
             rejected_datagrams: 0,
@@ -396,9 +407,16 @@ impl Stream {
             "scope":"socket_receive_kernel_age_protocol_wait_authentication_and_consumer_queue_not_client_to_host"})
     }
 
+    /// The failure that ended this stream and the line that raised it.
+    pub fn failure_origin(&self) -> Option<(&'static str, &'static Location<'static>)> {
+        self.failure.zip(self.failure_site)
+    }
+
+    #[track_caller]
     fn fail(&mut self, code: &'static str) {
         if self.failure.is_none() {
             self.failure = Some(code);
+            self.failure_site = Some(Location::caller());
             // `code` comes only from fixed internal call sites and never includes
             // peer addresses, control payloads, keys, or other session material.
             eprintln!("amaterasu control transport failed code={code}");

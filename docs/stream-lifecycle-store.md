@@ -9,7 +9,8 @@ shaped like a Vuex store.
 | Vuex      | Here |
 |-----------|------|
 | mutation  | a `StreamIssue`: layer, phase, code, reason, disposition, fallback and the `file:line` that reported it |
-| commit    | `StreamIssue::report` publishes it on the `amaterasu.stream.issue/1` topic; the runtime stamps the reporting module's authenticated identity |
+| commit    | `StreamIssue::report` publishes it on the `amaterasu.stream.report/1` topic; the runtime stamps the reporting module's authenticated identity |
+| binding   | a `StreamBinding` from a consumer's operation prefix to the stream, so the providers it calls can report first-hand |
 | state     | NVHTTP's `StreamLifecycleStore`: one `StreamLifecycle` per stream |
 | getter    | `launch.lifecycle` in `POST /v1/nvhttp/launch_status` |
 
@@ -38,11 +39,30 @@ pushes into a `StreamIssueOutbox` and flushes it from the module's tick with
 `flush` or `flush_with`. The outbox holds 64 issues; when it is full the oldest
 is dropped and counted.
 
-`operation` is any operation ID the module holds for the stream: NVHTTP's
-stream key (the `rtsp_operation_id` RTSP and the stream session receive) or an
-ID NVHTTP derived from it (`<key>-…`, `<key>.…`, `<key>:…`). NVHTTP also
-registers its application operation as an alias, so lifecycle coordinator
-transitions (`<application operation>-lifecycle…`) reach the same stream.
+`operation` is the operation ID the module was called with for the stream.
+Every module reports its own failures; no module relays another's.
+
+A module that calls providers for a stream under operation IDs of its own
+publishes a binding first, so those providers' reports reach the stream:
+
+```rust
+outbox.push_binding(StreamBinding::new(operation_i_was_called_with, my_prefix));
+```
+
+The chain on a Linux launch:
+
+| Caller | Binds | Providers then report under |
+|--------|-------|-----------------------------|
+| NVHTTP | its application operation (local alias) | RTSP, launch, display: the NVHTTP stream key or IDs derived from it |
+| stream session | `ss-<id>` to its `rtsp_operation_id` | video, audio, audio encode, transports, display, input: `ss-<id>-…` |
+| video | `video-<epoch>-<id>` to the `ss-<id>-video` it was opened with | capture and encoder providers: `video-…-capture-…`, `…-encoder-attempt-…` |
+| lifecycle coordinator | each provider operation it allocates to the transition's operation | frame limiter, RTX HDR |
+
+An operation matches a stream when it equals the key or an alias, or starts
+with one followed by `-`, `.` or `:`; the longest match wins. A binding may
+name its stream through an alias. Reports that arrive before their binding are
+kept as unattributed and filed under the stream when the binding arrives; the
+root cause is still the earliest critical failure by commit order.
 
 All fields except `operation` and `site` must be short identifiers
 (`[A-Za-z0-9_.:-]`, at most 64 bytes). An issue cannot carry a request body,
@@ -50,7 +70,7 @@ path or message. Invalid issues are refused by `report` and counted by the
 subscriber.
 
 A module needs the topic's `publish` grant in its component definition
-(`crates/release/src/profiles.rs`, `STREAM_ISSUE_TOPIC`). Without it the
+(`crates/release/src/profiles.rs`, `STREAM_REPORT_TOPIC`). Without it the
 runtime refuses the event; the module's own log line remains.
 
 ## Dispositions
@@ -91,15 +111,17 @@ issue's `layer` (the part of the stream it concerns). They differ when a module
 reports a failure it saw in a dependency: the stream session reports a video
 encoder failure with layer `encode_video`.
 
+## Trust
+
+Any module granted the topic can publish a binding, so a module could file
+another stream's reports under the wrong launch. Publishers are installed,
+signed components with an explicit grant, the same trust the rest of the
+control plane relies on. The publisher identity on every entry is the
+runtime's, not the payload's.
+
 ## Limits
 
 Events are notifications. If NVHTTP's subscription falls behind, the open
 streams are marked `audit_gap` instead of presenting a partial record as
 complete; the reporters' log lines (`stream.lifecycle.*`) remain the complete
 record. The store keeps the last 32 streams.
-
-Not yet reporting: RTSP, video, capture, display and audio report through
-the stream session or NVHTTP rather than publishing themselves. Frame limiter
-reports carry the coordinator's opaque provider operation ID, so they appear
-under `unattributed_issues` until the coordinator passes the stream key to
-providers.

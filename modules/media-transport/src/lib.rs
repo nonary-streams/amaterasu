@@ -2,6 +2,7 @@
 mod controller;
 mod datagrams;
 mod diagnostics;
+mod lifecycle_issues;
 mod model;
 mod native;
 mod opus_packet;
@@ -32,7 +33,13 @@ struct MediaTransportModule {
 
 impl ManagedModule for MediaTransportModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        Self::start_configured(runtime, None)
+        let module = Self::start_configured(runtime, None)?;
+        module
+            .controller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .enable_stream_issue_reports();
+        Ok(module)
     }
 
     fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
@@ -70,6 +77,7 @@ impl ManagedModule for MediaTransportModule {
                 Err(TryLockError::Poisoned(_)) => return Err("transport state unavailable".into()),
             };
             controller.tick();
+            controller.publish_stream_issues(&mut |command| self.runtime.send(command));
             if due {
                 controller.take_processing_latencies()
             } else {

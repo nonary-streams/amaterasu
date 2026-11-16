@@ -57,7 +57,6 @@ pub(super) fn redirect(record: &mut Record, job: &mut Job) -> Result<(), &'stati
         .is_none()
         && record.source_scope.is_none()
     {
-        use sha2::{Digest, Sha256};
         record.source_scope = Some(super::shared_capture::SettingsScope {
             service: record
                 .source_preparation
@@ -65,7 +64,7 @@ pub(super) fn redirect(record: &mut Record, job: &mut Job) -> Result<(), &'stati
                 .unwrap()
                 .display_settings_service
                 .clone(),
-            operation_id: format!("source-{:x}", Sha256::digest(&record.config.operation_id)),
+            operation_id: super::record::source_scope_operation(&record.config.operation_id),
             scope: None,
             prepared: false,
             closed: false,
@@ -151,6 +150,18 @@ pub(super) fn consume(record: &mut Record, job: &mut Job, payload: &Value, now: 
                 return true;
             }
             scope_mut(record).scope = parsed.ok();
+            // Source hooks name their own operations after the scope.
+            if let (Some(stream), Some(scope)) = (
+                record.config.rtsp_operation_id.clone(),
+                record.source_scope.as_ref().and_then(|scope| scope.scope.as_ref()),
+            ) {
+                record.issues.push_binding(
+                    amaterasu_module_sdk::stream_lifecycle::StreamBinding::new(
+                        stream,
+                        scope.id.clone(),
+                    ),
+                );
+            }
             job.step = Step::ReadSourceHookSettings;
         }
         Step::ReadSourceHookSettings => {

@@ -391,8 +391,18 @@ impl Record {
 
     pub fn new(id: u64, owner: String, config: PrepareConfig, input_ttl_ms: u64) -> Self {
         let virtual_display_state = "not_requested".to_owned();
+        let mut issues = amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox::default();
+        if let Some(stream) = config.rtsp_operation_id.as_deref() {
+            // Providers called for this session report first-hand under the
+            // names it gave them; these bindings file them under the stream.
+            for alias in session_aliases(id, &config) {
+                issues.push_binding(amaterasu_module_sdk::stream_lifecycle::StreamBinding::new(
+                    stream, alias,
+                ));
+            }
+        }
         Self {
-            issues: Default::default(),
+            issues,
             providers: Default::default(),
             extension_route: None,
             extension_checked: false,
@@ -530,17 +540,17 @@ impl Record {
     }
 
     pub fn operation(&self, resource: Resource) -> String {
-        format!("ss-{:x}-{}", self.id, resource.name())
+        format!("{}-{}", session_operation_prefix(self.id), resource.name())
     }
 
     pub fn input_operation(&self) -> String {
-        format!("ss-{:x}-input", self.id)
+        format!("{}-input", session_operation_prefix(self.id))
     }
 
     pub fn display_operation(&self) -> String {
         self.display_operation_id
             .clone()
-            .unwrap_or_else(|| format!("ss-{:x}-display", self.id))
+            .unwrap_or_else(|| format!("{}-display", session_operation_prefix(self.id)))
     }
 
     pub fn lease(&self, audio: bool) -> String {
@@ -936,4 +946,32 @@ impl Record {
 
 pub(super) fn error(code: &str) -> Value {
     json!({"ok":false,"code":code})
+}
+
+/// Every operation this session issues to a provider starts with this.
+pub(super) fn session_operation_prefix(id: u64) -> String {
+    format!("ss-{id:x}")
+}
+
+/// Every name this session gives a provider for its stream: the prefix of
+/// its operations, the display-settings scope operation and the virtual
+/// display identity.
+fn session_aliases(id: u64, config: &PrepareConfig) -> Vec<String> {
+    let mut aliases = vec![
+        session_operation_prefix(id),
+        source_scope_operation(&config.operation_id),
+    ];
+    aliases.extend(
+        config
+            .virtual_display_intent
+            .as_ref()
+            .map(|intent| intent.identity.clone()),
+    );
+    aliases
+}
+
+/// The display-settings scope operation for a session's source preparation.
+pub(super) fn source_scope_operation(operation_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("source-{:x}", Sha256::digest(operation_id))
 }

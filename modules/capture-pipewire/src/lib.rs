@@ -4,6 +4,7 @@ mod admission;
 mod backend;
 mod buffers;
 mod controller;
+mod lifecycle_issues;
 mod model;
 mod native;
 
@@ -11,7 +12,10 @@ use amaterasu_module_sdk::capture::{
     SourcePreflightFactory, SourcePreflightProvider, SourcePreflightRequest,
     SourcePreflightResponse,
 };
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, LogLevel, ManagedModule, ModuleResult, Response, RuntimeClient,
+    stream_lifecycle::StreamIssueOutbox,
+};
 use backend::NativeBackend;
 use controller::Controller;
 use model::{Operation, Settings};
@@ -47,6 +51,10 @@ struct CaptureModule {
     pending_opens: Vec<PendingOpen>,
     polled_request: Option<PolledRequest>,
     shutting_down: bool,
+    stream_issues: StreamIssueOutbox,
+    /// Off unless started by the runtime, so scripted fixtures see only the
+    /// commands they expect.
+    report_stream_issues: bool,
 }
 #[derive(Clone)]
 struct PolledRequest {
@@ -105,6 +113,8 @@ impl ManagedModule for CaptureModule {
             pending_opens: Vec::new(),
             polled_request: None,
             shutting_down: false,
+            stream_issues: StreamIssueOutbox::default(),
+            report_stream_issues: true,
         })
     }
 
@@ -134,6 +144,7 @@ impl ManagedModule for CaptureModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.publish_stream_issues();
         let now = self.epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         // Acquire before polling or removing pending requests: a concurrent
         // native preflight must not block the host or strand dequeued work.
@@ -246,6 +257,28 @@ impl ManagedModule for CaptureModule {
 }
 
 impl CaptureModule {
+    /// Publish what opens and source monitoring reported. A native preflight
+    /// holding the controller defers collection to a later tick.
+    fn publish_stream_issues(&mut self) {
+        if let Ok(mut controller) = self.controller.try_lock() {
+            controller.take_stream_issues(&mut self.stream_issues);
+        }
+        if !self.report_stream_issues {
+            self.stream_issues.drain().for_each(drop);
+            return;
+        }
+        if self.stream_issues.is_empty() {
+            return;
+        }
+        if let Err(error) = self.stream_issues.flush(&self.runtime) {
+            let _ = self.runtime.log(
+                LogLevel::Warning,
+                "capture.stream_issues",
+                &format!("stream issue report failed error={error}"),
+            );
+        }
+    }
+
     #[cfg(test)]
     fn dispatch(
         &mut self,
@@ -289,6 +322,20 @@ impl CaptureModule {
                 return Ok(());
             }
             self.cancel_unreferenced_open_locked(controller, &caller, &operation);
+        }
+        if let (
+            Err(code),
+            Operation::Open {
+                operation_id: Some(operation),
+                ..
+            },
+        ) = (&reply, &operation)
+        {
+            self.stream_issues.push(lifecycle_issues::capture_failure(
+                operation,
+                "pipewire.open",
+                code,
+            ));
         }
         let (payload, created) = match reply {
             Ok(reply) => (reply.payload, reply.created),
