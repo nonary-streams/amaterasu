@@ -195,16 +195,28 @@ impl Router {
             return Some(xml::error(503, "pairing capacity exhausted"));
         }
         let deadline = now + PAIRING_TIMEOUT;
+        let discover_hostname = crate::client_names::legacy_name(&name);
+        let name = if discover_hostname {
+            remote.to_string()
+        } else {
+            name
+        };
         let payload = json!({"action":"begin","client_id":client,"name":name,"client_certificate_pem":pem,"salt":salt});
-        if let Err(error) = self.queue(
-            Some(connection),
-            Purpose::Begin {
-                client: client.into(),
-            },
-            payload,
-            deadline,
-            now,
-        ) {
+        let naming = discover_hostname
+            && self
+                .client_names
+                .start(client, connection, remote, &payload, deadline);
+        if !naming
+            && let Err(error) = self.queue(
+                Some(connection),
+                Purpose::Begin {
+                    client: client.into(),
+                },
+                payload,
+                deadline,
+                now,
+            )
+        {
             return Some(xml::error(503, error));
         }
         self.transcripts.insert(
@@ -219,6 +231,38 @@ impl Router {
             },
         );
         None
+    }
+
+    pub(super) fn poll_client_names(&mut self, now: Instant, replies: &mut Vec<(u64, Reply)>) {
+        for resolved in self.client_names.completed() {
+            let Some(connection) = resolved.connection else {
+                continue;
+            };
+            if !self
+                .transcripts
+                .get(&resolved.client)
+                .is_some_and(|transcript| transcript.deadline == resolved.deadline)
+            {
+                continue;
+            }
+            let result = if now >= resolved.deadline {
+                Err("pairing request expired")
+            } else {
+                self.queue(
+                    Some(connection),
+                    Purpose::Begin {
+                        client: resolved.client.clone(),
+                    },
+                    resolved.payload,
+                    resolved.deadline,
+                    now,
+                )
+            };
+            if let Err(error) = result {
+                self.abort_transcript(&resolved.client, now);
+                replies.push((connection, xml::error(503, error)));
+            }
+        }
     }
 
     fn verify(

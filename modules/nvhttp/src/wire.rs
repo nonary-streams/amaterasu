@@ -106,6 +106,7 @@ pub struct Router {
     participants: Vec<participants::Binding>,
     launches: LaunchController,
     transcripts: BTreeMap<String, pairing::Transcript>,
+    client_names: crate::client_names::ClientNames,
     jobs: BTreeMap<u64, Job>,
     artwork_reservations: BTreeSet<u64>,
     cancellations: BTreeMap<u64, Instant>,
@@ -200,6 +201,7 @@ impl Router {
             participants: Vec::new(),
             launches,
             transcripts: BTreeMap::new(),
+            client_names: crate::client_names::ClientNames::new(None),
             jobs: BTreeMap::new(),
             artwork_reservations: BTreeSet::new(),
             cancellations: BTreeMap::new(),
@@ -207,6 +209,10 @@ impl Router {
             next_call: 0,
             presentation: None,
         }
+    }
+
+    pub fn set_pairing_network(&mut self, network: Option<amaterasu_module_sdk::network::Network>) {
+        self.client_names = crate::client_names::ClientNames::new(network);
     }
 
     pub fn set_participants(&mut self, bindings: Vec<participants::Binding>) {
@@ -750,6 +756,7 @@ impl Router {
         } else {
             Vec::new()
         };
+        self.poll_client_names(now, &mut replies);
         if poll_presentation && let Some(presentation) = &mut self.presentation {
             replies.extend(presentation.poll(
                 &mut self.launches,
@@ -1001,6 +1008,9 @@ impl Router {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) {
         self.launches.connection_closed(connection, now);
+        for client in self.client_names.cancel(connection) {
+            self.abort_transcript(&client, now);
+        }
         let keys: Vec<_> = self
             .jobs
             .iter()
@@ -1056,7 +1066,8 @@ impl Router {
             .presentation
             .as_mut()
             .is_none_or(presentation::PresentationRouter::quiesce);
-        streams && presentation
+        let names = self.client_names.quiesce();
+        streams && presentation && names
     }
 
     pub fn package_activation_barrier(&mut self, pending: bool) -> bool {

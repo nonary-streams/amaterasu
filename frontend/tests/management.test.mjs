@@ -93,7 +93,7 @@ function loadManagement() {
     String,
     TextEncoder,
   });
-  for (const source of ["src/types.ts", "src/ui.ts", "src/management.ts"]) {
+  for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/management.ts"]) {
     vm.runInContext(
       ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }),
       context,
@@ -261,7 +261,7 @@ test("double submit sends one approval and shows protocol progress instead of co
   await flushUi();
 
   const approvalCall = calls.find((call) => call.route === "pairing/approve_pin");
-  assert.equal(JSON.stringify(approvalCall.payload), JSON.stringify({ pairing_id: "a".repeat(32), pin: "0427" }));
+  assert.equal(JSON.stringify(approvalCall.payload), JSON.stringify({ pairing_id: "a".repeat(32), pin: "0427", name: "Living room" }));
   assert.match(content.textContent, /Pairing in progress/);
   assert.match(content.textContent, /must complete its pairing exchange/);
   assert.doesNotMatch(content.textContent, /0427|paired successfully|pairing complete/i);
@@ -605,4 +605,56 @@ test("unmount after ready preserves selected source for the next page", async ()
   await flushUi();
 
   assert.equal(calls.filter(({ route }) => route === "capture/cancel_portal_selection").length, 0);
+});
+
+
+test("pairing defaults the editable client name and submits an optional replacement", async () => {
+  const { module } = loadManagement();
+  const content = connectedContent();
+  const approvals = [];
+  module.renderHostManagement({ content, api: {
+    allows: () => true,
+    async post(route, payload) {
+      if (route === "pairing/pending") return pairingReply(request("steamdeck"));
+      if (route === "pairing/approve_pin") { approvals.push(payload); return { ok: true }; }
+      return baseReply(route);
+    },
+  }, notify() {}, navigate() {} });
+  await flushUi();
+  const form = descendants(content, "form")[0];
+  const [pin, name] = descendants(form, "input");
+  assert.equal(name.value, "steamdeck");
+  name.value = "  Living room Deck  ";
+  pin.value = "1234";
+  form.listeners.get("submit")({ preventDefault() {} });
+  await flushUi();
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].name, "Living room Deck");
+  assert.equal(approvals[0].pin, "1234");
+});
+
+test("invalid client names do not approve or clear the PIN", async () => {
+  for (const invalid of ["   ", "x".repeat(129), "é".repeat(65), "Device\nname"]) {
+    const { module } = loadManagement();
+    const content = connectedContent();
+    let approvals = 0;
+    module.renderHostManagement({ content, api: {
+      allows: () => true,
+      async post(route) {
+        if (route === "pairing/pending") return pairingReply(request("steamdeck"));
+        if (route === "pairing/approve_pin") approvals++;
+        return baseReply(route);
+      },
+    }, notify() {}, navigate() {} });
+    await flushUi();
+    const form = descendants(content, "form")[0];
+    const [pin, name] = descendants(form, "input");
+    name.value = invalid;
+    pin.value = "1234";
+    form.listeners.get("submit")({ preventDefault() {} });
+    await flushUi();
+    assert.equal(approvals, 0);
+    assert.equal(pin.value, "1234");
+    assert.match(content.textContent, /Enter a client name/);
+  }
 });

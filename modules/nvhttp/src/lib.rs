@@ -3,6 +3,7 @@
 mod api;
 
 mod audio_driver_install;
+mod client_names;
 mod discovery;
 mod discovery_ipv6;
 mod encoder_refresh;
@@ -284,6 +285,7 @@ impl ManagedModule for NvhttpModule {
                 },
                 launches,
             );
+            router.set_pairing_network(network.clone());
             router.select_session_presentation(
                 &runtime,
                 settings.session_presentation_provider.as_deref(),

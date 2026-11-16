@@ -52,6 +52,7 @@ pub enum Operation {
     ApprovePin {
         pairing_id: String,
         pin: String,
+        name: Option<String>,
     },
     GetServerCert {
         pairing_id: String,
@@ -146,10 +147,19 @@ impl Operation {
                     && client_certificate_pem.len() <= 4096
                     && hex_length(salt, 16)
             }
-            Self::ApprovePin { pairing_id, pin } => {
+            Self::ApprovePin {
+                pairing_id,
+                pin,
+                name,
+            } => {
                 identifier(pairing_id, 32)
                     && pin.len() == 4
                     && pin.bytes().all(|byte| byte.is_ascii_digit())
+                    && name.as_deref().is_none_or(|name| {
+                        !name.trim().is_empty()
+                            && name.len() <= 128
+                            && !name.chars().any(char::is_control)
+                    })
             }
             Self::GetServerCert { pairing_id } | Self::Cancel { pairing_id } => {
                 identifier(pairing_id, 32)

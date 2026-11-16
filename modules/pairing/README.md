@@ -89,7 +89,7 @@ hex-encoded PEM `clientcert` to `client_certificate_pem` when beginning:
 
 ```json
 {"action":"begin","client_id":"moonlight-uniqueid","name":"Living room","client_certificate_pem":"...","salt":"<16 bytes hex>"}
-{"action":"approve_pin","pairing_id":"<returned id>","pin":"1234"}
+{"action":"approve_pin","pairing_id":"<returned id>","pin":"1234","name":"Living room"}
 {"action":"get_server_cert","pairing_id":"<returned id>"}
 {"action":"client_challenge","pairing_id":"<returned id>","clientchallenge":"<16 bytes encrypted hex>"}
 {"action":"server_challenge_response","pairing_id":"<returned id>","serverchallengeresp":"<32 bytes encrypted hex>"}
@@ -98,7 +98,10 @@ hex-encoded PEM `clientcert` to `client_certificate_pem` when beginning:
 
 Begin returns `ok`, `pending:true`, opaque random `pairing_id`, and `expires_at`
 (Unix seconds). Only a configured administrator runtime caller can approve the
-four-digit PIN. The PIN is not returned or stored, and cannot be injected by
+four-digit PIN. Approval accepts an optional `name` (1–128 UTF-8 bytes, no
+control characters or blank names), replacing the pending name before the
+authenticated exchange persists the client. Omitting it retains the detected name.
+The PIN is not returned or stored, and cannot be injected by
 adding fields to a public phase. Pending transcripts are bound to the initiating
 runtime caller. An adapter serving multiple clients must also keep a private
 mapping between its HTTP request/client and the returned opaque pairing ID.

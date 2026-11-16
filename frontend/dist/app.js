@@ -20320,13 +20320,23 @@ var Amaterasu;
                 pin.maxLength = 4;
                 pin.pattern = "[0-9]{4}";
                 pin.required = true;
+                const name = Amaterasu.input("pairing_name", pending.name);
+                name.maxLength = 128;
+                name.required = true;
+                name.autocomplete = "off";
                 const approve = Amaterasu.el("button", "button primary", "Approve PIN");
                 approve.type = "submit";
-                const form = Amaterasu.el("form", "pairing-approval", Amaterasu.field("Four-digit PIN", pin), status, approve);
+                const form = Amaterasu.el("form", "pairing-approval", Amaterasu.field("Four-digit PIN", pin), Amaterasu.field("Client name", name, "Use the detected name or choose your own before pairing."), status, approve);
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (approve.disabled)
                         return;
+                    const submittedName = name.value.trim();
+                    if (!submittedName || new TextEncoder().encode(submittedName).length > 128 ||
+                        /[\u0000-\u001f\u007f-\u009f]/.test(submittedName)) {
+                        status.replaceChildren(Amaterasu.errorPanel(new Error("Enter a client name of 1–128 bytes without control characters.")));
+                        return;
+                    }
                     const submittedPin = pin.value;
                     pin.value = "";
                     if (!/^\d{4}$/.test(submittedPin)) {
@@ -20338,6 +20348,7 @@ var Amaterasu;
                             await context.api.post("pairing/approve_pin", {
                                 pairing_id: pending.pairing_id,
                                 pin: submittedPin,
+                                name: submittedName,
                             });
                         }
                         catch {

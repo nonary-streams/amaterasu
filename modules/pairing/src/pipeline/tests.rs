@@ -318,13 +318,22 @@ fn exchange(
     client_pin: &str,
     time: u64,
 ) -> ClientTranscript {
+    exchange_with_name(state, pipeline, id, client_pin, time, None)
+}
+fn exchange_with_name(
+    state: &mut Harness,
+    pipeline: &mut Pipeline,
+    id: &str,
+    client_pin: &str,
+    time: u64,
+    name: Option<&str>,
+) -> ClientTranscript {
+    let mut approval = json!({"action":"approve_pin","pairing_id":id,"pin":"1234"});
+    if let Some(name) = name {
+        approval["name"] = name.into();
+    }
     assert_eq!(
-        state.request(
-            pipeline,
-            "console",
-            json!({"action":"approve_pin","pairing_id":id,"pin":"1234"}),
-            time
-        )["ok"],
+        state.request(pipeline, "console", approval, time)["ok"],
         true
     );
     let cert = state.request(
@@ -366,7 +375,14 @@ fn full_moonlight_gen7_transcript_persists_certificate_before_success() {
         true
     );
     assert_eq!(state.tray_notifications, 1);
-    let client = exchange(&mut state, &mut pipeline, &id, "1234", now());
+    let client = exchange_with_name(
+        &mut state,
+        &mut pipeline,
+        &id,
+        "1234",
+        now(),
+        Some("Living room Deck"),
+    );
     assert_eq!(state.tray_notifications, 1);
     state.enqueue("nvhttp",json!({"action":"client_pairing_secret","pairing_id":id,"clientpairingsecret":client.finish()}));
     pipeline
@@ -414,6 +430,7 @@ fn full_moonlight_gen7_transcript_persists_certificate_before_success() {
         json!({"action":"list_clients"}),
         now(),
     );
+    assert_eq!(listed["clients"][0]["name"], "Living room Deck");
     let certificate_id = listed["clients"][0]["certificate_id"].clone();
     assert!(!listed.to_string().contains("PRIVATE KEY"));
     assert_eq!(
@@ -3681,4 +3698,47 @@ fn entitlements_require_admin_revision_and_survive_restart() {
         listed["clients"][0]["entitlements"],
         json!(["org.alpha/read", "net.beta/write"])
     );
+}
+
+#[test]
+fn optional_approval_name_is_validated_before_the_pending_transcript_changes() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    let id = begin(&mut state, &mut pipeline, "named-client", now());
+    for invalid in [
+        json!(""),
+        json!("  "),
+        json!("x".repeat(129)),
+        json!("é".repeat(65)),
+        json!("name\n"),
+        json!(false),
+    ] {
+        let response = state.request(
+            &mut pipeline,
+            "console",
+            json!({"action":"approve_pin","pairing_id":id,"pin":"1234","name":invalid}),
+            now(),
+        );
+        assert_eq!(response["ok"], false, "{response}");
+    }
+    let pending = state.request(&mut pipeline, "console", json!({"action":"pending"}), now());
+    assert_eq!(pending["pending"][0]["awaiting_pin"], true);
+    assert_eq!(pending["pending"][0]["name"], "Moonlight test");
+    let rejected = state.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"approve_pin","pairing_id":id,"pin":"1234","name":"Untrusted rename"}),
+        now(),
+    );
+    assert_eq!(rejected["code"], "forbidden");
+    let approved = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"approve_pin","pairing_id":id,"pin":"1234"}),
+        now(),
+    );
+    assert_eq!(approved["ok"], true);
+    let pending = state.request(&mut pipeline, "console", json!({"action":"pending"}), now());
+    assert_eq!(pending["pending"][0]["name"], "Moonlight test");
 }

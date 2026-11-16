@@ -99,7 +99,11 @@ impl Engine {
                 };
                 self.begin(caller, &document, client, now)
             }
-            Operation::ApprovePin { pairing_id, pin } => self.approve(pairing_id, &pin),
+            Operation::ApprovePin {
+                pairing_id,
+                pin,
+                name,
+            } => self.approve(pairing_id, &pin, name),
             Operation::GetServerCert { pairing_id } => {
                 self.advance(caller, pairing_id, &document, |transcript, identity| {
                     Ok(match transcript.server_certificate(identity)? {
@@ -339,9 +343,17 @@ impl Engine {
         }
         self.pending.remove(id).ok_or("pairing_not_found")
     }
-    fn approve(&mut self, id: String, pin: &str) -> Result<Change, &'static str> {
+    fn approve(
+        &mut self,
+        id: String,
+        pin: &str,
+        name: Option<String>,
+    ) -> Result<Change, &'static str> {
         let mut pending = self.pending.remove(&id).ok_or("pairing_not_found")?;
         pending.approve(pin)?;
+        if let Some(name) = name {
+            pending.client.name = name;
+        }
         self.pending.insert(id, pending);
         Ok(Change::Read(json!({"ok":true})))
     }

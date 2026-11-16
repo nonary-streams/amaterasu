@@ -3899,7 +3899,14 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "identity" | "pending" | "list_clients" => fields(object, &[], &[]),
         "approve_pin" => {
-            fields(object, &["pairing_id", "pin"], &[])?;
+            fields(object, &["pairing_id", "pin"], &["name"])?;
+            if let Some(name) = object.get("name") {
+                let name = name.as_str().ok_or(INVALID)?;
+                if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control)
+                {
+                    return Err(INVALID);
+                }
+            }
             let id = text(object, "pairing_id")?;
             let pin = text(object, "pin")?;
             if id.is_empty()
@@ -5367,5 +5374,43 @@ mod updater_and_tray_tests {
             .unwrap()
             .remove("expected_revision");
         assert!(payload(route, missing_revision.to_string().as_bytes()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pairing_approval_name_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn approval_accepts_a_bounded_optional_name_and_rejects_invalid_names() {
+        let route = Route {
+            service: "amaterasu.pairing/1",
+            action: "approve_pin",
+            scope: Some("pairing.admin"),
+            requires_empty_body: false,
+        };
+        for name in [
+            None,
+            Some(json!("Living room Deck")),
+            Some(json!("é".repeat(64))),
+        ] {
+            let mut body = json!({"pairing_id":"a".repeat(32),"pin":"1234"});
+            if let Some(name) = name {
+                body["name"] = name;
+            }
+            assert!(validate(route, body.as_object().unwrap()).is_ok());
+        }
+        for name in [
+            json!(null),
+            json!(true),
+            json!(""),
+            json!("  "),
+            json!("x".repeat(129)),
+            json!("é".repeat(65)),
+            json!("name\n"),
+        ] {
+            let body = json!({"pairing_id":"a".repeat(32),"pin":"1234","name":name});
+            assert!(validate(route, body.as_object().unwrap()).is_err());
+        }
     }
 }

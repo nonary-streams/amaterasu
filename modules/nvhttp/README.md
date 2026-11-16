@@ -909,3 +909,13 @@ its caller authorization and idempotency. Grant NVHTTP access to that service
 and order its component before NVHTTP. Use the same capture selection for
 stream-session and management when replacing the default provider. Product
 settings and client requests cannot change this startup selection.
+
+
+For pairing requests using Moonlight's legacy `roth` placeholder (or a missing
+name), the transport resolves the requesting peer's hostname through the selected
+Network SDK provider. Lookup runs on one of at most eight workers with a 750 ms
+budget and retains worker/provider ownership through retirement. If no hostname
+is available, the peer address is the default; the placeholder is never saved.
+Meaningful device names supplied by clients are preserved. The management pairing
+form lets the administrator edit that default before PIN approval. Names remain
+display metadata and do not authenticate the requesting peer.

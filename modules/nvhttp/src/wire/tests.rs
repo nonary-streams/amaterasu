@@ -2192,3 +2192,73 @@ fn approved_handler_obeys_exact_wrapped_broker_size_limit() {
         Response::Pending
     ));
 }
+
+#[test]
+fn pairing_legacy_placeholder_falls_back_to_the_requesting_address() {
+    let mut router = router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    let target = begin_target().replace("devicename=Living+room", "devicename=roth");
+    assert!(dispatch(&mut router, &mut broker, 1, &target, now).is_none());
+    poll(&mut router, &mut broker, now);
+    let begin = broker
+        .accepted
+        .iter()
+        .find(|payload| payload["action"] == "begin")
+        .unwrap();
+    assert_eq!(begin["name"], "127.0.0.1");
+}
+
+#[test]
+fn pairing_uses_the_requesting_hostname_without_blocking_the_router() {
+    let mut router = router();
+    router.set_pairing_network(Some(amaterasu_module_sdk::network::Network::test_provider()));
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    let target = begin_target().replace("devicename=Living+room", "devicename=roth");
+    assert!(dispatch(&mut router, &mut broker, 1, &target, now).is_none());
+    assert!(broker.accepted.is_empty());
+    let deadline = now + Duration::from_secs(3);
+    loop {
+        poll(&mut router, &mut broker, Instant::now());
+        if let Some(begin) = broker
+            .accepted
+            .iter()
+            .find(|payload| payload["action"] == "begin")
+        {
+            assert_ne!(begin["name"], "roth");
+            assert_ne!(begin["name"], "127.0.0.1");
+            assert!(!begin["name"].as_str().unwrap().is_empty());
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn closing_pairing_connection_during_hostname_lookup_never_submits_a_begin() {
+    let mut router = router();
+    router.set_pairing_network(Some(amaterasu_module_sdk::network::Network::test_provider()));
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    let target = begin_target().replace("devicename=Living+room", "devicename=roth");
+    assert!(dispatch(&mut router, &mut broker, 1, &target, now).is_none());
+    router.cancel_with(1, now, &mut |command| broker.send(command));
+    assert!(router.transcripts.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        poll(&mut router, &mut broker, Instant::now());
+        if router.quiesce() {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !broker
+            .accepted
+            .iter()
+            .any(|payload| payload["action"] == "begin")
+    );
+}

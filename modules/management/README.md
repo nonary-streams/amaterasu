@@ -286,12 +286,15 @@ Pairing routes require **`pairing.admin`** even for public identity and metadata
 | `/v1/pairing/identity` | `{}` |
 | `/v1/pairing/pending` | `{}` |
 | `/v1/pairing/list_clients` | `{}` |
-| `/v1/pairing/approve_pin` | `{"pairing_id":"<pending id>","pin":"0123"}` |
+| `/v1/pairing/approve_pin` | `{"pairing_id":"<pending id>","pin":"0123","name":"Living room Deck"}` |
 | `/v1/pairing/unpair` | `{"certificate_id":"<64 hex fingerprint>","expected_revision":7}` (revision optional for legacy clients) |
 | `/v1/pairing/update_client_permissions` | `{"certificate_id":"<64 hex fingerprint>","expected_revision":7,"permissions":{"list_apps":true,"view_streams":true,"launch_apps":false,"terminate_streams":false}}` |
 | `/v1/pairing/set_permission_mode` | `{"enabled":true,"expected_revision":7}` |
 
-The PIN must be a four-digit string, preserving leading zeros. Initialize/import
+The PIN must be a four-digit string, preserving leading zeros. The optional
+`name` replaces the detected client name before the pairing exchange completes;
+it must contain 1–128 UTF-8 bytes without control characters and cannot be blank.
+Omission preserves the detected name. Initialize/import
 of host identity and direct client trust imports remain trusted-console-only.
 The Gen7 begin/challenge/secret phases and certificate authentication checks stay
 with the transport module; they are not HTTP management routes. The owner-only
