@@ -357,7 +357,10 @@ fn install_into(
                 .insert(display.service.clone());
         }
         for method in amaterasu_module_sdk::display_settings::methods(&display.service) {
-            let mut callers = BTreeSet::from([owner.principal.clone()]);
+            // Parent-bound startup retains the transport initiator through
+            // source preparation and the provider's nested display calls.
+            let mut callers = selection.request_ancestors.clone();
+            callers.insert(owner.principal.clone());
             if method.method == "acquire" {
                 callers.insert(selection.processor.principal.clone());
             }
@@ -374,7 +377,12 @@ fn install_into(
             policy,
             ApiMethodApproval {
                 provider: selection.processor.principal.clone(),
-                callers: BTreeSet::from([owner.principal.clone()]),
+                callers: selection
+                    .request_ancestors
+                    .iter()
+                    .cloned()
+                    .chain([owner.principal.clone()])
+                    .collect(),
                 method: amaterasu_module_sdk::display_settings::preparation::method(
                     &control.service,
                 ),

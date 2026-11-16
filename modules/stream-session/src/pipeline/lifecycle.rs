@@ -1307,6 +1307,7 @@ impl Pipeline {
                 {
                     return Err("video_format_configuration_mismatch");
                 }
+                record.media_video_format_configured = true;
                 job.step = Step::AcquireOutput;
                 Ok(true)
             }

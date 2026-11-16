@@ -1531,3 +1531,132 @@ fn display_settings_selection_conflicts_do_not_overwrite_policy() {
     assert!(enable_rtx_hdr(&mut policy, &root.path().join("runtime")).is_err());
     assert_eq!(serde_json::to_value(&policy).unwrap(), before);
 }
+
+#[test]
+fn rtsp_warmup_retains_authority_through_source_preparation() {
+    use amaterasu_contracts::{Command, Response};
+    let root = TemporaryRoot::new("rtsp-source-authority");
+    let mut policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    enable_rtx_hdr(&mut policy, &root.path().join("runtime")).unwrap();
+    policy.settings.clear();
+    let display_service = amaterasu_module_sdk::display_settings::SERVICE;
+    let preparation_service = "nonary.rtx-hdr/1";
+    let methods: Vec<_> = policy
+        .api_methods
+        .iter()
+        .filter(|approval| {
+            approval.method.service == display_service
+                || (approval.method.service == preparation_service
+                    && approval.method.method == "prepare_source")
+        })
+        .cloned()
+        .collect();
+    for old_policy in [true, false] {
+        let mut candidate = policy.clone();
+        if old_policy {
+            for approval in &mut candidate.api_methods {
+                if methods
+                    .iter()
+                    .any(|method| method.method == approval.method)
+                {
+                    approval.callers.remove("amaterasu.rtsp");
+                }
+            }
+        }
+        let mut broker = amaterasu_runtime::Broker::new(candidate).unwrap();
+        {
+            let (provider, service) = ("amaterasu.stream-session", "amaterasu.stream-session/1");
+            let response = broker.dispatch(
+                provider,
+                Command::Register {
+                    service: service.into(),
+                },
+            );
+            assert!(matches!(response, Response::Ok), "{provider}: {response:?}");
+        }
+        for approval in &methods {
+            assert!(matches!(
+                broker.dispatch(
+                    &approval.provider,
+                    Command::RegisterApi {
+                        method: approval.method.clone()
+                    }
+                ),
+                Response::Ok
+            ));
+        }
+        let accepted = |response| match response {
+            Response::Accepted { id } => id,
+            other => panic!("request rejected: {other:?}"),
+        };
+        let parent = accepted(broker.dispatch(
+            "amaterasu.rtsp",
+            Command::Request {
+                service: "amaterasu.stream-session/1".into(),
+                payload: json!({"action":"warm_source"}),
+                timeout_ms: 5000,
+                operation_id: "warmup".into(),
+                parent: None,
+            },
+        ));
+        assert!(matches!(
+            broker.dispatch("amaterasu.stream-session", Command::Poll {}),
+            Response::Request { .. }
+        ));
+        let call =
+            |service: &str, method: &str, payload, operation: &str, parent| Command::CallApi {
+                service: service.into(),
+                method: method.into(),
+                interface_major: 1,
+                interface_minor: 0,
+                payload,
+                timeout_ms: 5000,
+                operation_id: operation.into(),
+                parent: Some(parent),
+            };
+        let open = broker.dispatch("amaterasu.stream-session", call(display_service, "open_scope",
+            json!({"operation_id":"source-test","source":"output","consumers":["amaterasu.rtx-hdr"]}), "open", parent));
+        if old_policy {
+            assert!(matches!(open, Response::Error { code, .. } if code == "permission_denied"));
+            continue;
+        }
+        accepted(open);
+        let preparation = accepted(broker.dispatch(
+            "amaterasu.stream-session",
+            call(
+                preparation_service,
+                "prepare_source",
+                json!({"context":{}}),
+                "prepare",
+                parent,
+            ),
+        ));
+        assert!(
+            matches!(broker.dispatch("amaterasu.rtx-hdr", Command::Poll {}), Response::Request { id, .. } if id == preparation)
+        );
+        accepted(broker.dispatch(
+            "amaterasu.rtx-hdr",
+            call(
+                display_service,
+                "acquire",
+                json!({"operation_id":"adjust","scope":{},"adjustment":{}}),
+                "acquire",
+                preparation,
+            ),
+        ));
+        // A principal with neither composition membership nor grants remains denied.
+        assert!(matches!(
+            broker.dispatch(
+                "unselected.plugin",
+                call(
+                    display_service,
+                    "open_scope",
+                    json!({"operation_id":"bad","source":"output","consumers":[]}),
+                    "bad",
+                    parent
+                )
+            ),
+            Response::Error { .. }
+        ));
+    }
+}

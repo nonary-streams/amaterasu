@@ -69,6 +69,16 @@ pub(super) fn local_address(payload: &Value, name: &str) -> Result<String, &'sta
 pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStatus, &'static str> {
     let config = &record.config;
     let expected_discovery = config.discovery.is_some();
+    let mut expected_video = config.video.effective();
+    if record.media_video_format_configured {
+        let start = record.start.as_ref().ok_or("invalid_transport_response")?;
+        expected_video.codec = match start.configuration.video_stream_format.codec {
+            amaterasu_module_sdk::VideoCodec::H264 => amaterasu_media::VideoCodec::H264,
+            amaterasu_module_sdk::VideoCodec::Hevc => amaterasu_media::VideoCodec::Hevc,
+            amaterasu_module_sdk::VideoCodec::Av1 => amaterasu_media::VideoCodec::Av1,
+        };
+        expected_video.codecs.clear();
+    }
     let peer_discovery = response_bool(
         payload,
         "peer_discovery",
@@ -85,7 +95,7 @@ pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStat
     if payload["peer_ip"] != json!(config.peer_ip)
         || payload["stream_audio"] != config.stream_audio
         || peer_discovery != expected_discovery
-        || payload["video"] != json!(config.video.effective())
+        || payload["video"] != json!(expected_video)
         || batch_size_fallback != config.video.batch_size_fallback()
         || payload["audio"]["packet_ms"] != config.audio.packet_ms
         || payload["audio"]["channels"] != config.audio.channels

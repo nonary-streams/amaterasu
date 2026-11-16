@@ -1224,6 +1224,12 @@ impl Broker {
         if service == "amaterasu.media-transport/1" && action == "configure_video_format" {
             let allocation = self.allocations.get_mut(&key).unwrap();
             allocation.request["video_stream_format"] = call.payload["video_stream_format"].clone();
+            allocation.request["video"]["codec"] =
+                call.payload["video_stream_format"]["codec"].clone();
+            allocation.request["video"]
+                .as_object_mut()
+                .unwrap()
+                .remove("codecs");
             return json!({"ok":true,"stream":if self.wrong_media_video_format_response {id + 1} else {id},
                 "video_stream_format":call.payload["video_stream_format"]});
         }

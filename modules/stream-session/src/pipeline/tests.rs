@@ -2060,3 +2060,34 @@ fn encoder_provider_reaches_capture_video_and_failed_open_cleans_up() {
             .contains_key(&Resource::Video)
     );
 }
+
+#[test]
+fn configured_media_status_requires_the_selected_codec_and_preserves_wire_checks() {
+    let mut host = Harness::new();
+    let mut offer = prepare();
+    offer["video"] = json!({"codecs":["h264","hevc"],"packet_size":1024,"fec_percentage":20,"min_parity_shards":2,"max_fec_blocks":1});
+    let id = host.response(1, offer)["session"].as_u64().unwrap();
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    let mut start_request = start(id);
+    start_request["configuration"]["configuration"]["codec"] = json!("hevc");
+    start_request["configuration"]["configuration"]["video_stream_format"] =
+        json!({"codec":"hevc","bit_depth":8,"dynamic_range":"sdr"});
+    record.start = Some(serde_json::from_value(start_request["configuration"].clone()).unwrap());
+    let mut video = record.config.video.effective();
+    video.codec = amaterasu_media::VideoCodec::Hevc;
+    video.codecs.clear();
+    let mut status = json!({"peer_ip":record.config.peer_ip,"stream_audio":record.config.stream_audio,
+        "video":video,"video_batch_size_fallback":false,"video_port":record.config.video_port,
+        "audio_port":record.config.audio_port,"audio":{"packet_ms":record.config.audio.packet_ms,
+        "channels":record.config.audio.channels,"wire_payload_bytes":record.wire_audio_bytes},
+        "video_encrypted":record.config.encrypt_video,"audio_encrypted":record.config.stream_audio && record.config.encrypt_audio,
+        "permit_legacy_audio_iv_wrap":record.config.stream_audio && record.config.permit_legacy_audio_iv_wrap});
+    assert!(super::responses::media_status(record, &status).is_err());
+    record.media_video_format_configured = true;
+    assert!(super::responses::media_status(record, &status).is_ok());
+    status["video"]["codec"] = json!("av1");
+    assert!(super::responses::media_status(record, &status).is_err());
+    status["video"] = json!(video);
+    status["video"]["packet_size"] = json!(1200);
+    assert!(super::responses::media_status(record, &status).is_err());
+}
