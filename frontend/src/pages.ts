@@ -921,6 +921,8 @@ namespace Amaterasu {
   }
 
   export function renderDiagnostics(context: PageContext): void {
+    const alertsArea = el("div");
+    const alertObserver = renderDiagnosticAlerts(context, alertsArea);
     const area = el("div");
     const performanceArea = el("div");
     const hostLogArea = el("div");
@@ -1030,6 +1032,7 @@ namespace Amaterasu {
           return load();
         }),
       ),
+      alertsArea,
       performanceArea,
       hostLogArea,
       area,
@@ -1141,7 +1144,7 @@ namespace Amaterasu {
       }
     }
     if (context.api.allows("diagnostics.read")) refreshPerformance = renderPerformance(context, performanceArea);
-    if (context.api.allows("host-logs.read")) refreshHostLogs = renderHostLogs(context, hostLogArea);
+    if (context.api.allows("host-logs.read")) refreshHostLogs = renderHostLogs(context, hostLogArea, alertObserver);
     void load();
     void loadRecentSessions();
   }

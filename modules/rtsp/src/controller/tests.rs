@@ -1083,6 +1083,7 @@ pub(super) fn record(state: State) -> Record {
         negotiated_slices_per_frame: None,
         negotiated_video_stream_format: None,
         client_feature_flags: None,
+        adjustments: Vec::new(),
         negotiated_color: None,
         negotiated_video: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
@@ -1793,6 +1794,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         negotiated_slices_per_frame: None,
         negotiated_video_stream_format: None,
         client_feature_flags: None,
+        adjustments: Vec::new(),
         negotiated_color: None,
         negotiated_video: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
@@ -2823,6 +2825,7 @@ fn ten_bit_depth_and_launch_dynamic_range_are_independent() {
         announce.video.format = amaterasu_module_sdk::VideoStreamFormat {
             codec: amaterasu_module_sdk::VideoCodec::Hevc,
             bit_depth: 10,
+            chroma_sampling: Default::default(),
             dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
         };
         assert!(record.accept_announce(&announce));
@@ -2842,6 +2845,7 @@ fn unsupported_negotiated_codec_cannot_arm_h264_start_configuration() {
     announce.video.format = amaterasu_module_sdk::VideoStreamFormat {
         codec: amaterasu_module_sdk::VideoCodec::Hevc,
         bit_depth: 8,
+        chroma_sampling: Default::default(),
         dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
     };
 
@@ -4295,5 +4299,76 @@ fn accepted_fractional_announce_reaches_the_video_configuration_without_rounding
     assert_eq!(
         payload["configuration"]["configuration"]["fps_milli"],
         59_940
+    );
+}
+
+#[test]
+fn unknown_optional_client_features_warn_without_reaching_stream_configuration() {
+    let (mut record, mut announce) = announced_profile_record();
+    assert_eq!(record.response()["warnings"], json!([]));
+    announce.client_feature_flags = u32::MAX;
+    assert!(record.accept_announce(&announce));
+    let payload = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(payload["configuration"]["client_feature_flags"], 15);
+    let warnings = record.response()["warnings"].clone();
+    let optional = warnings
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|warning| warning["code"] == "unsupported_optional_client_features")
+        .unwrap();
+    assert_eq!(optional["ignored_feature_flags"], !15_u32);
+    announce.client_feature_flags = 3;
+    assert!(record.accept_announce(&announce));
+    assert!(
+        !record.response()["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "unsupported_optional_client_features")
+    );
+}
+
+#[test]
+fn bandwidth_budget_and_fallback_details_reach_the_same_stream() {
+    let (mut record, mut announce) = announced_profile_record();
+    announce.video.configured_bitrate_kbps = Some(10_000);
+    announce
+        .adjustments
+        .push(amaterasu_gamestream::sdp::StreamAdjustment::new(
+            "audio_quality_default",
+            1,
+            0,
+        ));
+    assert!(record.accept_announce(&announce));
+    let payload = record.authenticated_start_payload(23).unwrap();
+    let bitrate = payload["configuration"]["configuration"]["bitrate"]
+        .as_u64()
+        .unwrap();
+    assert!(bitrate < 10_000_000);
+    let adjustments = payload["configuration"]["stream_adjustments"]
+        .as_array()
+        .unwrap();
+    assert!(
+        adjustments
+            .iter()
+            .any(|value| value["code"] == "audio_quality_default")
+    );
+    assert!(
+        adjustments
+            .iter()
+            .any(|value| value["code"] == "bandwidth_adjusted")
+    );
+}
+
+#[test]
+fn yuv444_announce_reaches_the_unchanged_stream_start_contract() {
+    let (mut record, mut announce) = announced_profile_record();
+    announce.video.format.chroma_sampling = amaterasu_module_sdk::ChromaSampling::Yuv444;
+    assert!(record.accept_announce(&announce));
+    let payload = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(
+        payload["configuration"]["configuration"]["video_stream_format"]["chroma_sampling"],
+        "yuv444"
     );
 }

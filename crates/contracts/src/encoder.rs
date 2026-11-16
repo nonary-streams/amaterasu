@@ -19,12 +19,29 @@ pub enum DynamicRange {
     Hdr,
 }
 
+/// Chroma sampling is part of the immutable encoded wire format.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromaSampling {
+    #[default]
+    Yuv420,
+    Yuv444,
+}
+
+impl ChromaSampling {
+    pub const fn is_default(&self) -> bool {
+        matches!(self, Self::Yuv420)
+    }
+}
+
 /// Immutable codec facts selected from the client's negotiation and host policy.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VideoStreamFormat {
     pub codec: VideoCodec,
     pub bit_depth: u8,
+    #[serde(default, skip_serializing_if = "ChromaSampling::is_default")]
+    pub chroma_sampling: ChromaSampling,
     pub dynamic_range: DynamicRange,
 }
 
@@ -32,6 +49,7 @@ impl VideoStreamFormat {
     pub const H264_SDR: Self = Self {
         codec: VideoCodec::H264,
         bit_depth: 8,
+        chroma_sampling: ChromaSampling::Yuv420,
         dynamic_range: DynamicRange::Sdr,
     };
 
@@ -466,11 +484,13 @@ mod tests {
             VideoStreamFormat {
                 codec: VideoCodec::Hevc,
                 bit_depth: 8,
+                chroma_sampling: Default::default(),
                 dynamic_range: DynamicRange::Sdr,
             },
             VideoStreamFormat {
                 codec: VideoCodec::Av1,
                 bit_depth: 10,
+                chroma_sampling: Default::default(),
                 dynamic_range: DynamicRange::Hdr,
             },
         ] {
@@ -480,20 +500,48 @@ mod tests {
             VideoStreamFormat {
                 codec: VideoCodec::H264,
                 bit_depth: 10,
+                chroma_sampling: Default::default(),
                 dynamic_range: DynamicRange::Hdr,
             },
             VideoStreamFormat {
                 codec: VideoCodec::Hevc,
                 bit_depth: 8,
+                chroma_sampling: Default::default(),
                 dynamic_range: DynamicRange::Hdr,
             },
             VideoStreamFormat {
                 codec: VideoCodec::Av1,
                 bit_depth: 12,
+                chroma_sampling: Default::default(),
                 dynamic_range: DynamicRange::Sdr,
             },
         ] {
             assert_eq!(format.validate(), Err("unsupported_video_format"));
         }
+    }
+}
+
+#[cfg(test)]
+mod chroma_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_format_defaults_to_420_and_444_round_trips_explicitly() {
+        let legacy = r#"{"codec":"h264","bit_depth":8,"dynamic_range":"sdr"}"#;
+        let mut format: VideoStreamFormat = serde_json::from_str(legacy).unwrap();
+        assert_eq!(format, VideoStreamFormat::H264_SDR);
+        assert!(
+            serde_json::to_value(format)
+                .unwrap()
+                .get("chroma_sampling")
+                .is_none()
+        );
+        format.chroma_sampling = ChromaSampling::Yuv444;
+        let value = serde_json::to_value(format).unwrap();
+        assert_eq!(value["chroma_sampling"], "yuv444");
+        assert_eq!(
+            serde_json::from_value::<VideoStreamFormat>(value).unwrap(),
+            format
+        );
     }
 }

@@ -1178,3 +1178,41 @@ fn approved_native_api_snapshot_keeps_the_callers_real_identity() {
         "permission_denied"
     );
 }
+
+#[test]
+fn compatibility_adjustments_do_not_require_history_and_are_recorded_when_available() {
+    for history_available in [false, true] {
+        let mut host = Harness::new();
+        host.broker.history_available = history_available;
+        let session = host.response(1, prepare())["session"].as_u64().unwrap();
+        let adjustment =
+            amaterasu_gamestream::sdp::StreamAdjustment::new("audio_quality_default", 1, 0);
+        // Runtime fallback evidence belongs to the provider result, separately
+        // from the immutable requested start configuration.
+        host.pipeline
+            .records
+            .get_mut(&session)
+            .unwrap()
+            .runtime_adjustments
+            .push(adjustment);
+        assert_eq!(host.response(2, start(session))["state"], "active");
+        host.idle();
+        if history_available {
+            let event = host
+                .broker
+                .history_events
+                .iter()
+                .find(|event| event["event_type"] == "stream_adjustments")
+                .expect("fallback event");
+            assert_eq!(
+                event["session_id"],
+                format!("stream-session-{session:016x}")
+            );
+            assert_eq!(
+                event["payload"]["adjustments"][0]["code"],
+                "audio_quality_default"
+            );
+        }
+        assert_eq!(host.pipeline.records[&session].state, State::Active);
+    }
+}

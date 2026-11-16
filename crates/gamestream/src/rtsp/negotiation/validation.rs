@@ -21,10 +21,10 @@ pub(super) fn launch(launch: &TrustedLaunch, capabilities: &Capabilities) -> Res
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
         || [launch.audio_port, launch.video_port, launch.control_port].contains(&0)
-        || !(16..=3840).contains(&capabilities.max_width)
-        || !(16..=2160).contains(&capabilities.max_height)
-        || !(1..=120).contains(&capabilities.max_fps)
-        || !(100..=100000).contains(&capabilities.max_bitrate_kbps)
+        || !(16..=8192).contains(&capabilities.max_width)
+        || !(16..=8192).contains(&capabilities.max_height)
+        || !(1..=1000).contains(&capabilities.max_fps)
+        || !(100..=1_000_000).contains(&capabilities.max_bitrate_kbps)
         || capabilities.supported_colors.is_empty()
     {
         return Err(Error::InvalidLaunch);

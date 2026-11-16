@@ -54,7 +54,7 @@ fn hevc_sdr_announce_is_parsed_but_requires_end_to_end_capability() {
             .codec,
         VideoCodec::H264
     );
-    assert!(parse_announce(changed("x-nv-vqos[0].bitStreamFormat", "1").as_bytes()).is_err());
+    assert!(parse_announce(changed("x-nv-vqos[0].bitStreamFormat", "1").as_bytes()).is_ok());
 }
 
 #[test]
@@ -123,14 +123,20 @@ fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
 }
 
 #[test]
-fn client_pcm_capabilities_are_retained_while_unknown_bits_stay_rejected() {
+fn client_capabilities_retain_unknown_bits_without_rejecting_streams() {
     let enabled = parse_announce(changed("x-ml-general.featureFlags", "7").as_bytes()).unwrap();
     assert_eq!(enabled.client_feature_flags, 7);
     let legacy = parse_announce(changed("x-ml-general.featureFlags", "3").as_bytes()).unwrap();
     assert_eq!(legacy.client_feature_flags, 3);
     let speaker = parse_announce(changed("x-ml-general.featureFlags", "15").as_bytes()).unwrap();
     assert_eq!(speaker.client_feature_flags, 15);
-    assert!(parse_announce(changed("x-ml-general.featureFlags", "16").as_bytes()).is_err());
+    for flags in [16_u32, 31, u32::MAX] {
+        let parsed =
+            parse_announce(changed("x-ml-general.featureFlags", &flags.to_string()).as_bytes())
+                .unwrap();
+        assert_eq!(parsed.client_feature_flags, flags);
+    }
+    assert!(parse_announce(changed("x-ml-general.featureFlags", "4294967296").as_bytes()).is_err());
 }
 
 #[test]
@@ -163,6 +169,7 @@ fn selected_codec_and_dynamic_range_produce_the_shared_video_format() {
             VideoStreamFormat {
                 codec,
                 bit_depth,
+                chroma_sampling: Default::default(),
                 dynamic_range,
             },
             "bitStreamFormat={bitstream_format}, dynamicRangeMode={range_mode}"
@@ -223,7 +230,7 @@ fn surround_audio_requires_exact_channel_mask_and_enable_pair() {
         for (name, value) in [
             ("x-nv-audio.surround.channelMask", "3"),
             ("x-nv-audio.surround.enable", "0"),
-            ("x-nv-audio.surround.AudioQuality", "1"),
+            ("x-nv-audio.surround.AudioQuality", "2"),
             ("x-nv-aqos.packetDuration", "20"),
         ] {
             let changed = announce.replace(
@@ -273,30 +280,28 @@ fn unsupported_media_modes_and_invalid_numeric_boundaries_fail() {
         ("x-nv-vqos[0].bitStreamFormat", "3"),
         ("x-nv-vqos[0].bitStreamFormat", "4"),
         ("x-nv-video[0].dynamicRangeMode", "2"),
-        ("x-ss-video[0].chromaSamplingType", "1"),
+        ("x-ss-video[0].chromaSamplingType", "2"),
         ("x-nv-video[0].clientViewportWd", "1919"),
-        ("x-nv-video[0].clientViewportHt", "2162"),
+        ("x-nv-video[0].clientViewportHt", "8194"),
         ("x-nv-video[0].maxFPS", "0"),
-        ("x-nv-video[0].maxFPS", "121"),
+        ("x-nv-video[0].maxFPS", "1001000"),
         ("x-nv-video[0].maxFPS", "60.0"),
         ("x-nv-video[0].maxFPS", "4294967296"),
         ("x-nv-video[0].maxFPS", "+60"),
-        ("x-nv-video[0].clientRefreshRateX100", "12000"),
         ("x-nv-video[0].packetSize", "1391"),
         ("x-nv-video[0].packetSize", "65535"),
         ("x-nv-video[0].videoEncoderSlicesPerFrame", "0"),
         ("x-nv-video[0].videoEncoderSlicesPerFrame", "2147483648"),
-        ("x-nv-video[0].maxNumReferenceFrames", "2"),
+        ("x-nv-video[0].maxNumReferenceFrames", "17"),
         ("x-nv-video[0].encoderCscMode", "4"),
         ("x-nv-audio.surround.numChannels", "4"),
         ("x-nv-audio.surround.channelMask", "63"),
-        ("x-nv-audio.surround.AudioQuality", "1"),
+        ("x-nv-audio.surround.AudioQuality", "2"),
         ("x-nv-aqos.packetDuration", "20"),
         ("x-nv-vqos[0].fec.enable", "0"),
         ("x-nv-vqos[0].fec.minRequiredFecPackets", "3"),
         ("x-nv-vqos[0].bllFec.enable", "1"),
         ("x-nv-vqos[0].drc.enable", "1"),
-        ("x-nv-vqos[0].bw.maximumBitrateKbps", "15000"),
     ] {
         assert!(
             parse_announce(changed(name, value).as_bytes()).is_err(),
@@ -331,7 +336,6 @@ fn duplicate_missing_and_critical_extensions_fail_but_bounded_extensions_survive
         Err(Error::Missing("x-nv-video[0].maxFPS"))
     );
     for suffix in [
-        "a=x-ss-video[0].intraRefresh:1\r\n",
         "a=x-nv-video[1].clientViewportWd:1920\r\n",
         "a=x-nv-video[0].newCodec:1\r\n",
     ] {
@@ -401,13 +405,78 @@ fn configured_bandwidth_can_exceed_the_capped_encoder_bitrate() {
     assert_eq!(parsed.video.configured_bitrate_kbps, Some(150000));
     assert_eq!(parsed.video.bitrate_kbps, 100000);
     // Metadata does not increase the permitted encoder bitrate.
-    let over_limit = announcement.replace(":100000 ", ":100001 ");
+    let over_limit = announcement.replace(":100000 ", ":1000001 ");
     assert!(parse_announce(over_limit.as_bytes()).is_err());
     assert!(
-        parse_announce(changed("x-ml-video.configuredBitrateKbps", "15999").as_bytes()).is_err()
+        parse_announce(changed("x-ml-video.configuredBitrateKbps", "15999").as_bytes()).is_ok()
     );
     assert!(
         parse_announce(changed("x-ml-video.configuredBitrateKbps", "4294967296").as_bytes())
             .is_err()
     );
+}
+
+#[test]
+fn compatibility_hints_do_not_reject_usable_streams() {
+    let input = changed("x-nv-video[0].maxFPS", "144")
+        .replace("clientViewportWd:1920", "clientViewportWd:5120")
+        .replace("AudioQuality:0", "AudioQuality:1")
+        .replace("initialBitrateKbps:16000", "initialBitrateKbps:12000");
+    let parsed = parse_announce(input.as_bytes()).unwrap();
+    assert_eq!(parsed.video.fps, 144);
+    assert_eq!(parsed.video.width, 5120);
+    assert_eq!(parsed.video.refresh_rate_x100, 0);
+    assert!(
+        parsed
+            .adjustments
+            .iter()
+            .any(|adjustment| adjustment.code == "refresh_hint_ignored")
+    );
+    assert!(
+        parsed
+            .adjustments
+            .iter()
+            .any(|adjustment| adjustment.code == "audio_quality_default")
+    );
+}
+
+#[test]
+fn omitted_legacy_optional_fields_use_compatible_defaults() {
+    let optional = [
+        "encoderCscMode",
+        "bitStreamFormat",
+        "dynamicRangeMode",
+        "packetDuration",
+        "useReliableUdp",
+        "featureFlags",
+    ];
+    let input = FIXTURE
+        .split_inclusive("\r\n")
+        .filter(|line| {
+            !optional
+                .iter()
+                .any(|key| line.contains(&format!(".{key}:")))
+        })
+        .collect::<String>();
+    let parsed = parse_announce(input.as_bytes()).unwrap();
+    assert_eq!(parsed.video.format.codec, VideoCodec::H264);
+    assert_eq!(parsed.audio.packet_duration_ms, 5);
+    assert_eq!(parsed.control, ControlProtocol::Enet);
+    assert!(
+        parsed
+            .adjustments
+            .iter()
+            .any(|adjustment| adjustment.code == "compatibility_defaults")
+    );
+}
+
+#[test]
+fn yuv444_is_part_of_the_negotiated_wire_format() {
+    let parsed =
+        parse_announce(changed("x-ss-video[0].chromaSamplingType", "1").as_bytes()).unwrap();
+    assert_eq!(
+        parsed.video.format.chroma_sampling,
+        amaterasu_contracts::encoder::ChromaSampling::Yuv444
+    );
+    assert_ne!(parsed.video.format, VideoStreamFormat::H264_SDR);
 }

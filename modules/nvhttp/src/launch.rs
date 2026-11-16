@@ -649,12 +649,12 @@ pub struct StreamProfile {
 
 impl StreamProfile {
     fn validate(&self) -> Result<(), &'static str> {
-        if !(16..=3840).contains(&self.max_width)
-            || !(16..=2160).contains(&self.max_height)
+        if !(16..=8192).contains(&self.max_width)
+            || !(16..=8192).contains(&self.max_height)
             || !self.max_width.is_multiple_of(2)
             || !self.max_height.is_multiple_of(2)
-            || !(1..=120).contains(&self.max_fps)
-            || !(100..=100_000).contains(&self.bitrate_kbps)
+            || !(1..=1000).contains(&self.max_fps)
+            || !(100..=1_000_000).contains(&self.bitrate_kbps)
             || self.max_reference_frames > 1
             || !matches!(self.packet_ms, 5 | 10)
             || !(6_000..=512_000).contains(&self.audio_bitrate)

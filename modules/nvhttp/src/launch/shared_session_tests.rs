@@ -787,8 +787,18 @@ fn unrelated_paired_client_can_end_all_shared_streams_and_launch_again() {
     let (connection, reply) = broker.reply(&mut controller, now);
     assert_eq!(connection, 80);
     assert_eq!(reply.status, 200);
-    assert!(controller.records.values().all(|record| record.state.terminal()));
-    assert!(broker.transports.values().all(|transport| transport["state"] == "closed"));
+    assert!(
+        controller
+            .records
+            .values()
+            .all(|record| record.state.terminal())
+    );
+    assert!(
+        broker
+            .transports
+            .values()
+            .all(|transport| transport["state"] == "closed")
+    );
     assert!(controller.launch(81, request(9), peer(9), now).is_none());
     let (connection, reply) = broker.reply(&mut controller, now);
     assert_eq!(connection, 81);
@@ -803,10 +813,23 @@ fn host_shutdown_drains_a_paused_application_before_the_host_deadline() {
     stream["state"] = json!("failed");
     stream["failure"] = json!("peer_disconnected");
     for tick in 1..=200 {
-        controller.poll(now + Duration::from_millis(tick * 50), &mut |command| broker.send(command));
+        controller.poll(now + Duration::from_millis(tick * 50), &mut |command| {
+            broker.send(command)
+        });
     }
     let paused = now + Duration::from_secs(10);
-    assert!(controller.records.values().any(|record| record.state == State::Paused), "{:?}", controller.records.values().map(|record| (record.state, record.stage)).collect::<Vec<_>>());
+    assert!(
+        controller
+            .records
+            .values()
+            .any(|record| record.state == State::Paused),
+        "{:?}",
+        controller
+            .records
+            .values()
+            .map(|record| (record.state, record.stage))
+            .collect::<Vec<_>>()
+    );
     let mut drained_at = None;
     for tick in 0..=400 {
         let at = paused + Duration::from_millis(tick * 50);
@@ -816,7 +839,11 @@ fn host_shutdown_drains_a_paused_application_before_the_host_deadline() {
             break;
         }
     }
-    let states: Vec<_> = controller.records.values().map(|record| (record.state, record.stage)).collect();
+    let states: Vec<_> = controller
+        .records
+        .values()
+        .map(|record| (record.state, record.stage))
+        .collect();
     let drained_at = drained_at.unwrap_or_else(|| panic!("shutdown never drained: {states:?}"));
     assert!(drained_at < 15_000, "drain took {drained_at} ms");
     assert!(broker.broker.application_stopped);
@@ -826,7 +853,13 @@ fn host_shutdown_drains_a_paused_application_before_the_host_deadline() {
 fn private_catalog_cannot_be_shared_by_clients_with_either_preference() {
     for (retained_private, joining_private) in [(true, false), (true, true), (false, true)] {
         let (mut controller, broker, now) = one_client_application();
-        controller.records.values_mut().next().unwrap().peer.client_properties["requested_resolution_only"] = json!(retained_private);
+        controller
+            .records
+            .values_mut()
+            .next()
+            .unwrap()
+            .peer
+            .client_properties["requested_resolution_only"] = json!(retained_private);
         let mut joining = peer(2);
         joining.client_properties["requested_resolution_only"] = json!(joining_private);
         let command_count = broker.broker.commands.len();
@@ -848,12 +881,46 @@ fn paused_private_catalog_rejects_other_owners_and_catalog_changes_before_effect
         let mut joining = peer(if case == "other_owner" { 2 } else { 1 });
         joining.client_properties["requested_resolution_only"] = json!(case != "opt_out");
         let mut stream = request(3);
-        if case == "mode_change" { stream.width = 1920; }
+        if case == "mode_change" {
+            stream.width = 1920;
+        }
         let command_count = broker.broker.commands.len();
         let reply = controller.resume(11, stream, &joining, now).unwrap();
         assert_eq!(reply.status, 409, "{case}");
-        assert_eq!(controller.records.values().next().unwrap().state, State::Paused);
+        assert_eq!(
+            controller.records.values().next().unwrap().state,
+            State::Paused
+        );
         assert_eq!(broker.broker.commands.len(), command_count);
         assert!(!broker.broker.application_stopped);
+    }
+}
+
+#[test]
+fn ending_shared_transport_does_not_consume_replacement_capacity() {
+    for state in [State::Stopping, State::CleanupFailed] {
+        let (mut controller, _broker, now) = two_client_application();
+        let departed = controller
+            .records
+            .values_mut()
+            .find(|record| record.application_session.is_some())
+            .unwrap();
+        departed.state = state;
+        let departed_id = departed.id;
+        assert!(
+            controller
+                .join_stream(12, request(3), peer(3), StreamResponse::Resume, now)
+                .is_none(),
+            "{state:?}"
+        );
+        assert!(
+            controller.pending_resume.is_some(),
+            "replacement was admitted"
+        );
+        assert_eq!(controller.records.len(), 3);
+        assert!(
+            controller.records.contains_key(&departed_id),
+            "cleanup ownership must remain retained"
+        );
     }
 }

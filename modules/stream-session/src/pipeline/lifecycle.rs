@@ -830,6 +830,12 @@ impl Pipeline {
                 Step::StartLifecycle => {
                     record.state = State::Active;
                     record.history.activated(now);
+                    if let Some(start) = &record.start {
+                        record.history.record_adjustments(&start.stream_adjustments);
+                        record
+                            .history
+                            .record_adjustments(&record.runtime_adjustments);
+                    }
                     record.host_metrics.activated(record.id);
                     record.session_effects.activated(record.id);
                     self.activate_tray_session(record.id);
@@ -1353,6 +1359,12 @@ impl Pipeline {
                 } else {
                     record.state = State::Active;
                     record.history.activated(now);
+                    if let Some(start) = &record.start {
+                        record.history.record_adjustments(&start.stream_adjustments);
+                        record
+                            .history
+                            .record_adjustments(&record.runtime_adjustments);
+                    }
                     record.host_metrics.activated(record.id);
                     record.session_effects.activated(record.id);
                     self.activate_tray_session(record.id);
@@ -1409,6 +1421,12 @@ impl Pipeline {
                 }
                 record.state = State::Active;
                 record.history.activated(now);
+                if let Some(start) = &record.start {
+                    record.history.record_adjustments(&start.stream_adjustments);
+                    record
+                        .history
+                        .record_adjustments(&record.runtime_adjustments);
+                }
                 record.host_metrics.activated(record.id);
                 record.session_effects.activated(record.id);
                 self.activate_tray_session(record.id);
@@ -1669,6 +1687,33 @@ impl Pipeline {
                     return Err("video_not_running");
                 }
                 configure_absolute_input(record, payload)?;
+                for (field, code) in [
+                    ("capture_fallback_reason", "capture_fallback"),
+                    ("vkms_fallback_reason", "capture_fallback"),
+                    ("encoder_fallback_reason", "encoder_fallback"),
+                ] {
+                    if let Some(reason) = payload[field].as_str() {
+                        let mut adjustment =
+                            amaterasu_gamestream::sdp::StreamAdjustment::new(code, 1, 0);
+                        adjustment.reason = Some(reason.to_owned());
+                        if adjustment.valid() {
+                            let (session, _) = record.history.live_identity();
+                            let message = json!({"event":"stream_adjustment", "stream":session,
+                                "code":adjustment.code,"requested":1,"effective":0,"reason":reason})
+                            .to_string();
+                            let _ = send(Command::Log {
+                                level: amaterasu_module_sdk::LogLevel::Warning as u8,
+                                target: "stream.compatibility".into(),
+                                message,
+                            });
+                            if record.runtime_adjustments.len() < 16
+                                && !record.runtime_adjustments.contains(&adjustment)
+                            {
+                                record.runtime_adjustments.push(adjustment);
+                            }
+                        }
+                    }
+                }
                 job.step = if record
                     .start
                     .as_ref()

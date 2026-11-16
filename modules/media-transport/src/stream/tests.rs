@@ -1062,6 +1062,7 @@ fn authenticated_format_freezes_codec_and_rejects_later_reconfiguration() {
     let av1 = VideoStreamFormat {
         codec: NegotiatedCodec::Av1,
         bit_depth: 8,
+        chroma_sampling: Default::default(),
         dynamic_range: DynamicRange::Sdr,
     };
     stream.configure_video_format(av1).unwrap();
@@ -1069,6 +1070,7 @@ fn authenticated_format_freezes_codec_and_rejects_later_reconfiguration() {
     assert_eq!(
         stream.configure_video_format(VideoStreamFormat {
             bit_depth: 10,
+            chroma_sampling: Default::default(),
             ..av1
         }),
         Err("video_format_conflict")
@@ -1101,6 +1103,7 @@ fn explicit_open_format_selects_hevc_and_accepts_ten_bit_formats() {
     settings.video_stream_format = Some(VideoStreamFormat {
         codec: NegotiatedCodec::Hevc,
         bit_depth: 8,
+        chroma_sampling: Default::default(),
         dynamic_range: DynamicRange::Sdr,
     });
     assert_eq!(
@@ -1110,6 +1113,7 @@ fn explicit_open_format_selects_hevc_and_accepts_ten_bit_formats() {
     settings.video_stream_format = Some(VideoStreamFormat {
         codec: NegotiatedCodec::Hevc,
         bit_depth: 10,
+        chroma_sampling: Default::default(),
         dynamic_range: DynamicRange::Hdr,
     });
     assert_eq!(

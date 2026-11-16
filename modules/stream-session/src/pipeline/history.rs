@@ -110,6 +110,15 @@ impl SessionHistory {
         );
     }
 
+    pub(super) fn record_adjustments(
+        &mut self,
+        adjustments: &[amaterasu_gamestream::sdp::StreamAdjustment],
+    ) {
+        if !adjustments.is_empty() {
+            self.queue_event("stream_adjustments", json!({"adjustments":adjustments}));
+        }
+    }
+
     pub(super) fn observe_media(
         &mut self,
         accepted_video_access_units: u64,
@@ -818,6 +827,29 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("numeric zero")
+        );
+    }
+}
+
+#[cfg(test)]
+mod adjustment_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_is_attached_to_the_exact_stream_history() {
+        let mut history = SessionHistory::new(7, Some("rtsp-0000000000000001".into()));
+        history.activated(10);
+        history.record_adjustments(&[amaterasu_gamestream::sdp::StreamAdjustment::new(
+            "audio_quality_default",
+            1,
+            0,
+        )]);
+        let event = &history.updates.back().unwrap().request.payload["event"];
+        assert_eq!(event["session_id"], "rtsp-0000000000000001");
+        assert_eq!(event["event_type"], "stream_adjustments");
+        assert_eq!(
+            event["payload"]["adjustments"][0]["code"],
+            "audio_quality_default"
         );
     }
 }

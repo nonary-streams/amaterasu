@@ -57,6 +57,7 @@ pub(super) struct Record {
     pub negotiated_slices_per_frame: Option<i32>,
     pub negotiated_video_stream_format: Option<amaterasu_module_sdk::VideoStreamFormat>,
     pub client_feature_flags: Option<u32>,
+    pub adjustments: Vec<amaterasu_gamestream::sdp::StreamAdjustment>,
     pub negotiated_color: Option<amaterasu_gamestream::sdp::ColorMode>,
     pub negotiated_video: Option<crate::model::NegotiatedVideo>,
     pub url: String,
@@ -111,7 +112,43 @@ impl Record {
         &mut self,
         announce: &amaterasu_gamestream::sdp::Announce,
     ) -> bool {
-        let negotiated_video = self.config.negotiate_announce(announce);
+        let mut negotiated_video = self.config.negotiate_announce(announce);
+        self.adjustments = if negotiated_video.is_some() {
+            announce.adjustments.clone()
+        } else {
+            Vec::new()
+        };
+        if let (Some(video), Some(budget)) = (
+            &mut negotiated_video,
+            announce
+                .video
+                .configured_bitrate_kbps
+                .filter(|value| *value > 0),
+        ) {
+            let profile = self.config.effective_profile();
+            let after_fec = if profile.fec_percentage <= 80 {
+                u64::from(budget) * u64::from(100 - profile.fec_percentage) / 100
+            } else {
+                u64::from(budget)
+            };
+            let audio = u64::from(profile.audio_bitrate)
+                .div_ceil(1000)
+                .min(after_fec / 5);
+            let adjusted = after_fec
+                .saturating_sub(audio)
+                .saturating_sub(500.min(after_fec / 10))
+                .clamp(100, u64::from(u32::MAX)) as u32;
+            let effective = video.bitrate_kbps.min(adjusted);
+            if effective != video.bitrate_kbps {
+                self.adjustments
+                    .push(amaterasu_gamestream::sdp::StreamAdjustment::new(
+                        "bandwidth_adjusted",
+                        video.bitrate_kbps,
+                        effective,
+                    ));
+                video.bitrate_kbps = effective;
+            }
+        }
         let accepted = negotiated_video.is_some();
         if !accepted {
             let expected = self.config.effective_profile();
@@ -166,7 +203,7 @@ impl Record {
             encryption,
             self.negotiated_slices_per_frame?,
             self.negotiated_video_stream_format?,
-            self.client_feature_flags?,
+            self.client_feature_flags? & amaterasu_gamestream::sdp::KNOWN_CLIENT_FEATURE_FLAGS,
         );
         payload["configuration"]["configuration"]["width"] = serde_json::json!(video.width);
         payload["configuration"]["configuration"]["height"] = serde_json::json!(video.height);
@@ -186,6 +223,9 @@ impl Record {
             amaterasu_gamestream::sdp::ColorMode::Bt709Limited => "bt709_limited",
             amaterasu_gamestream::sdp::ColorMode::Bt709Full => "bt709_full",
         });
+        if !self.adjustments.is_empty() {
+            payload["configuration"]["stream_adjustments"] = json!(self.adjustments);
+        }
         Some(payload)
     }
 
@@ -254,6 +294,17 @@ impl Record {
             "display_request":self.config.display_request,
             "display_applied":self.display_applied,
             "failure":self.failure,"cleanup_error":self.cleanup_error});
+        let mut warnings = serde_json::to_value(&self.adjustments).unwrap_or_else(|_| json!([]));
+        let ignored = self.client_feature_flags.unwrap_or(0)
+            & !amaterasu_gamestream::sdp::KNOWN_CLIENT_FEATURE_FLAGS;
+        if ignored != 0 {
+            warnings.as_array_mut().expect("warning array").push(json!({
+                "code":"unsupported_optional_client_features",
+                "message":"Some optional client features are unavailable; streaming can continue.",
+                "ignored_feature_flags":ignored
+            }));
+        }
+        response["warnings"] = warnings;
         if let Some(context) = &self.config.source_capture_context {
             response["source_capture_context"] = json!(context);
         }

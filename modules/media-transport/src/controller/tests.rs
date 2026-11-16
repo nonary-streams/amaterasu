@@ -123,6 +123,7 @@ fn authenticated_video_format_selection_rejects_mismatched_packets_before_queuei
     let hevc = amaterasu_module_sdk::VideoStreamFormat {
         codec: amaterasu_module_sdk::VideoCodec::Hevc,
         bit_depth: 8,
+        chroma_sampling: Default::default(),
         dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
     };
     let configured = stream_controller

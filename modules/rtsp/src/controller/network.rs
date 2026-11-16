@@ -105,6 +105,22 @@ impl Controller {
                     success,
                     "configuration_mismatch",
                 );
+                if completed && success {
+                    for adjustment in &record.adjustments {
+                        if self.pending_adjustment_logs.len() < 64 {
+                            self.pending_adjustment_logs.push_back(
+                                json!({
+                                    "event":"stream_adjustment", "stream":record.config.history_activity_id.as_deref().unwrap_or(&record.config.operation_id),
+                                    "code":adjustment.code,"requested":adjustment.requested,
+                                    "effective":adjustment.effective
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                    self.pending_ignored_client_features |= announce.client_feature_flags
+                        & !amaterasu_gamestream::sdp::KNOWN_CLIENT_FEATURE_FLAGS;
+                }
                 if !completed {
                     record.negotiated_encryption = None;
                     record.client_feature_flags = None;

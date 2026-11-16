@@ -1077,6 +1077,8 @@ fn is_default_qp(value: &i32) -> bool {
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartConfigData {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stream_adjustments: Vec<amaterasu_gamestream::sdp::StreamAdjustment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_capture_context: Option<amaterasu_module_sdk::capture::SourceCaptureContext>,
     #[serde(
@@ -1293,6 +1295,14 @@ impl StartConfig {
         stream_audio: bool,
         custom_audio: bool,
     ) -> Result<(), &'static str> {
+        if self.stream_adjustments.len() > 16
+            || self
+                .stream_adjustments
+                .iter()
+                .any(|adjustment| !adjustment.valid())
+        {
+            return Err("invalid_stream_adjustments");
+        }
         if self.source_id.is_some() && self.source_capture_context.is_some() {
             return Err("source_mode_cannot_select_capture_context");
         }
@@ -1520,15 +1530,15 @@ impl VideoConfiguration {
                 && self.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Sdr)
                 || (cfg!(target_os = "linux") && self.video_stream_format.bit_depth == 10))
-            && (16..=3840).contains(&self.width)
-            && (16..=2160).contains(&self.height)
+            && (16..=8192).contains(&self.width)
+            && (16..=8192).contains(&self.height)
             && self.width.is_multiple_of(2)
             && self.height.is_multiple_of(2)
-            && (1..=120).contains(&self.fps)
+            && (1..=1000).contains(&self.fps)
             && self.fps_milli.is_none_or(|rate| {
-                (1000..=120_000).contains(&rate) && rate.div_ceil(1000) == self.fps
+                (1000..=1_000_000).contains(&rate) && rate.div_ceil(1000) == self.fps
             })
-            && (100_000..=100_000_000).contains(&self.bitrate)
+            && (100_000..=1_000_000_000).contains(&self.bitrate)
             && self.slices_per_frame >= 1
             && self.nvenc_settings.validate().is_ok()
             && self.max_reference_frames <= 16
@@ -2331,13 +2341,13 @@ mod tests {
     fn start_validation_rejects_unsupported_geometry_and_labels() {
         for (field, value) in [
             ("width", 17),
-            ("width", 3842),
+            ("width", 8194),
             ("height", 15),
-            ("height", 2162),
+            ("height", 8194),
             ("fps", 0),
-            ("fps", 121),
+            ("fps", 1001),
             ("bitrate", 99999),
-            ("bitrate", 100000001),
+            ("bitrate", 1000000001),
             ("max_reference_frames", 17),
         ] {
             let mut config = start_json();

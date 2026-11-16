@@ -18039,6 +18039,134 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function streamCompatibilityAlerts(contents) {
+        const alerts = new Map();
+        const pattern = /^\[([^\]\r\n]{1,64})\]: Warning: amaterasu\.rtsp::rtsp\.negotiation: Optional client features (0x[0-9a-f]{8}) are unsupported and ignored; streaming can continue\.$/;
+        for (const line of contents.split("\n")) {
+            const fallback = /^\[([^\]\r\n]{1,64})\]: Warning: (?:amaterasu\.rtsp::rtsp|amaterasu\.stream-session::stream)\.compatibility: (\{.{1,2048}\})$/.exec(line.replace(/\r$/, ""));
+            if (fallback) {
+                try {
+                    const value = JSON.parse(fallback[2]);
+                    if (value.event === "stream_adjustment" && typeof value.stream === "string" && /^(rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16})$/.test(value.stream) &&
+                        ["refresh_hint_ignored", "intra_refresh_unavailable", "audio_quality_default", "optional_client_features", "bandwidth_adjusted", "compatibility_defaults", "capture_fallback", "encoder_fallback"].includes(value.code) &&
+                        (value.reason === undefined || (typeof value.reason === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value.reason))) &&
+                        Number.isSafeInteger(value.requested) && value.requested >= 0 && value.requested <= 4294967295 &&
+                        Number.isSafeInteger(value.effective) && value.effective >= 0 && value.effective <= 4294967295) {
+                        const key = `adjustment:${value.stream}:${value.code}:${value.requested}:${value.effective}`;
+                        const existing = alerts.get(key);
+                        if (existing) {
+                            existing.occurrences++;
+                            existing.lastSeen = fallback[1];
+                        }
+                        else {
+                            if (alerts.size >= 32)
+                                alerts.delete(alerts.keys().next().value);
+                            alerts.set(key, { key, featureFlags: "", occurrences: 1, lastSeen: fallback[1], adjustment: value });
+                        }
+                    }
+                }
+                catch { }
+                continue;
+            }
+            const match = pattern.exec(line.replace(/\r$/, ""));
+            if (!match)
+                continue;
+            const flags = match[2];
+            const numeric = Number.parseInt(flags.slice(2), 16);
+            if (numeric === 0 || (numeric & 15) !== 0)
+                continue;
+            const key = `optional-client-features:${flags}`;
+            const existing = alerts.get(key);
+            if (existing) {
+                existing.occurrences++;
+                existing.lastSeen = match[1];
+            }
+            else {
+                if (alerts.size >= 32)
+                    alerts.delete(alerts.keys().next().value);
+                alerts.set(key, { key, featureFlags: flags, occurrences: 1, lastSeen: match[1] });
+            }
+        }
+        return [...alerts.values()];
+    }
+    Amaterasu.streamCompatibilityAlerts = streamCompatibilityAlerts;
+    function renderDiagnosticAlerts(context, target) {
+        const storageKey = `amaterasu.diagnostic-alert-dismissals.v1.${encodeURIComponent(context.api.hostOrigin)}`;
+        const dismissed = new Set();
+        let persistent = true;
+        let alerts = [];
+        let state = "loading";
+        try {
+            const stored = JSON.parse(window.localStorage.getItem(storageKey) ?? "[]");
+            if (Array.isArray(stored))
+                for (const key of stored.slice(-64)) {
+                    if (typeof key === "string" && /^(optional-client-features:0x[0-9a-f]{8}|adjustment:(?:rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16}):[a-z_]+:[0-9]+:[0-9]+)$/.test(key))
+                        dismissed.add(key);
+                }
+        }
+        catch {
+            persistent = false;
+        }
+        function save() {
+            while (dismissed.size > 64)
+                dismissed.delete(dismissed.values().next().value);
+            try {
+                window.localStorage.setItem(storageKey, JSON.stringify([...dismissed]));
+            }
+            catch {
+                persistent = false;
+            }
+        }
+        function render() {
+            const list = Amaterasu.el("div");
+            list.setAttribute("aria-live", "polite");
+            const visible = alerts.filter((alert) => !dismissed.has(alert.key));
+            for (const alert of visible) {
+                if (alert.adjustment) {
+                    const adjustment = alert.adjustment;
+                    const messages = {
+                        refresh_hint_ignored: "An inconsistent display refresh hint was ignored. The requested stream frame rate is used.",
+                        intra_refresh_unavailable: "Intra refresh is unavailable. Streaming continues with the default refresh behavior.",
+                        audio_quality_default: "The requested audio quality is unavailable. Streaming continues with the configured audio quality.",
+                        optional_client_features: "Unsupported optional client features were ignored.",
+                        bandwidth_adjusted: "The video bitrate was reduced to allow room for audio and network overhead.",
+                        capture_fallback: "The capture provider could not initialize. Streaming continues with a compatible capture path.",
+                        encoder_fallback: "The encoder could not initialize. Streaming continues with a compatible encoder.",
+                        compatibility_defaults: "The client omitted optional settings. Compatible defaults were used.",
+                    };
+                    list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", "Stream continued with adjusted settings"), Amaterasu.el("p", "", messages[adjustment.code]), Amaterasu.el("p", "muted", `Stream: ${adjustment.stream}. Requested: ${adjustment.requested}; used: ${adjustment.effective}.${adjustment.reason ? ` Reason: ${adjustment.reason}.` : ""} Last seen: ${alert.lastSeen}.`), Amaterasu.button("Dismiss", () => { dismissed.add(alert.key); save(); render(); })));
+                    continue;
+                }
+                const dismiss = Amaterasu.button("Dismiss", () => { dismissed.add(alert.key); save(); render(); });
+                dismiss.setAttribute("aria-label", `Dismiss optional client feature alert ${alert.featureFlags}`);
+                list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", "Some optional client features are unavailable"), Amaterasu.el("p", "", "Streaming can continue. Amaterasu ignored optional features advertised by your client that this host does not recognize."), Amaterasu.el("p", "", "If you need these features, check for host and client updates. Otherwise, no action is needed."), Amaterasu.el("p", "muted", `Feature flags: ${alert.featureFlags}. Seen ${alert.occurrences} time(s) in the retained host log. Last seen: ${alert.lastSeen}.`), dismiss));
+            }
+            if (!visible.length && state === "ready")
+                list.append(Amaterasu.el("p", "muted", "No undismissed stream compatibility alerts in the retained host log."));
+            if (state === "loading")
+                list.append(Amaterasu.el("p", "muted", "Checking the retained host log for stream compatibility alerts…"));
+            if (state === "unavailable")
+                list.append(Amaterasu.el("p", "notice", context.api.allows("host-logs.read")
+                    ? "Alerts could not be refreshed. Previously loaded alerts remain visible. Use Refresh to try again."
+                    : "Host-log read access is required to view stream compatibility alerts."));
+            const restore = Amaterasu.button("Restore dismissed alerts", () => { dismissed.clear(); save(); render(); });
+            restore.disabled = dismissed.size === 0;
+            target.replaceChildren(Amaterasu.panel("Alerts", list, restore, Amaterasu.el("p", "muted", persistent
+                ? "Dismissals are saved for this host in this browser. Dismissing an alert does not change streaming or delete logs. Different feature flags can raise a new alert."
+                : "Browser storage is unavailable. Dismissals last only while this page is open; streaming and logs are unchanged."), Amaterasu.el("p", "muted", "Alerts cover reported stream adjustments and optional-feature warnings in the retained host log. They refresh with the host log; paused log refresh also pauses new alerts.")));
+        }
+        if (!context.api.allows("host-logs.read"))
+            state = "unavailable";
+        render();
+        return {
+            snapshot(contents) { alerts = streamCompatibilityAlerts(contents); state = "ready"; render(); },
+            unavailable() { state = "unavailable"; render(); },
+        };
+    }
+    Amaterasu.renderDiagnosticAlerts = renderDiagnosticAlerts;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     const HOST_LOG_MAX_BYTES = 10 * 1024 * 1024;
     const HOST_LOG_CHUNK_BYTES = 4096;
     const HOST_LOG_PREVIEW_LINES = 300;
@@ -18069,7 +18197,7 @@ var Amaterasu;
             throw new Error("The host returned an invalid log response.");
         return value;
     }
-    function renderHostLogs(context, target) {
+    function renderHostLogs(context, target, alerts) {
         let generation = 0;
         let contents = "";
         let latestContents = "";
@@ -18454,10 +18582,12 @@ var Amaterasu;
                     }
                     updateFollowing();
                 }
+                alerts?.snapshot(latestContents);
                 progress.textContent = discarded ? `${discarded} older log segments were discarded before this snapshot.` : "Snapshot loaded.";
             }
             catch (error) {
                 if (valid()) {
+                    alerts?.unavailable();
                     progress.replaceChildren(Amaterasu.errorPanel(error));
                 }
             }
@@ -19661,6 +19791,8 @@ var Amaterasu;
     }
     Amaterasu.diagnosticSessionOutcome = diagnosticSessionOutcome;
     function renderDiagnostics(context) {
+        const alertsArea = Amaterasu.el("div");
+        const alertObserver = Amaterasu.renderDiagnosticAlerts(context, alertsArea);
         const area = Amaterasu.el("div");
         const performanceArea = Amaterasu.el("div");
         const hostLogArea = Amaterasu.el("div");
@@ -19764,7 +19896,7 @@ var Amaterasu;
             void refreshHostLogs?.();
             void loadRecentSessions();
             return load();
-        })), performanceArea, hostLogArea, area, Amaterasu.panel("Recent stream outcomes", sessionsArea, Amaterasu.el("p", "muted", "Session history is separate from caller-scoped diagnostics; no record-to-session correlation is implied. Only recognized termination codes receive a stage label.")));
+        })), alertsArea, performanceArea, hostLogArea, area, Amaterasu.panel("Recent stream outcomes", sessionsArea, Amaterasu.el("p", "muted", "Session history is separate from caller-scoped diagnostics; no record-to-session correlation is implied. Only recognized termination codes receive a stage label.")));
         async function loadRecentSessions() {
             const request = ++sessionRequest;
             if (!context.api.allows("session.read")) {
@@ -19855,7 +19987,7 @@ var Amaterasu;
         if (context.api.allows("diagnostics.read"))
             refreshPerformance = Amaterasu.renderPerformance(context, performanceArea);
         if (context.api.allows("host-logs.read"))
-            refreshHostLogs = Amaterasu.renderHostLogs(context, hostLogArea);
+            refreshHostLogs = Amaterasu.renderHostLogs(context, hostLogArea, alertObserver);
         void load();
         void loadRecentSessions();
     }

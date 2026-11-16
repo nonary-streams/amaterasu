@@ -2,6 +2,8 @@
 use amaterasu_contracts::encoder::VideoStreamFormat;
 
 mod attributes;
+mod compatibility;
+pub use compatibility::StreamAdjustment;
 mod diagnostics;
 mod negotiate;
 mod syntax;
@@ -105,6 +107,7 @@ pub struct Announce {
     pub fec: Fec,
     pub client_feature_flags: u32,
     pub ignored_attributes: usize,
+    pub adjustments: Vec<StreamAdjustment>,
 }
 
 /// A downstream implementation must explicitly acknowledge transport features.

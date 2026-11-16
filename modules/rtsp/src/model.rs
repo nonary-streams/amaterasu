@@ -518,12 +518,12 @@ impl Profile {
     }
 
     fn validate(&self) -> Result<(), &'static str> {
-        if !(16..=3840).contains(&self.width)
-            || !(16..=2160).contains(&self.height)
+        if !(16..=8192).contains(&self.width)
+            || !(16..=8192).contains(&self.height)
             || !self.width.is_multiple_of(2)
             || !self.height.is_multiple_of(2)
-            || !(1..=120).contains(&self.fps)
-            || !(100..=100000).contains(&self.bitrate_kbps)
+            || !(1..=1000).contains(&self.fps)
+            || !(100..=1_000_000).contains(&self.bitrate_kbps)
             || self.max_reference_frames > 16
             || self.video_max_batch_size_kb > 64
             || !matches!(self.packet_ms, 5 | 10)
@@ -582,12 +582,12 @@ pub struct NegotiationBounds {
 
 impl NegotiationBounds {
     fn validate(&self) -> Result<(), &'static str> {
-        if !(16..=3840).contains(&self.max_width)
-            || !(16..=2160).contains(&self.max_height)
+        if !(16..=8192).contains(&self.max_width)
+            || !(16..=8192).contains(&self.max_height)
             || !self.max_width.is_multiple_of(2)
             || !self.max_height.is_multiple_of(2)
-            || !(1..=120).contains(&self.max_fps)
-            || !(100..=100_000).contains(&self.max_bitrate_kbps)
+            || !(1..=1000).contains(&self.max_fps)
+            || !(100..=1_000_000).contains(&self.max_bitrate_kbps)
             || self.max_reference_frames > 1
         {
             return Err("invalid_negotiation_bounds");
@@ -609,12 +609,12 @@ pub(crate) struct NegotiatedVideo {
 
 impl NegotiatedVideo {
     pub fn validate(self) -> bool {
-        (16..=3840).contains(&self.width)
-            && (16..=2160).contains(&self.height)
+        (16..=8192).contains(&self.width)
+            && (16..=8192).contains(&self.height)
             && self.width.is_multiple_of(2)
             && self.height.is_multiple_of(2)
-            && (1..=120).contains(&self.fps)
-            && (100..=100_000).contains(&self.bitrate_kbps)
+            && (1..=1000).contains(&self.fps)
+            && (100..=1_000_000).contains(&self.bitrate_kbps)
             && self.bitrate_kbps.checked_mul(1_000).is_some()
             && self.max_reference_frames <= 1
     }
@@ -3247,14 +3247,14 @@ mod tests {
         for (field, profile_value) in [
             ("width", json!(15)),
             ("width", json!(17)),
-            ("width", json!(3842)),
+            ("width", json!(8194)),
             ("height", json!(15)),
             ("height", json!(17)),
-            ("height", json!(2162)),
+            ("height", json!(8194)),
             ("fps", json!(0)),
-            ("fps", json!(121)),
+            ("fps", json!(1001)),
             ("bitrate_kbps", json!(99)),
-            ("bitrate_kbps", json!(100001)),
+            ("bitrate_kbps", json!(1000001)),
             ("max_reference_frames", json!(17)),
             ("packet_ms", json!(20)),
             ("audio_bitrate", json!(5999)),
@@ -3689,7 +3689,7 @@ mod tests {
                 max_width: 2560,
                 max_height: 1440,
                 max_fps: 120,
-                max_bitrate_kbps: 100_001,
+                max_bitrate_kbps: 1_000_001,
                 max_reference_frames: 1,
             },
         ] {

@@ -36,6 +36,8 @@ struct EncoderEntry {
     identity: Option<EncoderIdentity>,
     hardware: bool,
     hdr10: bool,
+    yuv444: bool,
+    yuv444_10bit: bool,
 }
 
 /// Enumerated encoders in registry order, so a numeric encoder selection
@@ -130,6 +132,23 @@ impl EncoderSnapshot {
             .any(|e| e.codec == Some(VideoCodec::Av1) && e.hdr10)
         {
             codec_mode_support |= SCM_AV1_MAIN10;
+        }
+        for entry in &self.entries {
+            if entry.yuv444 {
+                codec_mode_support |= match entry.codec {
+                    Some(VideoCodec::H264) => 0x0004_0000,
+                    Some(VideoCodec::Hevc) => 0x0008_0000,
+                    Some(VideoCodec::Av1) => 0x0020_0000,
+                    None => 0,
+                };
+            }
+            if entry.yuv444_10bit {
+                codec_mode_support |= match entry.codec {
+                    Some(VideoCodec::Hevc) => 0x0010_0000,
+                    Some(VideoCodec::Av1) => 0x0040_0000,
+                    _ => 0,
+                };
+            }
         }
         CodecAdvertisement {
             codec_mode_support,
@@ -260,6 +279,8 @@ fn encoder_entry(encoder: &Value) -> Result<EncoderEntry, &'static str> {
             _ => None,
         },
         hardware,
+        yuv444: encoder["yuv444"].as_bool().unwrap_or(false),
+        yuv444_10bit: encoder["yuv444_10bit"].as_bool().unwrap_or(false),
         hdr10: hardware
             && encoder
                 .get("hdr10")

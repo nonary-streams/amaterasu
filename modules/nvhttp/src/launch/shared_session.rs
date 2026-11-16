@@ -236,11 +236,7 @@ impl Controller {
                     record.application_root() == application
                         && matches!(
                             record.state,
-                            State::Starting
-                                | State::AwaitingDelivery
-                                | State::Ready
-                                | State::Stopping
-                                | State::CleanupFailed
+                            State::Starting | State::AwaitingDelivery | State::Ready
                         )
                 })
                 .count()

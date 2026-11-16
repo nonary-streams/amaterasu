@@ -220,3 +220,21 @@ fn hdr_offers_require_explicit_ten_bit_capability_and_preserve_indices() {
             .is_err()
     );
 }
+
+#[test]
+fn yuv444_advertisement_requires_explicit_provider_capabilities() {
+    let mut entry = encoder("nvenc", "hevc", true);
+    assert_eq!(
+        snapshot(vec![entry.clone()])
+            .advertisement()
+            .codec_mode_support
+            & 0x0018_0000,
+        0
+    );
+    entry["yuv444"] = json!(true);
+    entry["yuv444_10bit"] = json!(true);
+    assert_eq!(
+        snapshot(vec![entry]).advertisement().codec_mode_support & 0x0018_0000,
+        0x0018_0000
+    );
+}

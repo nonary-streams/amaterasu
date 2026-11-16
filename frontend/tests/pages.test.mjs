@@ -60,7 +60,7 @@ class FakeElement {
 }
 
 const pageTestContext = createPageContext();
-for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/pages.ts"]) {
+for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/diagnostic_alerts.ts", "src/pages.ts"]) {
   vm.runInContext(
     ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
@@ -73,7 +73,7 @@ for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/pages.ts
       pageTestContext,
     );
   }
-  if (source === "src/session_history.ts" || source === "src/session_timeline.ts") vm.runInContext("Object.assign(globalThis, Amaterasu)", pageTestContext);
+  if (source === "src/diagnostic_alerts.ts" || source === "src/session_history.ts" || source === "src/session_timeline.ts") vm.runInContext("Object.assign(globalThis, Amaterasu)", pageTestContext);
 }
 
 function createPageContext() {

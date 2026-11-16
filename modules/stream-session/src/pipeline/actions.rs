@@ -343,7 +343,10 @@ impl Pipeline {
         } = input;
 
         let lifecycle_admitter = self.settings.lifecycle_admitters.contains(&owner);
-        if configuration.client_feature_flags.is_some() && !lifecycle_admitter {
+        if (configuration.client_feature_flags.is_some()
+            || !configuration.stream_adjustments.is_empty())
+            && !lifecycle_admitter
+        {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
@@ -642,7 +645,10 @@ fn validate_start_configuration(
     if configuration.lifecycle_target.is_some() && record.providers.lifecycle.is_none() {
         return Err("lifecycle_provider_not_selected");
     }
-    if configuration.client_feature_flags.is_some() && !lifecycle_admitter {
+    if (configuration.client_feature_flags.is_some()
+        || !configuration.stream_adjustments.is_empty())
+        && !lifecycle_admitter
+    {
         return Err("permission_denied");
     }
     if record.processing_plan_provider.is_some()
