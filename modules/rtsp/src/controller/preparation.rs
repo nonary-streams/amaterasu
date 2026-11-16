@@ -84,17 +84,12 @@ pub(super) fn apply_response(record: &mut Record, payload: &Value) -> Preparatio
     } else {
         candidate
             .as_ref()
-            .zip(record.negotiated_video)
-            .zip(record.negotiated_video_stream_format)
-            .is_some_and(|((binding, video), format)| {
+            .zip(record.negotiated_video_mode())
+            .is_some_and(|(binding, mode)| {
                 matches!(&target, Some(amaterasu_extension_api::LifecycleTarget::Stream { generation, .. }) if binding.generation == *generation)
                     && binding.geometry_revision > 0
                     && binding.plan_revision > 0
-                    && binding.mode.width == video.width
-                    && binding.mode.height == video.height
-                    && binding.mode.refresh_millihz == video.fps * 1000
-                    && binding.mode.hdr
-                        == (format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr)
+                    && binding.mode == mode
             })
     };
     if payload["status"] != "succeeded"

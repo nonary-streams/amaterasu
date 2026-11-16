@@ -49,7 +49,11 @@ trait Drive {
     fn timing_summary(&mut self) -> Option<Value> {
         None
     }
-    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure>;
+    fn tick(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<PlaneProgress, PlaneFailure>;
     fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str>;
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
@@ -82,8 +86,12 @@ impl Drive for Plane {
     fn discard_contributions(&mut self) {
         Plane::discard_contributions(self);
     }
-    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
-        Plane::tick(self, media_active)
+    fn tick(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<PlaneProgress, PlaneFailure> {
+        Plane::tick(self, media_active, control_budget)
     }
     fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
         Plane::send_rumble(self, command)
@@ -105,8 +113,23 @@ impl Drive for Plane {
     }
 }
 
-type Factory<'a> = dyn FnMut(Handles, &crate::providers::ProviderServices) -> Result<Box<dyn Drive>, &'static str>
+type Factory<'a> = dyn FnMut(
+        Handles,
+        &crate::providers::ProviderServices,
+        Option<&crate::plane::NegotiatedRoute>,
+    ) -> Result<Box<dyn Drive>, &'static str>
     + 'a;
+type Probe<'a> = dyn FnMut(
+        &crate::model::ExtensionRoute,
+        u64,
+        &crate::model::PrepareConfig,
+    ) -> Result<amaterasu_media::VideoFramingLimits, &'static str>
+    + 'a;
+
+struct NativeOperations<'a, 'b> {
+    factory: &'a mut Factory<'b>,
+    probe: &'a mut Probe<'b>,
+}
 
 /// Queued events need a batch request only when the direct lane is not
 /// already delivering them.
@@ -398,9 +421,15 @@ impl Pipeline {
                     runtime.send_ephemeral(command)
                 }
             },
-            &mut |handles, providers| {
-                Plane::new(runtime, handles, providers)
-                    .map(|plane| Box::new(plane) as Box<dyn Drive>)
+            &mut |handles, providers, route| {
+                match route {
+                    Some(route) => Plane::new_planned(runtime, handles, providers, route),
+                    None => Plane::new(runtime, handles, providers),
+                }
+                .map(|plane| Box::new(plane) as Box<dyn Drive>)
+            },
+            &mut |route, media, config| {
+                crate::plane::probe_extension_chain(runtime, route, media, config)
             },
             &mut |service, payload| runtime.call_direct(service, payload),
         );
@@ -442,8 +471,9 @@ impl Pipeline {
         now: u64,
         send: &mut Send<'_>,
         factory: &mut Factory<'_>,
+        probe: &mut Probe<'_>,
     ) -> ModuleResult<()> {
-        self.tick_with_direct(now, send, factory, &mut |_, _| {
+        self.tick_with_direct(now, send, factory, probe, &mut |_, _| {
             Ok(amaterasu_module_sdk::DirectReply::Unavailable {
                 code: amaterasu_module_sdk::DIRECT_UNAVAILABLE.into(),
             })
@@ -455,6 +485,7 @@ impl Pipeline {
         now: u64,
         send: &mut Send<'_>,
         factory: &mut Factory<'_>,
+        probe: &mut Probe<'_>,
         direct: &mut direct_input::DirectCall<'_>,
     ) -> ModuleResult<()> {
         if !self.journal.loaded {
@@ -526,7 +557,8 @@ impl Pipeline {
                 .records
                 .remove(&job.session)
                 .expect("owned workflow record");
-            let retain = self.advance(&mut record, &mut job, now, send, factory);
+            let mut operations = NativeOperations { factory, probe };
+            let retain = self.advance(&mut record, &mut job, now, send, &mut operations);
             self.records.insert(record.id, record);
             if retain {
                 self.job = Some(job);
@@ -918,6 +950,10 @@ impl Pipeline {
                                     && record.client_haptics_requested
                                     && now >= record.rumble_poll_at)))))
                 || (record.state == State::Armed && now >= record.next_auth_poll)
+                || (record.state == State::Starting
+                    && record.video_warmup_wait.is_some_and(|wait| {
+                        now >= record.video_readiness_next_poll_at || now >= wait.deadline
+                    }))
         };
         let next = self
             .records
@@ -930,7 +966,9 @@ impl Pipeline {
         };
         self.control_after = record.id;
         self.background_turn = false;
-        let (step, deadline) = if record.state == State::Armed {
+        let (step, deadline) = if let Some(wait) = record.video_warmup_wait {
+            (Step::WaitVideoReady, wait.deadline)
+        } else if record.state == State::Armed {
             (
                 if record.control_authenticated {
                     Step::MediaReady
@@ -1006,7 +1044,15 @@ impl Pipeline {
         {
             record.lifecycle_control_permit = false;
         }
-        self.job = Some(Job::new(id, None, step, deadline));
+        let request = if step == Step::WaitVideoReady {
+            self.records
+                .get_mut(&id)
+                .and_then(|record| record.video_warmup_wait.take())
+                .map(|wait| wait.request)
+        } else {
+            None
+        };
+        self.job = Some(Job::new(id, request, step, deadline));
         true
     }
 
@@ -1108,6 +1154,7 @@ impl Pipeline {
                 }
                 record.lifecycle_delivery_permit = false;
             }
+            let control_budget = input::control_read_budget(record, self.settings.enable_input);
             let Some(plane) = record.plane.as_mut() else {
                 continue;
             };
@@ -1148,7 +1195,7 @@ impl Pipeline {
                 }
             }
             let media_active = matches!(record.state, State::Active | State::Stopping);
-            let result = plane.tick(media_active);
+            let result = plane.tick(media_active, control_budget);
             match result {
                 Ok(progress) => {
                     record.history.observe_encode_timing(progress.encode_timing);

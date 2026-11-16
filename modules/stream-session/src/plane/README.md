@@ -6,7 +6,11 @@ output before returning. Callbacks never invoke another provider. No pointer int
 provider storage survives its callback, and partial binding failure releases all
 bindings acquired so far.
 
-`tick` reads up to four authenticated control records first. Closed or failed
+`tick` reads up to 64 authenticated control records first, limited further by the
+input coordinator’s available queue capacity. It reserves room for the largest
+translated modifier chord and client-silence neutral reports. At zero capacity a
+rejecting callback still checks the live control provider without consuming its
+queued event; media continues while input catches up. Closed or failed
 control delivery stops media forwarding. Initial authentication is a pipeline
 precondition; an empty authenticated control queue is normal. Records preserve the
 message kind, authenticated sequence and bounded body for the pipeline's typed

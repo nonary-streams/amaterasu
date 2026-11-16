@@ -130,6 +130,22 @@ impl Controller {
             }
             Ok(NegotiationStep::Action {
                 ticket: action_ticket,
+                action: Action::ExtensionAnnounce(announce),
+            }) => {
+                let success = record.accept_extension_announce(&announce);
+                let completed = self.finish_immediate_action(
+                    &mut record,
+                    connection,
+                    action_ticket,
+                    success,
+                    "unsupported_video_format",
+                );
+                if !completed {
+                    record.extension_announce = None;
+                }
+            }
+            Ok(NegotiationStep::Action {
+                ticket: action_ticket,
                 action: Action::Play,
             }) => {
                 let Some(session) = record.session else {
@@ -206,11 +222,7 @@ impl Controller {
                 );
                 return;
             };
-            let Some(video) = record.negotiated_video else {
-                self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
-                return;
-            };
-            let Some(format) = record.negotiated_video_stream_format else {
+            let Some(video) = record.negotiated_video_mode() else {
                 self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
                 return;
             };
@@ -220,9 +232,7 @@ impl Controller {
                 "target":target, "intent":record.config.lifecycle_intent,
                 "client_context":record.config.lifecycle_client_context,
                 "settings_revision":record.config.lifecycle_settings_revision,
-                "requested_video":{"width":video.width,"height":video.height,
-                    "refresh_millihz":video.fps * 1000,
-                    "hdr":format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr},
+                "requested_video":video,
                 "consumer_requirements":if input_required && record.config.lifecycle_capture_mode.is_managed() { vec!["capture", "input"] } else { vec!["capture"] }});
             if let Some(source) = &record.config.borrowed_capture {
                 request["borrowed_capture"] = json!(source);
@@ -255,6 +265,8 @@ impl Controller {
         action_ticket: u64,
         deadline: u64,
     ) {
+        let mut payload = payload;
+        payload["prepare_video_before_play"] = json!(true);
         let operation = self.operation_id(record, "arm");
         self.job = Some(Job {
             ticket: record.id,

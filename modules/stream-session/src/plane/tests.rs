@@ -200,11 +200,15 @@ struct Fake {
 }
 
 impl Backend for Fake {
-    fn control(&mut self) -> PlaneResult<Option<ControlRecord>> {
+    fn control(&mut self, accept: bool) -> PlaneResult<Option<ControlRecord>> {
         if self.control_failed {
             Err("control_failed")
         } else {
-            Ok(self.controls.pop_front())
+            Ok(if accept {
+                self.controls.pop_front()
+            } else {
+                None
+            })
         }
     }
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
@@ -1045,4 +1049,25 @@ fn contribution_queue_is_bounded_and_stop_discards_unsent_messages() {
     pump.backend.feedback_busy = false;
     pump.pump_feedback(true).unwrap();
     assert!(pump.backend.feedback_sent.is_empty());
+}
+
+#[test]
+fn zero_control_budget_preserves_queued_input_and_still_checks_transport() {
+    let mut pump = Pump::new(Fake::default());
+    pump.backend.controls.push_back(ControlRecord {
+        message_type: 0x200,
+        sequence: 1,
+        payload: vec![0],
+    });
+    let progress = pump.tick_with_control_budget(false, 0).unwrap();
+    assert!(progress.controls.is_empty());
+    assert_eq!(pump.backend.controls.len(), 1);
+    let progress = pump.tick_with_control_budget(false, 1).unwrap();
+    assert_eq!(progress.controls.len(), 1);
+    pump.backend.control_failed = true;
+    assert_eq!(
+        pump.tick_with_control_budget(true, 0).unwrap_err().code,
+        "control_failed"
+    );
+    assert_eq!(pump.backend.video_reads, 0);
 }

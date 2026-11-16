@@ -98,6 +98,19 @@ _Static_assert(offsetof(AmaterasuEncoderApiV1_2, submit_dmabuf_leased) == 64, "e
 _Static_assert(offsetof(AmaterasuEncoderApiV1_2, cancel_dmabuf_leases) == 72, "encoder lease cancel offset");
 _Static_assert(offsetof(AmaterasuEncoderApiV1_4, gpu_input_ready) == sizeof(AmaterasuEncoderApiV1_3), "encoder readiness preserves timing prefix");
 _Static_assert(sizeof(AmaterasuVideoApi) == 40, "video table layout");
+_Static_assert(sizeof(AmaterasuVideoPlanSelectionV2) == 168, "video plan selection v2 layout");
+_Static_assert(offsetof(AmaterasuVideoPlanSelectionV2, payload_type) == 128, "video plan v2 payload offset");
+_Static_assert(offsetof(AmaterasuVideoPlanSelectionV2, encoding_name) == 136, "video plan v2 name offset");
+_Static_assert(sizeof(AmaterasuNegotiatedVideoPlanTransportApiV2) == 64, "video plan v2 api layout");
+_Static_assert(sizeof(AmaterasuVideoPlanSelection) == 128, "video plan selection layout");
+_Static_assert(offsetof(AmaterasuVideoPlanSelection, codec) == 48, "video plan codec offset");
+_Static_assert(offsetof(AmaterasuVideoPlanSelection, clock_epoch) == 96, "video plan clock offset");
+_Static_assert(offsetof(AmaterasuVideoPlanSelection, metadata_required) == 120, "video plan metadata policy offset");
+_Static_assert(sizeof(AmaterasuNegotiatedVideoPlanTransportApi) == 64, "plan transport table layout");
+_Static_assert(offsetof(AmaterasuNegotiatedVideoPlanTransportApi, probe) == 32, "plan probe offset");
+_Static_assert(offsetof(AmaterasuNegotiatedVideoPlanTransportApi, submit) == 48, "plan submit offset");
+_Static_assert(sizeof(AmaterasuVideoFramingApiV2_1) == 48, "video framing probe table layout");
+_Static_assert(offsetof(AmaterasuVideoFramingApiV2_1, probe) == 40, "video framing probe offset");
 _Static_assert(sizeof(AmaterasuVideoApiV1_1) == 48, "video v1.1 table layout");
 _Static_assert(offsetof(AmaterasuVideoApiV1_1, geometry) == 40, "video geometry offset");
 _Static_assert(sizeof(AmaterasuAudioFrame) == 104, "audio frame layout");
@@ -146,6 +159,8 @@ _Static_assert(sizeof(AmaterasuNegotiatedVideoApi) == 40, "video unit table layo
 _Static_assert(sizeof(AmaterasuNegotiatedVideoTransportApi) == 48, "video transport table layout");
 _Static_assert(sizeof(AmaterasuVideoFramingApi) == 40, "video framing table layout");
 _Static_assert(sizeof(AmaterasuVideoFecBlock) == 16, "video FEC plan block layout");
-_Static_assert(sizeof(AmaterasuVideoFramingLimits) == 48, "video framing limits layout");
+_Static_assert(sizeof(AmaterasuVideoFramingLimits) == 64, "video framing limits layout");
+_Static_assert(offsetof(AmaterasuVideoFramingLimits, max_wire_bytes) == 40, "video limits v1 prefix");
+_Static_assert(offsetof(AmaterasuVideoFramingLimits, min_fec_percentage) == 48, "video limits v2 tail");
 _Static_assert(sizeof(AmaterasuVideoFramePlan) == 112, "video frame plan layout");
 #endif

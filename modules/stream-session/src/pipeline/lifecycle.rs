@@ -9,7 +9,7 @@ impl Pipeline {
         job: &mut Job,
         now: u64,
         send: &mut Send<'_>,
-        factory: &mut Factory<'_>,
+        operations: &mut NativeOperations<'_, '_>,
     ) -> bool {
         let shutdown_deadline = self.shutdown_deadline.or_else(|| {
             (job.cleanup || record.state == State::Stopping)
@@ -116,6 +116,11 @@ impl Pipeline {
                     return true;
                 }
                 rpc::Progress::Unresolved => {
+                    if job.step == Step::ProbeExtensionSource {
+                        let _ = pending.shutdown(send);
+                        record.extension_checked = true;
+                        return self.deliver_success(record, job, now, send);
+                    }
                     if job.step == Step::PersistJournal {
                         self.retain_uncertain_journal(record, job, pending, now);
                         self.journal.failed = true;
@@ -184,6 +189,7 @@ impl Pipeline {
                         Step::ValidateLifecycleCandidate
                             | Step::ReadFrozenProcessingSettings
                             | Step::PlanGpuProcessing
+                            | Step::ProbeExtensionSource
                             | Step::ObserveLifecycleCapture
                             | Step::AckLifecycleCapture
                             | Step::AckLifecycleStream
@@ -202,9 +208,24 @@ impl Pipeline {
                         job.pending = Some(pending);
                         return true;
                     }
-                    return self.consume(record, job, payload, now, send, factory);
+                    return self.consume(record, job, payload, now, send, operations);
                 }
                 rpc::Progress::Failed => {
+                    if job.step == Step::ProbeExtensionSource {
+                        record.extension_checked = true;
+                        return self.deliver_success(record, job, now, send);
+                    }
+                    if job.step == Step::PollGamepadFeedback
+                        && matches!(
+                            pending.admission_error_code(),
+                            Some("busy" | "resource_exhausted")
+                        )
+                    {
+                        // This optional read was explicitly not admitted; no
+                        // input effect or feedback item can have been consumed.
+                        record.rumble_poll_at = now.saturating_add(100);
+                        return false;
+                    }
                     if matches!(
                         job.step,
                         Step::ObserveActiveBinding | Step::ValidateActiveBinding
@@ -385,6 +406,12 @@ impl Pipeline {
         if !job.cleanup
             && job.step == Step::StatusVirtualDisplay
             && now < record.virtual_display_next_poll_at
+        {
+            return true;
+        }
+        if !job.cleanup
+            && job.step == Step::WaitVideoReady
+            && now < record.video_readiness_next_poll_at
         {
             return true;
         }
@@ -571,8 +598,33 @@ impl Pipeline {
         payload: Value,
         now: u64,
         send: &mut Send<'_>,
-        factory: &mut Factory<'_>,
+        operations: &mut NativeOperations<'_, '_>,
     ) -> bool {
+        if job.step == Step::ProbeExtensionSource {
+            record.extension_checked = true;
+            if let Some(route) = &record.extension_route
+                && payload["ok"] == true
+                && payload["source_id"].as_u64() == Some(route.source_id)
+                && payload["encoder"] == json!(route.encoder)
+                && payload["profile"] == json!(route.profile)
+                && let Some(media) = record.resources.get(&Resource::Media)
+            {
+                record.extension_limits = match (operations.probe)(route, *media, &record.config) {
+                    Ok(limits) => Some(limits),
+                    Err(code) => {
+                        eprintln!("amaterasu extension downstream preflight rejected code={code}");
+                        None
+                    }
+                };
+            }
+            if payload["ok"] != true {
+                eprintln!(
+                    "amaterasu extension source preflight rejected code={:?}",
+                    payload["code"].as_str().unwrap_or("invalid_response")
+                );
+            }
+            return self.deliver_success(record, job, now, send);
+        }
         if job.step == Step::PersistJournal {
             debug_assert!(job.journal_committed);
             job.journal_document = None;
@@ -1027,6 +1079,18 @@ impl Pipeline {
             return true;
         }
         if payload["ok"] != true {
+            if job.step == Step::PollGamepadFeedback
+                && matches!(
+                    safe_dependency_code(&payload),
+                    "busy" | "resource_exhausted"
+                )
+            {
+                // Polling optional feedback must not turn known saturation
+                // into loss of keyboard/video. Back off so renew/input work
+                // can use the workflow slot; rumble expiry still runs.
+                record.rumble_poll_at = now.saturating_add(100);
+                return false;
+            }
             if matches!(job.step, Step::ProbeAudioReconfiguration(_)) {
                 record.pending_audio = None;
                 if let Some(request) = job.request {
@@ -1077,8 +1141,16 @@ impl Pipeline {
         let result = (|| match job.step {
             Step::Open(resource) => {
                 let result = self.opened(record, job, resource, &payload, now, send);
-                if result.is_ok() && resource == Resource::Video && !record.config.stream_audio {
-                    record.plane = Some(factory(record.handles()?, &record.providers)?);
+                if result.is_ok()
+                    && resource == Resource::Video
+                    && !record.config.stream_audio
+                    && !record.video_warmup_requested
+                {
+                    record.plane = Some((operations.factory)(
+                        record.handles()?,
+                        &record.providers,
+                        record.negotiated_route.as_ref(),
+                    )?);
                 }
                 result
             }
@@ -1236,6 +1308,42 @@ impl Pipeline {
                 };
                 Ok(true)
             }
+            Step::WaitVideoReady => {
+                if payload["ok"] != true {
+                    return Err("invalid_video_startup_response");
+                }
+                let status = component_status(&payload, record.resources[&Resource::Video])
+                    .ok_or("invalid_video_startup_response")?;
+                if status["state"] != "running" || !status["error"].is_null() {
+                    return Err("video_startup_failed");
+                }
+                if status["startup_frame_readiness"] != true {
+                    return Err("video_startup_readiness_unsupported");
+                }
+                match status["startup_frame_ready"].as_bool() {
+                    Some(false) => {
+                        record.video_readiness_next_poll_at = now.saturating_add(25);
+                        // The read has settled. Yield the global workflow slot
+                        // so existing streams can renew leases and drain input.
+                        record.video_warmup_wait = Some(record::PendingVideoWarmup {
+                            request: job.request.ok_or("missing_arm_request")?,
+                            deadline: job.deadline,
+                        });
+                        Ok(false)
+                    }
+                    Some(true) => {
+                        record.video_warmup_ready = true;
+                        eprintln!(
+                            "amaterasu source warmup ready session={} elapsed_ms={}",
+                            record.id,
+                            now.saturating_sub(record.video_warmup_started_at)
+                        );
+                        Self::arm(record, job.request.ok_or("missing_arm_request")?, now, send);
+                        Ok(false)
+                    }
+                    None => Err("invalid_video_startup_readiness"),
+                }
+            }
             Step::Authenticate => {
                 let status = component_status(&payload, record.resources[&Resource::Control]);
                 if status.is_some_and(|value| {
@@ -1284,7 +1392,26 @@ impl Pipeline {
                     {
                         return Err("display_lease_missing");
                     }
-                    job.step = Step::ConfigureMediaVideoFormat;
+                    job.step = if record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.configuration.extension_profile.is_some())
+                    {
+                        if record.video_warmup_ready {
+                            if !record.config.stream_audio {
+                                record.plane = Some((operations.factory)(
+                                    record.handles()?,
+                                    &record.providers,
+                                    record.negotiated_route.as_ref(),
+                                )?);
+                            }
+                            video_open_next_step(record)
+                        } else {
+                            Step::AcquireOutput
+                        }
+                    } else {
+                        Step::ConfigureMediaVideoFormat
+                    };
                     Ok(true)
                 } else if status["state"] == "discovering" {
                     if record.state == State::Armed {
@@ -1315,12 +1442,27 @@ impl Pipeline {
                     return Err("video_format_configuration_mismatch");
                 }
                 record.media_video_format_configured = true;
-                job.step = Step::AcquireOutput;
+                if record.video_warmup_ready {
+                    if !record.config.stream_audio {
+                        record.plane = Some((operations.factory)(
+                            record.handles()?,
+                            &record.providers,
+                            record.negotiated_route.as_ref(),
+                        )?);
+                    }
+                    job.step = video_open_next_step(record);
+                } else {
+                    job.step = Step::AcquireOutput;
+                }
                 Ok(true)
             }
             Step::AcquireAudio => {
                 require_lease(record, &payload, true)?;
-                record.plane = Some(factory(record.handles()?, &record.providers)?);
+                record.plane = Some((operations.factory)(
+                    record.handles()?,
+                    &record.providers,
+                    record.negotiated_route.as_ref(),
+                )?);
                 job.step = Step::Activate;
                 Ok(true)
             }
@@ -1689,6 +1831,7 @@ impl Pipeline {
                 if payload["state"] != "running" || payload["packet_boundaries"] != true {
                     return Err("video_not_running");
                 }
+                record.accept_negotiated_unit(payload)?;
                 configure_absolute_input(record, payload)?;
                 for (field, code) in [
                     ("capture_fallback_reason", "capture_fallback"),
@@ -1717,16 +1860,10 @@ impl Pipeline {
                         }
                     }
                 }
-                job.step = if record
-                    .start
-                    .as_ref()
-                    .is_some_and(|start| start.manages_lifecycle_capture())
-                {
-                    Step::ObserveLifecycleCapture
-                } else if record.config.stream_audio {
-                    Step::Open(Resource::AudioCapture)
+                job.step = if record.video_warmup_requested && !record.video_warmup_ready {
+                    Step::WaitVideoReady
                 } else {
-                    Step::Activate
+                    video_open_next_step(record)
                 };
             }
             Resource::AudioCapture => {
@@ -1803,6 +1940,21 @@ impl Pipeline {
         now: u64,
         send: &mut Send<'_>,
     ) -> bool {
+        if record.state == State::Prepared
+            && !record.extension_checked
+            && record.extension_route.is_some()
+        {
+            if record
+                .config
+                .extension_probe
+                .as_ref()
+                .is_some_and(|config| config.valid_extension_probe())
+            {
+                job.step = Step::ProbeExtensionSource;
+                return true;
+            }
+            record.extension_checked = true;
+        }
         if job.request.is_none() && record.armed_accepted {
             return false;
         }
@@ -1902,6 +2054,20 @@ fn safe_dependency_code(payload: &serde_json::Value) -> &str {
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         })
         .unwrap_or("unavailable")
+}
+
+fn video_open_next_step(record: &Record) -> Step {
+    if record
+        .start
+        .as_ref()
+        .is_some_and(|start| start.manages_lifecycle_capture())
+    {
+        Step::ObserveLifecycleCapture
+    } else if record.config.stream_audio {
+        Step::Open(Resource::AudioCapture)
+    } else {
+        Step::Activate
+    }
 }
 
 #[cfg(test)]

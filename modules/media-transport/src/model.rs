@@ -28,14 +28,24 @@ pub struct Settings {
     pub enabled: bool,
     pub allow_remote: bool,
     pub allowed_principals: Vec<String>,
+    /// Separately granted native service and startup-authorized profiles.
+    pub plan_service: Option<String>,
+    pub extension_profiles: Vec<amaterasu_contracts::media_profile::VideoProfile>,
 }
 
 impl Settings {
     pub fn validate(&self) -> TransportResult<()> {
-        if self
-            .network_provider
-            .as_deref()
-            .is_some_and(|service| !amaterasu_module_sdk::network::valid_provider(service))
+        if self.plan_service.as_deref().is_some_and(|name| {
+            !amaterasu_contracts::valid_name(name) || name == "amaterasu.media-transport/1"
+        }) || !(amaterasu_contracts::media_profile::VideoProfileSnapshot {
+            profiles: self.extension_profiles.clone(),
+        })
+        .validate()
+            || (!self.extension_profiles.is_empty() && self.plan_service.is_none())
+            || self
+                .network_provider
+                .as_deref()
+                .is_some_and(|service| !amaterasu_module_sdk::network::valid_provider(service))
             || self.allowed_principals.len() > 16
             || self.allowed_principals.iter().any(|principal| {
                 principal.is_empty()

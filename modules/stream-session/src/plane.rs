@@ -12,7 +12,8 @@ use amaterasu_gamestream::control::{
 };
 use amaterasu_media::*;
 use amaterasu_module_sdk::RuntimeClient;
-use packets::{AudioPacket, PcmPacket, VideoAssembly, VideoPacket};
+pub(crate) use packets::VideoUnitSelection;
+use packets::{AudioPacket, PcmPacket, VideoAssembly, VideoPacket, VideoUnitPacket};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -67,6 +68,26 @@ pub struct Handles {
     pub processed_audio: Option<(u32, u32, AudioFormatId, u32, AudioFormatId)>,
     /// ABI codec identifier of the negotiated video codec.
     pub video_codec: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct NegotiatedRoute {
+    pub profile: amaterasu_contracts::media_profile::VideoProfile,
+    pub video_service: String,
+    pub framer_service: String,
+    pub transport_service: String,
+    pub selection: VideoUnitSelection,
+    pub clock_origin_us: u64,
+    pub limits: VideoFramingLimits,
+}
+
+pub(crate) fn probe_extension_chain(
+    runtime: &RuntimeClient,
+    route: &crate::model::ExtensionRoute,
+    media: u64,
+    config: &crate::model::PrepareConfig,
+) -> PlaneResult<VideoFramingLimits> {
+    native::probe_chain(runtime, route, media, config)
 }
 
 #[derive(Debug)]
@@ -138,8 +159,67 @@ impl Plane {
         Some(summary)
     }
 
-    pub fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
-        self.pump.tick(media_active)
+    pub(crate) fn new_planned(
+        runtime: &RuntimeClient,
+        handles: Handles,
+        providers: &crate::providers::ProviderServices,
+        route: &NegotiatedRoute,
+    ) -> PlaneResult<Self> {
+        let backend = native::NativeBackend::new_planned(runtime, handles, providers, route)?;
+        let mut pump = Pump::with_media(
+            backend,
+            handles.stream_audio,
+            handles.audio_channels,
+            handles.video_codec,
+        );
+        pump.negotiated_video = Some(route.selection);
+        pump.encoded_source = handles.encoded_audio_source;
+        pump.processing = handles.audio_processor.is_some();
+        pump.frame_trace = Some(diagnostics::FrameTrace::new(
+            amaterasu_module_sdk::trace::Tracer::bind(runtime),
+            handles.video,
+        ));
+        Ok(Self { pump })
+    }
+
+    /// This entry is not exposed by production admission until the caller has
+    /// proved the exact client, encoder, framer and transport selection.
+    #[allow(dead_code)]
+    fn new_negotiated(
+        runtime: &RuntimeClient,
+        handles: Handles,
+        providers: &crate::providers::ProviderServices,
+        video_service: &str,
+        transport_service: &str,
+        selection: VideoUnitSelection,
+    ) -> PlaneResult<Self> {
+        if !selection.valid() || selection.stream != handles.video || handles.hdr {
+            return Err("negotiated_video_selection_invalid");
+        }
+        let backend = native::NativeBackend::new_negotiated(
+            runtime,
+            handles,
+            providers,
+            video_service,
+            transport_service,
+        )?;
+        let mut pump = Pump::with_media(
+            backend,
+            handles.stream_audio,
+            handles.audio_channels,
+            handles.video_codec,
+        );
+        pump.negotiated_video = Some(selection);
+        Ok(Self { pump })
+    }
+
+    pub fn tick(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<Progress, TickFailure> {
+        self.pump
+            .tick_with_control_budget(media_active, control_budget)
     }
 
     pub fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
@@ -205,10 +285,19 @@ trait Backend {
     fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
         Ok(None)
     }
-    fn control(&mut self) -> PlaneResult<Option<ControlRecord>>;
+    fn control(&mut self, accept: bool) -> PlaneResult<Option<ControlRecord>>;
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool>;
     fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool>;
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>>;
+    fn video_unit(
+        &mut self,
+        _selection: &VideoUnitSelection,
+    ) -> PlaneResult<Option<VideoUnitPacket>> {
+        Err("negotiated_video_unsupported")
+    }
+    fn submit_video_unit(&mut self, _unit: &NegotiatedVideoUnit) -> PlaneResult<bool> {
+        Err("negotiated_video_unsupported")
+    }
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>>;
     fn audio(&mut self) -> PlaneResult<Option<AudioPacket>>;
     fn submit_video(
@@ -244,6 +333,8 @@ struct Pump<B> {
     processing: bool,
     audio_channels: u32,
     video: VideoAssembly,
+    negotiated_video: Option<VideoUnitSelection>,
+    pending_video_unit: Option<VideoUnitPacket>,
     pending_pcm: Option<PcmPacket>,
     pending_processed: Option<PcmPacket>,
     processor_draining: bool,
@@ -260,6 +351,7 @@ struct Pump<B> {
     audio_recovery_needed: bool,
     last_accepted_video_sequence: Option<u64>,
     frame_trace: Option<diagnostics::FrameTrace>,
+    last_video_unit_timestamp: Option<u64>,
 }
 
 impl<B: Backend> Pump<B> {
@@ -277,6 +369,8 @@ impl<B: Backend> Pump<B> {
             processing: false,
             audio_channels,
             video: VideoAssembly::new(video_codec),
+            negotiated_video: None,
+            pending_video_unit: None,
             pending_pcm: None,
             pending_processed: None,
             processor_draining: false,
@@ -293,10 +387,20 @@ impl<B: Backend> Pump<B> {
             audio_recovery_needed: false,
             last_accepted_video_sequence: None,
             frame_trace: None,
+            last_video_unit_timestamp: None,
         }
     }
 
+    #[cfg(test)]
     fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
+        self.tick_with_control_budget(media_active, CONTROL_READ_BUDGET)
+    }
+
+    fn tick_with_control_budget(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<Progress, TickFailure> {
         self.timing.cadence.observe(Instant::now());
         if let Some(code) = self.failure {
             return Err(TickFailure {
@@ -304,7 +408,7 @@ impl<B: Backend> Pump<B> {
                 progress: Box::default(),
             });
         }
-        let result = self.advance(media_active);
+        let result = self.advance(media_active, control_budget.min(CONTROL_READ_BUDGET));
         if let Err(failure) = &result {
             if failure.code == "audio_encoder_failed" {
                 self.audio_recovery_needed = true;
@@ -315,7 +419,11 @@ impl<B: Backend> Pump<B> {
         result
     }
 
-    fn advance(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
+    fn advance(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<Progress, TickFailure> {
         // Check the authenticated provider before any media effect. A failed or
         // closed control stream ends pumping; routing metadata grants no authority.
         let mut progress = Progress::default();
@@ -329,8 +437,16 @@ impl<B: Backend> Pump<B> {
                     progress: Box::default(),
                 })?;
         let control_started = Instant::now();
-        for _ in 0..CONTROL_READ_BUDGET {
-            let message = match self.backend.control() {
+        if control_budget == 0 {
+            // Still check the live authenticated provider before forwarding
+            // media. The rejecting sink leaves any queued input unconsumed.
+            self.backend.control(false).map_err(|code| TickFailure {
+                code,
+                progress: Box::default(),
+            })?;
+        }
+        for _ in 0..control_budget {
+            let message = match self.backend.control(true) {
                 Ok(message) => message,
                 Err(code) => {
                     return Err(TickFailure {
@@ -352,7 +468,9 @@ impl<B: Backend> Pump<B> {
             .timing
             .window
             .control_budget_exhausted
-            .saturating_add(u64::from(progress.controls.len() == CONTROL_READ_BUDGET));
+            .saturating_add(u64::from(
+                control_budget != 0 && progress.controls.len() == control_budget,
+            ));
         if let Err(code) = self.pump_feedback(false) {
             return Err(TickFailure {
                 code,
@@ -492,6 +610,9 @@ impl<B: Backend> Pump<B> {
     }
 
     fn pump_video(&mut self, progress: &mut Progress) -> PlaneResult<()> {
+        if let Some(selection) = self.negotiated_video {
+            return self.pump_video_unit(selection, progress);
+        }
         for _ in 0..READ_BUDGET {
             if self.video_ended {
                 break;
@@ -533,6 +654,73 @@ impl<B: Backend> Pump<B> {
                 self.video_ended = header.flags == FLAG_END_OF_STREAM;
                 self.video.clear();
             }
+        }
+        Ok(())
+    }
+
+    /// A negotiated unit is already a complete access unit. Retain it unchanged
+    /// on BUSY and account only for successful local transport admission.
+    fn pump_video_unit(
+        &mut self,
+        selection: VideoUnitSelection,
+        progress: &mut Progress,
+    ) -> PlaneResult<()> {
+        for _ in 0..READ_BUDGET {
+            if self.video_ended {
+                break;
+            }
+            if self.pending_video_unit.is_none() {
+                self.pending_video_unit = self.backend.video_unit(&selection)?;
+                if let (Some(trace), Some(packet)) =
+                    (&mut self.frame_trace, &self.pending_video_unit)
+                {
+                    let unit = packet.header();
+                    if unit.flags != VIDEO_UNIT_END_OF_STREAM {
+                        trace.packet_read(unit.access_unit_id);
+                    }
+                }
+            }
+            let Some(packet) = &self.pending_video_unit else {
+                break;
+            };
+            let unit = packet.header();
+            if !selection.accepts(&unit) {
+                return Err("negotiated_video_mismatch");
+            }
+            if unit.flags != VIDEO_UNIT_END_OF_STREAM
+                && (self
+                    .last_accepted_video_sequence
+                    .is_some_and(|previous| unit.access_unit_id <= previous)
+                    || self
+                        .last_video_unit_timestamp
+                        .is_some_and(|previous| unit.timestamp_us < previous))
+            {
+                return Err("negotiated_video_sequence");
+            }
+            if !self.backend.submit_video_unit(&unit)? {
+                break;
+            }
+            self.video_ended = unit.flags == VIDEO_UNIT_END_OF_STREAM;
+            if !self.video_ended {
+                if let Some(trace) = &self.frame_trace {
+                    trace.transport_admitted(unit.access_unit_id);
+                }
+                progress.accepted_video_access_units =
+                    progress.accepted_video_access_units.saturating_add(1);
+                progress.accepted_media_payload_bytes = progress
+                    .accepted_media_payload_bytes
+                    .saturating_add(unit.data.len as u64);
+                if let Some(previous) = self.last_accepted_video_sequence
+                    && unit.access_unit_id > previous.saturating_add(1)
+                {
+                    progress.observed_video_sequence_gaps = progress
+                        .observed_video_sequence_gaps
+                        .saturating_add(unit.access_unit_id - previous - 1);
+                }
+                self.last_accepted_video_sequence = Some(unit.access_unit_id);
+                self.last_video_unit_timestamp = Some(unit.timestamp_us);
+            }
+            self.pending_video_unit = None;
         }
         Ok(())
     }
@@ -731,3 +919,6 @@ impl<B: Backend> Pump<B> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod negotiated_tests;

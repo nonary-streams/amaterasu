@@ -238,3 +238,16 @@ fn yuv444_advertisement_requires_explicit_provider_capabilities() {
         0x0018_0000
     );
 }
+
+#[test]
+fn transport_extensions_add_only_explicit_extension_bits() {
+    let snapshot = EncoderSnapshot::parse(&json!({"ok":true,"encoders":[],
+        "transport_extensions":[{"codec_mode_mask":8388608,"bitstream":"186f0393"}]}))
+    .unwrap();
+    assert_eq!(snapshot.advertisement().codec_mode_support, 0x00800001);
+    assert!(
+        EncoderSnapshot::parse(&json!({"ok":true,"encoders":[],
+        "transport_extensions":[{"codec_mode_mask":256}]}))
+        .is_err()
+    );
+}

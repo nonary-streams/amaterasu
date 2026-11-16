@@ -146,7 +146,7 @@ fn exercise<P: FramingProvider>(provider_impl: P, marker: u8) {
         };
         let limits = VideoFramingLimits {
             size: size_of::<VideoFramingLimits>() as u32,
-            version: 1,
+            version: VIDEO_FRAMING_LIMITS_VERSION,
             packet_size: 1024,
             crypto_overhead: 0,
             network_overhead: 28,
@@ -156,6 +156,10 @@ fn exercise<P: FramingProvider>(provider_impl: P, marker: u8) {
             min_parity_shards: 0,
             max_fec_percentage: 0,
             max_wire_bytes: 8192,
+            min_fec_percentage: 0,
+            max_fec_blocks: 1,
+            fec_policy_flags: 0,
+            reserved: 0,
         };
         let mut output = Output {
             busy: true,

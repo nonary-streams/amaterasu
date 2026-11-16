@@ -10,6 +10,10 @@ use amaterasu_abi::{BorrowedBytes, NativeInterface, STATUS_INVALID_ARGUMENT, Sta
 use std::{ffi::c_void, mem::size_of};
 
 pub const VIDEO_UNIT_VERSION: u32 = 1;
+/// FEC policy fields extend the v1 limits prefix and require framing API v2.
+pub const VIDEO_FRAMING_LIMITS_VERSION: u32 = 2;
+pub const VIDEO_FRAMING_INTERFACE_MAJOR: u32 = 2;
+pub const VIDEO_FRAMING_INTERFACE_MINOR: u32 = 1;
 pub const VIDEO_UNIT_KEYFRAME: u32 = 1;
 pub const VIDEO_UNIT_DISCONTINUITY: u32 = 2;
 pub const VIDEO_UNIT_END_OF_STREAM: u32 = 4;
@@ -18,6 +22,9 @@ pub const VIDEO_FRAME_MAX_DATAGRAMS: u32 = 2048;
 pub const VIDEO_FRAME_MAX_FIELD_WORK: u64 = 256 * 1024 * 1024;
 pub const VIDEO_FRAME_RECORD_START: u32 = 1;
 pub const VIDEO_FRAME_CRITICAL_PREFIX: u32 = 2;
+/// Trusted policy may omit parity only when the frame cannot fit protected
+/// blocks within its negotiated block limit. This is not a provider preference.
+pub const VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED: u32 = 1;
 
 /// One complete access unit, bound to one selected source and configuration.
 /// Bytes are immutable and borrowed only through the sink/submit call. This
@@ -134,7 +141,7 @@ pub struct VideoFecBlock {
 /// Host-supplied bounds from trusted session composition and peer negotiation.
 /// packet_size is NV header plus payload, excluding the 16-byte RTP header.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VideoFramingLimits {
     pub size: u32,
     pub version: u32,
@@ -147,6 +154,120 @@ pub struct VideoFramingLimits {
     pub min_parity_shards: u32,
     pub max_fec_percentage: u32,
     pub max_wire_bytes: u64,
+    /// V2 tail; the preceding V1 field offsets remain unchanged.
+    pub min_fec_percentage: u32,
+    pub max_fec_blocks: u32,
+    pub fec_policy_flags: u32,
+    pub reserved: u32,
+}
+
+/// Authenticated video-source selection supplied to the transport once, before
+/// any packet or nonce state changes. Metadata-required sessions are not
+/// supported by this version.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VideoPlanSelection {
+    pub size: u32,
+    pub version: u32,
+    pub stream: u64,
+    pub generation: u64,
+    pub offer_id: u64,
+    pub source_id: u64,
+    pub config_generation: u64,
+    pub codec: EncoderFormatId,
+    pub framing: EncoderFormatId,
+    pub clock_epoch: [u8; 16],
+    pub clock_origin_us: u64,
+    pub metadata_required: u32,
+    pub reserved: u32,
+}
+
+/// Version 2 carries the exact bounded negotiated wire identity inline.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VideoPlanSelectionV2 {
+    pub base: VideoPlanSelection,
+    pub payload_type: u32,
+    pub encoding_name_len: u32,
+    pub encoding_name: [u8; 32],
+}
+
+impl VideoPlanSelectionV2 {
+    /// Returns the exact wire name only for canonical, bounded descriptors.
+    pub fn wire_name(&self) -> Option<&[u8]> {
+        let len = usize::try_from(self.encoding_name_len).ok()?;
+        if self.base.size as usize != size_of::<Self>()
+            || self.base.version != 2
+            || !(99..=127).contains(&self.payload_type)
+            || !(1..=32).contains(&len)
+            || self.encoding_name[len..].iter().any(|byte| *byte != 0)
+            || !self.encoding_name[..len]
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return None;
+        }
+        Some(&self.encoding_name[..len])
+    }
+
+    /// Produce the internal v1 descriptor after validating the v2 wire fields.
+    pub fn base_v1(&self) -> Option<VideoPlanSelection> {
+        self.wire_name()?;
+        let mut base = self.base;
+        base.size = size_of::<VideoPlanSelection>() as u32;
+        base.version = 1;
+        Some(base)
+    }
+}
+
+#[repr(C)]
+pub struct NegotiatedVideoPlanTransportApiV2 {
+    pub base: NativeInterface,
+    pub probe: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelectionV2,
+        *mut VideoFramingLimits,
+    ) -> Status,
+    pub prepare: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelectionV2,
+        *mut VideoFramingLimits,
+    ) -> Status,
+    pub submit: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const NegotiatedVideoUnit,
+        *const VideoFramePlan,
+    ) -> Status,
+    pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
+}
+
+/// Plan transport is a distinct typed family from unit-only transport. Prepare
+/// outputs host-controlled limits; it never accepts FEC policy from the caller.
+#[repr(C)]
+pub struct NegotiatedVideoPlanTransportApi {
+    pub base: NativeInterface,
+    pub probe: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelection,
+        *mut VideoFramingLimits,
+    ) -> Status,
+    pub prepare: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelection,
+        *mut VideoFramingLimits,
+    ) -> Status,
+    pub submit: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const NegotiatedVideoUnit,
+        *const VideoFramePlan,
+    ) -> Status,
+    pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
 }
 
 /// Framed bytes exclude the eight-byte short header. record_starts has one byte
@@ -188,7 +309,7 @@ impl VideoFramePlan {
         if self.size as usize != size_of::<Self>()
             || self.version != 1
             || limits.size as usize != size_of::<VideoFramingLimits>()
-            || limits.version != 1
+            || limits.version != VIDEO_FRAMING_LIMITS_VERSION
             || !(256..=1392).contains(&limits.packet_size)
             || !limits.packet_size.is_multiple_of(16)
             || limits.crypto_overhead > 256
@@ -199,13 +320,18 @@ impl VideoFramePlan {
             || limits.max_datagrams > VIDEO_FRAME_MAX_DATAGRAMS
             || limits.max_queue_bytes == 0
             || limits.min_parity_shards > 254
+            || limits.min_fec_percentage > limits.max_fec_percentage
             || limits.max_fec_percentage > 255
+            || !(1..=VIDEO_FRAME_MAX_BLOCKS as u32).contains(&limits.max_fec_blocks)
+            || limits.fec_policy_flags & !VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED != 0
+            || limits.reserved != 0
+            || (limits.min_fec_percentage == 0 && limits.min_parity_shards != 0)
             || limits.max_wire_bytes == 0
             || self.framed_bytes.len == 0
             || self.framed_bytes.len > MAX_VIDEO_ACCESS_UNIT_BYTES
             || self.framed_bytes.ptr.is_null()
             || self.block_count == 0
-            || self.block_count as usize > VIDEO_FRAME_MAX_BLOCKS
+            || self.block_count > limits.max_fec_blocks
         {
             return Err(invalid());
         }
@@ -242,6 +368,8 @@ impl VideoFramePlan {
         let mut offset = 0u32;
         let mut datagrams = 0u32;
         let mut field_work = 0u64;
+        let mut has_unprotected = false;
+        let mut has_protected = false;
         for (index, block) in self.blocks.iter().enumerate() {
             if index >= self.block_count as usize {
                 if block.first_data_shard != 0
@@ -258,6 +386,11 @@ impl VideoFramePlan {
                 || block.data_shards > 1023
                 || block.percentage > limits.max_fec_percentage
             {
+                return Err(invalid());
+            }
+            has_unprotected |= block.parity_shards == 0;
+            has_protected |= block.parity_shards != 0;
+            if block.parity_shards != 0 && block.percentage < limits.min_fec_percentage {
                 return Err(invalid());
             }
             let expected = u64::from(block.data_shards)
@@ -294,6 +427,20 @@ impl VideoFramePlan {
         {
             return Err(invalid());
         }
+        if limits.min_fec_percentage != 0 && has_unprotected {
+            let largest =
+                largest_protected_data(limits.min_fec_percentage, limits.min_parity_shards)
+                    .ok_or_else(invalid)?;
+            let capacity = largest
+                .checked_mul(limits.max_fec_blocks)
+                .ok_or_else(invalid)?;
+            if limits.fec_policy_flags & VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED == 0
+                || has_protected
+                || data_count <= capacity
+            {
+                return Err(invalid());
+            }
+        }
         let queue_bytes =
             u64::from(datagrams) * u64::from(limits.packet_size + 16 + limits.crypto_overhead);
         let wire_bytes = queue_bytes + u64::from(datagrams) * u64::from(limits.network_overhead);
@@ -307,6 +454,20 @@ impl VideoFramePlan {
             wire_bytes,
         })
     }
+}
+
+/// Maximum data shards that fit one protected 255-shard block under the
+/// minimum trusted policy, considering every representable wire percentage.
+fn largest_protected_data(min_percentage: u32, min_parity: u32) -> Option<u32> {
+    (1u32..255).rev().find(|data| {
+        let rate_for_minimum = if min_parity == 0 {
+            0
+        } else {
+            ((min_parity - 1) * 100 / data) + 1
+        };
+        let rate = min_percentage.max(rate_for_minimum);
+        rate <= 255 && data + (data * rate).div_ceil(100) <= 255
+    })
 }
 
 #[repr(C)]
@@ -330,6 +491,19 @@ pub struct VideoFramingApi {
     ) -> Status,
 }
 
+/// Optional v2.1 capability check. Success applies to the supplied identities
+/// and host limits only; it is not evidence of peer or hardware support.
+#[repr(C)]
+pub struct VideoFramingApiV2_1 {
+    pub base: VideoFramingApi,
+    pub probe: unsafe extern "C" fn(
+        *mut c_void,
+        *const EncoderFormatId,
+        *const EncoderFormatId,
+        *const VideoFramingLimits,
+    ) -> Status,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,7 +520,7 @@ mod tests {
     fn limits() -> VideoFramingLimits {
         VideoFramingLimits {
             size: size_of::<VideoFramingLimits>() as u32,
-            version: 1,
+            version: VIDEO_FRAMING_LIMITS_VERSION,
             packet_size: 1024,
             crypto_overhead: 32,
             network_overhead: 28,
@@ -354,7 +528,11 @@ mod tests {
             max_datagrams: VIDEO_FRAME_MAX_DATAGRAMS,
             max_queue_bytes: 8 * 1024 * 1024,
             min_parity_shards: 1,
+            min_fec_percentage: 50,
             max_fec_percentage: 100,
+            max_fec_blocks: 4,
+            fec_policy_flags: 0,
+            reserved: 0,
             max_wire_bytes: 8 * 1024 * 1024,
         }
     }
@@ -460,14 +638,128 @@ mod tests {
         plan.record_starts = BorrowedBytes::new(&invalid_starts);
         assert!(unsafe { plan.validate(&limits()) }.is_err());
     }
+    #[test]
+    fn fec_policy_rejects_zero_and_below_minimum_protection() {
+        let data = vec![7; 9 * 1008 - 7];
+        let mut plan = plan(&data, &[]);
+        plan.critical_prefix_shards = 0;
+        plan.blocks[0].data_shards = 10;
+        let mut policy = limits();
+        policy.min_fec_percentage = 20;
+        policy.min_parity_shards = 2;
+        policy.max_fec_percentage = 255;
+        plan.blocks[0].percentage = 0;
+        plan.blocks[0].parity_shards = 0;
+        assert!(unsafe { plan.validate(&policy) }.is_err());
+        plan.blocks[0].percentage = 15;
+        plan.blocks[0].parity_shards = 2;
+        assert!(unsafe { plan.validate(&policy) }.is_err());
+        plan.blocks[0].percentage = 20;
+        plan.blocks[0].parity_shards = 2;
+        assert!(unsafe { plan.validate(&policy) }.is_ok());
+        let small = vec![1; 1200];
+        plan.framed_bytes = BorrowedBytes::new(&small);
+        plan.blocks[0].data_shards = 2;
+        plan.blocks[0].percentage = 20;
+        plan.blocks[0].parity_shards = 1;
+        assert!(unsafe { plan.validate(&policy) }.is_err());
+    }
+
+    #[test]
+    fn only_explicit_large_frame_fallback_can_omit_parity() {
+        let small = vec![1; 1200];
+        let large = vec![1; 899 * 1008 - 7];
+        let mut policy = limits();
+        policy.min_fec_percentage = 20;
+        policy.min_parity_shards = 2;
+        policy.max_fec_percentage = 255;
+        let mut plan = plan(&large, &[]);
+        plan.critical_prefix_shards = 0;
+        plan.blocks[0] = VideoFecBlock {
+            first_data_shard: 0,
+            data_shards: 900,
+            parity_shards: 0,
+            percentage: 0,
+        };
+        assert!(unsafe { plan.validate(&policy) }.is_err());
+        policy.fec_policy_flags = VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED;
+        assert!(unsafe { plan.validate(&policy) }.is_ok());
+        plan.framed_bytes = BorrowedBytes::new(&small);
+        plan.blocks[0].data_shards = 2;
+        assert!(unsafe { plan.validate(&policy) }.is_err());
+        plan.framed_bytes = BorrowedBytes::new(&large);
+        plan.blocks[0] = VideoFecBlock {
+            first_data_shard: 0,
+            data_shards: 2,
+            parity_shards: 2,
+            percentage: 100,
+        };
+        plan.blocks[1] = VideoFecBlock {
+            first_data_shard: 2,
+            data_shards: 898,
+            parity_shards: 0,
+            percentage: 0,
+        };
+        plan.block_count = 2;
+        assert!(unsafe { plan.validate(&policy) }.is_err());
+        plan.blocks[0].data_shards = u32::MAX;
+        assert!(unsafe { plan.validate(&policy) }.is_err());
+        policy.max_fec_blocks = 0;
+        assert!(unsafe { plan.validate(&policy) }.is_err());
+    }
+
+    #[test]
+    fn fallback_capacity_matches_exhaustive_wire_rates() {
+        for min_percentage in [1, 20, 100, 255] {
+            for min_parity in [0, 1, 2, 100, 254] {
+                let expected = (1u32..255).rev().find(|data| {
+                    (min_percentage..=255).any(|percentage| {
+                        let parity = (data * percentage).div_ceil(100);
+                        parity >= min_parity && data + parity <= 255
+                    })
+                });
+                assert_eq!(largest_protected_data(min_percentage, min_parity), expected);
+            }
+        }
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn framing_tables_match_public_c_layout() {
+        assert_eq!(size_of::<VideoPlanSelectionV2>(), 168);
+        assert_eq!(
+            std::mem::offset_of!(VideoPlanSelectionV2, payload_type),
+            128
+        );
+        assert_eq!(
+            std::mem::offset_of!(VideoPlanSelectionV2, encoding_name),
+            136
+        );
+        assert_eq!(size_of::<NegotiatedVideoPlanTransportApiV2>(), 64);
+        assert_eq!(size_of::<VideoPlanSelection>(), 128);
+        assert_eq!(std::mem::offset_of!(VideoPlanSelection, codec), 48);
+        assert_eq!(std::mem::offset_of!(VideoPlanSelection, clock_epoch), 96);
+        assert_eq!(
+            std::mem::offset_of!(VideoPlanSelection, metadata_required),
+            120
+        );
+        assert_eq!(size_of::<NegotiatedVideoPlanTransportApi>(), 64);
+        assert_eq!(
+            std::mem::offset_of!(NegotiatedVideoPlanTransportApi, submit),
+            48
+        );
+        assert_eq!(size_of::<VideoFramingApiV2_1>(), 48);
+        assert_eq!(std::mem::offset_of!(VideoFramingApiV2_1, probe), 40);
         assert_eq!(size_of::<NegotiatedVideoUnit>(), 176);
         assert_eq!(std::mem::offset_of!(NegotiatedVideoUnit, clock), 120);
         assert_eq!(std::mem::offset_of!(NegotiatedVideoUnit, data), 160);
         assert_eq!(size_of::<VideoFecBlock>(), 16);
-        assert_eq!(size_of::<VideoFramingLimits>(), 48);
+        assert_eq!(size_of::<VideoFramingLimits>(), 64);
+        assert_eq!(std::mem::offset_of!(VideoFramingLimits, max_wire_bytes), 40);
+        assert_eq!(
+            std::mem::offset_of!(VideoFramingLimits, min_fec_percentage),
+            48
+        );
         assert_eq!(size_of::<VideoFramePlan>(), 112);
         assert_eq!(size_of::<VideoFramingApi>(), 40);
         assert_eq!(size_of::<NegotiatedVideoApi>(), 40);

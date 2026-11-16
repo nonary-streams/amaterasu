@@ -21,6 +21,7 @@ struct Provider {
     send_busy: bool,
     sent_control: Vec<(u64, u32, u32, u32, Vec<u8>)>,
     control_failed: bool,
+    pending_control: bool,
     pcm_failed: bool,
     alternate_audio: bool,
     submitted_pcm: bool,
@@ -473,13 +474,33 @@ unsafe extern "C" fn audio(context: *mut c_void, _: u64, sink: AudioUnitSink) ->
     };
     unsafe { (sink.write)(sink.context, &packet) }
 }
-unsafe extern "C" fn control(context: *mut c_void, _: u64, _: ControlMessageSink) -> Status {
-    if unsafe { &*context.cast::<Provider>() }.control_failed {
-        MEDIA_BACKEND_ERROR
-    } else {
-        MEDIA_PENDING
+unsafe extern "C" fn control(context: *mut c_void, _: u64, sink: ControlMessageSink) -> Status {
+    // SAFETY: the test host lends its stable provider for this synchronous call.
+    let provider = unsafe { &mut *context.cast::<Provider>() };
+    if provider.control_failed {
+        return MEDIA_BACKEND_ERROR;
     }
+    if !provider.pending_control {
+        return MEDIA_PENDING;
+    }
+    let bytes = [1_u8];
+    let message = ControlMessage {
+        message_type: 0x200,
+        channel: 0,
+        delivery: CONTROL_RELIABLE,
+        reserved: 0,
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+        sequence: 12,
+    };
+    // SAFETY: this message and its bytes remain alive through the callback.
+    let status = unsafe { sink.write.unwrap()(sink.context, &message) };
+    if status == STATUS_OK {
+        provider.pending_control = false;
+    }
+    status
 }
+
 unsafe extern "C" fn submit_pcm(context: *mut c_void, _: u64, frame: *const AudioFrame) -> Status {
     // SAFETY: the test host supplies a live provider and a synchronous frame borrow.
     let provider = unsafe { &mut *context.cast::<Provider>() };
@@ -808,7 +829,7 @@ fn native_delivery_failures_identify_the_control_and_pcm_lane() {
     .unwrap();
     host.provider.control_failed = true;
     assert_eq!(
-        backend.control().err(),
+        backend.control(true).err(),
         Some("native_delivery_failed_control")
     );
     host.provider.control_failed = false;
@@ -907,4 +928,27 @@ fn negotiated_audio_units_use_typed_providers_and_retain_metadata_on_busy() {
     assert_eq!(backend.audio().err(), Some("audio_format_mismatch"));
     drop(backend);
     assert_eq!(host.released, [1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn backpressure_declines_the_native_callback_without_consuming_its_event() {
+    let mut host = Host::new();
+    host.provider.pending_control = true;
+    let mut backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
+    assert!(backend.control(false).unwrap().is_none());
+    assert!(host.provider.pending_control);
+    let event = backend.control(true).unwrap().unwrap();
+    assert_eq!(event.sequence, 12);
+    assert_eq!(event.payload, [1]);
+    assert!(!host.provider.pending_control);
+    host.provider.control_failed = true;
+    assert_eq!(
+        backend.control(false).unwrap_err(),
+        "native_delivery_failed_control"
+    );
 }

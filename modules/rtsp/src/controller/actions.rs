@@ -299,6 +299,8 @@ impl Controller {
             adjustments: Vec::new(),
             negotiated_color: None,
             negotiated_video: None,
+            extension_offer: None,
+            extension_announce: None,
             url,
             session_token,
             udp_discovery,
@@ -335,6 +337,14 @@ impl Controller {
             record.udp_discovery.as_ref(),
             media_binds,
         );
+        if self.settings.extension_enabled
+            && record.config.min_threads == 2
+            && record.config.qp == 28
+        {
+            payload["extension_probe"] = record
+                .config
+                .extension_configuration(self.settings.extension_bit_depth);
+        }
         if record.config.display_admission_required() {
             // Stream-session starts its prepared timer after Apply/readback. Reserve
             // the whole Prepare budget so an orphaned lease cannot outlive Launch's

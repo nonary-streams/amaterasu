@@ -12,6 +12,20 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnitResponse {
+    stream: u64,
+    generation: u64,
+    offer_id: u64,
+    source_id: u64,
+    config_generation: u64,
+    codec: amaterasu_contracts::media_profile::FormatId,
+    framing: amaterasu_contracts::media_profile::FormatId,
+    clock_epoch: [u8; 16],
+    clock_origin_us: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum State {
@@ -120,10 +134,20 @@ impl Resource {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PendingVideoWarmup {
+    pub request: u64,
+    pub deadline: u64,
+}
+
 pub(super) struct Record {
     /// Failures recorded for the launch owner, published from the tick.
     pub issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
     pub providers: crate::providers::ProviderServices,
+    pub extension_route: Option<crate::model::ExtensionRoute>,
+    pub extension_checked: bool,
+    pub extension_limits: Option<amaterasu_media::VideoFramingLimits>,
+    pub negotiated_route: Option<crate::plane::NegotiatedRoute>,
     pub id: u64,
     pub history: super::history::SessionHistory,
     pub host_metrics: super::host_metrics_activity::HostMetricsActivity,
@@ -175,6 +199,11 @@ pub(super) struct Record {
     pub audio_recovery_needed: bool,
     pub prepared_until: u64,
     pub armed_accepted: bool,
+    pub video_warmup_requested: bool,
+    pub video_warmup_started_at: u64,
+    pub video_warmup_ready: bool,
+    pub video_readiness_next_poll_at: u64,
+    pub video_warmup_wait: Option<PendingVideoWarmup>,
     pub next_auth_poll: u64,
     pub control_authenticated: bool,
     pub control_disconnect_checked: bool,
@@ -263,6 +292,64 @@ pub(super) struct UncertainJournalWrite {
 }
 
 impl Record {
+    pub fn accept_negotiated_unit(&mut self, payload: &Value) -> Result<(), &'static str> {
+        let Some(profile) = self
+            .start
+            .as_ref()
+            .and_then(|start| start.configuration.extension_profile.as_ref())
+        else {
+            return Ok(());
+        };
+        let route = self
+            .extension_route
+            .as_ref()
+            .ok_or("extension_profile_not_offered")?;
+        let limits = self
+            .extension_limits
+            .ok_or("extension_profile_not_offered")?;
+        let unit: UnitResponse = serde_json::from_value(payload["negotiated_unit"].clone())
+            .map_err(|_| "invalid_video_unit_selection")?;
+        if profile != &route.profile
+            || unit.stream != self.resources[&Resource::Video]
+            || unit.generation != unit.stream
+            || unit.offer_id != u64::from(profile.wire_selector)
+            || unit.source_id != route.source_id
+            || unit.config_generation != 1
+            || unit.codec != profile.codec
+            || unit.framing != profile.framing
+            || unit.clock_epoch == [0; 16]
+            || unit.clock_origin_us == 0
+        {
+            return Err("invalid_video_unit_selection");
+        }
+        let id = |format: amaterasu_contracts::media_profile::FormatId| {
+            amaterasu_media::EncoderFormatId {
+                namespace_id: format.namespace_id,
+                value: format.value,
+                schema: format.schema,
+            }
+        };
+        self.negotiated_route = Some(crate::plane::NegotiatedRoute {
+            profile: route.profile.clone(),
+            video_service: route.video_unit_service.clone(),
+            framer_service: route.framer_service.clone(),
+            transport_service: route.plan_transport_service.clone(),
+            clock_origin_us: unit.clock_origin_us,
+            limits,
+            selection: crate::plane::VideoUnitSelection {
+                stream: unit.stream,
+                generation: unit.generation,
+                offer_id: unit.offer_id,
+                codec: id(unit.codec),
+                framing: id(unit.framing),
+                source_id: unit.source_id,
+                config_generation: unit.config_generation,
+                clock_epoch: unit.clock_epoch,
+                metadata_required: false,
+            },
+        });
+        Ok(())
+    }
     pub fn required_native_contract(&self, resource: Resource) -> Option<&'static str> {
         if resource == Resource::AudioCapture && self.config.audio.encoded_source() {
             return Some(amaterasu_module_sdk::audio::ENCODED_SOURCE_CONTRACT);
@@ -307,6 +394,10 @@ impl Record {
         Self {
             issues: Default::default(),
             providers: Default::default(),
+            extension_route: None,
+            extension_checked: false,
+            extension_limits: None,
+            negotiated_route: None,
             id,
             history: super::history::SessionHistory::new(id, config.history_activity_id.clone()),
             host_metrics: super::host_metrics_activity::HostMetricsActivity::new(id),
@@ -356,6 +447,11 @@ impl Record {
             audio_recovery_needed: false,
             prepared_until: 0,
             armed_accepted: false,
+            video_warmup_requested: false,
+            video_warmup_started_at: 0,
+            video_warmup_ready: false,
+            video_readiness_next_poll_at: 0,
+            video_warmup_wait: None,
             next_auth_poll: 0,
             control_authenticated: false,
             control_disconnect_checked: false,
@@ -611,6 +707,7 @@ impl Record {
             "ok": true,
             "session": self.id,
             "operation_id": self.config.operation_id,
+            "video_startup_ready": self.video_warmup_ready,
             "lifecycle_session_target": self.config.lifecycle_session_target,
             "lifecycle_capture_mode": self.config.lifecycle_capture_mode,
             "lifecycle_input_required": self.lifecycle_input_required,
@@ -627,6 +724,7 @@ impl Record {
             "encoder_provider": self.start.as_ref().and_then(|start| start.encoder_provider.as_deref()),
             "source_id": self.start.as_ref().and_then(|start| start.source_id),
             "client_feature_flags": self.start.as_ref().and_then(|start| start.client_feature_flags),
+            "extension_profile": self.extension_limits.as_ref().and_then(|_| self.extension_route.as_ref().map(|route| &route.profile)),
             "haptics_pcm_negotiated": self.start.as_ref().is_some_and(|start| {
                 start.client_feature_flags.is_some_and(|flags| {
                     flags & amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM != 0
@@ -763,7 +861,13 @@ impl Record {
                 }
                 if let Some(source_id) = start.source_id {
                     payload["source_id"] = json!(source_id);
-                } else {
+                }
+                if start.source_id.is_none()
+                    || self
+                        .extension_route
+                        .as_ref()
+                        .is_some_and(|route| route.submitted)
+                {
                     payload["capture_provider"] = json!(start.capture_provider);
                     payload["output"] = json!(
                         start

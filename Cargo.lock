@@ -367,6 +367,7 @@ dependencies = [
  "amaterasu-media",
  "amaterasu-module-sdk",
  "cc",
+ "libc",
  "libloading",
  "pkg-config",
  "serde",
@@ -645,11 +646,13 @@ dependencies = [
 name = "amaterasu-media-transport"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-gamestream",
  "amaterasu-media",
  "amaterasu-module-sdk",
  "amaterasu-network-policy",
  "amaterasu-network-sockets",
+ "amaterasu-runtime",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
@@ -1022,8 +1025,10 @@ dependencies = [
  "amaterasu-gamestream",
  "amaterasu-input-policy",
  "amaterasu-media",
+ "amaterasu-media-transport",
  "amaterasu-module-sdk",
  "amaterasu-runtime",
+ "amaterasu-video",
  "getrandom 0.3.4",
  "libloading",
  "serde",
@@ -1086,6 +1091,7 @@ dependencies = [
 name = "amaterasu-video"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-media",
  "amaterasu-module-sdk",
  "amaterasu-runtime",
