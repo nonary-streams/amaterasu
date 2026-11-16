@@ -64,7 +64,8 @@ ambiguous, NVHTTP reads the product document again and returns
 hostname. The readback still updates server-info to the hostname currently stored.
 The effective name also becomes the default device name for new stream sessions.
 Moonlight's optional `clientName` query value overrides the name for that launch;
-existing sessions retain the name resolved when they started. Capture output stays
+an invalid or oversized name is ignored with a warning and the default is used.
+Existing sessions retain the name resolved when they started. Capture output stays
 separate and continues to identify the display source.
 The standalone virtual-display service has no launch/session lifecycle binding, so
 its caller-supplied driver names are not changed by this setting. Platform discovery
@@ -614,17 +615,19 @@ The bounded normal metadata allowlist is `uniqueid`, `uuid`, `additionalStates`,
 `gcpersist`, `clientVrrRequested`, `continuousAudio`, and `corever`.
 Unknown fields are rejected, including executable, path, arguments,
 environment, or catalog-owner overrides. The current profile accepts SDR,
-negotiated stereo or surround playback, core version 1, and Boolean `sops` hints.
+negotiated stereo or surround playback and core version 1.
 `surroundAudioInfo` uses Moonlight's `channel_mask << 16 | channel_count` encoding:
 196610 for stereo, 4128774 for 5.1, and 104792072 for 7.1. Controller slot masks
-are bounded to 16 bits; `gcpersist` is Boolean. These hints do not grant native
-input access or override the configured controller lifecycle. `localAudioPlayMode` accepts
+normally use 16 bits and `gcpersist` is Boolean. Malformed optional controller,
+SOPS, VRR, and HDR capability hints are ignored with bounded warnings; these
+hints do not grant native input access or override the configured controller
+lifecycle. `localAudioPlayMode` accepts
 only `0` or `1` and defaults to `0`; it snapshots whether audio capture should
 prefer host audio, with the Windows audio module applying its Steam-sink fallback
-when host audio is disabled or the ordinary sink is unavailable. HDR remains
-unsupported, and SOPS/VRR hints do not apply display or game settings. Actual
-surround capture and encoding still require the selected provider's support.
-`additionalStates` is accepted only as a decimal Boolean.
+when host audio is disabled or the ordinary sink is unavailable. HDR, surround
+capture, and encoding require the selected providers' support; SOPS/VRR hints do
+not apply display or game settings. Malformed `additionalStates` is also ignored
+with a warning.
 
 The lifecycle calls the launch service's exported-app API with only the immutable
 numeric catalog ID and a private operation ID. Catalog policy resolves the trusted

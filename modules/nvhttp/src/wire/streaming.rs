@@ -1,5 +1,6 @@
 use super::query::{Query, hex_bytes};
-use crate::launch::LaunchRequest;
+use crate::launch::{AdvisoryWarnings, LaunchRequest};
+use amaterasu_module_sdk::stream_warnings::{MAX_SAFE_INTEGER, StreamWarning, WarningValue};
 
 const LAUNCH_FIELDS: &[&str] = &[
     "appid",
@@ -46,7 +47,7 @@ pub(super) fn resume_request(query: &Query) -> Result<LaunchRequest, &'static st
 
 fn streaming_request(query: &Query, kind: RequestKind) -> Result<LaunchRequest, &'static str> {
     query.require_only(LAUNCH_FIELDS)?;
-    validate_metadata(query)?;
+    let mut warnings = validate_metadata(query)?;
     let app_id = match (kind, query.get("appid")) {
         (RequestKind::Resume, None) => 0,
         (_, Some(value)) => application_id(value)?,
@@ -60,12 +61,15 @@ fn streaming_request(query: &Query, kind: RequestKind) -> Result<LaunchRequest, 
     let key_id = key_id(query.required("rikeyid")?)?;
     let host_audio_enabled = query.get("localAudioPlayMode") == Some("1");
     let audio_channels = surround_audio_channels(query.get("surroundAudioInfo"))?;
-    let device_name = query.get("clientName").unwrap_or_default();
-    if !device_name.is_empty()
-        && (device_name.len() > 128 || device_name.chars().any(char::is_control))
-    {
-        return Err("invalid device name");
-    }
+    let name = query.get("clientName").unwrap_or_default();
+    let device_name = if name.is_empty() {
+        None
+    } else if name.len() > 128 || name.chars().any(char::is_control) {
+        warnings.push(ignored_hint(query, "clientName", false));
+        None
+    } else {
+        Some(name.to_owned())
+    };
     Ok(LaunchRequest {
         hdr: query.get("hdrMode") == Some("1"),
         app_id,
@@ -75,9 +79,10 @@ fn streaming_request(query: &Query, kind: RequestKind) -> Result<LaunchRequest, 
         host_audio_enabled,
         continuous_audio: query.get("continuousAudio") == Some("1"),
         audio_channels,
-        device_name: (!device_name.is_empty()).then(|| device_name.to_owned()),
+        device_name,
         remote_input_key,
         key_id,
+        advisory_warnings: AdvisoryWarnings(warnings),
     })
 }
 
@@ -89,7 +94,7 @@ fn application_id(value: &str) -> Result<u32, &'static str> {
     Ok(app_id)
 }
 
-fn validate_metadata(query: &Query) -> Result<(), &'static str> {
+fn validate_metadata(query: &Query) -> Result<Vec<StreamWarning>, &'static str> {
     if query.get("uniqueid").is_some() {
         query.client_id()?;
     }
@@ -102,17 +107,28 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
     {
         return Err("invalid request identifier");
     }
-    optional_boolean(query, "additionalStates")?;
-    // Moonlight can request SOPS for a Desktop stream. It is a client hint;
-    // Amaterasu never changes the host display or application settings for it.
-    optional_boolean(query, "sops")?;
+    // SOPS and VRR are advisory; accepting them does not mutate host display policy.
+    let mut warnings = Vec::new();
+    for field in [
+        "additionalStates",
+        "sops",
+        "gcpersist",
+        "clientVrrRequested",
+    ] {
+        if optional_boolean(query, field).is_err() {
+            warnings.push(ignored_hint(query, field, true));
+        }
+    }
     optional_boolean(query, "hdrMode")?;
-    optional_decimal_mask(query, "clientHdrCapVersion", u32::MAX)?;
-    optional_decimal_mask(query, "clientHdrCapSupportedFlagsInUint32", u32::MAX)?;
+    for field in ["clientHdrCapVersion", "clientHdrCapSupportedFlagsInUint32"] {
+        if optional_decimal_mask(query, field, u32::MAX).is_err() {
+            warnings.push(ignored_hint(query, field, true));
+        }
+    }
     if let Some(kind) = query.get("clientHdrCapMetaDataId")
         && !matches!(kind, "0" | "NV_STATIC_METADATA_TYPE_1")
     {
-        return Err("unsupported HDR metadata type");
+        warnings.push(ignored_hint(query, "clientHdrCapMetaDataId", false));
     }
     if let Some(data) = query.get("clientHdrCapDisplayData")
         && (data.len() > 512
@@ -120,19 +136,39 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() || byte == b'x'))
     {
-        return Err("invalid HDR display metadata");
+        warnings.push(ignored_hint(query, "clientHdrCapDisplayData", false));
     }
     optional_boolean(query, "localAudioPlayMode")?;
     optional_boolean(query, "continuousAudio")?;
     // Slot hints are independent from permission to inject native input. Moonlight
     // reports player one in single-controller mode even without an attached pad.
     for field in ["remoteControllersBitmap", "gcmap", "gcpmap", "psmap"] {
-        optional_decimal_mask(query, field, u16::MAX as u32)?;
+        if optional_decimal_mask(query, field, u16::MAX as u32).is_err() {
+            warnings.push(ignored_hint(query, field, true));
+        }
     }
-    optional_boolean(query, "gcpersist")?;
-    // This is only a client pacing capability hint; accepting it does not enable host VRR.
-    optional_boolean(query, "clientVrrRequested")?;
-    require_optional_value(query, "corever", "1", "unsupported Moonlight core version")
+    require_optional_value(query, "corever", "1", "unsupported Moonlight core version")?;
+    Ok(warnings)
+}
+
+fn ignored_hint(query: &Query, field: &str, numeric: bool) -> StreamWarning {
+    let requested = if numeric {
+        query
+            .get(field)
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(value))
+            .map(WarningValue::Integer)
+    } else {
+        None
+    };
+    StreamWarning {
+        code: "invalid_client_hint".into(),
+        source: "amaterasu.nvhttp/1".into(),
+        reason: field.into(),
+        os_error: None,
+        requested,
+        effective: Some(WarningValue::Label("ignored".into())),
+    }
 }
 
 /// `surroundAudioInfo` is `channel_mask << 16 | channel_count`, from
@@ -334,7 +370,6 @@ mod tests {
             "localAudioPlayMode=2",
             "continuousAudio=true",
             "surroundAudioInfo=6",
-            "gcmap=65536",
             "corever=2",
         ] {
             assert!(
@@ -342,7 +377,17 @@ mod tests {
                 "accepted {field:?}"
             );
         }
-        assert!(parse_resume(&format!("{base}&clientName={}", "x".repeat(129))).is_err());
+        let bad_name = parse_resume(&format!("{base}&clientName={}", "x".repeat(129))).unwrap();
+        assert!(bad_name.device_name.is_none());
+        assert_eq!(bad_name.advisory_warnings.0[0].reason, "clientName");
+        assert_eq!(
+            parse_resume(&format!("{base}&gcmap=65536"))
+                .unwrap()
+                .advisory_warnings
+                .0[0]
+                .reason,
+            "gcmap"
+        );
     }
 
     #[test]
@@ -423,7 +468,9 @@ mod tests {
             "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1&clientName={}",
             "x".repeat(129)
         );
-        assert!(matches!(parse(&too_long), Err("invalid device name")));
+        let ignored = parse(&too_long).unwrap();
+        assert!(ignored.device_name.is_none());
+        assert_eq!(ignored.advisory_warnings.0[0].reason, "clientName");
     }
 
     #[test]
@@ -459,20 +506,51 @@ mod tests {
         );
         for field in [
             "hdrMode=2",
-            "sops=2",
             "surroundAudioInfo=393223",
             "localAudioPlayMode=2",
-            "remoteControllersBitmap=65536",
-            "gcmap=-1",
-            "psmap=x",
-            "gcpmap=65536",
-            "gcpersist=2",
             "corever=2",
-            "additionalStates=2",
         ] {
             let fields = format!("{base}&{field}");
             assert!(parse(&fields).is_err(), "accepted {field:?}");
         }
+    }
+
+    #[test]
+    fn invalid_advisory_metadata_warns_without_changing_request_identity() {
+        let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
+        let original = parse(base).unwrap();
+        for field in [
+            "additionalStates",
+            "sops",
+            "gcpersist",
+            "clientVrrRequested",
+            "remoteControllersBitmap",
+            "gcmap",
+            "gcpmap",
+            "psmap",
+            "clientHdrCapVersion",
+            "clientHdrCapSupportedFlagsInUint32",
+            "clientHdrCapMetaDataId",
+            "clientHdrCapDisplayData",
+        ] {
+            let request = parse(&format!("{base}&{field}=not-a-valid-hint")).unwrap();
+            assert!(
+                request == original,
+                "advisory metadata changed request identity: {field}"
+            );
+            assert_eq!(request.advisory_warnings.0.len(), 1, "{field}");
+            let warning = &request.advisory_warnings.0[0];
+            assert_eq!(warning.reason, field);
+            assert_eq!(warning.code, "invalid_client_hint");
+            assert!(warning.valid());
+        }
+        let negative = parse(&format!("{base}&gcmap=-1")).unwrap();
+        assert_eq!(
+            negative.advisory_warnings.0[0].requested,
+            Some(WarningValue::Integer(-1))
+        );
+        let huge = parse(&format!("{base}&gcmap=9007199254740992")).unwrap();
+        assert_eq!(huge.advisory_warnings.0[0].requested, None);
     }
 
     #[test]
@@ -616,29 +694,41 @@ mod tests {
                 );
             }
             for value in ["65536", "-1", "+1", "1.0", " 1", "1 ", ""] {
-                assert!(
-                    parse(&format!("{base}&{field}={value}")).is_err(),
-                    "accepted {value:?}"
-                );
+                let request = parse(&format!("{base}&{field}={value}")).unwrap();
+                assert_eq!(request.advisory_warnings.0[0].reason, field, "{value:?}");
             }
         }
         for value in ["0", "1"] {
             assert!(parse(&format!("{base}&gcpersist={value}")).is_ok());
         }
         for value in ["2", "-1", "", "true"] {
-            assert!(parse(&format!("{base}&gcpersist={value}")).is_err());
+            assert_eq!(
+                parse(&format!("{base}&gcpersist={value}"))
+                    .unwrap()
+                    .advisory_warnings
+                    .0[0]
+                    .reason,
+                "gcpersist"
+            );
         }
     }
 
     #[test]
-    fn accepts_optional_vrr_request_hint_but_rejects_malformed_values() {
+    fn optional_vrr_request_hint_warns_on_malformed_values() {
         let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
         assert!(parse(base).is_ok());
         for value in ["0", "1"] {
             assert!(parse(&format!("{base}&clientVrrRequested={value}")).is_ok());
         }
         for value in ["2", "-1", "", "true"] {
-            assert!(parse(&format!("{base}&clientVrrRequested={value}")).is_err());
+            assert_eq!(
+                parse(&format!("{base}&clientVrrRequested={value}"))
+                    .unwrap()
+                    .advisory_warnings
+                    .0[0]
+                    .reason,
+                "clientVrrRequested"
+            );
         }
         assert!(matches!(
             parse(&format!("{base}&clientVrrRequested=1&vrrUnsupported=1")),

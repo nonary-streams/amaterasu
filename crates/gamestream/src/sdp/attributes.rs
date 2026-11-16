@@ -19,6 +19,12 @@ impl Attributes<'_> {
         Ok(self.optional(name)?.unwrap_or(default))
     }
 
+    /// Read an optional hint without making its syntax a stream requirement.
+    /// The compatibility reporter separately records malformed values.
+    pub fn hint(&mut self, name: &'static str) -> Option<u32> {
+        self.0.remove(name).and_then(decimal)
+    }
+
     pub fn require_value(&mut self, name: &'static str, expected: u32) -> Result<(), Error> {
         let value = self.required(name)?;
         if value != expected {
@@ -35,7 +41,7 @@ impl Attributes<'_> {
     }
 
     pub fn finish(mut self) -> Result<usize, Error> {
-        // Known non-negotiating hints can be ignored, but still require unsigned syntax.
+        // These values are not used to negotiate media or security.
         for name in [
             "x-nv-video[0].timeoutLengthMs",
             "x-nv-video[0].framesWithInvalidRefThreshold",
@@ -43,7 +49,7 @@ impl Attributes<'_> {
             "x-nv-vqos[0].qosTrafficType",
             "x-nv-aqos.qosTrafficType",
         ] {
-            self.optional(name)?;
+            let _ = self.hint(name);
         }
         for name in self.0.keys() {
             // Unknown extension namespaces are bounded and ignored. New parameters

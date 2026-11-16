@@ -79,6 +79,18 @@ pub(crate) struct VideoEncryptionPolicySnapshot {
     pub(crate) wan_mode: i64,
 }
 
+/// Ignored client hints are diagnostics, not part of stream request identity.
+#[derive(Clone, Default)]
+pub struct AdvisoryWarnings(pub(crate) Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>);
+
+impl PartialEq for AdvisoryWarnings {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AdvisoryWarnings {}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct LaunchRequest {
     pub hdr: bool,
@@ -96,6 +108,7 @@ pub struct LaunchRequest {
     pub device_name: Option<String>,
     pub remote_input_key: [u8; 16],
     pub key_id: u32,
+    pub advisory_warnings: AdvisoryWarnings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1353,6 +1366,7 @@ impl Controller {
             ),
         };
 
+        let warning_logger = self.logger.clone();
         if let Some(record) = self
             .records
             .values_mut()
@@ -1369,6 +1383,9 @@ impl Controller {
                     shared_capture.as_ref(),
                 )
             {
+                for warning in request.advisory_warnings.0.clone() {
+                    workflow::add_stream_warning(record, warning_logger.as_ref(), warning);
+                }
                 if matches!(record.state, State::Ready) {
                     record.launch_connection = Some(connection);
                     record.response_kind = response;
@@ -1504,6 +1521,7 @@ impl Controller {
             record.global_configured_virtual_sink = None;
             record.global_display_policy = json!({});
         }
+        workflow::add_request_warnings(&mut record, self.logger.as_ref());
         self.records.insert(id, record);
         None
     }

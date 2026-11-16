@@ -25,7 +25,7 @@ pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
     };
     let encryption = encryption(&mut attributes, control)?;
     let fec = fec(&mut attributes)?;
-    let client_feature_flags = attributes.default("x-ml-general.featureFlags", 0)?;
+    let client_feature_flags = attributes.hint("x-ml-general.featureFlags").unwrap_or(0);
     // These bits advertise optional client capabilities, not required wire
     // behavior. Retain unknown bits for diagnostics; consumers select only
     // capabilities they understand. Encryption and transport checks stay strict.
@@ -51,19 +51,8 @@ pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
 fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
     let format = video_format(attributes)?;
     // Codec support is decided by the requested format and selected provider.
-    bounded(
-        attributes.default("x-nv-clientSupportHevc", 0)?,
-        0,
-        1,
-        "HEVC support",
-    )?;
-
-    bounded(
-        attributes.default("x-ss-video[0].intraRefresh", 0)?,
-        0,
-        1,
-        "intra refresh",
-    )?;
+    let _ = attributes.hint("x-nv-clientSupportHevc");
+    let _ = attributes.hint("x-ss-video[0].intraRefresh");
     const SLICES_PER_FRAME: &str = "x-nv-video[0].videoEncoderSlicesPerFrame";
     let slices_per_frame = bounded(
         attributes.required(SLICES_PER_FRAME)?,
@@ -71,7 +60,7 @@ fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
         i32::MAX as u32,
         SLICES_PER_FRAME,
     )? as i32;
-    attributes.optional("x-nv-video[0].rateControlMode")?;
+    let _ = attributes.hint("x-nv-video[0].rateControlMode");
     let width = bounded(
         attributes.required("x-nv-video[0].clientViewportWd")?,
         16,
@@ -94,7 +83,9 @@ fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
         requested_fps
     };
     let fps = bounded(fps, 1, 1000, "fps")?;
-    let mut refresh_rate_x100 = attributes.default("x-nv-video[0].clientRefreshRateX100", 0)?;
+    let mut refresh_rate_x100 = attributes
+        .hint("x-nv-video[0].clientRefreshRateX100")
+        .unwrap_or(0);
     if refresh_rate_x100 != 0
         && (refresh_rate_x100 > 100_000 || refresh_rate_x100.abs_diff(fps * 100) > 50)
     {
@@ -173,14 +164,11 @@ fn bitrate(attributes: &mut Attributes<'_>) -> Result<(u32, Option<u32>), Error>
         "x-nv-video[0].initialBitrateKbps",
         "x-nv-video[0].initialPeakBitrateKbps",
     ] {
-        attributes.optional(name)?;
+        let _ = attributes.hint(name);
     }
-    let configured = attributes.optional("x-ml-video.configuredBitrateKbps")?;
-    if let Some(value) = configured {
-        // Zero means unspecified. The RTSP owner accounts for transport and
-        // audio overhead before selecting an encoder rate within its policy.
-        bounded(value, 0, u32::MAX, "configured bitrate")?;
-    }
+    // Zero means unspecified. The RTSP owner accounts for transport and audio
+    // overhead before selecting an encoder rate within its policy.
+    let configured = attributes.hint("x-ml-video.configuredBitrateKbps");
     Ok((maximum, configured))
 }
 
@@ -194,12 +182,7 @@ fn audio(attributes: &mut Attributes<'_>) -> Result<Audio, Error> {
     ) {
         return Err(Error::Unsupported("audio channel layout"));
     }
-    bounded(
-        attributes.default("x-nv-audio.surround.AudioQuality", 0)?,
-        0,
-        1,
-        "audio quality",
-    )?;
+    let _ = attributes.hint("x-nv-audio.surround.AudioQuality");
     let packet_duration_ms = attributes.default("x-nv-aqos.packetDuration", 5)?;
     if !matches!(packet_duration_ms, 5 | 10) {
         return Err(Error::Unsupported("audio packet duration"));

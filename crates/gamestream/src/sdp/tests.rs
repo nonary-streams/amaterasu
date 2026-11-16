@@ -136,7 +136,15 @@ fn client_capabilities_retain_unknown_bits_without_rejecting_streams() {
                 .unwrap();
         assert_eq!(parsed.client_feature_flags, flags);
     }
-    assert!(parse_announce(changed("x-ml-general.featureFlags", "4294967296").as_bytes()).is_err());
+    let malformed =
+        parse_announce(changed("x-ml-general.featureFlags", "4294967296").as_bytes()).unwrap();
+    assert_eq!(malformed.client_feature_flags, 0);
+    assert!(
+        malformed
+            .adjustments
+            .iter()
+            .any(|item| item.code == "invalid_optional_hints")
+    );
 }
 
 #[test]
@@ -230,7 +238,6 @@ fn surround_audio_requires_exact_channel_mask_and_enable_pair() {
         for (name, value) in [
             ("x-nv-audio.surround.channelMask", "3"),
             ("x-nv-audio.surround.enable", "0"),
-            ("x-nv-audio.surround.AudioQuality", "2"),
             ("x-nv-aqos.packetDuration", "20"),
         ] {
             let changed = announce.replace(
@@ -240,8 +247,6 @@ fn surround_audio_requires_exact_channel_mask_and_enable_pair() {
                         mask.to_string()
                     } else if name == "x-nv-audio.surround.enable" {
                         "1".into()
-                    } else if name == "x-nv-audio.surround.AudioQuality" {
-                        "0".into()
                     } else {
                         "5".into()
                     }
@@ -296,7 +301,6 @@ fn unsupported_media_modes_and_invalid_numeric_boundaries_fail() {
         ("x-nv-video[0].encoderCscMode", "4"),
         ("x-nv-audio.surround.numChannels", "4"),
         ("x-nv-audio.surround.channelMask", "63"),
-        ("x-nv-audio.surround.AudioQuality", "2"),
         ("x-nv-aqos.packetDuration", "20"),
         ("x-nv-vqos[0].fec.enable", "0"),
         ("x-nv-vqos[0].fec.minRequiredFecPackets", "3"),
@@ -410,10 +414,61 @@ fn configured_bandwidth_can_exceed_the_capped_encoder_bitrate() {
     assert!(
         parse_announce(changed("x-ml-video.configuredBitrateKbps", "15999").as_bytes()).is_ok()
     );
-    assert!(
+    let malformed =
         parse_announce(changed("x-ml-video.configuredBitrateKbps", "4294967296").as_bytes())
-            .is_err()
+            .unwrap();
+    assert_eq!(malformed.video.configured_bitrate_kbps, None);
+    assert!(
+        malformed
+            .adjustments
+            .iter()
+            .any(|item| item.code == "invalid_optional_hints")
     );
+}
+
+#[test]
+fn invalid_non_negotiating_hints_warn_without_changing_the_stream_contract() {
+    for (index, name) in compatibility::OPTIONAL_NUMERIC_HINTS.iter().enumerate() {
+        let input = if FIXTURE.contains(&format!("a={name}:")) {
+            changed(name, "not-a-number")
+        } else {
+            format!("{FIXTURE}a={name}:not-a-number\r\n")
+        };
+        let parsed = parse_announce(input.as_bytes()).expect(name);
+        assert_eq!(parsed.video.format, VideoStreamFormat::H264_SDR, "{name}");
+        assert_eq!(parsed.control, ControlProtocol::EncryptedEnet, "{name}");
+        assert!(parsed.encryption.remote_input, "{name}");
+        let warning = parsed
+            .adjustments
+            .iter()
+            .find(|item| item.code == "invalid_optional_hints")
+            .expect(name);
+        assert_eq!(warning.requested, 1 << index, "{name}");
+        assert!(warning.valid());
+    }
+}
+
+#[test]
+fn unsupported_quality_and_capability_hints_do_not_reject() {
+    let input = changed("x-nv-audio.surround.AudioQuality", "2")
+        .replace("x-nv-clientSupportHevc:0", "x-nv-clientSupportHevc:2");
+    let input = format!("{input}a=x-ss-video[0].intraRefresh:2\r\n");
+    let parsed = parse_announce(input.as_bytes()).unwrap();
+    assert_eq!(parsed.video.format, VideoStreamFormat::H264_SDR);
+    for code in [
+        "audio_quality_default",
+        "hevc_capability_hint_ignored",
+        "intra_refresh_unavailable",
+    ] {
+        assert!(
+            parsed
+                .adjustments
+                .iter()
+                .any(|item| item.code == code && item.requested == 2)
+        );
+    }
+    assert!(parse_announce(changed("x-ss-general.encryptionEnabled", "8").as_bytes()).is_err());
+    assert!(parse_announce(changed("x-nv-vqos[0].bitStreamFormat", "3").as_bytes()).is_err());
 }
 
 #[test]

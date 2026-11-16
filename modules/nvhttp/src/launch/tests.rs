@@ -355,6 +355,7 @@ pub(super) fn request(key: u8) -> LaunchRequest {
         device_name: None,
         remote_input_key: [key; 16],
         key_id: 17,
+        advisory_warnings: super::AdvisoryWarnings::default(),
     }
 }
 
@@ -3833,6 +3834,54 @@ fn application_warnings_are_forwarded_to_the_exact_stream_history() {
     }).expect("history warning request");
     assert_eq!(history["activity_id"], controller.records[&1].rtsp_operation);
     assert_eq!(history["warnings"][0]["reason"], "proton_hook_unconfirmed");
+}
+
+#[test]
+fn invalid_client_hint_is_forwarded_to_exact_stream_history() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    let mut launch = request(1);
+    launch.advisory_warnings.0.push(serde_json::from_value(json!({
+        "code":"invalid_client_hint", "source":"amaterasu.nvhttp/1",
+        "reason":"clientVrrRequested", "requested":2, "effective":"ignored"
+    })).unwrap());
+    assert!(controller.launch(10, launch, peer(1), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    poll_after_delivery(&mut controller, &mut broker, connection, now);
+    let history = broker.commands.iter().find_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.stream-session/1" && payload["action"] == "record_history_warnings" => Some(payload),
+        _ => None,
+    }).expect("history warning request");
+    assert_eq!(history["activity_id"], controller.records[&1].rtsp_operation);
+    assert_eq!(history["warnings"][0]["reason"], "clientVrrRequested");
+    assert_eq!(history["warnings"][0]["requested"], 2);
+}
+
+#[test]
+fn an_ignored_hint_on_an_idempotent_retry_is_reported_without_conflict() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    let launch = request(1);
+    assert!(controller.launch(10, launch.clone(), peer(1), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    poll_after_delivery(&mut controller, &mut broker, connection, now);
+    let mut retry = launch;
+    retry.advisory_warnings.0.push(serde_json::from_value(json!({
+        "code":"invalid_client_hint", "source":"amaterasu.nvhttp/1",
+        "reason":"clientVrrRequested", "requested":2, "effective":"ignored"
+    })).unwrap());
+    let reply = controller.launch(11, retry, peer(1), now).unwrap();
+    assert_eq!(reply.status, 200);
+    poll_after_delivery(&mut controller, &mut broker, 11, now);
+    assert!(broker.commands.iter().any(|command| matches!(command,
+        Command::Request {service, payload, ..} if service == "amaterasu.stream-session/1"
+            && payload["action"] == "record_history_warnings"
+            && payload["warnings"][0]["reason"] == "clientVrrRequested")));
 }
 
 #[test]

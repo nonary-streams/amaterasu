@@ -34,6 +34,8 @@ impl StreamAdjustment {
             "refresh_hint_ignored"
                 | "intra_refresh_unavailable"
                 | "audio_quality_default"
+                | "hevc_capability_hint_ignored"
+                | "invalid_optional_hints"
                 | "optional_client_features"
                 | "bandwidth_adjusted"
                 | "compatibility_defaults"
@@ -50,7 +52,7 @@ pub(super) fn adjustments(
     let value = |key: &str| {
         attributes
             .get(key)
-            .and_then(|value| value.trim().parse::<u32>().ok())
+            .and_then(|value| super::syntax::decimal(value))
             .unwrap_or(0)
     };
     let mut adjustments = Vec::new();
@@ -70,6 +72,33 @@ pub(super) fn adjustments(
         if requested != 0 {
             adjustments.push(StreamAdjustment::new(code, requested, 0));
         }
+    }
+    let hevc_hint = value("x-nv-clientSupportHevc");
+    if hevc_hint > 1 {
+        adjustments.push(StreamAdjustment::new(
+            "hevc_capability_hint_ignored",
+            hevc_hint,
+            0,
+        ));
+    }
+    // One bounded bit per known non-negotiating numeric hint. Do not copy
+    // arbitrary client text into diagnostics, and do not create an unbounded
+    // number of adjustment records when several hints are malformed.
+    let invalid_hints = OPTIONAL_NUMERIC_HINTS
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| {
+            attributes
+                .get(**name)
+                .is_some_and(|value| super::syntax::decimal(value).is_none())
+        })
+        .fold(0_u32, |mask, (index, _)| mask | (1 << index));
+    if invalid_hints != 0 {
+        adjustments.push(StreamAdjustment::new(
+            "invalid_optional_hints",
+            invalid_hints,
+            0,
+        ));
     }
     let ignored = announce.client_feature_flags & !super::KNOWN_CLIENT_FEATURE_FLAGS;
     if ignored != 0 {
@@ -99,3 +128,22 @@ pub(super) fn adjustments(
     }
     adjustments
 }
+
+/// Bit positions in the `invalid_optional_hints` adjustment.
+pub(super) const OPTIONAL_NUMERIC_HINTS: &[&str] = &[
+    "x-ml-general.featureFlags",
+    "x-nv-clientSupportHevc",
+    "x-ss-video[0].intraRefresh",
+    "x-nv-audio.surround.AudioQuality",
+    "x-nv-video[0].clientRefreshRateX100",
+    "x-nv-video[0].rateControlMode",
+    "x-nv-vqos[0].bw.minimumBitrateKbps",
+    "x-nv-video[0].initialBitrateKbps",
+    "x-nv-video[0].initialPeakBitrateKbps",
+    "x-ml-video.configuredBitrateKbps",
+    "x-nv-video[0].timeoutLengthMs",
+    "x-nv-video[0].framesWithInvalidRefThreshold",
+    "x-nv-vqos[0].videoQualityScoreUpdateTime",
+    "x-nv-vqos[0].qosTrafficType",
+    "x-nv-aqos.qosTrafficType",
+];

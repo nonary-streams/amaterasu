@@ -16,6 +16,15 @@ Current behavior:
   configured bandwidth budget reserves video FEC, audio and packet overhead.
 - Unsupported high-quality audio and intra refresh use configured/default
   behavior and produce an alert instead of rejecting the stream.
+- Malformed non-negotiating numeric hints are ignored with an
+  `invalid_optional_hints` alert. Its requested value is a bit mask whose
+  positions are defined by `OPTIONAL_NUMERIC_HINTS` in the GameStream SDK;
+  arbitrary client text is not copied into logs. Actual codec, audio layout,
+  transport, encryption, and security fields remain strictly validated.
+- An unavailable controller-compatibility preference or optional Proton helper
+  uses a safe fallback and records a warning. Explicit client and application
+  overrides still take precedence. Failure to open or attach the optional
+  application output also records a warning and continues with null output.
 - The generic media path admits dimensions through 8192 per axis and frame
   rates through 1000 FPS, within signed profile limits and provider checks.
   These are validation ceilings, not claims that every encoder supports them.
@@ -36,6 +45,8 @@ feature failures.
 
 Alerts currently use bounded host log retention and refresh with that log.
 History retention follows the enabled Stats/history provider's policy.
+The warning contract and its remaining audit boundaries are described in
+`stream-failure-policy.md`.
 
 ## 4:4:4 validation
 

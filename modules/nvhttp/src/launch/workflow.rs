@@ -227,6 +227,15 @@ pub(super) fn add_stream_warning(
     }
 }
 
+pub(super) fn add_request_warnings(
+    record: &mut Record,
+    logger: Option<&amaterasu_module_sdk::LogEmitter>,
+) {
+    for warning in record.request.advisory_warnings.0.clone() {
+        add_stream_warning(record, logger, warning);
+    }
+}
+
 fn proton_policy_warning(
     payload: &Value,
     fallback: bool,
@@ -1424,6 +1433,7 @@ impl Controller {
                         || self.retire_stream_key(record.request.remote_input_key)
                     {
                         candidate.apply(&mut record);
+                        add_request_warnings(&mut record, logger.as_ref());
                         if let Some(warning) = warning {
                             add_stream_warning(&mut record, logger.as_ref(), warning);
                         }

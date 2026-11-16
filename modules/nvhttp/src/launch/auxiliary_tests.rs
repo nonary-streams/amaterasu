@@ -273,7 +273,7 @@ fn auxiliary_game_and_input_streams_have_independent_admission_and_stop() {
     assert_eq!(controller.current_game(&peer(2)), 1);
     assert_eq!(controller.records.len(), 2);
     assert!(!broker.commands[before..].iter().any(
-        |command| matches!(command,Command::Request{service,..} if service=="amaterasu.launch/1")
+        |command| matches!(command,Command::Request{service,payload,..} if service=="amaterasu.launch/1" && payload["action"] != "warnings")
     ));
     controller
         .stop_auxiliary_for_client(
