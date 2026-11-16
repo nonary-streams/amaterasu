@@ -754,6 +754,7 @@ var Amaterasu;
         subject = "";
         role = null;
         scopes = null;
+        get hostOrigin() { return this.base; }
         constructor(base) {
             const url = new URL(base || location.origin, location.origin);
             if (!["http:", "https:"].includes(url.protocol) ||

@@ -72,6 +72,8 @@ namespace Amaterasu {
     role: AccountRole | "token" | null = null;
     scopes: string[] | null = null;
 
+    get hostOrigin(): string { return this.base; }
+
     constructor(base: string) {
       const url = new URL(base || location.origin, location.origin);
       if (
