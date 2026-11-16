@@ -402,9 +402,11 @@ impl Controller {
             && record.config.min_threads == 2
             && record.config.qp == 28
         {
-            payload["extension_probe"] = record
-                .config
-                .extension_configuration(self.settings.extension_bit_depth);
+            payload["extension_probe"] = record.config.extension_configuration(
+                record
+                    .config
+                    .launch_extension_format(self.settings.extension_bit_depth),
+            );
         }
         if record.config.display_admission_required() {
             // Stream-session starts its prepared timer after Apply/readback. Reserve

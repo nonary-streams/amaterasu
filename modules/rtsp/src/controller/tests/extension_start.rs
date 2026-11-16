@@ -1,19 +1,39 @@
 use super::*;
 use amaterasu_contracts::media_profile::{VideoProfile, VideoProfileSnapshot};
 
-fn extension_record(hdr: bool) -> Record {
-    let profile: VideoProfile =
+/// The PyroWave profile a launch is offered: 10-bit HDR, or the 8-bit SDR
+/// profile Moonlight requests when HDR is off.
+fn launch_profile(hdr: bool) -> VideoProfile {
+    let mut profile: VideoProfile =
         serde_json::from_str(include_str!("../../../../../scripts/pyrowave/profile.json")).unwrap();
+    if !hdr {
+        profile.codec.value = 1;
+        profile.media_format = serde_json::from_value(
+            json!({"bit_depth":8,"dynamic_range":"sdr","chroma_sampling":"yuv420"}),
+        )
+        .unwrap();
+    }
+    profile
+}
+
+fn extension_record(hdr: bool) -> Record {
+    let profile = launch_profile(hdr);
     let snapshot = VideoProfileSnapshot {
         profiles: vec![profile.clone()],
     };
-    let announce = amaterasu_gamestream::sdp::parse_profile_announce(
-        include_bytes!(
-            "../../../../../crates/gamestream/src/sdp/fixtures/moonlight-pyrowave10.sdp"
-        ),
-        &snapshot,
-    )
-    .unwrap();
+    let fixture =
+        include_str!("../../../../../crates/gamestream/src/sdp/fixtures/moonlight-pyrowave10.sdp");
+    let announcement = if hdr {
+        fixture.to_owned()
+    } else {
+        fixture.replace(
+            "x-nv-video[0].dynamicRangeMode:1",
+            "x-nv-video[0].dynamicRangeMode:0",
+        )
+    };
+    let announce =
+        amaterasu_gamestream::sdp::parse_profile_announce(announcement.as_bytes(), &snapshot)
+            .unwrap();
     let (mut record, _) = announced_profile_record();
     record.config.profile.width = 2560;
     record.config.profile.height = 1440;
@@ -51,7 +71,9 @@ fn moonlight_generated_extension_request_uses_the_probed_start_configuration() {
     for hdr in [false, true] {
         let record = extension_record(hdr);
         let payload = record.authenticated_start_payload(23).unwrap();
-        let mut expected = record.config.extension_configuration(10);
+        let mut expected = record
+            .config
+            .extension_configuration(record.config.launch_extension_format(10));
         expected["extension_profile"] = json!(record.extension_offer.as_ref().unwrap());
         assert_eq!(payload["configuration"]["configuration"], expected);
         assert_eq!(

@@ -1367,7 +1367,22 @@ impl Open {
     /// Project the ordinary launch's inherited software defaults out of an
     /// independently selected encoder's contract. Explicit overrides remain
     /// present so unsupported requirements are still rejected by preflight.
-    pub(crate) fn extension_configuration(&self, bit_depth: u8) -> serde_json::Value {
+    /// The extension format a launch probes: 10-bit HDR when the client
+    /// launched in HDR and the host allows 10-bit extensions, else 8-bit SDR,
+    /// which is what Moonlight requests for an extension without HDR.
+    pub(crate) fn launch_extension_format(&self, max_bit_depth: u8) -> (u8, bool) {
+        if self.profile.hdr && max_bit_depth == 10 {
+            (10, true)
+        } else {
+            (8, false)
+        }
+    }
+
+    /// The encoder configuration for an extension stream in `format`
+    /// (bit depth, HDR). Prepare and start both describe the format
+    /// explicitly, so the start matches the probe exactly when the client
+    /// picks the profile offered for its launch.
+    pub(crate) fn extension_configuration(&self, format: (u8, bool)) -> serde_json::Value {
         let mut configuration = self.arm(1)["configuration"]["configuration"].clone();
         let object = configuration
             .as_object_mut()
@@ -1378,21 +1393,12 @@ impl Open {
             }
         }
         object.insert("max_reference_frames".into(), serde_json::json!(0));
-        // A client that launched in SDR asks for the extension's 8-bit
-        // profile, as Moonlight does for PyroWave without HDR. Only an HDR
-        // launch uses the configured higher bit depth.
-        if bit_depth == 10 {
-            let (bit_depth, dynamic_range) = if self.profile.hdr {
-                (10, "hdr")
-            } else {
-                (8, "sdr")
-            };
-            object.insert(
-                "video_stream_format".into(),
-                serde_json::json!({"codec":"hevc", "bit_depth":bit_depth,
-                    "dynamic_range":dynamic_range}),
-            );
-        }
+        let (bit_depth, hdr) = format;
+        object.insert(
+            "video_stream_format".into(),
+            serde_json::json!({"codec":"hevc", "bit_depth":bit_depth,
+                "dynamic_range":if hdr {"hdr"} else {"sdr"}}),
+        );
         configuration
     }
 

@@ -253,9 +253,13 @@ impl Record {
             payload["configuration"]["encrypt_video"] = json!(announce.encryption.video);
             payload["configuration"]["encrypt_audio"] = json!(announce.encryption.audio);
             payload["configuration"]["client_feature_flags"] = json!(announce.client_feature_flags);
-            payload["configuration"]["configuration"] = self
-                .config
-                .extension_configuration(profile.media_format.unwrap_or_default().bit_depth);
+            payload["configuration"]["configuration"] = self.config.extension_configuration({
+                let format = profile.media_format.unwrap_or_default();
+                (
+                    format.bit_depth,
+                    format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr,
+                )
+            });
             payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
             return Some(payload);
         }

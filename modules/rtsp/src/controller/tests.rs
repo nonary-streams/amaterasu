@@ -4541,7 +4541,9 @@ fn extension_bit_depth_follows_the_launch_dynamic_range() {
         record.config.profile.max_reference_frames = 1;
         record.config.sw_preset = Some("superfast".into());
         record.config.sw_tune = Some("zerolatency".into());
-        let projected = record.config.extension_configuration(10);
+        let projected = record
+            .config
+            .extension_configuration(record.config.launch_extension_format(10));
         assert!(projected.get("sw_preset").is_none());
         assert!(projected.get("sw_tune").is_none());
         assert_eq!(projected["max_reference_frames"], 0);
@@ -4559,9 +4561,14 @@ fn extension_bit_depth_follows_the_launch_dynamic_range() {
             wire_selector: 4,
             payload_type: 100,
             encoding_name: "EXAMPLE".into(),
+            // Each launch is offered the profile matching its dynamic range.
             media_format: Some(amaterasu_contracts::media_profile::VideoMediaFormat {
-                bit_depth: 10,
-                dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+                bit_depth: if hdr { 10 } else { 8 },
+                dynamic_range: if hdr {
+                    amaterasu_module_sdk::DynamicRange::Hdr
+                } else {
+                    amaterasu_module_sdk::DynamicRange::Sdr
+                },
                 chroma_sampling: Default::default(),
             }),
             wire_attributes: Vec::new(),
@@ -4579,10 +4586,14 @@ fn extension_bit_depth_follows_the_launch_dynamic_range() {
                     "x-nv-vqos[0].bitStreamFormat:0",
                     "x-nv-vqos[0].bitStreamFormat:4",
                 );
-        let announcement = announcement.replace(
-            "x-nv-video[0].dynamicRangeMode:0",
-            "x-nv-video[0].dynamicRangeMode:1",
-        );
+        let announcement = if hdr {
+            announcement.replace(
+                "x-nv-video[0].dynamicRangeMode:0",
+                "x-nv-video[0].dynamicRangeMode:1",
+            )
+        } else {
+            announcement
+        };
         // The Windows PyroWave client leaves the legacy encoder CSC hint at
         // its default. The extension bitstream owns its color metadata.
         let announcement = announcement.replace(
@@ -4628,7 +4639,9 @@ fn extension_projection_preserves_explicit_software_requirements() {
     let (mut record, _) = announced_profile_record();
     record.config.sw_preset = Some("slow".into());
     record.config.sw_tune = Some("film".into());
-    let projected = record.config.extension_configuration(10);
+    let projected = record
+        .config
+        .extension_configuration(record.config.launch_extension_format(10));
     assert_eq!(projected["sw_preset"], "slow");
     assert_eq!(projected["sw_tune"], "film");
 }
