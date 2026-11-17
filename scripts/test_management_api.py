@@ -2,7 +2,6 @@
 """Real HTTP/authentication/catalog integration through the persistent native host."""
 from __future__ import annotations
 
-import base64
 import http.client
 import json
 import os
@@ -153,7 +152,7 @@ class Api:
         host, port = status["bound_address"].rsplit(":", 1)
         self.host, self.port = host, int(port)
 
-    def post(self, path, payload=None, token=None, origin=None, extra=None):
+    def post(self, path, payload=None, token=None, origin=None, extra=None, *, binary=False):
         headers = {"Content-Type": "application/json"}
         if token is not None:
             headers["Authorization"] = "Bearer " + token
@@ -164,7 +163,8 @@ class Api:
         try:
             connection.request("POST", path, json.dumps(payload or {}), headers)
             response = connection.getresponse()
-            return response.status, json.loads(response.read()), dict(response.getheaders())
+            body = response.read()
+            return response.status, body if binary else json.loads(body), dict(response.getheaders())
         finally:
             connection.close()
 
@@ -638,10 +638,24 @@ def test_auth_and_crud(console, api):
     )
     assert status == 200 and fullscreen_saved["entry"]["launch"] == fullscreen_updated_entry["launch"], fullscreen_saved
     catalog_revision = fullscreen_updated["revision"]
+    status, fullscreen_default, _ = api.post(
+        "/v1/catalog/update",
+        {
+            "id": fullscreen_created["id"],
+            "entry": {**fullscreen_entry, "launch": {"kind": "playnite_fullscreen"}},
+            "expected_revision": catalog_revision,
+        },
+        administrator,
+    )
+    assert status == 200 and fullscreen_default["ok"], fullscreen_default
+    assert fullscreen_default["entry"]["launch"] == {
+        "kind": "playnite_fullscreen", "exit_timeout_seconds": 10
+    }, fullscreen_default
+    catalog_revision = fullscreen_default["revision"]
     for invalid_launch in (
         {"kind": "playnite_fullscreen", "exit_timeout_seconds": 301},
         {"kind": "playnite_fullscreen", "exit_timeout_seconds": 10, "path": game_path},
-        {"kind": "playnite_fullscreen"},
+        {"kind": "playnite_fullscreen", "exit_timeout_seconds": "10"},
     ):
         status, rejected, _ = api.post(
             "/v1/catalog/create",
@@ -1067,16 +1081,20 @@ def test_auth_and_crud(console, api):
     assert games["games"][0]["installed"], games
     artwork_revision = games["games"][0].get("artwork_revision")
     assert isinstance(artwork_revision, str) and artwork_revision.isdecimal(), games
-    status, artwork, _ = api.post("/v1/steam/artwork_read", {
-        "app_id": 730, "revision": artwork_revision, "offset": 0,
-    }, administrator)
-    assert status == 200 and artwork["ok"], artwork
-    assert artwork["next_offset"] is None and artwork["total_bytes"] == len(STEAM_ARTWORK), artwork
-    assert artwork["mime_type"] == "image/png", artwork
-    assert base64.b64decode(artwork["data"]) == STEAM_ARTWORK, artwork
-    assert api.post("/v1/steam/artwork_read", {
-        "app_id": 730, "revision": artwork_revision, "offset": 1,
+    artwork_request = {"app_id": 730, "revision": artwork_revision}
+    status, artwork, artwork_headers = api.post(
+        "/v1/steam/artwork", artwork_request, administrator, binary=True
+    )
+    assert status == 200 and artwork == STEAM_ARTWORK, (status, len(artwork))
+    assert artwork_headers["Content-Type"] == "image/png", artwork_headers
+    assert artwork_headers["Content-Length"] == str(len(STEAM_ARTWORK)), artwork_headers
+    assert artwork_headers["Cache-Control"] == "no-store", artwork_headers
+    assert artwork_headers["X-Content-Type-Options"] == "nosniff", artwork_headers
+    assert api.post("/v1/steam/artwork", artwork_request)[0] == 401
+    assert api.post("/v1/steam/artwork", {
+        **artwork_request, "offset": 1,
     }, administrator)[0] == 400
+    assert api.post("/v1/steam/artwork_read", artwork_request, administrator)[0] == 404
     deadline = time.monotonic() + 5
     while True:
         status, lutris_status, _ = api.post("/v1/lutris/status", token=administrator)

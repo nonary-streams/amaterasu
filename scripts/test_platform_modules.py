@@ -329,16 +329,25 @@ def test_steam_disabled_policy(harness: PlatformHarness) -> None:
         *[{"action": "status"} for _ in range(8)],
         {"action": "list"},
     )
-    assert responses[0]["ok"] is False and responses[0]["code"] in {
-        "settings_loading", "disabled"
-    }, responses
+    linux_policy = sys.platform.startswith("linux")
+    refresh = responses[0]
+    if refresh["ok"]:
+        assert linux_policy and refresh["enabled"], refresh
+    else:
+        assert refresh["code"] == "settings_loading" or (
+            not linux_policy and refresh["code"] == "steam_disabled"
+        ), refresh
     assert all(response["ok"] for response in responses[1:]), responses
     result = responses[-1]
     # Linux follows the reference policy and keeps Steam enabled even when the
     # persisted document disables discovery. Automatic catalog sync stays off.
-    assert result["enabled"] == sys.platform.startswith("linux"), result
-    assert not result["scanning"] and result["games"] == [], result
+    assert result["enabled"] == linux_policy, result
+    if not linux_policy:
+        assert not result["scanning"] and result["games"] == [], result
+    # Enabled Linux discovery may still be scanning or return the fixture's
+    # installed game; automatic catalog writes must remain disabled.
     assert not result["catalog_sync"]["enabled"], result
+    assert not result["catalog_sync"]["syncing"], result
 
 
 def test_disabled_native_devices(harness: PlatformHarness) -> None:
