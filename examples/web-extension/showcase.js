@@ -19,10 +19,9 @@
         return mountCompatibilityFallback(container, sdk?.signal);
       }
 
-      const root = element("main", "okami-showcase");
+      const root = element("section", "okami-showcase");
       root.setAttribute("aria-label", "Component showcase");
       const controls = [];
-      const dialogs = [];
       let removeStylesheet = () => {};
       let cleanedUp = false;
 
@@ -30,11 +29,8 @@
         if (cleanedUp) return;
         cleanedUp = true;
         sdk.signal?.removeEventListener("abort", cleanup);
-        for (const control of controls) {
+        for (const control of controls.reverse()) {
           try { control.dispose(); } catch {}
-        }
-        for (const dialog of dialogs) {
-          try { dialog.close(); } catch {}
         }
         removeStylesheet();
         root.remove();
@@ -42,15 +38,21 @@
 
       try {
         sdk.signal?.addEventListener("abort", cleanup, { once: true });
-        removeStylesheet = attachShowcaseStylesheet(root);
-        const intro = element("header", "showcase-intro");
-        intro.append(element("h2", "", "Ink, paper, and living controls"),
-          element("p", "", "A component board for Amaterasu's Ōkami theme. The controls use host UI SDK components and semantic theme tokens."),
-          element("div", "showcase-brush"));
+        removeStylesheet = attachShowcaseStylesheet(root, sdk);
+        const use = (control) => {
+          controls.push(control);
+          return control;
+        };
         const grid = element("div", "showcase-theme-grid");
-        grid.append(buildTheme("light", sdk, controls, dialogs),
-          buildTheme("dark", sdk, controls, dialogs));
-        root.append(intro, grid);
+        const appearance = use(sdk.ui.tabs({
+          label: "Appearance",
+          tabs: [
+            { id: "light", label: "Light", content: buildTheme("light", sdk.ui, use) },
+            { id: "dark", label: "Dark", content: buildTheme("dark", sdk.ui, use) },
+          ],
+        }));
+        grid.append(appearance.element);
+        root.append(grid);
         container.append(root);
         return cleanup;
       } catch (error) {
@@ -64,15 +66,18 @@
     return sdk?.version === 1 &&
       sdk.ui?.version === 1 &&
       Array.isArray(sdk.features) &&
-      sdk.features.includes("ui.controls/1");
+      ["ui.controls/1", "ui.controls/2", "ui.controls/3", "ui.forms/2", "ui.layout/1",
+        "ui.elements/1", "ui.feedback/1", "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1",
+        "ui.summary/1", "ui.sparklines/1"]
+        .every((feature) => sdk.features.includes(feature));
   }
 
   function mountCompatibilityFallback(container, signal) {
-    const root = element("main", "okami-showcase");
+    const root = element("section", "okami-showcase");
     root.setAttribute("aria-label", "Component showcase fallback");
     const heading = element("h2", "", "Basic component showcase");
     const explanation = element("p", "",
-      "This host does not provide the versioned reusable controls. Basic native controls remain available.");
+      "This host supports the basic preview. Update the host to explore the full component library.");
     const label = element("label", "showcase-field");
     label.append(element("span", "", "Sample text"));
     const input = element("input", "");
@@ -104,12 +109,8 @@
     }
   }
 
-  function attachShowcaseStylesheet(root) {
-    const stylesheet = document.createElement("link");
-    stylesheet.rel = "stylesheet";
-    stylesheet.href = showcaseStylesheetUrl;
-    const status = element("p", "showcase-style-status",
-      "Showcase styles could not be loaded; host styles remain available.");
+  function attachShowcaseStylesheet(root, sdk) {
+    const status = element("p", "showcase-style-status", "Loading showcase styles.");
     status.setAttribute("role", "status");
     status.setAttribute("aria-live", "polite");
     let disposed = false;
@@ -124,6 +125,14 @@
       root.dataset.stylesheetState = "loaded";
       status.remove();
     };
+    root.append(status);
+    if (sdk.features.includes("ui.assets/1") && typeof sdk.assets?.stylesheet === "function") {
+      void sdk.assets.stylesheet("showcase.css").then(onLoad, showFallback);
+      return () => { disposed = true; };
+    }
+    const stylesheet = document.createElement("link");
+    stylesheet.rel = "stylesheet";
+    stylesheet.href = showcaseStylesheetUrl;
     const removeListeners = () => {
       stylesheet.removeEventListener?.("load", onLoad);
       stylesheet.removeEventListener?.("error", showFallback);
@@ -132,7 +141,6 @@
       typeof stylesheet.addEventListener === "function" &&
       typeof document.head?.append === "function";
     if (supportsStylesheetLoading) {
-      status.textContent = "Loading showcase styles.";
       stylesheet.addEventListener("load", onLoad);
       stylesheet.addEventListener("error", showFallback);
       try {
@@ -144,24 +152,11 @@
     } else {
       showFallback();
     }
-    try {
-      root.append(status);
-    } catch (error) {
-      disposed = true;
-      removeListeners();
-      stylesheet.remove();
-      throw error;
-    }
     return () => {
       disposed = true;
       removeListeners();
       stylesheet.remove();
     };
-  }
-
-  function retainControl(control, controls) {
-    controls.push(control);
-    return control;
   }
 
   function element(tag, className, text) {
@@ -171,185 +166,220 @@
     return node;
   }
 
-  function panel(title) {
-    const section = element("section", "panel showcase-panel");
-    section.append(element("h4", "", title));
-    return section;
+  const deviceRows = [
+    ["Living room TV", "Online", "Moonlight", "2 min ago"],
+    ["Steam Deck", "Offline", "Moonlight", "1 hour ago"],
+    ["Laptop", "Online", "Browser", "Just now"],
+  ];
+
+  const metricRows = [
+    ["cpu", "CPU", "%", sampleSeries(4, 4, 37, 0.8, { 8: 1.8, 24: 2.4, 40: 1.2, 63: 4, 68: 2.1, 83: 3 })],
+    ["gpu", "GPU", "%", sampleSeries(3, 3, 19, 0.55, { 8: 2, 13: 3, 34: 3.4, 43: 1.8, 64: 2, 74: 4.6 })],
+    ["encoder", "Encode", "%", sampleSeries(0, 0.5, 29, 0.42, { 6: 4.5, 12: 1.6, 25: 2, 31: 2.7, 48: 3.9, 64: 2.4, 85: 2.5 })],
+    ["network", "Network", "Mbps", sampleSeries(0, 1.2, 11, 0.8, { 2: 5, 7: 1.9, 15: 4.4, 25: 6.7, 42: 4, 59: 3.4, 73: 5.3, 89: 2.8 })],
+  ];
+
+  function sampleSeries(latest, baseline, seed, variation, spikes) {
+    return Array.from({ length: 96 }, (_, time) => {
+      seed = (seed * 48271) % 2147483647;
+      const ripple = ((seed % 997) / 997 - 0.5) * variation;
+      return time === 95 ? latest : Math.max(0, baseline + ripple + (spikes[time] ?? 0));
+    });
   }
 
-  function buildTheme(themeName, sdk, controls, dialogs) {
-    const swatch = element("section", "showcase-theme");
+  function buildTheme(themeName, ui, use) {
+    const swatch = element("section", "showcase-theme amaterasu-paper");
     swatch.setAttribute("data-theme", themeName);
     swatch.setAttribute("aria-label", themeName + " appearance sample");
-    swatch.append(element("h3", "", themeName[0].toUpperCase() + themeName.slice(1) + " appearance"));
 
-    const buttons = panel("Buttons and states");
-    const actions = element("div", "showcase-actions");
-    const actionStatus = element("span", "badge good", "Ready");
-    const primary = element("button", "button primary", "Primary action");
-    primary.type = "button";
-    primary.addEventListener("click", () => { actionStatus.textContent = "Action received"; });
-    const secondary = element("button", "button secondary", "Secondary");
-    secondary.type = "button";
-    const disabled = element("button", "button secondary", "Unavailable");
-    disabled.type = "button";
-    disabled.disabled = true;
-    actions.append(primary, secondary, disabled, actionStatus);
-    buttons.append(actions);
-    swatch.append(buttons);
+    const card = (label, panelName, children, appearance = "plain") => {
+      const panel = use(ui.card({ label, appearance }));
+      panel.element.classList.add("showcase-card");
+      panel.element.dataset.panel = panelName;
+      panel.content.append(...children);
+      swatch.append(panel.element);
+    };
 
-    const inputs = panel("Inputs and validation");
-    const emailField = element("label", "showcase-field");
-    emailField.append(element("span", "", "Email address"));
-    const email = element("input", "");
-    email.type = "email";
-    email.name = "email-" + themeName;
-    email.required = true;
-    email.placeholder = "name@example.com";
-    email.setAttribute("aria-invalid", "true");
-    email.setAttribute("aria-describedby", "email-help-" + themeName);
-    const emailHelp = element("small", "", "Required field · validation feedback");
-    emailHelp.id = "email-help-" + themeName;
-    emailField.append(email, emailHelp);
-    const notesField = element("label", "showcase-field");
-    notesField.append(element("span", "", "Notes"));
-    const notes = element("input", "");
-    notes.type = "text";
-    notes.name = "notes-" + themeName;
-    notes.placeholder = "Use Tab to move through controls";
-    notesField.append(notes);
-    inputs.append(emailField, notesField);
-    swatch.append(inputs);
-
-    const tabsPanel = panel("Keyboard tabs");
-    const tabList = element("div", "showcase-tabs");
-    tabList.setAttribute("role", "tablist");
-    tabList.setAttribute("aria-label", themeName + " sample tabs");
-    const tabNames = ["Overview", "Details", "History"];
-    const tabButtons = [];
-    const tabPanels = [];
-    function selectTab(index, focus) {
-      tabButtons.forEach((tab, tabIndex) => {
-        const selected = tabIndex === index;
-        tab.setAttribute("aria-selected", String(selected));
-        tab.setAttribute("tabindex", selected ? "0" : "-1");
-        tabPanels[tabIndex].hidden = !selected;
-      });
-      if (focus) tabButtons[index].focus();
+    const actionStatus = use(ui.status({ message: "" }));
+    actionStatus.element.classList.add("showcase-announcement");
+    const button = (label, variant, onClick = () => actionStatus.setMessage("Action received."), disabled = false) =>
+      use(ui.button({ label, variant, onClick, disabled })).element;
+    const actions = element("div", "showcase-actions showcase-button-variants");
+    actions.append(button("Primary", "primary"), button("Secondary", "secondary"),
+      button("Outline", "outline"), button("Ghost", "ghost"));
+    const states = element("div", "showcase-actions showcase-button-states");
+    for (const [label, state] of [["Default", "default"], ["Hover", "hover"], ["Active", "active"], ["Unavailable", "disabled"]]) {
+      const sample = button(label, "outline", undefined, state === "disabled");
+      sample.dataset.state = state;
+      states.append(sample);
     }
-    tabNames.forEach((name, index) => {
-      const tab = element("button", "button secondary showcase-tab", name);
-      tab.type = "button";
-      tab.id = "showcase-" + themeName + "-tab-" + index;
-      tab.setAttribute("role", "tab");
-      tab.setAttribute("aria-controls", "showcase-" + themeName + "-panel-" + index);
-      tab.setAttribute("aria-selected", index === 0 ? "true" : "false");
-      tab.setAttribute("tabindex", index === 0 ? "0" : "-1");
-      tab.addEventListener("click", () => selectTab(index, false));
-      tab.addEventListener("keydown", (event) => {
-        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-        event.preventDefault();
-        const active = tabButtons.findIndex((candidate) => candidate.getAttribute("aria-selected") === "true");
-        const next = event.key === "Home" ? 0 : event.key === "End" ? tabButtons.length - 1 :
-          (active + (event.key === "ArrowRight" ? 1 : -1) + tabButtons.length) % tabButtons.length;
-        selectTab(next, true);
-      });
-      tabButtons.push(tab);
-      tabList.append(tab);
-      const content = element("div", "showcase-tab-panel", name + " content · arrow keys move between tabs");
-      content.id = "showcase-" + themeName + "-panel-" + index;
-      content.setAttribute("role", "tabpanel");
-      content.setAttribute("aria-labelledby", tab.id);
-      content.setAttribute("tabindex", "0");
-      content.hidden = index !== 0;
-      tabPanels.push(content);
-    });
-    tabsPanel.append(tabList, ...tabPanels);
-    swatch.append(tabsPanel);
+    card("Buttons", "buttons", [actions, states, actionStatus.element]);
 
-    const shared = panel("Reusable host controls");
-    const toggle = retainControl(
-      sdk.ui.toggle({ label: "Enable detail", value: true }), controls);
-    const select = retainControl(sdk.ui.select({ label: "Profile", choices: [
-      { value: "balanced", label: "Balanced" }, { value: "quiet", label: "Quiet" }, { value: "sharp", label: "Sharp" },
-    ], value: "balanced" }), controls);
-    const radios = retainControl(sdk.ui.radioGroup({ label: "Surface", choices: [
-      { value: "paper", label: "Paper" }, { value: "ink", label: "Ink" },
-    ], value: "paper" }), controls);
-    const slider = retainControl(sdk.ui.slider({
-      label: "Brush strength", minimum: 0, maximum: 100, step: 5, value: 65,
-    }), controls);
-    [toggle, select, radios, slider].forEach((control) => shared.append(control.element));
+    const switches = element("div", "showcase-switch-examples");
+    for (const [label, value, disabled] of [["On", true, false], ["Off", false, false], ["Disabled", false, true]]) {
+      switches.append(use(ui.toggle({ label, value, disabled })).element);
+    }
+    const checks = element("div", "showcase-switch-examples showcase-check-examples");
+    checks.append(
+      use(ui.checkbox({ label: "Checked", value: true })).element,
+      use(ui.checkbox({ label: "Unchecked", value: false })).element,
+      use(ui.checkbox({ label: "Disabled", value: true, disabled: true })).element,
+    );
+    card("Toggles & checkboxes", "switches", [switches, checks]);
 
-    swatch.append(shared);
+    const badges = element("div", "showcase-actions");
+    for (const [label, tone] of [["Online", "success"], ["Warning", "warning"], ["Error", "error"], ["Info", "info"]]) {
+      badges.append(use(ui.badge({ label, tone })).element);
+    }
+    card("Badges", "badges", [badges]);
 
-    const statuses = panel("Cards and status");
-    statuses.append(element("p", "muted", "Host status"),
-      element("span", "badge good", "Ready"), element("span", "badge accent", "Preview"),
-      element("span", "badge bad", "Needs attention"));
-    swatch.append(statuses);
+    const ready = use(ui.statusCard({
+      label: "Status card", title: "Host Ready", description: "Example streaming status.", tone: "success",
+    }));
+    ready.element.dataset.panel = "status";
+    swatch.append(ready.element);
 
-    const alerts = panel("Alerts");
-    const warning = element("aside", "showcase-alert", "Warning · Review this setting before saving.");
-    warning.setAttribute("role", "status");
-    const error = element("aside", "showcase-alert", "Error · The requested value is unavailable.");
-    error.setAttribute("role", "alert");
-    error.setAttribute("data-kind", "error");
-    alerts.append(warning, error);
-    swatch.append(alerts);
+    const facts = element("div", "showcase-info-grid");
+    for (const [label, icon, value, description] of [
+      ["GPU", "gpu", "NVIDIA RTX 4090", "3% · 45 °C"],
+      ["Capture", "capture", "WGC", "3840 × 2160 at 120 Hz"],
+      ["Encoder", "encoder", "HEVC (NVENC)", "YUV444 · 10-bit"],
+    ]) {
+      facts.append(use(ui.infoCard({ label, value, description, icon })).element);
+    }
+    card("Info cards", "facts", [facts]);
 
-    const tablePanel = panel("Table");
-    const tableScroll = element("div", "showcase-table-wrap");
-    const table = element("table", "showcase-table");
-    table.append(element("caption", "", "Provider readiness"));
-    const head = element("thead");
-    const headerRow = element("tr");
-    ["Provider", "State", "Updated"].forEach((value) => {
-      const heading = element("th", "", value);
-      heading.setAttribute("scope", "col");
-      headerRow.append(heading);
-    });
-    head.append(headerRow);
-    const body = element("tbody");
-    [["Steam", "Ready", "Just now"], ["Lutris", "Scanning", "1 min ago"]].forEach((row) => {
-      const tr = element("tr");
-      row.forEach((value, index) => {
-        const cell = element("td", "", value);
-        if (index === 0) cell.setAttribute("scope", "row");
-        tr.append(cell);
-      });
-      body.append(tr);
-    });
-    table.append(head, body);
-    tableScroll.append(table);
-    tablePanel.append(tableScroll);
-    swatch.append(tablePanel);
+    const illustration = element("div", "amaterasu-banner showcase-illustrated");
+    const illustrated = use(ui.card({ label: "Card header", appearance: "brush" }));
+    illustrated.append(element("p", "", "Use a card to group related settings or explain an action."));
+    illustration.append(illustrated.element);
+    card("Panel / card", "illustration", [illustration]);
 
-    const modalPanel = panel("Modal and focus return");
-    const trigger = element("button", "button secondary", "Open dialog");
-    trigger.type = "button";
-    const dialog = element("dialog", "showcase-modal");
-    dialog.id = "showcase-" + themeName + "-dialog";
-    dialog.setAttribute("aria-labelledby", "showcase-" + themeName + "-dialog-title");
-    const title = element("h4", "", "Confirm this sample");
-    title.id = "showcase-" + themeName + "-dialog-title";
-    const copy = element("p", "", "Native modal behavior keeps focus inside until the dialog closes.");
-    const modalActions = element("div", "actions");
-    const cancel = element("button", "button secondary", "Cancel");
-    cancel.type = "button";
-    cancel.addEventListener("click", () => dialog.close());
-    const confirm = element("button", "button primary", "Continue");
-    confirm.type = "button";
-    confirm.addEventListener("click", () => dialog.close());
-    modalActions.append(cancel, confirm);
-    dialog.append(title, copy, modalActions);
-    trigger.setAttribute("aria-haspopup", "dialog");
-    trigger.setAttribute("aria-controls", dialog.id);
-    trigger.addEventListener("click", () => dialog.showModal());
-    dialog.addEventListener("close", () => trigger.focus());
-    dialogs.push(dialog);
-    modalPanel.append(trigger, dialog);
-    swatch.append(modalPanel);
+    const quickSettings = [];
+    for (const [label, value] of [
+      ["Enable streaming", true], ["Use virtual display", true], ["HDR (10-bit)", true],
+      ["Auto-start host", false], ["Keep host awake", true],
+    ]) {
+      quickSettings.push(use(ui.toggle({ label, value })).element);
+    }
+    card("Quick settings", "quick", quickSettings);
+
+    const metrics = element("div", "showcase-metrics");
+    for (const [id, label, unit, samples] of metricRows) {
+      metrics.append(use(ui.metricChart({
+        label, unit, minimum: 0, maximum: 10, appearance: "sparkline",
+        series: [{ id, label, points: samples.map((value, time) => ({ time, value })) }],
+      })).element);
+    }
+    card("Metric / performance", "metrics", [metrics]);
+
+    const table = use(ui.table({
+      caption: "Sample paired devices",
+      columns: ["Name", "Status", "Type", "Last seen"].map((header) => ({ header })),
+      rows: deviceRows,
+    }));
+    const deviceStatus = use(ui.status({ message: "3 devices shown." }));
+    const search = use(ui.searchField({
+      label: "Find a device", value: "", placeholder: "Search by name",
+      onChange(query) {
+        const match = query.trim().toLowerCase();
+        const visible = deviceRows.filter(([name]) => name.toLowerCase().includes(match));
+        table.setRows(visible);
+        deviceStatus.setMessage(
+          visible.length === 0 ? "No matching devices." :
+            visible.length === 1 ? "1 device shown." : `${visible.length} devices shown.`,
+        );
+      },
+    }));
+    const text = use(ui.textField({
+      label: "Device name", value: "", placeholder: "Device name",
+      required: true,
+      onChange: (value) => text.setState({ error: value.trim() ? null : "Name is required." }),
+    }));
+    const select = use(ui.select({
+      label: "Profile", value: "balanced", choices: [
+        { value: "balanced", label: "Balanced" }, { value: "quality", label: "High quality" },
+        { value: "latency", label: "Low latency" },
+      ],
+    }));
+    card("Inputs", "inputs", [text.element, select.element, search.element]);
+
+    const streamingSettings = element("div", "showcase-tab-controls");
+    streamingSettings.append(
+      use(ui.slider({ label: "Target bitrate", minimum: 10, maximum: 80, step: 5, value: 30 })).element,
+      use(ui.numberField({ label: "Target frame rate", minimum: 30, maximum: 240, step: 1, value: 60 })).element,
+    );
+    const renderingSettings = use(ui.radioGroup({
+      label: "Scaling mode", value: "fit", choices: [
+        { value: "fit", label: "Fit to screen" }, { value: "native", label: "Native resolution" },
+      ],
+    }));
+    const tabs = use(ui.tabs({
+      label: "Settings sections",
+      tabs: [
+        { id: "general", label: "General", content: element("p", "", "Set how the host starts.") },
+        { id: "streaming", label: "Streaming", content: streamingSettings },
+        { id: "audio", label: "Audio", content: element("p", "", "Choose an audio device.") },
+        { id: "advanced", label: "Advanced", content: renderingSettings.element },
+      ],
+    }));
+    const progress = use(ui.progress({ label: "Scan progress", maximum: 100, value: 64, message: "64%" }));
+    const tabProgress = element("div", "showcase-tab-progress");
+    for (const [label, child] of [["Tabs", tabs.element], ["Progress bar", progress.element]]) {
+      const panel = use(ui.card({ label }));
+      panel.element.classList.add("showcase-inner-card");
+      panel.append(child);
+      tabProgress.append(panel.element);
+    }
+    tabProgress.dataset.panel = "tab-progress";
+    swatch.append(tabProgress);
+
+    const alerts = [];
+    for (const [severity, message] of [
+      ["success", "The profile was saved."],
+      ["warning", "Changes take effect on the next stream."],
+      ["error", "Could not connect to the sample device."],
+      ["info", "A new sample profile is available."],
+    ]) {
+      const alert = use(ui.alert({ message, severity, dismissible: severity === "info" }));
+      alerts.push(alert.element);
+    }
+    card("Alerts / notifications", "alerts", alerts);
+
+    const confirm = button("Confirm", "primary", () => dialog.close());
+    const dialog = use(ui.dialog({
+      title: "Confirm changes",
+      description: "Apply these sample settings?",
+      actions: [confirm],
+    }));
+    const dialogPreview = element("div", "amaterasu-blossom-panel showcase-dialog-preview");
+    const dialogActions = element("div", "showcase-actions showcase-dialog-actions");
+    dialogActions.append(button("Cancel", "outline", () => actionStatus.setMessage("Action cancelled.")),
+      button("Open dialog", "primary", () => dialog.open()));
+    dialogPreview.append(element("h3", "", "Confirm changes"),
+      element("p", "", "Apply these sample settings?"), dialogActions, dialog.element);
+    card("Modal", "modal", [dialogPreview]);
+    deviceStatus.element.classList.add("showcase-announcement");
+    card("Table", "devices", [table.element, deviceStatus.element]);
+
+    const tooltipText = "Pair a client to start streaming.";
+    const help = use(ui.tooltip({ trigger: button("Pair client", "ghost"), message: tooltipText }));
+    const note = element("p", "plugin-tooltip showcase-tooltip-preview", tooltipText);
+    card("Tooltip", "tooltip", [note, help.element]);
+
+    const icons = element("div", "showcase-actions");
+    for (const [icon, label, message, variant] of [
+      ["settings", "Profile settings", "Open the sample profile settings.", "outline"],
+      ["edit", "Edit profile", "Edit the sample streaming profile.", "outline"],
+      ["delete", "Remove profile", "Remove the sample streaming profile.", "danger"],
+      ["more", "More options", "See additional profile actions.", "outline"],
+    ]) {
+      const action = use(ui.iconButton({ icon, label, variant, onClick: () => actionStatus.setMessage(label + " selected.") }));
+      const tooltip = use(ui.tooltip({ trigger: action.element, message }));
+      icons.append(tooltip.element);
+    }
+    card("Icon buttons", "icons", [icons]);
     return swatch;
   }
-  })();
+
+})();

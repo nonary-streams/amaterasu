@@ -1,0 +1,352 @@
+/* Shared painted finishes for console controls and the web extension UI SDK. */
+:root {
+  --ink-swipe: url("./ink-swipe.svg");
+  --ink-seal: url("./ink-seal.svg");
+}
+
+:root, [data-theme="dark"] {
+  --seal-pigment: #aaca9f;
+  --ink-success-fill: #2d402f;
+  --ink-warning-fill: #47371e;
+  --ink-error-fill: #4e2c27;
+  --ink-info-fill: #273b4b;
+  --ink-mark-contrast: #211b13;
+}
+
+[data-theme="light"] {
+  --seal-pigment: #206040;
+  --ink-success-fill: #d8e7cd;
+  --ink-warning-fill: #f5dfa9;
+  --ink-error-fill: #f4cfc5;
+  --ink-info-fill: #d6e6f3;
+  --ink-mark-contrast: #fff9ed;
+}
+
+.button.outline {
+  border-color: var(--strong);
+  border-radius: 3px;
+}
+
+.plugin-tablist {
+  gap: 2px;
+}
+
+.plugin-tablist > .plugin-tab {
+  min-height: 38px;
+  padding: 6px 12px;
+}
+
+.plugin-ui-card {
+  color: var(--fg);
+  box-shadow: none;
+}
+
+.plugin-ui-card[data-appearance="brush"] > h2 {
+  padding: 3px 12px;
+  line-height: 1.35;
+}
+
+.plugin-dialog {
+  border-color: var(--strong);
+}
+
+.plugin-dialog > h2::after {
+  height: 5px;
+}
+
+.plugin-ui-table th {
+  background: color-mix(in srgb, var(--line) 24%, var(--panel));
+}
+
+.plugin-toggle input[type="checkbox"] {
+  width: 2.5rem;
+  height: 1.375rem;
+  border-color: var(--strong);
+  background: color-mix(in srgb, var(--strong) 33%, var(--subtle));
+}
+
+.plugin-toggle input[type="checkbox"]::before {
+  inset-block-start: .125rem;
+  inset-inline-start: .125rem;
+  width: 1rem;
+  height: 1rem;
+}
+
+.plugin-toggle input[type="checkbox"]:checked::before {
+  transform: translateX(1.125rem);
+}
+
+.plugin-toggle input[type="checkbox"]:checked:dir(rtl)::before {
+  transform: translateX(-1.125rem);
+}
+
+.plugin-checkbox input[type="checkbox"] {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+
+.plugin-tooltip::after {
+  position: absolute;
+  inset-block-start: -4px;
+  left: clamp(8px, calc(16px - var(--plugin-tooltip-offset, 0px)), calc(100% - 12px));
+  width: 6px;
+  height: 6px;
+  border-block-start: 1px solid var(--strong);
+  border-inline-start: 1px solid var(--strong);
+  background: var(--ink-button);
+  transform: rotate(45deg);
+  pointer-events: none;
+  content: "";
+}
+
+.plugin-tooltip[data-placement="above"]::after {
+  inset-block-start: auto;
+  inset-block-end: -4px;
+  transform: rotate(225deg);
+}
+
+.ink-seal {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 2.1em;
+  height: 2.1em;
+  border: 2px solid currentColor;
+  border-radius: 45% 55% 49% 51% / 51% 49% 55% 45%;
+  background: transparent;
+  color: var(--seal-pigment);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.badge:not(:where(.plugin-badge, .app-art > *)) {
+  max-inline-size: 100%;
+  gap: .4em;
+  border-radius: 999px;
+  background: var(--subtle);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+:is(.plugin-badge[data-tone="success"], .plugin-feedback-alert[data-severity="success"],
+    .badge.good:not(:where(.app-art > *))) {
+  --tone-bg: var(--ink-success-fill);
+  --tone-border: var(--status-border);
+  --tone-text: var(--good);
+}
+
+:is(.plugin-badge[data-tone="warning"], .plugin-feedback-alert[data-severity="warning"], .notice) {
+  --tone-bg: var(--ink-warning-fill);
+  --tone-border: var(--warning-border);
+  --tone-text: var(--warning-text);
+}
+
+:is(.plugin-badge[data-tone="error"], .plugin-feedback-alert[data-severity="error"], .notice.error,
+    .badge.bad:not(:where(.app-art > *))) {
+  --tone-bg: var(--ink-error-fill);
+  --tone-border: var(--error-border);
+  --tone-text: var(--error-text);
+}
+
+:is(.plugin-badge[data-tone="info"], .plugin-feedback-alert[data-severity="info"]) {
+  --tone-bg: var(--ink-info-fill);
+}
+
+.badge:is(.good, .bad):not(:where(.app-art > *)), .notice, .notice.error {
+  border-color: var(--tone-border);
+  background: var(--tone-bg);
+  color: var(--tone-text);
+}
+
+.badge.good:not(:where(.app-art > *))::before {
+  width: .55em;
+  height: .55em;
+  flex: none;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+
+.notice, .notice.error {
+  position: relative;
+  padding-inline-start: 2.4rem;
+  border-inline-start-width: 1px;
+  border-radius: 3px;
+  overflow-wrap: anywhere;
+}
+
+.notice :is(strong, .muted) {
+  color: inherit;
+}
+
+.plugin-feedback-alert {
+  position: relative;
+  padding-block: .4rem;
+  padding-inline: 1.95rem .6rem;
+  border-width: 1px;
+  border-color: color-mix(in srgb, var(--tone-text) 19%, var(--tone-bg));
+  border-radius: 3px;
+  font-size: .875rem;
+  line-height: 1.45;
+}
+
+:is(.plugin-feedback-alert, .notice, .badge.bad:not(:where(.app-art > *)),
+    .plugin-badge:is([data-tone="warning"], [data-tone="error"], [data-tone="info"]))::before {
+  display: grid;
+  place-items: center;
+  flex: none;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: var(--tone-text);
+  color: var(--ink-mark-contrast);
+  font: 700 .7rem/1 system-ui, sans-serif;
+  content: "i" / "";
+}
+
+:is(.notice, .plugin-feedback-alert)::before {
+  position: absolute;
+  inset-block-start: var(--notice-mark-top, .5rem);
+  inset-inline-start: var(--notice-mark-start, .55rem);
+  width: 1rem;
+  height: 1rem;
+}
+
+.notice {
+  --notice-mark-top: 1.25rem;
+  --notice-mark-start: .8rem;
+}
+
+:is(.plugin-badge:is([data-tone="warning"], [data-tone="error"], [data-tone="info"]),
+    .badge.bad:not(:where(.app-art > *)))::before {
+  width: .78rem;
+  height: .78rem;
+  font-size: .6rem;
+}
+
+.plugin-feedback-alert[data-severity="success"]::before {
+  content: "✓" / "";
+}
+
+:is(.plugin-feedback-alert[data-severity="warning"], .plugin-badge[data-tone="warning"],
+    .notice:not(.error))::before {
+  border: 0;
+  border-radius: 0;
+  padding-top: .22rem;
+  clip-path: polygon(50% 3%, 100% 95%, 0 95%);
+  content: "!" / "";
+}
+
+.plugin-badge[data-tone="warning"]::before {
+  padding-top: .13rem;
+}
+
+:is(.plugin-feedback-alert[data-severity="error"], .plugin-badge[data-tone="error"],
+    .notice.error, .badge.bad:not(:where(.app-art > *)))::before {
+  content: "×" / "";
+}
+
+.plugin-feedback-alert[data-severity="error"]::before {
+  font-size: .85rem;
+}
+
+.plugin-feedback-alert[data-dismissible] {
+  min-height: 34px;
+  padding-block: .15rem;
+  padding-inline-end: .2rem;
+}
+
+.button.plugin-alert-dismiss {
+  width: 30px;
+  min-height: 30px;
+}
+
+.plugin-feedback-progressbar {
+  height: .7rem;
+}
+
+.plugin-metric-plot path[stroke="var(--accent)"] {
+  stroke: var(--seal-pigment);
+}
+
+.plugin-gauge-dial path[stroke="var(--accent)"] {
+  stroke: var(--accent-text);
+}
+
+@media (forced-colors: none) {
+  @supports (mask-image: url("./ink-swipe.svg")) {
+    /* Let the dry bristles show beyond a fully painted area under the label. */
+    .button:is(.primary, .secondary):not(.catalog-override-choice, .icon-button)::before,
+    .plugin-ui-card[data-appearance="brush"] > h2::before,
+    .plugin-tablist > .plugin-tab[aria-selected="true"]::before {
+      mask:
+        var(--ink-swipe) center / 100% 100% no-repeat,
+        linear-gradient(to right, #000 calc(100% - 6px), transparent) center /
+          calc(100% - 22px) calc(100% - 14px) no-repeat;
+    }
+
+    .button:is(.primary, .secondary):not(.catalog-override-choice, .icon-button)::before {
+      inset: -1px -5px;
+    }
+
+    .plugin-ui-card[data-appearance="brush"] > h2::before,
+    .plugin-tablist > .plugin-tab[aria-selected="true"]::before {
+      inset: -1px -3px;
+    }
+
+    .plugin-feedback-progressbar[value]::-webkit-progress-value {
+      border-radius: 0;
+      mask-image: var(--ink-swipe);
+    }
+
+    .plugin-feedback-progressbar[value]::-moz-progress-bar {
+      border-radius: 0;
+      mask-image: var(--ink-swipe);
+    }
+
+    .ink-seal {
+      border-color: transparent;
+    }
+
+    .ink-seal::before {
+      position: absolute;
+      inset: -2px;
+      background: currentColor;
+      mask: var(--ink-seal) center / contain no-repeat;
+      pointer-events: none;
+      content: "";
+    }
+  }
+}
+
+@media (forced-colors: active) {
+  .plugin-tooltip::after {
+    border-color: CanvasText;
+    background: Canvas;
+  }
+
+  :is(.notice, .plugin-feedback-alert) {
+    border-color: CanvasText;
+  }
+
+  :is(.plugin-feedback-alert, .notice, .badge.bad:not(:where(.app-art > *)),
+      .plugin-badge:is([data-tone="warning"], [data-tone="error"], [data-tone="info"]))::before {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  :is(.plugin-feedback-alert[data-severity="warning"], .plugin-badge[data-tone="warning"],
+      .notice:not(.error))::before {
+    border: 1px solid CanvasText;
+    border-radius: 50%;
+    padding-top: 0;
+    clip-path: none;
+  }
+
+  .plugin-metric-plot path[stroke="var(--accent)"],
+  .plugin-gauge-dial path[stroke="var(--accent)"] {
+    stroke: CanvasText;
+  }
+}

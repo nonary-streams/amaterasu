@@ -121,17 +121,17 @@ generation when changing scopes or administrator principals.
 
 ## Component showcase
 
-The `showcase.js` page consumes the versioned `sdk.ui` controls and displays
-light and dark semantic theme samples, button and field states, keyboard tabs,
-status and alert panels, a native dialog, and a responsive table. Page styles
-use host semantic theme tokens. Its stylesheet is a separate signed same-origin
-asset to satisfy the host's `style-src 'self'` policy. If the asset cannot load,
-the page reports the issue and keeps the controls usable with host styles.
+The `showcase.js` page exercises the public `sdk.ui` factories in light and
+dark mode. It includes action variants, native fields, keyboard tabs, badges,
+alerts, progress, charts, cards, a responsive table, a modal, and tooltips.
+See the [UI SDK guide](../../docs/web-extension-ui-sdk.md#shared-amaterasu-components)
+for factory signatures and capability checks.
 
-Before mounting the stylesheet or shared controls, the showcase checks SDK v1,
-UI SDK v1, and the `ui.controls/1` feature. Older hosts receive a native-control
-fallback. The showcase is an extension consumer and does not replace or modify
-shared controls. To package it, copy `showcase.js` and `showcase.css` into a clean
+The showcase checks the SDK versions and features it uses. Older hosts render a
+basic native-control preview. On current hosts the separate signed stylesheet
+supplies the showcase layout, and the host supplies the component appearance.
+If the stylesheet fails to load, the page reports it and keeps the controls
+usable with host styles. To package it, copy `showcase.js` and `showcase.css` into a clean
 source directory and use the `amaterasu-web-extension pack` workflow
 above with ID `showcase`, title `UI Elements`, entrypoint `showcase.js`, and no
 method declarations. Stage and approve the signed extension through the normal

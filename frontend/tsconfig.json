@@ -51,6 +51,8 @@
     "src/tokens.ts",
     "src/maintenance.ts",
     "src/extension_ui.ts",
+    "src/extension_ui_elements.ts",
+    "src/extension_ui_summary.ts",
     "src/extension_ui_layout.ts",
     "src/extension_ui_tabs.ts",
     "src/extension_ui_feedback.ts",

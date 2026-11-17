@@ -169,7 +169,13 @@ test('plugin sections honor SDK defaults and retain edits across keyboard collap
       await evaluate(`document.documentElement.dataset.theme = ${JSON.stringify(theme)}`);
       assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, `${width}px ${theme} has no overflow`);
       assert.equal(await evaluate(`Array.from(rtx.querySelectorAll('input')).filter(node=>node.checkVisibility()).every(node=>{const box=node.getBoundingClientRect();return box.width>0 && box.left>=0 && box.right<=innerWidth;})`), true);
-      assert.equal(await evaluate(`Array.from(rtx.querySelectorAll('.plugin-toggle')).every(node=>getComputedStyle(node).flexDirection==='row')`), true, 'toggle labels stay beside their controls');
+      assert.equal(await evaluate(`Array.from(rtx.querySelectorAll('.plugin-toggle'))
+        .filter(node => node.checkVisibility()).every(node => {
+          const label = node.querySelector('label').getBoundingClientRect();
+          const control = node.querySelector('input').getBoundingClientRect();
+          const verticalOffset = Math.abs((label.top + label.bottom - control.top - control.bottom) / 2);
+          return label.right <= control.left && verticalOffset <= 1;
+        })`), true, 'toggle labels stay beside their controls');
       if (process.env.AMATERASU_SCREENSHOT_DIR) {
         await mkdir(process.env.AMATERASU_SCREENSHOT_DIR, { recursive: true });
         const { data } = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });

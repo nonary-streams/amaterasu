@@ -22,6 +22,7 @@ dialog({
   title,
   description?,
   content?: string | Node | readonly (string | Node)[],
+  actions?: readonly HTMLElement[], // ui.dialog-actions/1
   initialFocus?,
   cancelLabel?,
   onClose?,
@@ -41,7 +42,7 @@ and associated with the native dialog through `aria-labelledby`. Optional
 Append `element` before calling `open()`. Opening uses native `showModal()`,
 which gives the dialog modal semantics and keeps Tab navigation within it. The
 cancel button receives focus by default. Pass `initialFocus` to focus a
-plugin-owned element inside `content` instead. After a normal close or cancel,
+plugin-owned element inside `content` or a supplied action. After a normal close or cancel,
 focus returns to the connected element that was active before `open()`.
 
 The cancel button and Escape both close with reason `cancel`; `close()` reports
@@ -59,13 +60,42 @@ restoring focus into a page that is being torn down. `dispose()` is idempotent
 and removes the dialog and its listeners even if `onClose` throws; the callback
 exception may propagate to the caller.
 
+## Footer actions
+
+When the host advertises `ui.dialog-actions/1`, append native buttons or SDK
+action elements through the `actions` option. The footer renders them in
+array order after Cancel and wraps when space is limited. A supplied action can
+close the modal through your callback or normal native dialog form behavior.
+The button remains bound to the lifecycle of its owning SDK surface.
+
+```js
+if (sdk.features?.includes("ui.dialog-actions/1")) {
+  const confirm = sdk.ui.button({
+    label: "Confirm",
+    variant: "primary",
+    onClick: async () => {
+      await save();
+      dialog.close();
+    },
+  });
+  const dialog = sdk.ui.dialog({
+    title: "Confirm changes",
+    description: "Apply these settings?",
+    actions: [confirm.element],
+  });
+  container.append(dialog.element);
+  dialog.open();
+}
+```
+
 ## Safe content and lifecycle
 
 String content is inserted as text, never parsed as HTML. For richer content,
 pass DOM nodes created by the plugin in the current document; a
-`DocumentFragment` and its descendants are supported. The SDK rejects nodes
-owned by a different document. `initialFocus` may point to a focusable element
-inside a passed node or fragment. Use `textContent` for dynamic values and avoid
+`DocumentFragment` and its descendants are supported for content. The SDK rejects
+nodes owned by a different document. Supply each action separately from content
+and other actions. `initialFocus` may point to a focusable element inside a
+passed node or fragment. Use `textContent` for dynamic values and avoid
 `innerHTML`.
 
 Dialogs are bound to the extension's lifecycle `AbortSignal`. They close and

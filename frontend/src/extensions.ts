@@ -56,7 +56,8 @@ namespace Amaterasu {
     readonly version: 1;
     readonly signal: AbortSignal;
     readonly features?: readonly string[];
-    readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1 & ExtensionUiChartsV1;
+    readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1 & ExtensionUiChartsV1
+      & ExtensionUiControlsV3 & ExtensionUiElementsV1 & ExtensionUiSummaryV1;
     readonly assets?: { stylesheet(path: string): Promise<void> };
     canCall?(method: string): boolean;
     readonly application?: Pick<ApplicationExtensionContext, "id" | "name"> & { readonly notifyChanged?: () => void };
@@ -218,11 +219,20 @@ namespace Amaterasu {
       const sdk: ExtensionPageSdk = Object.freeze({
         version: 1 as const,
         signal: controller.signal,
-        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", "ui.charts/1", "ui.assets/1", ...(descriptor.settings_provider && (application || slot === "settings") ? ["ui.settings/1"] : []), ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
+        features: Object.freeze([
+          "ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1",
+          "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1", "ui.sparklines/1", "ui.assets/1", "ui.controls/3", "ui.elements/1",
+          "ui.summary/1",
+          ...(descriptor.settings_provider && (application || slot === "settings") ? ["ui.settings/1"] : []),
+          ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : []),
+        ]),
         ui: Object.freeze({
           ...createExtensionUiWithDialogsV1(controller.signal),
           ...createExtensionUiTabsV1(controller.signal),
           ...createExtensionUiChartsV1(controller.signal),
+          ...createExtensionUiControlsV3(controller.signal),
+          ...createExtensionUiElementsV1(controller.signal),
+          ...createExtensionUiSummaryV1(controller.signal),
         }),
         assets: Object.freeze({ stylesheet: (path: string) => loadExtensionStylesheet(id, descriptor.digest, path, controller.signal) }),
         canCall: (method: string) => !controller.signal.aborted && aliases.has(method),

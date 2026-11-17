@@ -1,0 +1,474 @@
+/* The overview lays its existing host data out on a compact sheet below the shell artwork. */
+.overview-sheet {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.overview-sheet .overview-masthead {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 0;
+  margin: 0;
+  padding: 0 0 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
+}
+
+.overview-sheet .overview-masthead::before,
+.overview-sheet .overview-masthead::after,
+.overview-sheet .overview-masthead h1::after {
+  display: none;
+}
+
+.overview-sheet .overview-masthead > div:first-child {
+  min-width: 0;
+  max-width: none;
+}
+
+.overview-sheet .overview-masthead h1 {
+  font-size: clamp(30px, 4.2vw, 46px);
+  line-height: 1.08;
+}
+
+.overview-sheet .overview-masthead .muted {
+  max-width: none;
+  margin-top: 3px;
+}
+
+.overview-sheet .overview-summary,
+.overview-sheet .overview-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 365px), 1fr));
+  align-items: stretch;
+  gap: 14px;
+  margin: 0;
+}
+
+.overview-sheet :is(.overview-service-area, .overview-activity-area, .overview-metric-area, .overview-detail-panel) {
+  min-width: 0;
+}
+
+.overview-sheet .overview-details > .panel,
+.overview-sheet .overview-activity-area > .panel {
+  height: 100%;
+  margin: 0;
+}
+
+.overview-sheet .overview-summary :is(.overview-status, .overview-activity-panel) {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  align-content: start;
+  align-items: start;
+  gap: 10px;
+  min-height: 0;
+  height: 100%;
+  margin: 0;
+  padding: 13px 17px;
+  border: 1px solid var(--line);
+  border-radius: var(--surface-radius);
+  background: var(--panel);
+  box-shadow: var(--surface-shadow);
+}
+
+.overview-sheet :is(.overview-status, .overview-activity-panel)::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0 auto;
+  z-index: -1;
+  width: min(53%, 245px);
+  height: min(94px, 80%);
+  background: url("./scroll-foothills.svg") right bottom / contain no-repeat;
+  mask: linear-gradient(142deg, transparent 12%, #000 82%);
+  opacity: .24;
+  pointer-events: none;
+}
+
+.overview-sheet .overview-activity-panel::after {
+  background-image: url("./scroll-blossoms.svg");
+  width: min(34%, 160px);
+  opacity: .19;
+}
+
+.overview-sheet .overview-status .ink-summary-label,
+.overview-sheet .overview-activity-panel .overview-status-label {
+  font-size: 11px;
+  letter-spacing: .09em;
+  line-height: 1.25;
+}
+
+.overview-sheet .overview-status .ink-status-body,
+.overview-sheet .overview-activity-state {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+}
+
+.overview-sheet .overview-status .ink-status-seal,
+.overview-sheet .overview-activity-panel .ink-status-seal {
+  width: 66px;
+  height: 66px;
+}
+
+.overview-sheet .overview-activity-panel .ink-status-seal > .overview-icon {
+  width: 42%;
+  height: 42%;
+}
+
+.overview-sheet .overview-status .ink-status-title {
+  margin: 0 0 3px;
+  font-family: var(--font-brush, var(--font-display));
+  font-size: clamp(25px, 2.35vw, 35px);
+  line-height: 1.05;
+  letter-spacing: -.025em;
+  overflow-wrap: anywhere;
+}
+
+.overview-sheet .overview-status .ink-summary-description,
+.overview-sheet .overview-activity-copy .muted {
+  margin: 4px 0 0;
+  color: var(--secondary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.overview-sheet .overview-activity-summary {
+  margin: 0;
+  font-size: clamp(19px, 1.9vw, 25px);
+  line-height: 1.14;
+  letter-spacing: -.02em;
+}
+
+.overview-sheet .overview-activity-copy > .button {
+  width: fit-content;
+  min-height: 34px;
+  margin-top: 9px;
+  padding: 4px 13px;
+  font-size: 13px;
+}
+
+.overview-sheet .overview-activity-panel {
+  --summary-ink: var(--gold);
+}
+
+.overview-sheet .overview-activity-panel[data-tone="live"] {
+  --summary-ink: var(--good);
+}
+
+.overview-sheet .overview-activity-panel[data-tone="attention"] {
+  --summary-ink: var(--warning-strong);
+}
+
+.overview-sheet .metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.overview-sheet .metric {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 11px;
+  overflow-wrap: anywhere;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-top: 2px solid color-mix(in srgb, var(--gold) 66%, var(--line));
+  border-radius: var(--surface-radius);
+  background: var(--panel);
+}
+
+.overview-sheet .metric .ink-info-icon {
+  width: 37px;
+  height: 37px;
+}
+
+.overview-sheet .metric .ink-summary-label {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.22;
+}
+
+.overview-sheet .metric .ink-info-value {
+  display: block;
+  margin: 2px 0;
+  font-family: var(--font-display);
+  font-size: 25px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.overview-sheet .metric .ink-summary-description {
+  margin: 0;
+  color: var(--secondary);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.overview-sheet .overview-detail-panel {
+  padding: 14px;
+}
+
+.overview-detail-panel > h2 {
+  margin: 0 0 10px;
+  font-size: 19px;
+  line-height: 1.15;
+}
+
+.overview-detail-panel .table-scroll {
+  max-width: 100%;
+  margin: 0;
+}
+
+.overview-detail-panel :is(th, td) {
+  padding: 5px 9px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.overview-detail-panel .badge {
+  padding: 4px 8px;
+  border-radius: 999px;
+}
+
+.overview-sheet .quick-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 182px), 1fr));
+  gap: 7px;
+}
+
+.overview-sheet .button.quick-action {
+  display: grid;
+  grid-template-columns: 23px minmax(0, 1fr) 15px;
+  align-items: center;
+  align-content: start;
+  gap: 2px 7px;
+  min-width: 0;
+  min-height: 54px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 13px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.overview-sheet .button.quick-action:hover {
+  border-color: var(--accent-border);
+  background: var(--subtle);
+}
+
+.overview-sheet .overview-quick-icon {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  width: 21px;
+  height: 21px;
+  color: var(--accent-text);
+}
+
+.overview-sheet .quick-action small {
+  grid-column: 2;
+  grid-row: 2;
+  color: var(--secondary);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.overview-sheet .quick-action-arrow {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  width: 15px;
+  height: 15px;
+  color: var(--muted);
+}
+
+.overview-icon {
+  display: block;
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.overview-sheet .overview-plugin-sections,
+.overview-sheet .overview-plugin-sections:empty {
+  margin: 0;
+}
+
+.overview-sheet .overview-plugin-sections:empty {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  .overview-sheet .metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 565px) {
+  .overview-sheet {
+    gap: 12px;
+  }
+  .overview-sheet .overview-masthead {
+    align-items: start;
+  }
+  .overview-sheet .overview-masthead .muted {
+    font-size: 13px;
+  }
+  .overview-sheet .overview-masthead .button {
+    padding-inline: 10px;
+  }
+  .overview-sheet .overview-summary :is(.overview-status, .overview-activity-panel) {
+    padding: 12px;
+  }
+  .overview-sheet .overview-status .ink-status-seal,
+  .overview-sheet .overview-activity-panel .ink-status-seal {
+    width: 48px;
+    height: 48px;
+  }
+  .overview-sheet .metric {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+  .overview-sheet .metric .ink-info-icon {
+    width: 30px;
+    height: 30px;
+  }
+}
+
+@media (min-width: 2201px) {
+  .overview-sheet {
+    gap: .85rem;
+  }
+  .overview-sheet .overview-masthead {
+    gap: .85rem;
+    padding-block-end: .85rem;
+  }
+  .overview-sheet .overview-masthead h1 {
+    font-size: 2.9rem;
+  }
+  .overview-sheet .overview-masthead .muted {
+    margin-top: .2rem;
+    font-size: .95rem;
+  }
+  .overview-sheet .overview-masthead .button {
+    min-height: 2.5rem;
+    padding: .5rem 1.05rem;
+    font-size: .9rem;
+  }
+  .overview-sheet :is(.overview-summary, .overview-details, .metrics) {
+    gap: .9rem;
+  }
+  .overview-sheet .overview-summary :is(.overview-status, .overview-activity-panel) {
+    gap: .65rem;
+    padding: .9rem 1.1rem;
+  }
+  .overview-sheet :is(.overview-status, .overview-activity-panel)::after {
+    width: min(53%, 16rem);
+    height: min(6.25rem, 80%);
+  }
+  .overview-sheet .overview-activity-panel::after {
+    width: min(34%, 11rem);
+  }
+  .overview-sheet .overview-status .ink-summary-label,
+  .overview-sheet .overview-activity-panel .overview-status-label {
+    font-size: .74rem;
+  }
+  .overview-sheet .overview-status .ink-status-body,
+  .overview-sheet .overview-activity-state {
+    gap: .95rem;
+  }
+  .overview-sheet .overview-status .ink-status-seal,
+  .overview-sheet .overview-activity-panel .ink-status-seal {
+    width: 4.45rem;
+    height: 4.45rem;
+  }
+  .overview-sheet .overview-status .ink-status-title {
+    font-size: 2.2rem;
+  }
+  .overview-sheet .overview-activity-summary {
+    font-size: 1.6rem;
+  }
+  .overview-sheet .overview-status .ink-summary-description,
+  .overview-sheet .overview-activity-copy .muted {
+    margin-top: .23rem;
+    font-size: .87rem;
+  }
+  .overview-sheet .overview-activity-copy > .button {
+    min-height: 2.25rem;
+    margin-top: .55rem;
+    padding: .25rem .85rem;
+    font-size: .85rem;
+  }
+  .overview-sheet .metric {
+    gap: .75rem;
+    padding: .85rem;
+  }
+  .overview-sheet .metric .ink-info-icon {
+    width: 2.45rem;
+    height: 2.45rem;
+  }
+  .overview-sheet .metric :is(.ink-summary-label, .ink-summary-description) {
+    font-size: .76rem;
+  }
+  .overview-sheet .metric .ink-info-value {
+    margin: .12rem 0;
+    font-size: 1.65rem;
+  }
+  .overview-sheet .overview-detail-panel {
+    padding: .95rem;
+  }
+  .overview-detail-panel > h2 {
+    margin-bottom: .65rem;
+    font-size: 1.3rem;
+  }
+  .overview-detail-panel :is(th, td) {
+    padding: .35rem .6rem;
+    font-size: .84rem;
+  }
+  .overview-detail-panel .badge {
+    padding: .25rem .55rem;
+    font-size: .78rem;
+  }
+  .overview-sheet .quick-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: .5rem;
+  }
+  .overview-sheet .button.quick-action {
+    grid-template-columns: 1.55rem minmax(0, 1fr) 1rem;
+    gap: .12rem .5rem;
+    min-height: 3.5rem;
+    padding: .55rem;
+    font-size: .9rem;
+  }
+  .overview-sheet .overview-quick-icon {
+    width: 1.45rem;
+    height: 1.45rem;
+  }
+  .overview-sheet .quick-action small {
+    font-size: .76rem;
+  }
+  .overview-sheet .quick-action-arrow {
+    width: 1rem;
+    height: 1rem;
+  }
+}
+
+@media (forced-colors: active) {
+  .overview-sheet :is(.overview-status, .overview-activity-panel)::after {
+    display: none;
+  }
+}

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">
+  <title>Amaterasu sun seal</title>
+  <defs>
+    <path id="flame" d="M44 23c-.9-6.2 1-13 6.1-19.4-.9 7.2 4.9 11.7 2.2 20.5L49 29z"/>
+    <path id="gold" d="M49.2 8.1c-1.2 4.9 1 8 .8 12.9l-2-1.7c.2-3.2-.6-6.7 1.2-11.2z"/>
+  </defs>
+  <g fill="#a22a20">
+    <use href="#flame"/><use href="#flame" transform="rotate(45 48 48)"/>
+    <use href="#flame" transform="rotate(90 48 48)"/><use href="#flame" transform="rotate(135 48 48)"/>
+    <use href="#flame" transform="rotate(180 48 48)"/><use href="#flame" transform="rotate(225 48 48)"/>
+    <use href="#flame" transform="rotate(270 48 48)"/><use href="#flame" transform="rotate(315 48 48)"/>
+  </g>
+  <g fill="#dfae5e">
+    <use href="#gold"/><use href="#gold" transform="rotate(45 48 48)"/>
+    <use href="#gold" transform="rotate(90 48 48)"/><use href="#gold" transform="rotate(135 48 48)"/>
+    <use href="#gold" transform="rotate(180 48 48)"/><use href="#gold" transform="rotate(225 48 48)"/>
+    <use href="#gold" transform="rotate(270 48 48)"/><use href="#gold" transform="rotate(315 48 48)"/>
+  </g>
+  <path fill="#30251f" d="M46.6 18.8c16.5-1.2 30.4 10.6 31 27.8.5 16.6-11.7 30.1-28 30.9-14.8.8-28.8-10.8-30.7-26.8C16.7 35.2 29.4 20.1 46.6 18.8Z"/>
+  <path fill="#dfb267" d="M46 21.8c14.7-1.2 26.9 9.6 28 24.1 1.5 15.4-9.7 27.8-24.8 28.5-13.6.8-25.6-9.8-26.9-24.4-1.1-14.7 9.1-27.3 23.7-28.2Z"/>
+  <path fill="#b73224" d="M46.7 24.6c13.1-1 23.6 8.6 24.7 21.5 1 13.2-8.5 24.4-21.4 25.3-13.1 1-24.3-8.8-25.4-21.6-.9-12.6 8.5-24.1 22.1-25.2Z"/>
+  <path fill="#f9ecd3" d="M29.3 49.7c7.1-1 11.5-6.3 17.2-13 6.6 5.8 11.2 13.3 20 16.9-6.2-.1-12.7-2.7-18-5.9l2.8.3-3.8-4.3-2.6 4.3-1.7-.9c-2.7 2.5-7.9 4-13.9 2.6Z"/>
+  <path fill="#f5c576" d="M28.9 54.3c9.6 2.3 17.7 0 24.8-2-6.4 3.8-14.9 5.5-21.7 4.2l3.1-.1z"/>
+</svg>

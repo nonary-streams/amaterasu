@@ -4,22 +4,19 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import ts from "typescript";
+import { consoleSource, consoleStyles, serveConsoleAsset } from "./browser-console-fixture.mjs";
 import { createServer } from "node:http";
 const sdkRoot = resolve("..");
 const assets = { "display.js": readFileSync(join(sdkRoot, "modules/display/ui/display.js")), "settings.js": readFileSync(join(sdkRoot, "modules/frame-limiter/ui/settings.js")) };
 const server = createServer((request, response) => {
+    if (serveConsoleAsset(request, response)) return;
     const name = request.url.split("/").at(-1);
     if (assets[name]) {
         response.setHeader("Content-Type", "text/javascript");
         response.end(assets[name]);
     }
-    else if (name === "base.css") {
-        response.setHeader("Content-Type", "text/css");
-        response.end(readFileSync(join(sdkRoot, "frontend/dist/styles.css")));
-    }
     else
-        response.end('<!doctype html><meta charset=utf-8><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/base.css"><main style="padding:24px;max-width:1400px;margin:auto"><div id="sections"></div><div id="legacy-display" data-settings-owner="amaterasu.display">Legacy display controls</div><div id="host-plugins"></div><div id="app-plugins"></div></main>');
+        response.end(`<!doctype html><meta charset=utf-8><meta name="viewport" content="width=device-width,initial-scale=1">${consoleStyles}<main style="padding:24px;max-width:1400px;margin:auto"><div id="sections"></div><div id="legacy-display" data-settings-owner="amaterasu.display">Legacy display controls</div><div id="host-plugins"></div><div id="app-plugins"></div></main>`);
 });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const origin = `http://127.0.0.1:${server.address().port}`;
@@ -66,8 +63,7 @@ try {
     };
     for (let i = 0; i < 100 && !await evaluate(`!!document.querySelector('#sections')`); i++)
         await new Promise(resolve => setTimeout(resolve, 20));
-    const source = ['locale-catalogs.ts', 'locale.ts', 'model.ts', 'ui.ts', 'extension_fields.ts', 'extension_ui.ts', 'extension_ui_layout.ts', 'extension_ui_tabs.ts', 'extension_ui_feedback.ts', 'extension_ui_dialog.ts', 'extension_ui_charts.ts', 'extension_slots.ts', 'session_extensions.ts', 'updates.ts', 'extensions.ts'].map(file => readFileSync(join(sdkRoot, 'frontend/src', file), 'utf8')).join('\n');
-    await evaluate(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }));
+    await evaluate(consoleSource);
     const frame = JSON.parse(readFileSync(join(sdkRoot, 'modules/frame-limiter/metadata/linux.json'), 'utf8')).descriptor;
     const displayUi = JSON.parse(readFileSync(join(sdkRoot, 'modules/display/ui/ui.json'), 'utf8'));
     await evaluate(`(async()=>{
@@ -97,7 +93,7 @@ try {
       throw Error(route);
     }};
     window.context={content:document.querySelector('main'),api,registerDraftGuard(){return()=>{};}};
-    Amaterasu.renderUpdates({...context,content:document.querySelector('#sections')});
+    Amaterasu.renderPlugins({...context,initialPluginsView:'modules',content:document.querySelector('#sections')});
     Amaterasu.renderExtensionSlot(context,document.querySelector('#host-plugins'),'settings');
   })()`);
     const until = async (expression) => { for (let i = 0; i < 150; i++) {
@@ -108,7 +104,8 @@ try {
     await until(`document.querySelector('#host-plugins input[type=range][max="1000"]')`);
     assert.equal(await evaluate(`getComputedStyle(document.querySelector('#legacy-display')).display==='none'`), true, 'signed ownership replaces legacy controls');
     assert.match(await evaluate(`document.querySelector('#sections').textContent`), /amaterasu.display/);
-    assert.match(await evaluate(`document.querySelector('#sections').textContent`), /amaterasu.frame-limiter/);
+    await evaluate(`[...document.querySelectorAll('#sections .plugin-row')].find(row => row.textContent.includes('Frame limiter')).click()`);
+    assert.match(await evaluate(`document.querySelector('#sections .plugin-detail-pane').textContent`), /amaterasu\.frame-limiter/);
     await evaluate(`{const control=document.querySelector('#host-plugins input[type=range][max="1000"]');control.value='59.94';control.dispatchEvent(new Event('input',{bubbles:true}));}`);
     await until(`documents.host.values.frame_limiter_fps_limit===59.94`);
     await until(`[...document.querySelectorAll('#host-plugins select')].some(node=>node.labels?.[0]?.textContent.includes('Display preparation'))`);

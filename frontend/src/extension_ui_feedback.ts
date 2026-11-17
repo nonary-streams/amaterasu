@@ -7,6 +7,7 @@ namespace Amaterasu {
   export interface ExtensionUiFeedbackAlertOptions {
     message: ExtensionUiText;
     severity?: "info" | "success" | "warning" | "error";
+    dismissible?: boolean;
   }
 
   export interface ExtensionUiFeedbackProgressOptions {
@@ -132,17 +133,32 @@ namespace Amaterasu {
         validateFeedbackMessage(options.message);
         const severity = options.severity === undefined ? "info" : options.severity;
         if (!["info", "success", "warning", "error"].includes(severity)) throw new Error("Invalid plugin alert severity.");
+        if (options.dismissible !== undefined && typeof options.dismissible !== "boolean")
+          throw new Error("Invalid plugin alert dismissible state.");
         const element = makeElement("plugin-feedback-alert");
-        element.setAttribute("role", "alert");
-        element.setAttribute("aria-live", "assertive");
-        element.setAttribute("aria-atomic", "true");
+        const messageElement = options.dismissible ? el("span", "plugin-feedback-message") : element;
+        messageElement.setAttribute("role", "alert");
+        messageElement.setAttribute("aria-live", "assertive");
+        messageElement.setAttribute("aria-atomic", "true");
         element.setAttribute("data-severity", severity);
-        feedbackSetMessage(element, options.message);
+        feedbackSetMessage(messageElement, options.message);
+        const dismiss = options.dismissible ? el("button", "button ghost plugin-alert-dismiss") : null;
+        const hide = (): void => { element.hidden = true; };
+        if (dismiss) {
+          dismiss.type = "button";
+          Amaterasu.setLocalizedAttribute(dismiss, "aria-label", "Dismiss alert");
+          const glyph = el("span", "", "×");
+          glyph.setAttribute("aria-hidden", "true");
+          dismiss.append(glyph);
+          dismiss.addEventListener("click", hide, { signal });
+          element.setAttribute("data-dismissible", "");
+          element.append(messageElement, dismiss);
+        }
         let disposed = false;
         const handle = feedbackHandle<ExtensionUiFeedbackAlert>(element, signal, {
           setMessage(message) {
             if (disposed || signal.aborted) return;
-            feedbackSetMessage(element, message);
+            feedbackSetMessage(messageElement, message);
           },
           setSeverity(nextSeverity) {
             if (disposed || signal.aborted) return;
@@ -151,7 +167,14 @@ namespace Amaterasu {
           },
         });
         const originalDispose = handle.dispose;
-        return Object.freeze({ ...handle, dispose() { disposed = true; originalDispose(); } });
+        return Object.freeze({
+          ...handle,
+          dispose() {
+            disposed = true;
+            dismiss?.removeEventListener("click", hide);
+            originalDispose();
+          },
+        });
       },
       progress(options) {
         feedbackLifecycle(signal);

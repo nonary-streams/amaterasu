@@ -10,7 +10,8 @@ The additive status, alert, and progress components are documented in the
 `ui.feedback/1` capability while keeping `sdk.ui.version` at 1.
 The semantic card and table components use the separate additive
 `ui.layout/1` capability. The native modal dialog uses the additive `ui.dialog/1`
-capability documented in the [dialog UI SDK guide](web-extension-ui-dialog.md).
+capability, with inline footer actions available with `ui.dialog-actions/1`.
+Both are documented in the [dialog UI SDK guide](web-extension-ui-dialog.md).
 These capabilities do not change `sdk.version` or `sdk.ui.version`.
 
 Hosts that implement the base controls advertise `ui.controls/1` in the
@@ -193,6 +194,94 @@ return () => quality.dispose();
 The controls use host semantic classes and theme variables. Plugins can add
 page-specific markup and styles around them; no product-specific provider,
 Vibeshine feature, or fixed palette is part of this API.
+
+## Shared Amaterasu components
+
+The [component showcase](../examples/web-extension/showcase.js) is a browser
+extension that uses the same public factories as third-party plugins. Import the
+[SDK declarations](../sdk/web/amaterasu-ui.d.ts) for editor and type-checker
+support. The host supplies light and dark themes, keyboard focus styling, and
+local artwork. Plugins can use the controls without shipping a theme stylesheet.
+
+`ui.controls/3` adds `checkbox()`, `searchField()`, and `iconButton()`, plus
+`outline` and `ghost` variants for `button()`. The checkbox and search field
+use native inputs and share the value, form state, and disposal behavior of the
+existing controls. The icon button uses the same asynchronous action lifecycle
+as `button()`. It requires a localized accessible label and an icon name from
+the SDK type, such as `edit`, `delete`, `more`, or `refresh`.
+
+`ui.elements/1` adds `badge({ label, tone })` and
+`tooltip({ trigger, message })`. Badge tones are `neutral`, `success`,
+`warning`, `error`, and `info`. A tooltip accepts a native button or an SDK
+action element containing one native button. Its message comes into view on
+hover or keyboard focus, and Escape dismisses it. Keep a meaningful button
+label even when it has a tooltip. The two factories return `element` and
+`dispose()`, and the host disposes them when the extension unmounts.
+
+Host-styled decorations are available through the CSS classes `amaterasu-paper`
+for a washi surface, `amaterasu-banner` for an illustrated header, and
+`amaterasu-blossom-panel` for a flowering branch in a panel corner. Apply
+these classes to the respective container. The host stylesheet loads its own
+artwork from the signed web bundle.
+
+With `ui.summary/1`, plugins can use the same stamped status card and
+compact information tile as the host overview. Both factories return
+`{ element, dispose() }` and bind their lifetime to the mounted page.
+
+```js
+if (sdk.features?.includes("ui.summary/1")) {
+  const health = sdk.ui.statusCard({
+    label: "Capture service", title: "Capture ready", tone: "success",
+    description: "The selected display is available.",
+  });
+  const display = sdk.ui.infoCard({
+    icon: "capture", label: "Display", value: selectedDisplay.name,
+  });
+  container.append(health.element, display.element);
+}
+```
+
+Status tones match badge tones. An info tile can use a `gpu`, `capture`,
+`encoder`, `catalog`, `sessions`, `processes`, or `discoveries` pictogram.
+Omit `icon` for a text-only tile. Labels, descriptions, and status titles
+accept localized SDK text. A string `value` on an info tile is literal,
+suitable for device names and readings. Supply localized SDK text for a
+value that should follow the host language.
+
+When `ui.elements/1` is present, `ui.layout/1` cards also accept
+`appearance: "brush"` for a painted heading and `appearance: "illustrated"`
+for a decorated card. The default is `"plain"`. With `ui.feedback/1`,
+`alert({ message, severity, dismissible: true })` adds a localized close
+action. Closing hides that alert instance. Use a fresh alert for a new event.
+
+```js
+if (!sdk.features?.includes("ui.controls/3") ||
+    !sdk.features.includes("ui.elements/1") ||
+    !sdk.features.includes("ui.layout/1")) {
+  return; // Render the plugin's compatible controls.
+}
+
+const card = sdk.ui.card({ label: "Devices", appearance: "illustrated" });
+const status = sdk.ui.badge({ label: "Connected", tone: "success" });
+const refresh = sdk.ui.iconButton({
+  icon: "refresh",
+  label: "Refresh devices",
+  variant: "outline",
+  onClick: () => refreshDevices(),
+});
+const hint = sdk.ui.tooltip({
+  trigger: refresh.element,
+  message: "Request the latest device list from the host.",
+});
+card.append(status.element);
+card.append(hint.element);
+container.append(card.element);
+```
+
+For larger sections, compose `card()`, `table()`, `tabs()`, `dialog()`, and
+the feedback controls. Hosts with `ui.charts/1` also supply `metricGauge()`
+and `metricChart()` for performance readings. Check each advertised feature your
+plugin uses. These additions keep the SDK and UI version at 1.
 
 ## Semantic cards and tables (`ui.layout/1`)
 
@@ -408,6 +497,30 @@ visibility, and keyboard/pointer inspection. Data updates validate completely
 before replacing the existing data. Owners dispose controls they remove before
 the mount closes; the lifecycle signal also retires them. The SDK does not
 collect data, infer missing values, or equate a stored sample with remote delivery.
+
+Hosts with `ui.sparklines/1` also accept `appearance: "sparkline"` in
+`metricChart()`. This mode puts the label, latest observation and plot in a
+compact row that wraps in narrow panels. The plot keeps the same scale and
+missing-value rules. Focus the plot and use the arrow keys, Home or End to
+inspect historical values. Hover also shows the timed readout. The latest
+observation stays visible during inspection. When the most recent sample is
+null, the row displays “Unavailable.” For multiple series, the row identifies
+the latest value of each series by name.
+
+```js
+const chart = sdk.ui.metricChart({
+  label: "CPU",
+  unit: "%",
+  minimum: 0,
+  maximum: 100,
+  series: cpuSeries,
+  ...(sdk.features?.includes("ui.sparklines/1") && { appearance: "sparkline" }),
+});
+container.append(chart.element);
+```
+
+The default `"full"` appearance includes axes, zoom and series controls.
+`setData()` and `dispose()` work with either appearance.
 
 Public TypeScript declarations are published in
 [`sdk/web/amaterasu-ui.d.ts`](../sdk/web/amaterasu-ui.d.ts). They are generated
