@@ -9,6 +9,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+
+import audit_stream_failures as launcher
 
 import summarize_stream_failures as audit
 
@@ -146,6 +149,65 @@ class ScenarioTests(unittest.TestCase):
                                "--json", str(raw), "--markdown", str(root / "scenario.md")])
             self.assertEqual(code, 2)
             self.assertEqual(raw.read_bytes(), before)
+
+    def test_output_aliases_cannot_corrupt_inputs_or_each_other(self):
+        for target in ("raw", "catalog", "markdown"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                raw = root / "raw.json.gz"
+                raw.write_bytes(gzip.compress(json.dumps(synthetic_report()["raw"]).encode(), mtime=0))
+                catalog = root / "catalog.json"
+                catalog.write_text('{"schema_version":1,"scenarios":[]}')
+                markdown = root / "scenario.md"
+                markdown.write_text("existing report")
+                source = {"raw": raw, "catalog": catalog, "markdown": markdown}[target]
+                output = root / "scenario.json"
+                try:
+                    os.link(source, output)
+                except OSError as error:
+                    self.skipTest(f"hard links unavailable: {error}")
+                before = {path: path.read_bytes() for path in (raw, catalog, markdown)}
+                code = audit.main(["--report", f"source={raw}", "--catalog", str(catalog),
+                                   "--json", str(output), "--markdown", str(markdown)])
+                self.assertEqual(code, 2)
+                for path, data in before.items():
+                    self.assertEqual(path.read_bytes(), data)
+
+    def test_launcher_rejects_aliases_before_running_the_analyzer(self):
+        for target in ("catalog", "markdown"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                catalog = root / "catalog.json"
+                catalog.write_text('{"schema_version":1,"scenarios":[]}')
+                markdown = root / "report.md"
+                markdown.write_text("existing report")
+                raw = root / "report.raw.json.gz"
+                source = catalog if target == "catalog" else markdown
+                try:
+                    os.link(source, raw)
+                except OSError as error:
+                    self.skipTest(f"hard links unavailable: {error}")
+                before = source.read_bytes()
+                with mock.patch.object(launcher.subprocess, "run") as run:
+                    code = launcher.main(["--root", str(root), "--catalog", str(catalog),
+                        "--json", str(root / "report.json"), "--raw-json", str(raw), "--markdown", str(markdown)])
+                    run.assert_not_called()
+                self.assertEqual(code, 2)
+                self.assertEqual(source.read_bytes(), before)
+
+    def test_artifact_replace_preserves_a_hard_linked_source_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.write_bytes(b"preserve this input")
+            output = root / "report.json"
+            try:
+                os.link(source, output)
+            except OSError as error:
+                self.skipTest(f"hard links unavailable: {error}")
+            audit.write_artifact(output, b'{"new":"artifact"}')
+            self.assertEqual(source.read_bytes(), b"preserve this input")
+            self.assertEqual(json.loads(output.read_text()), {"new":"artifact"})
 
     def test_real_checkout_default_output_follows_actual_stream_sinks(self):
         # This invokes the actual Rust analyzer against the current repository,

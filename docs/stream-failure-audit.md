@@ -140,3 +140,10 @@ For a separate policy worktree, set `AMATERASU_AUDIT_TEST_ROOT=/path/to/policy-w
 when running the Python suite; only source is read there, and tool builds remain
 in `CARGO_TARGET_DIR`. The suite must not require an old rejection branch to
 remain after its deliberate replacement by backpressure.
+
+
+Output preflight checks distinguish filesystem identity as well as resolved
+names: existing hard-link aliases of raw/catalog inputs and other outputs are
+rejected. Artifact writes replace the destination inode, including the raw Rust
+CLI, so an output alias does not truncate another source/evidence inode. These
+checks preserve inputs; they do not turn source analysis into a runtime proof.

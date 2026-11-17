@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 
 CATEGORIES = {"critical_proposed", "recoverable_proposed", "unresolved", "expected_stop"}
@@ -507,6 +508,40 @@ def render(result):
     return "\n".join(lines) + "\n"
 
 
+def paths_alias(first, second):
+    """Resolve names and existing inode identity without following output links."""
+    if first.resolve() == second.resolve():
+        return True
+    try:
+        return first.samefile(second)
+    except FileNotFoundError:
+        return False
+
+
+def validate_output_paths(outputs, protected=()):
+    protected = tuple(protected)
+    for index, output in enumerate(outputs):
+        if output.is_symlink() or any(paths_alias(output, source) for source in protected):
+            raise ValueError("refusing to overwrite a raw input/catalog or alias")
+        if any(paths_alias(output, previous) for previous in outputs[:index]):
+            raise ValueError("outputs must be distinct files, including hard links")
+
+
+def write_artifact(path, data):
+    """Replace an output inode so a later alias cannot truncate another file."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".stream-audit-", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(data)
+        if path.exists():
+            temporary.chmod(path.stat().st_mode & 0o777)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", action="append", required=True, metavar="LABEL=RAW.json[.gz]")
@@ -523,18 +558,15 @@ def main(argv=None):
             reports.append(load_report(label, path))
         outputs = [args.json, args.markdown]
         input_paths = {Path(r["path"]) for r in reports} | {args.catalog.resolve()}
+        validate_output_paths(outputs, input_paths)
         for output in outputs:
-            if output.is_symlink() or output.resolve() in input_paths:
-                raise ValueError("refusing to overwrite a raw input/catalog or symlink")
             for report in reports:
                 root = Path(report["raw"]["source"].get("root", ".")).resolve()
                 if any(output.resolve().is_relative_to(root / p) for p in ("crates", "modules", ".git")):
                     raise ValueError("refusing output inside source inputs")
-        if outputs[0].resolve() == outputs[1].resolve():
-            raise ValueError("JSON and Markdown outputs must differ")
         result = summarize(json.loads(args.catalog.read_text(encoding="utf-8")), reports)
-        args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-        args.markdown.write_text(render(result), encoding="utf-8")
+        write_artifact(args.json, (json.dumps(result, indent=2) + "\n").encode("utf-8"))
+        write_artifact(args.markdown, render(result).encode("utf-8"))
         print(json.dumps(result["summary"], sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError, IndexError, TypeError, UnicodeError, EOFError) as error:

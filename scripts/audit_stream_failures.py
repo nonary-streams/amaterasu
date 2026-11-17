@@ -44,11 +44,10 @@ def main(argv=None):
     raw_path = args.raw_json or args.json.with_name(args.json.stem + ".raw.json.gz")
     outputs = [args.json, raw_path] + ([args.markdown] if args.markdown else [])
     try:
-        if len({p.resolve() for p in outputs}) != len(outputs):
-            raise ValueError("scenario JSON, raw evidence and Markdown outputs must differ")
+        scenarios.validate_output_paths(outputs, [args.catalog])
         root = args.root.resolve(strict=True)
         for output in outputs:
-            if output.is_symlink() or output.suffix in (".rs", ".toml", ".lock") or output.resolve() == args.catalog.resolve():
+            if output.is_symlink() or output.suffix in (".rs", ".toml", ".lock", ".py") or output.resolve() == args.catalog.resolve():
                 raise ValueError("refusing source/catalog/symlink output")
             if any(output.resolve().is_relative_to(root / p) for p in ("crates", "modules", ".git")):
                 raise ValueError("refusing output inside source inputs")
@@ -65,12 +64,12 @@ def main(argv=None):
             stored = gzip.compress(payload, mtime=0) if raw_path.suffix == ".gz" else payload
             if raw_path.suffix == ".gz" and gzip.decompress(stored) != payload:
                 raise ValueError("raw compression verification failed")
-            raw_path.write_bytes(stored)
+            scenarios.write_artifact(raw_path, stored)
         report = scenarios.load_report("source", raw_path)
         output = scenarios.summarize(json.loads(args.catalog.read_text(encoding="utf-8")), [report])
-        args.json.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+        scenarios.write_artifact(args.json, (json.dumps(output, indent=2) + "\n").encode("utf-8"))
         if args.markdown:
-            args.markdown.write_text(scenarios.render(output), encoding="utf-8")
+            scenarios.write_artifact(args.markdown, scenarios.render(output).encode("utf-8"))
         summary = output["summary"]
         groups = output["decision_group_summary"]
         print(f"Scenario report: {summary['source_anchored_failure_or_recovery_scenarios']} source-anchored failure/recovery entries; {summary['expected_stop_scenarios']} expected stop; {summary['missing_evidence_scenarios']} unmatched/incomplete catalog entries.")

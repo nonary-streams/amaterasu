@@ -358,6 +358,7 @@ fn outputs_cannot_overwrite_source_inputs() {
         source.clone(),
         root.0.join("modules/rtsp/api.json"),
         root.0.join("Cargo.toml"),
+        root.0.join("audit.py"),
     ] {
         let status = Command::new(env!("CARGO_BIN_EXE_amaterasu-stream-failure-audit"))
             .arg("--root")
@@ -393,4 +394,39 @@ fn catches_do_not_automatically_demote_and_path_limits_are_visible() {
         .find(|f| result.inventory.functions[f.function].name == "file_close")
         .unwrap();
     assert_eq!(file.classification, "unresolved");
+}
+
+#[test]
+fn raw_outputs_preserve_hard_linked_source_and_remain_independent() {
+    let root = TempRoot::new();
+    let source = root.0.join("modules/rtsp/src/lib.rs");
+    let original = b"fn source() {}";
+    fs::write(&source, original).unwrap();
+    let json = root.0.join("out.json");
+    let markdown = root.0.join("out.md");
+    if fs::hard_link(&source, &json).is_err() {
+        return;
+    }
+    fs::hard_link(&json, &markdown).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_amaterasu-stream-failure-audit"))
+        .arg("--root")
+        .arg(&root.0)
+        .arg("--json")
+        .arg(&json)
+        .arg("--markdown")
+        .arg(&markdown)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(source).unwrap(), original);
+    assert!(serde_json::from_slice::<serde_json::Value>(&fs::read(json).unwrap()).is_ok());
+    assert!(
+        fs::read_to_string(markdown)
+            .unwrap()
+            .starts_with("# Stream failure source audit")
+    );
 }

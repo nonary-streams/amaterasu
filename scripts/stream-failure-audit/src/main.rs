@@ -1,8 +1,10 @@
 use amaterasu_stream_failure_audit::{report, scan};
 use std::{
     env, fs,
+    io::{self, Write},
     path::PathBuf,
     process::{Command, ExitCode},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 fn main() -> ExitCode {
@@ -86,9 +88,9 @@ fn run() -> Result<bool, String> {
     let complete =
         result.inventory.errors.is_empty() && result.unmatched_decision_symbols.is_empty();
     let bytes = serde_json::to_vec_pretty(&result).map_err(|e| e.to_string())?;
-    fs::write(&json, bytes).map_err(|e| format!("{}: {e}", json.display()))?;
+    write_artifact(&json, &bytes).map_err(|e| format!("{}: {e}", json.display()))?;
     if let Some(path) = markdown {
-        fs::write(&path, report::markdown(&result, markdown_limit))
+        write_artifact(&path, report::markdown(&result, markdown_limit).as_bytes())
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     println!(
@@ -101,6 +103,38 @@ fn run() -> Result<bool, String> {
         json.display()
     );
     Ok(complete)
+}
+
+/// Replace an artifact rather than truncating an existing inode that may also
+/// name a source file. create_new never touches an existing temporary path.
+fn write_artifact(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("output has no parent"))?;
+    let temporary = parent.join(format!(
+        ".stream-audit-{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.flush()?;
+        if let Ok(metadata) = fs::metadata(path) {
+            fs::set_permissions(&temporary, metadata.permissions())?;
+        }
+        Ok::<(), io::Error>(())
+    })();
+    drop(file);
+    let result = result.and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn output_path(root: &std::path::Path, path: PathBuf) -> Result<PathBuf, String> {
@@ -123,7 +157,7 @@ fn output_path(root: &std::path::Path, path: PathBuf) -> Result<PathBuf, String>
         .any(|p| path.starts_with(root.join(p)))
         || path
             .extension()
-            .is_some_and(|e| e == "rs" || e == "toml" || e == "lock")
+            .is_some_and(|e| e == "rs" || e == "toml" || e == "lock" || e == "py")
     {
         return Err(format!(
             "refusing to write an audit into source/manifest inputs: {}",
