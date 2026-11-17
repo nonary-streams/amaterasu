@@ -57,6 +57,25 @@ impl Installer {
     fn revision(&self) -> ModuleResult<String> {
         installed::revision(&self.root, &self.base()?)
     }
+    fn retire_stale_setup(&self) -> ModuleResult<()> {
+        if let Some(mut operation) = self.state.observe()?
+            && !matches!(
+                operation.phase,
+                Phase::Activating | Phase::Ready | Phase::Failed | Phase::Cancelled
+            )
+            && operation.in_flight.is_none()
+            && operation.installation_revision != self.revision()?
+        {
+            let previous = operation.revision;
+            operation.error = Some("plugin_revision_conflict".into());
+            operation.phase = Phase::Failed;
+            operation.revision = previous.checked_add(1).ok_or("plugin_revision_exhausted")?;
+            self.state.save((&operation.id, previous), &operation)?;
+            let _ = self.runtime.send(Command::HostPluginSetup { hold: false });
+        }
+        Ok(())
+    }
+
     fn status(&self) -> ModuleResult<Value> {
         if !cfg!(any(windows, target_os = "linux")) {
             return Ok(json!({"ok":true,"supported":false}));
@@ -335,7 +354,7 @@ impl ManagedModule for Installer {
                 "/run/amaterasu-plugin-installer/control.sock"
             },
         ));
-        Ok(Self {
+        let installer = Self {
             runtime,
             repositories: settings["repository_directory"]
                 .as_str()
@@ -350,7 +369,9 @@ impl ManagedModule for Installer {
             stopping: false,
             activation_requested: false,
             next_work: std::time::Instant::now(),
-        })
+        };
+        installer.retire_stale_setup()?;
+        Ok(installer)
     }
     fn tick(&mut self) -> ModuleResult<()> {
         if self.job.as_ref().is_some_and(JoinHandle::is_finished)

@@ -14,7 +14,10 @@ use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
 mod offline;
 mod restore;
-pub use offline::{activate_stopped, restore_stopped};
+pub use offline::{
+    activate_stopped, remove_stopped_plugin_overlay, restore_stopped,
+    stopped_plugin_overlay_revision,
+};
 pub use restore::restore;
 
 fn read_allowlist(root: &Path) -> PackageResult<PolicyAllowlist> {

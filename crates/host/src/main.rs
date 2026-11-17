@@ -149,6 +149,18 @@ fn run() -> PackageResult<()> {
                 "Verified restore prepared; the accepted release is unchanged. Start the managed service to complete its trial."
             );
         }
+        #[cfg(target_os = "linux")]
+        [command, root, active] if command == "plugin-overlay-revision-offline" => {
+            println!(
+                "{}",
+                package_activation::stopped_plugin_overlay_revision(Path::new(root), active)?
+            );
+        }
+        #[cfg(target_os = "linux")]
+        [command, root, active, revision] if command == "remove-plugin-overlay-offline" => {
+            package_activation::remove_stopped_plugin_overlay(Path::new(root), active, revision)?;
+            println!("Removed the plugin overlay from the stopped installation.");
+        }
         [command, root] if command == "probe" => {
             supervisor::probe(Path::new(root), None)?;
             println!("Component set passed the development lifecycle probe.");
@@ -166,7 +178,7 @@ fn run() -> PackageResult<()> {
         }
         _ => {
             return Err(
-                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | reconcile-package-activation ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | activate-package-offline ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | restore-package-offline ROOT MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT | service-user ROOT ACTIVE_DIGEST (Linux user service)"
+                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | reconcile-package-activation ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | activate-package-offline ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | restore-package-offline ROOT MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | plugin-overlay-revision-offline ROOT ACTIVE_DIGEST | remove-plugin-overlay-offline ROOT ACTIVE_DIGEST INSTALLATION_REVISION | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT | service-user ROOT ACTIVE_DIGEST (Linux user service)"
                     .into(),
             );
         }

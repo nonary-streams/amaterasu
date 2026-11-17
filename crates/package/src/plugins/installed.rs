@@ -5,9 +5,9 @@ use super::{
     operation::{Operation, Phase},
 };
 use crate::{
-    BootstrapConfig, PackageResult, VerifiedPackage, read_json,
-    repository::{CandidateKind, RepositoryStore, verify_candidate},
-    write_json_atomically,
+    BootstrapConfig, PackageResult, VerifiedPackage, read_bounded, read_json,
+    repository::{CandidateKind, RepositoryStore, VerifiedCatalog, verify_candidate},
+    sha256, write_json_atomically,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -92,6 +92,24 @@ pub fn stage(root: &Path, base: &str, operation: &Operation) -> PackageResult<()
     }
     check_floors(&selection, &operation.sources)?;
     selection.pending = Some(operation.clone());
+    selection.error = None;
+    save(root, &selection)
+}
+
+/// Remove the complete overlay after the caller has locked a stopped,
+/// authenticated installation and verified the pinned base package.
+pub fn remove_stopped_overlay(root: &Path, base: &str, expected: &str) -> PackageResult<()> {
+    let mut selection = read(root)?;
+    if selection.pending.is_some() || selection.trial {
+        return Err("plugin_activation_in_progress".into());
+    }
+    let actual =
+        sha256(&serde_json::to_vec(&(base, &selection.active)).map_err(|e| e.to_string())?);
+    if actual != expected || selection.active.is_empty() {
+        return Err("plugin_stale_recovery".into());
+    }
+    selection.previous = std::mem::take(&mut selection.active);
+    selection.active_drivers.clear();
     selection.error = None;
     save(root, &selection)
 }
@@ -195,6 +213,76 @@ pub fn verify_sources_from_store(
             let manifest: PluginManifest = read_json(&directory.join("manifest.json"))?;
             if manifest.sequence != source.sequence {
                 return Err("plugin_sequence_changed".into());
+            }
+            Ok(VerifiedPlugin {
+                source: source.clone(),
+                manifest,
+                directory,
+            })
+        })
+        .collect()
+}
+
+fn require_listed_plugin(catalog: &VerifiedCatalog, source: &PluginSource) -> PackageResult<()> {
+    if !catalog.candidates().iter().any(|candidate| {
+        candidate.kind == CandidateKind::NativePlugin
+            && candidate.slot == source.plugin
+            && candidate.version == source.version
+            && candidate.manifest_sha256 == source.manifest_digest
+    }) {
+        return Err("plugin_no_longer_listed".into());
+    }
+    Ok(())
+}
+
+fn verify_installed_sources(
+    store: &RepositoryStore,
+    selection: &Selection,
+    now: u64,
+) -> PackageResult<Vec<VerifiedPlugin>> {
+    let target = crate::current_target();
+    selection
+        .active
+        .iter()
+        .map(|source| {
+            let key = format!("{}:{}", source.publisher, source.plugin);
+            if !selection
+                .floors
+                .get(&key)
+                .is_some_and(|(sequence, digest)| {
+                    *sequence == source.sequence && *digest == source.manifest_digest
+                })
+            {
+                return Err("plugin_active_floor_mismatch".into());
+            }
+            let approved = store.approved(&source.repository)?;
+            if approved.fingerprint != source.publisher {
+                return Err("plugin_publisher_changed".into());
+            }
+            let catalog = store.catalog_for_installed_plugin(&source.repository, &target, now)?;
+            require_listed_plugin(&catalog, source)?;
+            let directory = store.existing_native_candidate_cache_path(
+                &source.repository,
+                &source.manifest_digest,
+            )?;
+            super::validate_directory(&directory)?;
+            let raw = read_bounded(&directory.join("manifest.json"), 1024 * 1024)?;
+            if sha256(&raw) != source.manifest_digest {
+                return Err("plugin_active_manifest_changed".into());
+            }
+            let signature = read_json(&directory.join("manifest.sig"))?;
+            let keys = [(approved.fingerprint, approved.public_key)].into();
+            // Manifest expiry uses the current time even when the authenticated
+            // catalog listing has lapsed.
+            let manifest = super::verify_manifest(&raw, &signature, &keys, now)?;
+            if manifest.id != source.plugin
+                || manifest.version != source.version
+                || manifest.sequence != source.sequence
+            {
+                return Err("plugin_candidate_identity_mismatch".into());
+            }
+            for artifact in manifest.artifacts()? {
+                super::verify_artifact(&directory, &artifact)?;
             }
             Ok(VerifiedPlugin {
                 source: source.clone(),
@@ -314,6 +402,7 @@ pub fn apply_locked(
     if sources.is_empty() {
         return Ok(package);
     }
+    let now = crate::unix_timestamp();
     check_floors(&selection, sources)?;
     if let Some(directory) = &selection.approval_store {
         let approvals = RepositoryStore::new(directory.clone())?;
@@ -322,21 +411,24 @@ pub fn apply_locked(
             if approved.fingerprint != source.publisher {
                 return Err("plugin_publisher_changed".into());
             }
-            let catalog = approvals.catalog(
-                &source.repository,
-                &crate::current_target(),
-                crate::unix_timestamp(),
-            )?;
-            if !catalog
-                .candidates()
-                .iter()
-                .any(|candidate| candidate.manifest_sha256 == source.manifest_digest)
-            {
-                return Err("plugin_no_longer_listed".into());
-            }
+            let catalog = if selection.trial {
+                approvals.catalog(&source.repository, &crate::current_target(), now)?
+            } else {
+                approvals.catalog_for_installed_plugin(
+                    &source.repository,
+                    &crate::current_target(),
+                    now,
+                )?
+            };
+            require_listed_plugin(&catalog, source)?;
         }
     }
-    let plugins = verify_sources_locked(root, sources, bootstrap)?;
+    let plugins = if selection.trial {
+        verify_sources_locked(root, sources, bootstrap)?
+    } else {
+        let store = RepositoryStore::new(root.join("repositories"))?;
+        verify_installed_sources(&store, &selection, now)?
+    };
     let approved = policy_for(bootstrap, &plugins)?;
     let components = super::compose(
         &package.manifest.components,
@@ -389,3 +481,6 @@ pub fn approval_store(root: &Path, directory: std::path::PathBuf) -> PackageResu
     selected.approval_store = Some(directory);
     save(root, &selected)
 }
+
+#[cfg(test)]
+mod tests;

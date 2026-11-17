@@ -33,6 +33,72 @@ pub fn restore_stopped(root: &Path, request: &HostPackageRestore) -> PackageResu
     )
 }
 
+/// Compute the exact overlay revision before offline removal.
+pub fn stopped_plugin_overlay_revision(
+    root: &Path,
+    expected_active: &str,
+) -> PackageResult<String> {
+    let service = StoppedService::identify(root, expected_active)?;
+    amaterasu_package::plugins::installed::revision(&service.root, expected_active)
+}
+
+/// Recover the verified base after an installed overlay can no longer load.
+pub fn remove_stopped_plugin_overlay(
+    root: &Path,
+    expected_active: &str,
+    expected_overlay: &str,
+) -> PackageResult<()> {
+    let service = StoppedService::identify(root, expected_active)?;
+    match fs::symlink_metadata(service.root.join("package-activation-journal.json")) {
+        Ok(_) => return Err("offline plugin recovery requires completed base activation".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let plugin_operations = amaterasu_package::plugins::operation::OperationStore::new(
+        service.state_root.join("plugin-installation"),
+    )?;
+    if plugin_operations
+        .read()?
+        .is_some_and(|operation| operation.in_flight.is_some())
+    {
+        return Err("offline plugin recovery requires completed plugin setup".into());
+    }
+    let selection: amaterasu_package::ActivationState =
+        amaterasu_package::read_json(&service.root.join("selection.json"))?;
+    if selection.active.as_deref() != Some(expected_active)
+        || !selection.healthy_sets.contains(expected_active)
+        || selection.pending.is_some()
+        || selection.trial.is_some()
+    {
+        return Err("offline plugin recovery requires the exact healthy active base".into());
+    }
+    let bootstrap: amaterasu_package::BootstrapConfig =
+        amaterasu_package::read_json(&service.root.join("bootstrap.json"))?;
+    if bootstrap.development || bootstrap.allow_unsigned {
+        return Err("offline plugin recovery requires an installed signed base".into());
+    }
+    crate::publisher_selection::with_verified_selected(
+        &service.root,
+        expected_active,
+        &bootstrap,
+        crate::publisher_selection::SelectionPurpose::RemoveStoppedPluginOverlay,
+        &mut |_, _| Ok(()),
+        |package| {
+            if !package.signed
+                || package.digest != expected_active
+                || package.manifest.host_context_schema != 1
+            {
+                return Err("offline plugin recovery could not verify the pinned base".into());
+            }
+            amaterasu_package::plugins::installed::remove_stopped_overlay(
+                &service.root,
+                expected_active,
+                expected_overlay,
+            )
+        },
+    )
+}
+
 /// A stopped managed service whose unit names this host, this root and the
 /// package the caller expects. The root lock is held while this value lives.
 struct StoppedService {

@@ -240,6 +240,33 @@ impl RepositoryStore {
         )
     }
 
+    /// Recheck the saved signed listing for an exact, already active plugin.
+    /// Catalog age gates discovery and activation. Revocation, catalog
+    /// authentication, replay protection and delisting still gate execution.
+    pub(crate) fn catalog_for_installed_plugin(
+        &self,
+        id: &str,
+        target: &str,
+        now: u64,
+    ) -> PackageResult<VerifiedCatalog> {
+        let state = self.read()?;
+        let record = active_record_ref(&state, id)?;
+        let saved = record
+            .catalog
+            .as_ref()
+            .ok_or("repository catalog not loaded")?;
+        let catalog: super::Catalog =
+            serde_json::from_str(&saved.raw).map_err(|error| error.to_string())?;
+        verify_catalog(
+            &record.approval,
+            saved.raw.as_bytes(),
+            &saved.signature,
+            &record.checkpoint,
+            target,
+            now.min(catalog.expires_unix.saturating_sub(1)),
+        )
+    }
+
     /// Lists every enrolled repository. A catalog that no longer verifies
     /// withholds only that repository's choices; it does not hide the others.
     pub fn list(&self, target: &str, now: u64) -> PackageResult<Vec<RepositoryListing>> {

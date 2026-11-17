@@ -207,6 +207,24 @@ selection is already running. Rust native images retain their code mappings
 until process exit for thread-local destructors; instance/resource shutdown and
 worker retirement still happen normally, and existing restart limits apply.
 
+### Recovering an installed overlay offline
+
+An exact active plugin may start with a lapsed cached catalog. The host still
+checks the latest accepted signed listing, the live publisher approval, the
+committed sequence and digest, manifest expiry and every artifact. A revoked
+publisher, delisted candidate, changed file or expired plugin manifest blocks
+that overlay. New offers and activation trials require fresh catalogs.
+
+On an installed Linux user service that is already stopped or failed, its OS
+owner can recover the verified base package without loading the plugin. Obtain
+the exact overlay revision with `amaterasu plugin-overlay-revision-offline ROOT
+ACTIVE_DIGEST`, then run `amaterasu remove-plugin-overlay-offline ROOT
+ACTIVE_DIGEST INSTALLATION_REVISION`. Use the active digest pinned in the
+managed service. The host verifies the unit, host and base selection again and
+refuses outstanding activation or machine-installation work. Removing the
+overlay retains publisher replay floors, cached files, driver installations
+and recovery receipts. The next service start uses the base composition.
+
 ## Validation boundary
 
 Automated coverage includes package integrity/trust/replay failures, exact

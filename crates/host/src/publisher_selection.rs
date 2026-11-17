@@ -11,6 +11,22 @@ use std::path::Path;
 pub enum SelectionPurpose {
     Worker,
     ExplicitRecovery,
+    #[cfg(target_os = "linux")]
+    RemoveStoppedPluginOverlay,
+}
+
+impl SelectionPurpose {
+    fn includes_overlay(self) -> bool {
+        match self {
+            Self::Worker | Self::ExplicitRecovery => true,
+            #[cfg(target_os = "linux")]
+            Self::RemoveStoppedPluginOverlay => false,
+        }
+    }
+
+    fn requires_worker_selection(self) -> bool {
+        self != Self::ExplicitRecovery
+    }
 }
 
 #[cfg(test)]
@@ -42,7 +58,7 @@ pub fn with_verified_selected<T>(
 ) -> PackageResult<T> {
     let selection: ActivationState = read_json(&root.join("selection.json"))?;
     if let Some(source) = selection.repository_sets.get(digest) {
-        if purpose == SelectionPurpose::Worker
+        if purpose.requires_worker_selection()
             && selection.active.as_deref() != Some(digest)
             && selection.pending.as_deref() != Some(digest)
             && selection.trial.as_deref() != Some(digest)
@@ -50,7 +66,7 @@ pub fn with_verified_selected<T>(
             return Err("repository native set lacks explicit activation authorization".into());
         }
         if !bootstrap.development
-            && (purpose != SelectionPurpose::Worker
+            && (!purpose.requires_worker_selection()
                 || selection.active.as_deref() != Some(digest)
                 || selection.pending.is_some()
                 || selection.trial.is_some()
@@ -101,7 +117,7 @@ pub fn with_verified_selected<T>(
             let returned_to = !bootstrap.development
                 && selection.active.as_deref() == Some(digest)
                 && package.manifest.sequence < floor.sequence;
-            if purpose == SelectionPurpose::Worker
+            if purpose.requires_worker_selection()
                 && (!bootstrap.development
                     || selection.pending.as_deref() == Some(digest)
                     || selection.trial.as_deref() == Some(digest))
@@ -110,7 +126,13 @@ pub fn with_verified_selected<T>(
             {
                 return Err("pending repository set was superseded by a newer release".into());
             }
-            amaterasu_package::plugins::installed::with_overlay(root, package, bootstrap, operation)
+            if purpose.includes_overlay() {
+                amaterasu_package::plugins::installed::with_overlay(
+                    root, package, bootstrap, operation,
+                )
+            } else {
+                operation(package)
+            }
         });
     }
     let package = verify_package_with_progress(
@@ -123,11 +145,8 @@ pub fn with_verified_selected<T>(
         },
         progress,
     )?;
-    if !amaterasu_package::plugins::installed::read(root)?
-        .active
-        .is_empty()
-        || amaterasu_package::plugins::installed::read(root)?.trial
-    {
+    let installed = amaterasu_package::plugins::installed::read(root)?;
+    if purpose.includes_overlay() && (!installed.active.is_empty() || installed.trial) {
         let store = RepositoryStore::new(root.join("repositories"))?;
         store.with_active_keys(|_| {
             amaterasu_package::plugins::installed::with_overlay(root, package, bootstrap, operation)
