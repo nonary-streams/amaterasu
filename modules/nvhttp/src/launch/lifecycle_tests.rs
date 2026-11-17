@@ -591,7 +591,7 @@ fn lost_resume_reply_before_stream_admission_retains_application() {
 }
 
 #[test]
-fn uncertain_abandoned_resume_keeps_application_fenced() {
+fn uncertain_history_does_not_fence_a_caller_abandoned_resume() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
@@ -608,27 +608,30 @@ fn uncertain_abandoned_resume_keeps_application_fenced() {
         if let Some(next) = controller.job.take() { job = next; }
     }
     let record = &controller.records[&id];
-    assert_eq!(record.state, State::CleanupFailed);
-    assert_eq!(record.cleanup_error, Some("resume_settlement_unconfirmed"));
+    assert_eq!(record.state, State::Paused);
+    assert_eq!(record.cleanup_error, None);
     assert_eq!(record.application_launch, Some(42));
     assert!(record.application_requested);
+    assert!(record.uncertain.is_empty());
+    assert_eq!(controller.pending_history_reservations.len(), 1);
 }
 
 #[test]
-fn connected_resume_history_settlement_uncertainty_preserves_application() {
-    for fail_release in [false, true] {
+fn history_settlement_uncertainty_preserves_initial_and_resumed_launches() {
+    for (resumed, fail_release) in [(false, false), (true, false), (true, true)] {
         let now = Instant::now();
         let mut controller = Controller::new(Some(config())).unwrap();
         assert!(controller.launch(10, request(1), peer(1), now).is_none());
         let record = controller.records.values_mut().next().unwrap();
         let id = record.id;
-        record.resumed = true;
+        record.resumed = resumed;
         record.lifecycle_session_target = serde_json::from_value(
             json!({"kind":"session","host_epoch":"e","session_id":"s","generation":1}),
         )
         .ok();
-        record.application_requested = true;
-        record.application_launch = Some(42);
+        if !resumed { record.lifecycle_session_target = None; }
+        record.application_requested = resumed;
+        record.application_launch = resumed.then_some(42);
         record.stage = Stage::ReserveHistory;
         let mut job = workflow::Job {
             record: id,
@@ -668,16 +671,34 @@ fn connected_resume_history_settlement_uncertainty_preserves_application() {
             }
         }
         let record = &controller.records[&id];
-        assert_eq!(record.state, State::CleanupFailed);
-        assert_eq!(record.cleanup_error, Some("resume_settlement_unconfirmed"));
-        assert_eq!(record.application_launch, Some(42));
-        assert!(record.application_requested);
-        assert_eq!(record.uncertain.len(), 1);
+        assert_eq!(record.state, State::Starting);
+        assert_eq!(record.cleanup_error, None);
+        assert_eq!(record.application_launch, resumed.then_some(42));
+        assert_eq!(record.application_requested, resumed);
+        assert!(record.uncertain.is_empty());
+        assert_eq!(controller.pending_history_reservations.len(), 1);
+        assert_eq!(controller.history_reservation_slots.len(), 1);
+        assert!(!record.history_reserved);
+        assert!(!record.history_release_required);
+        assert!(replies.is_empty());
         assert!(commands.iter().any(|command| matches!(command, Command::TakeResult { request: 7 })));
         // A lost result leaves the provider operation fenced; cancellation or
         // release would not prove that a delivered mutation has retired.
         assert!(!commands.iter().any(|command| matches!(command, Command::Cancel { request: 7 } | Command::ReleaseResult { request: 7 })));
         assert!(!commands.iter().any(|command| matches!(command, Command::Request { service, .. } if service == "amaterasu.launch/1")));
+        let operation = record.rtsp_operation.clone();
+        for _ in 0..3 {
+            controller.poll_history_reservations(now, &mut |command| match command {
+                Command::TakeResult { request: 7 } => Ok(Response::Result { payload: json!({
+                    "ok":true,"reserved":true,"activity_id":operation,"rtsp_operation_id":operation}) }),
+                Command::ReleaseResult { request: 7 } => Ok(Response::Ok),
+                other => panic!("must settle the original reservation, not replay it: {other:?}"),
+            });
+        }
+        assert!(controller.pending_history_reservations.is_empty());
+        assert!(controller.history_reservation_slots.is_empty());
+        assert!(controller.pending_history_releases.iter().any(|entry| entry.activity_id == operation));
+        assert_eq!(controller.records[&id].application_launch, resumed.then_some(42));
     }
 }
 
@@ -1061,4 +1082,23 @@ fn launches_proceed_during_the_sweep_and_capacity_refusal_sweeps_again() {
     }
     assert_eq!(broker.operations(), ["snapshot", "prepare", "snapshot"]);
     assert!(!broker.operations().contains(&"application_retired"));
+}
+
+
+#[test]
+fn history_reservation_settlement_capacity_skips_metadata_before_admission() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let record = controller.records.values_mut().next().unwrap();
+    let id = record.id;
+    record.stage = Stage::ReserveHistory;
+    for index in 0..64 { controller.history_reservation_slots.insert(format!("retained-{index}")); }
+    controller.schedule_record(id, now);
+    assert!(controller.job.is_none());
+    assert_eq!(controller.records[&id].state, State::Starting);
+    assert_eq!(controller.records[&id].stage, Stage::ReadProtonPolicy);
+    assert_eq!(controller.records[&id].failure, None);
+    assert_eq!(controller.history_reservation_slots.len(), 64);
+    assert!(!controller.records[&id].history_release_required);
 }

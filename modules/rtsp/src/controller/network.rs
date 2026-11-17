@@ -107,6 +107,7 @@ impl Controller {
         {
             // Existing prepared ownership remains available until DAG-ordered
             // quiescence. The shutdown announcement admits no new native start.
+            self.mark_noncritical_connection(connection);
             self.reply_status(
                 connection,
                 request.cseq,
@@ -562,6 +563,10 @@ impl Controller {
         reason: &'static str,
     ) {
         let noncritical = self.noncritical_connections.remove(&connection);
+        let queued_request = self
+            .pending_network
+            .iter()
+            .any(|pending| pending.connection == connection);
         self.pending_network
             .retain(|pending| pending.connection != connection);
         let Some(ticket) = ticket else {
@@ -585,10 +590,33 @@ impl Controller {
             .job
             .iter_mut()
             .chain(self.retiring_jobs.values_mut())
+            .chain(self.parked_job.iter_mut())
             .find(|job| {
                 job.ticket == ticket && job.network.is_some_and(|value| value.0 == connection)
             });
-        if noncritical && pending_mutation.is_none() {
+        let queued_io_loss = queued_request
+            && matches!(
+                reason,
+                "peer_closed"
+                    | "peer_disconnected"
+                    | "tcp_read_failed"
+                    | "tcp_write_failed"
+                    | "connection_deadline"
+            );
+        if (noncritical || queued_io_loss) && pending_mutation.is_none() {
+            if queued_io_loss {
+                let issue = StreamFailure::advisory("request_connection_lost")
+                    .because(reason)
+                    .at(
+                        record.config.operation_id.clone(),
+                        LifecycleLayer::Rtsp,
+                        "queued_request",
+                    );
+                if let StreamFailureDecision::Continue(issue) = StreamFailureHandler::decide(issue)
+                {
+                    record.issues.push(issue);
+                }
+            }
             self.records.insert(ticket, record);
             return;
         }

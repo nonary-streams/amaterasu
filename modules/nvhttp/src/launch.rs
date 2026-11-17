@@ -778,6 +778,8 @@ pub struct Controller {
     /// Optional diagnostics never occupy the critical launch/monitor job slot.
     diagnostic_jobs: BTreeMap<u64, (String, Job)>,
     pending_history_releases: VecDeque<PendingHistoryRelease>,
+    pending_history_reservations: VecDeque<(String, call::Call)>,
+    history_reservation_slots: BTreeSet<String>,
     active_history_release: Option<(PendingHistoryRelease, call::Call)>,
     /// What every layer reported about each stream: the root cause of a
     /// failure, demoted fallbacks and refusals, with who reported them.
@@ -856,6 +858,8 @@ impl Controller {
             job: None,
             diagnostic_jobs: BTreeMap::new(),
             pending_history_releases: VecDeque::new(),
+            pending_history_reservations: VecDeque::new(),
+            history_reservation_slots: BTreeSet::new(),
             active_history_release: None,
             stream_lifecycle: Default::default(),
             recent_refusals: VecDeque::new(),
@@ -1954,6 +1958,7 @@ impl Controller {
             });
         }
         self.poll_diagnostic_jobs(now, send);
+        self.poll_history_reservations(now, send);
         self.poll_history_releases(now, send);
         self.recover_failed_cleanup(now, send);
         self.stamp_ended(now);
@@ -2372,6 +2377,10 @@ impl Controller {
         for job in self.jobs_mut() {
             job.call.shutdown(send);
         }
+        for (_, mut call) in std::mem::take(&mut self.pending_history_reservations) {
+            call.abandon_warning(send);
+        }
+        self.history_reservation_slots.clear();
         for (_, mut job) in std::mem::take(&mut self.diagnostic_jobs).into_values() {
             job.call.abandon_warning(send);
         }

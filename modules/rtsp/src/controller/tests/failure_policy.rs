@@ -414,3 +414,33 @@ fn undeliverable_negotiation_only_completion_preserves_ownership() {
     assert_eq!(record.failure, None);
     assert_eq!(record.session, Some(23));
 }
+
+#[test]
+fn aborted_queued_requests_do_not_become_stream_transport_failures() {
+    for reason in [
+        "peer_closed",
+        "tcp_read_failed",
+        "connection_deadline",
+        "unexpected_pipelined_data",
+    ] {
+        let (mut controller, _) = prepared_controller();
+        controller
+            .pending_network
+            .push_back(super::super::PendingNetwork {
+                connection: 81,
+                ticket: 5,
+                request: request(Method::Play, "/", 8, true),
+            });
+        controller.disconnected(81, Some(5), reason);
+        assert!(controller.pending_network.is_empty());
+        if reason == "unexpected_pipelined_data" {
+            assert_eq!(
+                controller.records[&5].state,
+                State::Closing,
+                "invalid required framing remains a critical protocol failure"
+            );
+        } else {
+            assert_retained(&controller, State::Ready);
+        }
+    }
+}

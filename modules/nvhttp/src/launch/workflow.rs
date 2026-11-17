@@ -277,6 +277,7 @@ fn proton_policy_warning(
 }
 
 const MAX_PENDING_HISTORY_RELEASES: usize = 64;
+const MAX_HISTORY_RESERVATION_SLOTS: usize = 64;
 const HISTORY_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_HISTORY_RELEASE_ATTEMPTS: u8 = 8;
 
@@ -471,6 +472,52 @@ impl Controller {
                     call.abandon_warning(send);
                     self.record_history_release_lost(&entry, "attempts_exhausted");
                 }
+            }
+        }
+    }
+
+    /// Optional metadata owns no media/application resource. Keep the exact
+    /// admitted reservation until broker settlement, then release only that
+    /// activity. No retry dispatches a new reservation after uncertain admission.
+    pub(super) fn poll_history_reservations(&mut self, now: Instant, send: &mut Send<'_>) {
+        let Some((operation, mut call)) = self.pending_history_reservations.pop_front() else {
+            return;
+        };
+        match call.poll(send) {
+            Outcome::Waiting => self
+                .pending_history_reservations
+                .push_back((operation, call)),
+            Outcome::Uncertain => {
+                call.retry_settlement();
+                self.pending_history_reservations
+                    .push_back((operation, call));
+            }
+            Outcome::Result(_) | Outcome::Rejected | Outcome::Settled => {
+                self.history_reservation_slots.remove(&operation);
+                self.enqueue_history_release(operation.clone(), operation, None, now);
+            }
+        }
+    }
+
+    #[track_caller]
+    fn continue_without_history(&self, record: &mut Record, now: Instant, reason: &str) {
+        demote_record_warning(
+            record,
+            self.logger.as_ref(),
+            LifecycleLayer::History,
+            "reserve_history",
+            "history_reservation_unavailable",
+            reason,
+            "continue_without_history_reservation",
+        );
+        record.history_reserved = false;
+        record.history_release_required = false; // The retained background call owns release.
+        record.history_state = "unavailable";
+        if record.state == State::Starting {
+            if record.resumed && record.lifecycle_session_target.is_some() {
+                Self::advance_after_history(self.config.as_ref(), record, now);
+            } else {
+                record.stage = Stage::ReadProtonPolicy;
             }
         }
     }
@@ -670,6 +717,18 @@ impl Controller {
             self.records.insert(id, record);
             return;
         }
+        if phase == Phase::ReserveHistory {
+            if self.history_reservation_slots.len() >= MAX_HISTORY_RESERVATION_SLOTS {
+                self.continue_without_history(&mut record, now, "settlement_capacity");
+                if record.resume_abandoned && record.state != State::Stopping {
+                    reject_resume(&mut record, &mut self.management_replies);
+                }
+                self.records.insert(id, record);
+                return;
+            }
+            self.history_reservation_slots
+                .insert(record.rtsp_operation.clone());
+        }
         if !phase.routine_monitor() {
             self.log_phase(LogLevel::Debug, phase, "start");
         }
@@ -677,7 +736,7 @@ impl Controller {
         let deadline = if phase.optional_proton_policy_read()
             || matches!(
                 phase,
-                Phase::RecordHistoryWarnings | Phase::ReadLaunchWarnings
+                Phase::ReserveHistory | Phase::RecordHistoryWarnings | Phase::ReadLaunchWarnings
             ) {
             now + OPTIONAL_READ_BUDGET
         } else if matches!(
@@ -730,7 +789,7 @@ impl Controller {
             };
             record.failure_context = Some(FailureContext::new(job.phase, payload));
         }
-        if job.phase.optional_proton_policy_read()
+        if (job.phase.optional_proton_policy_read() || job.phase == Phase::ReserveHistory)
             && !matches!(outcome, Outcome::Waiting)
             && let Some(started) = job.deadline.checked_sub(OPTIONAL_READ_BUDGET)
             && let Some(record) = self.records.get_mut(&job.record)
@@ -743,6 +802,13 @@ impl Controller {
             record.deadline += now
                 .saturating_duration_since(started)
                 .min(OPTIONAL_READ_BUDGET);
+        }
+        if job.phase == Phase::ReserveHistory
+            && !matches!(outcome, Outcome::Waiting | Outcome::Uncertain)
+            && let Some(record) = self.records.get(&job.record)
+        {
+            self.history_reservation_slots
+                .remove(&record.rtsp_operation);
         }
         match outcome {
             Outcome::Waiting => self.job = Some(take_job(job)),
@@ -848,6 +914,22 @@ impl Controller {
                     replies,
                 );
             }
+            Outcome::Uncertain if job.phase == Phase::ReserveHistory => {
+                let Some(mut record) = self.records.remove(&job.record) else {
+                    return;
+                };
+                let operation = record.rtsp_operation.clone();
+                let mut call = take_call(job);
+                call.retry_settlement();
+                self.history_reservation_slots.insert(operation.clone());
+                self.pending_history_reservations
+                    .push_back((operation, call));
+                self.continue_without_history(&mut record, now, "uncertain_broker_settlement");
+                if record.resume_abandoned && record.state != State::Stopping {
+                    reject_resume(&mut record, replies);
+                }
+                self.records.insert(job.record, record);
+            }
             Outcome::Uncertain => {
                 self.log_phase(LogLevel::Warning, job.phase, "uncertain");
                 if job.phase.status_read() {
@@ -860,14 +942,7 @@ impl Controller {
                 record.uncertain.push_back((job.phase, take_call(job)));
                 record.retrying_uncertainty = false;
                 record.cleanup_error = Some("broker_settlement_unconfirmed");
-                if record.resume_abandoned
-                    || (record.resumed
-                        && record.lifecycle_session_target.is_some()
-                        && record.state != State::Stopping
-                        && matches!(job.phase, Phase::ReserveHistory)
-                        && !record.rtsp_requested
-                        && record.rtsp_ticket.is_none())
-                {
+                if record.resume_abandoned {
                     record.fail_cleanup(
                         amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
                             "resume_settlement_unconfirmed",
@@ -1431,7 +1506,7 @@ impl Controller {
                     stream_service.as_str(),
                     json!({"action":"reserve_history_activity", "activity_id":record.rtsp_operation,
                         "rtsp_operation_id":record.rtsp_operation}),
-                    5_000,
+                    OPTIONAL_READ_BUDGET.as_millis() as u64,
                 )
             }
             Phase::ReadProtonPolicy => (INPUT_SERVICE, json!({"action":"settings_get"}), 5_000),
