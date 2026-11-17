@@ -411,6 +411,7 @@ impl Controller {
                 .map_err(|_| "invalid_prepare_response")?;
             let launch = TrustedLaunch {
                 epoch: record.id,
+                operation: record.config.operation_id.clone(),
                 rtsp_target: record.url.clone(),
                 session_token: record.session_token.clone(),
                 encrypted_rtsp: true,
@@ -538,8 +539,9 @@ impl Controller {
             return;
         }
         let state = stream_state(payload);
+        let same_session = record.session.is_some() && response_session(payload) == record.session;
         let valid = payload["ok"] == true
-            && response_session(payload) == record.session
+            && same_session
             && matches!(state, Some("armed" | "starting" | "active"))
             && payload["video_startup_ready"] == true
             && payload["cleanup_error"].is_null();
@@ -551,7 +553,7 @@ impl Controller {
                 safe_provider_code(&payload["error"]),
             );
         }
-        if let Some(state) = state {
+        if same_session && let Some(state) = state {
             record.stream_state = Some(state.into());
         }
         let Some((connection, action_ticket)) = job.network else {
@@ -577,31 +579,31 @@ impl Controller {
                     .ok()
                 })
                 .filter(|report| {
-                    // Older managed preparations without optional history carry
-                    // only the selected session's local report identity. Bind
-                    // that exact child to this owner; never accept an arbitrary
-                    // advisory scope or infer native retirement from a report.
-                    let local_prepared_scope = record.config.history_activity_id.is_none()
+                    // Older managed preparations without history use the
+                    // selected stream-session's local identity.
+                    let local_scope = same_session
+                        && record.config.history_activity_id.is_none()
                         && record.config.lifecycle_capture_mode.is_managed()
-                        && record.session.is_some_and(|session| {
-                            response_session(payload) == Some(session)
-                                && report.operation == format!("ss-{session:x}")
-                        })
+                        && record
+                            .session
+                            .is_some_and(|session| report.operation == format!("ss-{session:x}"));
+                    let owned_start = same_session
                         && report.layer
                             == amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession
-                        && report.phase == "start"
+                        && report.phase == "start";
+                    let unchanged_preparation = payload["ok"] == false
+                        && record.state == State::Arming
                         && state == Some("prepared")
                         && payload["cleanup_error"].is_null();
-                    (report.operation == record.config.operation_id || local_prepared_scope)
+                    (report.operation == record.config.operation_id || local_scope)
+                        && owned_start
+                        && (report.is_critical() || unchanged_preparation)
                         && report.valid()
                         && !report.reason.is_empty()
                 });
             Err(match report {
                 Some(report) => {
-                    prepared_refusal = !report.is_critical()
-                        && state == Some("prepared")
-                        && response_session(payload) == record.session
-                        && payload["cleanup_error"].is_null();
+                    prepared_refusal = !report.is_critical();
                     amaterasu_module_sdk::stream_lifecycle::StreamFailure::reported(
                         "start_rejected",
                         report,
@@ -620,7 +622,7 @@ impl Controller {
         } else if prepared_refusal && record.failure.is_none() && record.state == State::Arming {
             // Exact selected provider confirms the same session is still only
             // prepared. No retirement or media mutation is inferred from a log.
-            record.state = State::Ready;
+            record.restore_admission();
         }
     }
 

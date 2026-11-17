@@ -74,6 +74,7 @@ pub(super) struct Record {
     /// confirmed. Port zero marks a provider-selected endpoint on this address.
     pub media_binds: Option<crate::model::MediaBinds>,
     pub expires: u64,
+    pub(super) admission_expires: u64,
     pub next_status: u64,
     pub observation_stale_at: u64,
     pub failure: Option<&'static str>,
@@ -152,9 +153,15 @@ impl Record {
         true
     }
     pub(super) fn begin_arm(&mut self, now: u64) -> u64 {
+        self.admission_expires = self.expires;
         self.state = State::Arming;
         self.expires = now.saturating_add(u64::from(self.config.ping_timeout_ms));
         self.expires
+    }
+
+    pub(super) fn restore_admission(&mut self) {
+        self.state = State::Ready;
+        self.expires = self.admission_expires;
     }
 
     pub(super) fn accept_announce(
@@ -453,7 +460,9 @@ impl Record {
         );
         match StreamFailureHandler::decide(issue) {
             StreamFailureDecision::Terminate(permit) => self.close_reported(permit, code),
-            StreamFailureDecision::Continue(issue) => self.issues.push(issue),
+            StreamFailureDecision::Continue(continuation) => {
+                self.issues.push(continuation.into_issue())
+            }
             StreamFailureDecision::Invalid(_) => {}
         }
     }

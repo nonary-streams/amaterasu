@@ -4,6 +4,7 @@ use crate::LogEmitter;
 use crate::control_error::ControlResult;
 use crate::events::{Backlog, Delivery, Subscription};
 use crate::{Command, ModuleResult, Response};
+use std::collections::BTreeSet;
 
 /// Events a subscription may hold before the owner must read them.
 const FEED_CAPACITY: usize = 64;
@@ -19,6 +20,7 @@ const RESUBSCRIBE_AFTER_POLLS: u32 = 512;
 #[derive(Debug, Default)]
 pub struct StreamIssueFeed {
     subscription: Option<Subscription<StreamReport>>,
+    binding_publishers: BTreeSet<String>,
     retry_in: u32,
     malformed: u64,
     unavailable: Option<String>,
@@ -27,6 +29,12 @@ pub struct StreamIssueFeed {
 impl StreamIssueFeed {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Grant a coordinator diagnostic alias authority independently of its
+    /// permission to publish first-hand reports.
+    pub fn allow_bindings_from(&mut self, publisher: impl Into<String>) {
+        self.binding_publishers.insert(publisher.into());
     }
 
     /// Events from a publisher that did not match [`StreamReport`] or failed
@@ -124,7 +132,13 @@ impl StreamIssueFeed {
                 StreamReport::Issue(issue) => {
                     store.commit(&event.publisher, issue);
                 }
-                StreamReport::Binding(binding) => store.bind(&binding.stream, &binding.alias),
+                StreamReport::Binding(binding) => {
+                    if !self.binding_publishers.contains(&event.publisher)
+                        || !store.bind_reported(&binding.stream, &binding.alias)
+                    {
+                        self.reject(&event.publisher, "invalid_stream_binding", logger);
+                    }
+                }
             },
             Delivery::Event(event) => {
                 self.reject(&event.publisher, "invalid_stream_issue", logger);

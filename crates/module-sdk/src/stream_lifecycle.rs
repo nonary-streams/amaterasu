@@ -31,7 +31,8 @@ mod feed;
 mod store;
 mod termination;
 pub use termination::{
-    StreamFailure, StreamFailureDecision, StreamFailureHandler, StreamTermination,
+    StreamContinuation, StreamFailure, StreamFailureDecision, StreamFailureHandler,
+    StreamFailureScope, StreamTermination,
 };
 
 pub use feed::StreamIssueFeed;

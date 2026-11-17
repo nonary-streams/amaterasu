@@ -1343,6 +1343,7 @@ struct Broker {
     held_application_stop_request: Option<u64>,
     application_stop_expired: bool,
     fail_rtsp_cleanup: bool,
+    fail_rtsp_open: bool,
     wrong_application_id: bool,
     lose_rtsp_open_once: bool,
     lost_rtsp_open: bool,
@@ -1442,6 +1443,7 @@ impl Default for Broker {
             held_application_stop_request: None,
             application_stop_expired: false,
             fail_rtsp_cleanup: false,
+            fail_rtsp_open: false,
             wrong_application_id: false,
             lose_rtsp_open_once: false,
             lost_rtsp_open: false,
@@ -1983,7 +1985,9 @@ impl Broker {
             }
             return json!({"ok":true,"launch":launch});
         }
-        let state = if action == "close" && self.fail_rtsp_cleanup {
+        let state = if action == "open" && self.fail_rtsp_open {
+            "failed"
+        } else if action == "close" && self.fail_rtsp_cleanup {
             "cleanup_failed"
         } else if action == "close" {
             "closed"
@@ -2019,7 +2023,7 @@ impl Broker {
             "display_request": self.rtsp_display_request.clone().unwrap_or(Value::Null),
             "display_applied": state == "ready" && self.rtsp_display_request.is_some()
                 && !missing_rtsp_display_readback,
-            "failure": null,
+            "failure": (state == "failed").then_some("provider_failed"),
             "cleanup_error": if state == "cleanup_failed" {
                 Value::String("fixture_failure".into())
             } else {
@@ -4929,56 +4933,88 @@ fn uncertain_startup_mutation_reports_critical_before_cleanup() {
 }
 
 #[test]
-fn missing_application_during_startup_reports_critical_issue() {
+fn missing_application_during_startup_replies_once_after_cleanup() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
-    launch_ready(&mut controller, &mut broker, now);
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let id = *controller.records.keys().next().unwrap();
-    controller.records.get_mut(&id).unwrap().state = super::record::State::Starting;
+    let record = controller.records.get_mut(&id).unwrap();
+    assert_eq!(record.launch_connection, Some(10));
+    record.application_requested = true;
     let job = Job {
         record: id,
         phase: Phase::LookupApplication,
-        call: Call::new("service/1", json!({}), "lookup".into(), 1000),
+        call: Call::new("amaterasu.launch/1", json!({}), "lookup".into(), 1000),
         deadline: now,
     };
-    controller.consume(&job, json!({"ok":false,"code":"launch_not_found"}), now, &mut Vec::new());
-    let record = controller.records.get_mut(&id).unwrap();
-    assert_eq!(record.state, super::record::State::Stopping);
-    assert!(record.issues.drain().any(|report| matches!(report, StreamReport::Issue(issue)
-        if issue.code == "application_launch_unavailable"
-            && issue.disposition == IssueDisposition::CriticalFailure
-            && !issue.reason.is_empty() && issue.valid())));
+    let mut replies = Vec::new();
+    controller.consume(
+        &job,
+        json!({"ok":false,"code":"launch_not_found"}),
+        now,
+        &mut replies,
+    );
+    for _ in 0..64 {
+        replies.extend(controller.poll(now, &mut |command| broker.send(command)));
+    }
+    assert_failed_startup_reply(
+        &controller,
+        replies,
+        "application_launch_unavailable",
+        "launch_not_found",
+    );
 }
 
 #[test]
-fn terminal_provider_during_startup_records_critical_issue() {
-    for (phase, service, expected) in [
-        (Phase::LookupApplication, "amaterasu.launch/1", "application_ended"),
-        (Phase::OpenRtsp, "amaterasu.rtsp/1", "rtsp_not_ready"),
+fn terminal_provider_during_startup_replies_once_after_cleanup() {
+    for (mut broker, expected, reason) in [
+        (
+            Broker {
+                application_state: "stopped",
+                ..Broker::default()
+            },
+            "application_ended",
+            "application_ended",
+        ),
+        (
+            Broker {
+                fail_rtsp_open: true,
+                ..Broker::default()
+            },
+            "rtsp_not_ready",
+            "provider_failed",
+        ),
     ] {
         let now = Instant::now();
         let mut controller = Controller::new(Some(config())).unwrap();
-        let mut broker = Broker::default();
-        launch_ready(&mut controller, &mut broker, now);
-        let id = *controller.records.keys().next().unwrap();
-        controller.records.get_mut(&id).unwrap().state = super::record::State::Starting;
-        let mut payload = broker.response(service, &json!({"action":"status"}));
-        if phase == Phase::LookupApplication {
-            payload["launch"]["state"] = json!("stopped");
-        } else {
-            payload["state"] = json!("failed");
-            payload["failure"] = json!("provider_failed");
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        let mut replies = Vec::new();
+        for _ in 0..64 {
+            replies.extend(controller.poll(now, &mut |command| broker.send(command)));
         }
-        let job = Job { record: id, phase, call: Call::new(service, json!({}), "lookup".into(), 1000), deadline: now };
-        controller.consume(&job, payload, now, &mut Vec::new());
-        let record = controller.records.get_mut(&id).unwrap();
-        assert_eq!(record.state, super::record::State::Stopping);
-        assert!(record.issues.drain().any(|report| matches!(report, StreamReport::Issue(issue)
-            if issue.code == expected && issue.disposition == IssueDisposition::CriticalFailure && issue.valid())));
+        assert_failed_startup_reply(&controller, replies, expected, reason);
+        assert_eq!(application_stop_count(&broker), 1);
     }
 }
 
+fn assert_failed_startup_reply(
+    controller: &Controller,
+    replies: Vec<(u64, Reply)>,
+    code: &str,
+    reason: &str,
+) {
+    assert_eq!(replies.len(), 1, "{code}");
+    assert_eq!((replies[0].0, replies[0].1.status), (10, 503), "{code}");
+    let record = &controller.records[&1];
+    assert_eq!(record.state, State::Failed);
+    assert_eq!(record.failure, Some(code));
+    assert_eq!(record.cleanup_error, None);
+    assert_eq!(record.launch_connection, None);
+    let root = lifecycle_of(controller, 1).root_cause().unwrap();
+    assert_eq!(root.issue.code, code);
+    assert_eq!(root.issue.reason, reason);
+}
 
 #[test]
 fn natural_application_exit_closes_the_stream_and_releases_the_application() {

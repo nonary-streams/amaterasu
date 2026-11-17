@@ -252,6 +252,12 @@ pub struct StreamLifecycleSnapshot {
     pub entries: Vec<LifecycleEntry>,
 }
 
+fn derived_from(operation: &str, prefix: &str) -> bool {
+    operation.len() > prefix.len()
+        && operation.starts_with(prefix)
+        && matches!(operation.as_bytes()[prefix.len()], b'-' | b'.' | b':')
+}
+
 /// Every tracked stream's lifecycle, kept by the launch owner.
 ///
 /// Issues are matched to a stream by operation: the stream key itself, an
@@ -330,7 +336,41 @@ impl StreamLifecycleStore {
         let Some(key) = self.resolve(stream).map(str::to_owned) else {
             return;
         };
-        self.alias(&key, alias);
+        self.bind_to_key(&key, alias);
+    }
+
+    /// A published binding cannot replace or shadow an operation the owner
+    /// already attributes to another stream, or claim a tracked stream key.
+    pub(super) fn bind_reported(&mut self, stream: &str, alias: &str) -> bool {
+        let Some(key) = self.resolve(stream).map(str::to_owned) else {
+            return false;
+        };
+        if self.streams.contains_key(alias)
+            || self.resolve(alias).is_some_and(|existing| existing != key)
+            || self
+                .streams
+                .keys()
+                .any(|other| *other != key && derived_from(other, alias))
+            || self
+                .aliases
+                .iter()
+                .any(|(other_alias, other)| *other != key && derived_from(other_alias, alias))
+        {
+            return false;
+        }
+        self.bind_to_key(&key, alias);
+        true
+    }
+
+    fn bind_to_key(&mut self, key: &str, alias: &str) {
+        if self
+            .aliases
+            .get(alias)
+            .is_some_and(|existing| existing == key)
+        {
+            return;
+        }
+        self.alias(key, alias);
         let waiting = std::mem::take(&mut self.unattributed);
         for entry in waiting {
             match self.resolve(&entry.issue.operation).map(str::to_owned) {
@@ -384,22 +424,17 @@ impl StreamLifecycleStore {
         if let Some(key) = self.aliases.get(operation) {
             return Some(key);
         }
-        let derived = |prefix: &str| {
-            operation.len() > prefix.len()
-                && operation.starts_with(prefix)
-                && matches!(operation.as_bytes()[prefix.len()], b'-' | b'.' | b':')
-        };
         // The longest matching prefix wins, so a stream whose key extends
         // another's is never credited to the shorter one.
         let stream = self
             .streams
             .keys()
-            .filter(|key| derived(key))
+            .filter(|key| derived_from(operation, key))
             .map(|key| (key.len(), key.as_str()));
         let aliased = self
             .aliases
             .iter()
-            .filter(|(alias, _)| derived(alias))
+            .filter(|(alias, _)| derived_from(operation, alias))
             .map(|(alias, key)| (alias.len(), key.as_str()));
         stream
             .chain(aliased)

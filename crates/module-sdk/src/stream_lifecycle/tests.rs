@@ -870,3 +870,45 @@ fn a_callers_fallback_recovers_a_providers_refusal() {
     );
     assert!(store.stream("launch-1").unwrap().healthy());
 }
+
+#[test]
+fn report_publishers_cannot_claim_or_redirect_another_streams_alias() {
+    let bind = |publisher, sequence, stream, alias| {
+        event(
+            publisher,
+            sequence,
+            serde_json::to_value(StreamReport::Binding(StreamBinding::new(stream, alias))).unwrap(),
+        )
+    };
+    let (mut send, _) = scripted(vec![
+        Ok(Response::Accepted { id: 9 }),
+        bind("amaterasu.capture", 1, "launch-a", "video-1"),
+        bind("amaterasu.video", 1, "launch-a", "video-1"),
+        bind("amaterasu.video", 2, "launch-b", "video-1"),
+        bind("amaterasu.video", 3, "launch-b", "video-1-capture"),
+        bind("amaterasu.video", 4, "launch-b", "video"),
+        event(
+            "amaterasu.capture",
+            2,
+            serde_json::to_value(StreamReport::Issue(StreamIssue::critical(
+                "video-1-capture-0",
+                LifecycleLayer::Capture,
+                "open",
+                "failed",
+            )))
+            .unwrap(),
+        ),
+        Ok(Response::Pending),
+    ]);
+    let mut store = StreamLifecycleStore::new();
+    store.open("launch-a");
+    store.open("launch-b");
+    let mut feed = StreamIssueFeed::new();
+    feed.allow_bindings_from("amaterasu.video");
+    assert_eq!(feed.poll_with(&mut send, &mut store, None, 16), 6);
+    assert_eq!(feed.malformed(), 4);
+    let failure = store.stream("launch-a").unwrap().root_cause().unwrap();
+    assert_eq!(failure.publisher, "amaterasu.capture");
+    assert_eq!(failure.issue.code, "failed");
+    assert!(store.stream("launch-b").unwrap().healthy());
+}

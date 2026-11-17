@@ -224,7 +224,9 @@ impl Pipeline {
             .because(reason)
             .caused_by(lifecycle_issues::step_layer(job.step));
             match StreamFailureHandler::decide(report) {
-                StreamFailureDecision::Continue(issue) => record.issues.push(issue),
+                StreamFailureDecision::Continue(continuation) => {
+                    record.issues.push(continuation.into_issue())
+                }
                 StreamFailureDecision::Terminate(permit) => {
                     // Only the common handler can authorize a terminal effect.
                     permit.terminate(|_| {

@@ -148,7 +148,9 @@ impl Record {
                     self.issues.push(issue);
                 }
             }),
-            StreamFailureDecision::Continue(issue) => self.issues.push(issue),
+            StreamFailureDecision::Continue(continuation) => {
+                self.issues.push(continuation.into_issue())
+            }
             StreamFailureDecision::Invalid(_) => {}
         }
     }
@@ -208,7 +210,8 @@ impl Controller {
                     self.stream_issues.push(issue);
                 }
             }),
-            StreamFailureDecision::Continue(issue) => {
+            StreamFailureDecision::Continue(continuation) => {
+                let issue = continuation.into_issue();
                 // No ticket exists: this refuses only the open operation.
                 rpc::complete(runtime, request, error(code));
                 if caller == self.settings.launch_owner {
@@ -242,7 +245,8 @@ impl Controller {
                     self.stream_issues.push(issue);
                 }
             }),
-            StreamFailureDecision::Continue(issue) => {
+            StreamFailureDecision::Continue(continuation) => {
+                let issue = continuation.into_issue();
                 rpc::complete(runtime, admission.request, error(code));
                 if admission.caller == self.settings.launch_owner {
                     self.stream_issues.push(issue);

@@ -368,7 +368,8 @@ impl Record {
                 });
                 true
             }
-            StreamFailureDecision::Continue(issue) => {
+            StreamFailureDecision::Continue(continuation) => {
+                let issue = continuation.into_issue();
                 if self.config.rtsp_operation_id.is_some() {
                     self.issues.push(issue);
                 }

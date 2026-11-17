@@ -4,6 +4,7 @@ fn negotiation() -> Negotiation {
     Negotiation::new(
         TrustedLaunch {
             epoch: 7,
+            operation: "test-launch".into(),
             rtsp_target: "rtspenc://127.0.0.1:48010/launch-1".into(),
             session_token: "opaque-session-1".into(),
             encrypted_rtsp: true,
@@ -267,9 +268,9 @@ fn epoch_session_and_completion_tickets_cannot_adopt_another_launch() {
     };
     assert_eq!(machine.complete(8, ticket), Err(Error::WrongEpoch));
     assert_eq!(machine.complete(7, ticket + 1), Err(Error::WrongTicket));
-    machine.complete(7, ticket).unwrap();
+    let reply = machine.complete(7, ticket).unwrap();
     assert_eq!(machine.complete(7, ticket), Err(Error::WrongTicket));
-    assert_eq!(machine.handle(7, &announce()), Err(Error::InvalidSequence));
+    assert_eq!(machine.handle(7, &announce()), Ok(Step::Reply(reply)));
 }
 
 #[test]
@@ -279,22 +280,8 @@ fn backend_rejection_never_emits_success_or_arms_play_but_allows_cleanup() {
     let Step::Action { ticket, .. } = machine.handle(7, &announce()).unwrap() else {
         panic!()
     };
-    let response = machine
-        .reject(
-            7,
-            ticket,
-            &amaterasu_module_sdk::stream_lifecycle::StreamTermination::try_from(
-                amaterasu_module_sdk::stream_lifecycle::StreamIssue::critical(
-                    "stream",
-                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Rtsp,
-                    "arm",
-                    "backend_unavailable",
-                )
-                .because("backend_unavailable"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+    let permit = backend_failure(&machine, ticket);
+    let response = machine.reject(7, ticket, &permit).unwrap();
     assert!(response.starts_with(b"RTSP/1.0 503 "));
     assert_eq!(machine.state(), State::Failed);
     assert_eq!(
@@ -539,4 +526,48 @@ fn negotiation_failure_criticality_is_explicit_and_reasons_are_stable() {
                 .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
         );
     }
+}
+
+fn backend_failure(
+    machine: &Negotiation,
+    ticket: u64,
+) -> amaterasu_module_sdk::stream_lifecycle::StreamTermination {
+    use amaterasu_module_sdk::stream_lifecycle::{
+        LifecycleLayer, StreamFailureDecision, StreamFailureHandler, StreamIssue,
+    };
+    let failure = StreamIssue::critical(
+        "test-launch",
+        LifecycleLayer::Rtsp,
+        "arm",
+        "backend_unavailable",
+    );
+    let scope = machine.failure_scope(7, ticket).unwrap();
+    let StreamFailureDecision::Terminate(permit) =
+        StreamFailureHandler::decide_scoped(failure, scope)
+    else {
+        panic!("expected critical failure")
+    };
+    permit
+}
+
+#[test]
+fn a_termination_permit_cannot_reject_another_pending_operation() {
+    let mut first = negotiation();
+    let mut second = negotiation();
+    setup_to_announce(&mut first);
+    setup_to_announce(&mut second);
+    let Step::Action { ticket, .. } = first.handle(7, &announce()).unwrap() else {
+        panic!()
+    };
+    assert!(
+        matches!(second.handle(7, &announce()), Ok(Step::Action { ticket: other, .. }) if ticket == other)
+    );
+    let permit = backend_failure(&first, ticket);
+    assert_eq!(
+        second.reject(7, ticket, &permit),
+        Err(Error::InvalidFailureReport)
+    );
+    assert_eq!(second.state(), State::Announce);
+    assert!(first.reject(7, ticket, &permit).is_ok());
+    assert!(second.complete(7, ticket).is_ok());
 }

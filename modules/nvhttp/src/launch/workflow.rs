@@ -2559,11 +2559,13 @@ impl Controller {
                     }
                     Ok((launch_id, _, _)) => {
                         record.application_launch = Some(launch_id);
-                        record.failure.get_or_insert("application_ended");
-                        if record.state == State::Starting {
-                            record.record_failure("application_ended");
-                        }
-                        record.request_cleanup(None, now);
+                        record.request_failure_cleanup(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                "application_ended",
+                            ),
+                            None,
+                            now,
+                        );
                     }
                     Err("launch_not_found") if job.phase == Phase::LookupApplication => {
                         if record
@@ -2576,13 +2578,13 @@ impl Controller {
                         } else {
                             record.application_requested = false;
                         }
-                        record
-                            .failure
-                            .get_or_insert("application_launch_unavailable");
-                        if record.state == State::Starting {
-                            record.record_failure("application_launch_unavailable");
-                        }
-                        record.request_cleanup(None, now);
+                        record.request_failure_cleanup(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                "application_launch_unavailable",
+                            ),
+                            Some("launch_not_found"),
+                            now,
+                        );
                     }
                     Err(code) => fail_record(
                         record,
@@ -2672,13 +2674,13 @@ impl Controller {
                         safe_rtsp_provider_code(&payload["cleanup_error"]),
                     );
                     record.rtsp_ticket = Some(ticket);
-                    if record.state == State::Starting {
-                        record.record_failure_because(
+                    record.request_failure_cleanup(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
                             "rtsp_not_ready",
-                            safe_rtsp_provider_code(&payload["failure"]),
-                        );
-                    }
-                    record.request_cleanup(None, now);
+                        ),
+                        Some(safe_rtsp_provider_code(&payload["failure"])),
+                        now,
+                    );
                 }
                 Err("ticket_not_found") if job.phase == Phase::LookupRtsp => {
                     if record
@@ -4726,7 +4728,7 @@ fn fail_before_resume_stream(
         && record.rtsp_ticket.is_none()
         && record.state == State::Starting
     {
-        record.process_failure(failure, |record| reject_resume(record, replies));
+        record.process_failure(failure, |record| apply_resume_rejection(record, replies));
     } else {
         fail_record(record, failure, now);
     }
@@ -4736,35 +4738,37 @@ fn fail_before_resume_stream(
 pub(super) fn reject_resume(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
     record.process_failure(
         amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("resume_rejected"),
-        |record| {
-            record.resume_abandoned = false;
-            if let Some(connection) = record.launch_connection.take() {
-                replies.push((
-                    connection,
-                    recorded(private_error(409, "resume settings are unavailable")),
-                ));
-            }
-            if record.application_session.is_some() {
-                record.state = State::Stopping;
-                record.stage = Stage::Cleanup;
-                record.transport_only_cleanup = true;
-                record.application_launch = None;
-                record.failure = Some("join_rejected");
-                return;
-            }
-            record.state = if record.history_release_required {
-                State::Starting
-            } else {
-                State::Paused
-            };
-            record.stage = if record.history_release_required {
-                Stage::ReleaseRejectedResumeHistory
-            } else {
-                Stage::Live
-            };
-            record.adopted = true;
-        },
+        |record| apply_resume_rejection(record, replies),
     );
+}
+
+fn apply_resume_rejection(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
+    record.resume_abandoned = false;
+    if let Some(connection) = record.launch_connection.take() {
+        replies.push((
+            connection,
+            recorded(private_error(409, "resume settings are unavailable")),
+        ));
+    }
+    if record.application_session.is_some() {
+        record.state = State::Stopping;
+        record.stage = Stage::Cleanup;
+        record.transport_only_cleanup = true;
+        record.application_launch = None;
+        record.failure = Some("join_rejected");
+        return;
+    }
+    record.state = if record.history_release_required {
+        State::Starting
+    } else {
+        State::Paused
+    };
+    record.stage = if record.history_release_required {
+        Stage::ReleaseRejectedResumeHistory
+    } else {
+        Stage::Live
+    };
+    record.adopted = true;
 }
 
 fn advance_resume_display(record: &mut Record, now: Instant) {

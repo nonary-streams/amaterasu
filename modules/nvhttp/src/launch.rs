@@ -1861,14 +1861,13 @@ impl Controller {
                 .records
                 .get_mut(&root)
                 .expect("retained session remains available");
-            record.rtsp_operation = operation;
+            record.begin_resume_operation(operation);
             record.authenticated_client_disconnected = false;
             record.rtsp_stream_ending = false;
             record.late_monitor_since = None;
             record.rtsp_closing_deadline = None;
             record.stop_application_after_stream_retirement = false;
             record.revoked = false;
-            record.failure = None;
             record.resumed = true;
             record.response_kind = response;
             record.adopted = false;

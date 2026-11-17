@@ -811,23 +811,32 @@ impl Controller {
         );
         let allowed = match StreamFailureHandler::decide(issue) {
             StreamFailureDecision::Terminate(permit) => permit.authorize(|_| true),
-            StreamFailureDecision::Continue(issue) => {
+            StreamFailureDecision::Continue(continuation) => {
+                let issue = continuation.into_issue();
                 self.stream_issues.push(issue);
                 self.mark_noncritical_connection(connection);
                 true // Refuse only the affected request; retain the stream.
             }
             StreamFailureDecision::Invalid(_) => false,
         };
-        allowed
-            && serialize_response(status, cseq, &[], &[])
-                .ok()
-                .is_some_and(|reply| self.reply_bytes(connection, &reply))
+        allowed && self.write_status(connection, cseq, status)
+    }
+
+    fn write_status(&mut self, connection: u64, cseq: u32, status: u16) -> bool {
+        serialize_response(status, cseq, &[], &[])
+            .ok()
+            .is_some_and(|reply| self.reply_bytes(connection, &reply))
+    }
+
+    fn deliver_reply(&mut self, connection: u64, reply: &[u8]) -> Result<(), &'static str> {
+        self.transport
+            .as_mut()
+            .ok_or("transport_unavailable")?
+            .reply(connection, reply)
     }
 
     fn reply_bytes(&mut self, connection: u64, reply: &[u8]) -> bool {
-        self.transport
-            .as_mut()
-            .is_some_and(|transport| transport.reply(connection, reply).is_ok())
+        self.deliver_reply(connection, reply).is_ok()
     }
 
     fn revoke_ticket(&mut self, ticket: u64) {

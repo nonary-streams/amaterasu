@@ -235,8 +235,18 @@ impl Controller {
     /// Read issues other layers publish. Off by default so a controller in a
     /// test speaks only the commands that test scripts.
     pub fn enable_stream_issue_feed(&mut self) {
-        self.stream_issue_feed
-            .get_or_insert_with(StreamIssueFeed::new);
+        self.stream_issue_feed.get_or_insert_with(|| {
+            let mut feed = StreamIssueFeed::new();
+            for coordinator in [
+                "amaterasu.rtsp",
+                "amaterasu.stream-session",
+                "amaterasu.session-lifecycle",
+                "amaterasu.video",
+            ] {
+                feed.allow_bindings_from(coordinator);
+            }
+            feed
+        });
     }
 
     pub(super) fn lifecycle_snapshot(&self, record: &Record) -> Option<StreamLifecycleSnapshot> {
@@ -251,6 +261,14 @@ impl Controller {
             self.stream_lifecycle.open(key);
             self.stream_lifecycle
                 .alias(key, &record.application_operation);
+            // The same display identity can legitimately outlive a stream.
+            // Its launch-owner snapshot authorizes a new stream's association.
+            if !record.state.terminal()
+                && let Some(intent) = &record.virtual_display_intent
+                && intent.reference_id == key
+            {
+                self.stream_lifecycle.bind(key, &intent.identity);
+            }
             self.stream_lifecycle.enter_phase(key, &label(record.stage));
             for report in record.issues.drain() {
                 match report {

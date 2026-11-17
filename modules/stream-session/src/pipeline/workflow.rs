@@ -178,7 +178,8 @@ impl Job {
                     self.stop_with_outcome(record, code, State::Failed, now);
                 });
             }
-            StreamFailureDecision::Continue(issue) => {
+            StreamFailureDecision::Continue(continuation) => {
+                let issue = continuation.into_issue();
                 self.failure_continued = true;
                 if record.config.rtsp_operation_id.is_some() {
                     record.issues.push(issue);

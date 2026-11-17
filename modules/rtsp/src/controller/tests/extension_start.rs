@@ -209,6 +209,7 @@ fn four_k_pyrowave_bandwidth_announcement_returns_200_and_reaches_play() {
         let mut negotiation = Negotiation::with_video_profiles(
             TrustedLaunch {
                 epoch: record.id,
+                operation: record.config.operation_id.clone(),
                 rtsp_target: record.url.clone(),
                 session_token: record.session_token.clone(),
                 encrypted_rtsp: true,

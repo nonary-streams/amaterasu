@@ -371,6 +371,7 @@ fn client_selects(
     let mut machine = Negotiation::with_video_profiles(
         TrustedLaunch {
             epoch: 7,
+            operation: "test-launch".into(),
             rtsp_target: "rtspenc://127.0.0.1:48010/launch".into(),
             session_token: "session-1".into(),
             encrypted_rtsp: true,

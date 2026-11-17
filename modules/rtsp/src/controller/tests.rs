@@ -1094,6 +1094,7 @@ pub(super) fn record(state: State) -> Record {
         local: "127.0.0.1:48010".parse().expect("literal"),
         media_binds: None,
         expires: 5_000,
+        admission_expires: 5_000,
         next_status: 5_000,
         observation_stale_at: OBSERVATION_STALE_MS,
         failure: None,
@@ -1823,6 +1824,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         local: "127.0.0.1:48010".parse().expect("literal"),
         media_binds: None,
         expires: 5_000,
+        admission_expires: 5_000,
         next_status: 5_000,
         observation_stale_at: OBSERVATION_STALE_MS,
         failure: None,
@@ -2557,10 +2559,11 @@ fn request(method: Method, target: &str, cseq: u32, session: bool) -> Request {
     }
 }
 
-fn pending_play(record: &Record) -> (Negotiation, u64) {
-    let mut negotiation = Negotiation::new(
+fn fresh_negotiation(record: &Record) -> Negotiation {
+    Negotiation::new(
         TrustedLaunch {
             epoch: record.id,
+            operation: record.config.operation_id.clone(),
             rtsp_target: record.url.clone(),
             session_token: record.session_token.clone(),
             encrypted_rtsp: true,
@@ -2572,7 +2575,11 @@ fn pending_play(record: &Record) -> (Negotiation, u64) {
         },
         record.capabilities(),
     )
-    .expect("valid negotiation");
+    .expect("valid negotiation")
+}
+
+fn pending_play(record: &Record) -> (Negotiation, u64) {
+    let mut negotiation = fresh_negotiation(record);
     let target = record.url.as_str();
     negotiation
         .handle(record.id, &request(Method::Options, target, 1, false))

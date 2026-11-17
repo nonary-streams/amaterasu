@@ -1,5 +1,5 @@
 use super::TransportResult;
-use amaterasu_gamestream::crypto::{Direction, RtspOpener, RtspSealer};
+use amaterasu_gamestream::crypto::{CryptoError, Direction, RtspOpener, RtspSealer};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::IpAddr,
@@ -85,6 +85,9 @@ impl Tickets {
             .ok_or("ticket_not_found")?
             .sealer
             .seal(plaintext)
-            .map_err(|_| "response_encryption_failed")
+            .map_err(|error| match error {
+                CryptoError::NonceExhausted => "response_nonce_exhausted",
+                _ => "response_encryption_failed",
+            })
     }
 }

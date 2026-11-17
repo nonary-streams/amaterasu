@@ -628,6 +628,7 @@ fn negotiate_announce(record: &mut Record, body: &str) -> bool {
     let permit = (!accepted).then(|| {
         match Controller::network_failure_decision(
             record,
+            action_ticket,
             "announce",
             amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
                 "configuration_mismatch",

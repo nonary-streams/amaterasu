@@ -58,7 +58,7 @@ impl Method {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Request {
     pub method: Method,
     /// Opaque target: parsing does not authorize a URL, session, or stream ID.

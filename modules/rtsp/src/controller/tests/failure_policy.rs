@@ -206,23 +206,7 @@ fn undeliverable_native_completion_retains_critical_rollback() {
 fn wrong_state_before_options_allows_a_corrected_request_on_the_same_ticket() {
     let (mut controller, _) = prepared_controller();
     let record = controller.records.get_mut(&5).unwrap();
-    record.negotiation = Some(
-        Negotiation::new(
-            TrustedLaunch {
-                epoch: record.id,
-                rtsp_target: record.url.clone(),
-                session_token: record.session_token.clone(),
-                encrypted_rtsp: true,
-                audio_port: 49_000,
-                video_port: 49_002,
-                control_port: 49_004,
-                control_connect_data: record.config.connect_data,
-                udp_discovery: None,
-            },
-            record.capabilities(),
-        )
-        .unwrap(),
-    );
+    record.negotiation = Some(fresh_negotiation(record));
     let target = record.url.clone();
     let mut sealer = RtspSealer::new(&KEY, Direction::ClientToHost).unwrap();
     let mut opener = RtspOpener::new(&KEY, Direction::HostToClient).unwrap();
@@ -283,11 +267,17 @@ fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
         "wrong_local_id",
         "wrong_local_layer",
         "wrong_local_phase",
+        "wrong_parent_layer",
+        "wrong_parent_phase",
         "local_with_history",
         "local_external",
         "local_missing_session",
         "local_wrong_reply_session",
         "local_cleanup_error",
+        "parent_missing_session",
+        "parent_wrong_reply_session",
+        "parent_cleanup_error",
+        "parent_mutated_state",
     ] {
         let continues = matches!(scenario, "warning" | "local_warning");
         let (mut controller, action) = prepared_controller();
@@ -313,14 +303,15 @@ fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
             "wrong_scope" => "other-stream".into(),
             "wrong_local_id" => "ss-18".into(),
             "warning" | "critical" => record.config.operation_id.clone(),
+            parent if parent.contains("parent") => record.config.operation_id.clone(),
             _ => "ss-17".into(),
         };
-        let layer = if scenario == "wrong_local_layer" {
+        let layer = if matches!(scenario, "wrong_local_layer" | "wrong_parent_layer") {
             LifecycleLayer::Input
         } else {
             LifecycleLayer::StreamSession
         };
-        let phase = if scenario == "wrong_local_phase" {
+        let phase = if matches!(scenario, "wrong_local_phase" | "wrong_parent_phase") {
             "cleanup"
         } else {
             "start"
@@ -352,15 +343,18 @@ fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(1));
         };
-        let response_session = if scenario == "local_wrong_reply_session" {
+        let response_session = if matches!(
+            scenario,
+            "local_wrong_reply_session" | "parent_wrong_reply_session"
+        ) {
             Some(24)
-        } else if scenario == "local_missing_session" {
+        } else if matches!(scenario, "local_missing_session" | "parent_missing_session") {
             record.session = None;
             None
         } else {
             Some(23)
         };
-        let cleanup_error = if scenario == "local_cleanup_error" {
+        let cleanup_error = if matches!(scenario, "local_cleanup_error" | "parent_cleanup_error") {
             Some("native_cleanup_unconfirmed")
         } else {
             None
@@ -380,7 +374,9 @@ fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
                 network: Some((connection, action)),
                 deadline: 1000,
             },
-            &json!({"ok":false,"session":response_session,"state":"prepared","cleanup_error":cleanup_error,
+            &json!({"ok":false,"session":response_session,
+                "state": if scenario == "parent_mutated_state" { "starting" } else { "prepared" },
+                "cleanup_error":cleanup_error,
                 "code":report.code,"stream_failure":report}),
             10,
         );
@@ -389,7 +385,10 @@ fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
             assert_eq!(record.failure, None);
             assert_eq!(record.session, Some(23));
         } else {
-            assert_eq!(record.state, State::Closing);
+            assert_eq!(record.state, State::Closing, "{scenario}");
+            assert_eq!(record.failure, Some("start_rejected"), "{scenario}");
+            assert_eq!(record.revoke_after, Some(connection), "{scenario}");
+            assert!(!record.cleanup_confirmed, "{scenario}");
         }
         controller.records.insert(5, record);
         client.set_nonblocking(true).unwrap();
@@ -458,6 +457,93 @@ fn undeliverable_negotiation_only_completion_preserves_ownership() {
     assert_eq!(record.state, State::Ready);
     assert_eq!(record.failure, None);
     assert_eq!(record.session, Some(23));
+}
+
+#[test]
+fn recoverable_play_refusal_preserves_the_original_admission_deadline() {
+    use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+    let (mut controller, action) = prepared_controller();
+    let mut record = controller.records.remove(&5).unwrap();
+    record.expires = 100;
+    record.config.ping_timeout_ms = 10_000;
+    assert_eq!(record.begin_arm(99), 10_099);
+    let report = StreamIssue::advisory(
+        record.config.operation_id.clone(),
+        LifecycleLayer::StreamSession,
+        "start",
+        "try_again",
+    )
+    .because("retry_prepared_request");
+    controller.armed(
+        &mut record,
+        Job {
+            ticket: 5,
+            phase: Phase::Arm,
+            call: Call::new(json!({}), "test-arm".into(), None),
+            caller: None,
+            network: Some((999, action)),
+            deadline: 10_099,
+        },
+        &json!({"ok":false,"session":23,"state":"prepared","stream_failure":report}),
+        99,
+    );
+    assert_eq!(record.state, State::Ready);
+    assert_eq!(record.expires, 100);
+    controller.records.insert(5, record);
+    controller.handle_network(999, 5, request(Method::Play, "/", 8, true), 101);
+    assert_eq!(controller.records[&5].state, State::Closing);
+    assert_eq!(controller.records[&5].failure, Some("prepare_expired"));
+    assert!(
+        controller.job.is_none(),
+        "expired admission reached the native start"
+    );
+}
+
+#[test]
+fn lost_negotiation_responses_replay_exact_data_over_a_fresh_authenticated_connection() {
+    let (mut controller, _) = prepared_controller();
+    let record = controller.records.get_mut(&5).unwrap();
+    record.negotiation = Some(fresh_negotiation(record));
+    let target = record.url.clone();
+    let address = controller.transport.as_ref().unwrap().local_addr().unwrap();
+    let mut sealer = RtspSealer::new(&KEY, Direction::ClientToHost).unwrap();
+    let mut opener = RtspOpener::new(&KEY, Direction::HostToClient).unwrap();
+    let mut now = 10;
+
+    for (request, expected) in [
+        (format!("OPTIONS {target} RTSP/1.0\r\nCSeq: 1\r\n\r\n"), "Public:"),
+        (format!("DESCRIBE {target} RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\n\r\n"), "H264/90000"),
+        ("SETUP streamid=audio/0/0 RTSP/1.0\r\nCSeq: 3\r\nTransport: unicast;X-GS-ClientPort=50000-50001\r\n\r\n".into(), "server_port=49000"),
+    ] {
+        let mut dropped = TcpStream::connect(address).unwrap();
+        let envelope = sealer.seal(request.as_bytes()).unwrap();
+        dropped.write_all(&envelope).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let transport = controller.transport.as_mut().unwrap();
+        let (connection, ticket, authenticated) = loop {
+            let events = transport.poll(now);
+            if let Some(Event::Request { connection, ticket, request }) = events.into_iter().next() {
+                break (connection, ticket, request);
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        };
+        drop(dropped);
+        now += 10_000;
+        assert!(transport.poll(now).into_iter().any(|event| matches!(event,
+            Event::Disconnected { connection: closed, .. } if closed == connection)));
+        controller.handle_network(connection, ticket, authenticated, 10);
+
+        let retry = exchange(&mut controller, &mut sealer, &mut opener, &request);
+        assert!(retry.starts_with("RTSP/1.0 200 "), "{retry}");
+        assert!(retry.contains(expected), "{retry}");
+        if expected.starts_with("server_port") {
+            assert!(retry.contains(&controller.records[&5].session_token), "{retry}");
+        }
+        let replay = exchange(&mut controller, &mut sealer, &mut opener, &request);
+        assert_eq!(replay, retry);
+        assert_retained(&controller, State::Ready);
+    }
 }
 
 #[test]

@@ -407,6 +407,47 @@ fn retained_resume_uses_fresh_rtsp_operation_and_rechecks_paused_session() {
 }
 
 #[test]
+fn failed_retained_resume_cannot_authorize_the_next_resume_reply() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let record = controller.records.get_mut(&1).unwrap();
+    record.lifecycle_required = true;
+    record.lifecycle_prepare_dispatched = true;
+    record.lifecycle_session_target = serde_json::from_value(
+        json!({"kind":"session","host_epoch":"e","session_id":"s","generation":1}),
+    )
+    .ok();
+    record.state = State::Paused;
+    record.stage = Stage::Live;
+    record.adopted = true;
+    record.launch_connection = None;
+
+    assert!(controller.resume(11, request(1), &peer(1), now).is_none());
+    let mut replies = Vec::new();
+    let record = controller.records.get_mut(&1).unwrap();
+    let first = record.rtsp_operation.clone();
+    workflow::reject_resume(record, &mut replies);
+    assert_eq!((replies[0].0, replies[0].1.status), (11, 409));
+    assert_eq!(record.state, State::Paused);
+
+    controller.pending_resume = None;
+    assert!(controller.resume(12, request(1), &peer(1), now).is_none());
+    let record = controller.records.get_mut(&1).unwrap();
+    assert_ne!(record.rtsp_operation, first);
+    workflow::reply_failure(record, &mut replies);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(record.launch_connection, Some(12));
+    record.process_failure(
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("resume_failed"),
+        |_| {},
+    );
+    workflow::reply_failure(record, &mut replies);
+    assert_eq!(replies.len(), 2);
+    assert_eq!((replies[1].0, replies[1].1.status), (12, 503));
+}
+
+#[test]
 fn retained_application_resumes_on_another_paired_client_without_relaunch() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();

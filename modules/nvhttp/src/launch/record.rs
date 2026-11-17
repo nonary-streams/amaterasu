@@ -536,26 +536,37 @@ impl Record {
         failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
         effect: impl FnOnce(&mut Self) -> T,
     ) -> Option<T> {
+        self.process_failure_because(failure, None, effect)
+    }
+
+    #[track_caller]
+    fn process_failure_because<T>(
+        &mut self,
+        failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
+        reason: Option<&str>,
+        effect: impl FnOnce(&mut Self) -> T,
+    ) -> Option<T> {
         use amaterasu_module_sdk::stream_lifecycle::{
             LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
         };
-        let issue = self.attributed(failure.at(
+        let mut issue = self.attributed(failure.at(
             self.rtsp_operation.clone(),
             LifecycleLayer::Nvhttp,
             "failure",
         ));
+        if let Some(reason) = reason {
+            issue = issue.because(reason);
+        }
         match StreamFailureHandler::decide(issue) {
             StreamFailureDecision::Terminate(permit) => {
-                let value = permit.authorize(|issue| {
-                    self.issues.push(issue.clone());
-                    effect(self)
-                });
+                self.issues.push(permit.issue().clone());
                 if self.failure_authority.is_none() {
                     self.failure_authority = Some(permit);
                 }
-                Some(value)
+                Some(effect(self))
             }
-            StreamFailureDecision::Continue(issue) => {
+            StreamFailureDecision::Continue(continuation) => {
+                let issue = continuation.into_issue();
                 self.issues.push(issue);
                 None
             }
@@ -567,10 +578,16 @@ impl Record {
         &mut self,
         effect: impl FnOnce(&mut Self) -> T,
     ) -> Option<T> {
-        let permit = self.failure_authority.take()?;
-        let value = permit.authorize(|_| effect(self));
-        self.failure_authority = Some(permit);
-        Some(value)
+        self.failure_authority
+            .as_ref()
+            .filter(|permit| permit.issue().operation == self.rtsp_operation)?;
+        Some(effect(self))
+    }
+
+    pub(super) fn begin_resume_operation(&mut self, operation: String) {
+        self.rtsp_operation = operation;
+        self.failure = None;
+        self.failure_authority = None;
     }
 
     #[track_caller]
@@ -583,18 +600,28 @@ impl Record {
     }
 
     #[track_caller]
+    pub(super) fn request_failure_cleanup(
+        &mut self,
+        failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
+        reason: Option<&str>,
+        now: Instant,
+    ) -> bool {
+        let code = failure.code();
+        self.process_failure_because(failure, reason, |record| {
+            record.failure.get_or_insert(code);
+            record.begin_cleanup(now);
+        })
+        .is_some()
+    }
+
+    #[track_caller]
     fn apply_cleanup_request(
         &mut self,
         failure: Option<amaterasu_module_sdk::stream_lifecycle::StreamFailure>,
         now: Instant,
     ) -> bool {
         if let Some(failure) = failure {
-            let code = failure.code();
-            self.process_failure(failure, |record| {
-                record.failure.get_or_insert(code);
-                record.begin_cleanup(now);
-            })
-            .is_some()
+            self.request_failure_cleanup(failure, None, now)
         } else {
             self.begin_cleanup(now); // Verified caller stop, not failure policy.
             true

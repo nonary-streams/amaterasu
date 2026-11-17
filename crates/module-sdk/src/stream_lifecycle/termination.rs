@@ -1,5 +1,6 @@
 //! A capability required by participating failure-driven stop boundaries.
 use super::StreamIssue;
+use std::sync::Arc;
 
 /// A lower-layer failure report with a stable local code. Unlike a string,
 /// this makes its criticality/fallback explicit before it reaches a boundary.
@@ -103,12 +104,46 @@ impl StreamFailure {
     }
 }
 
+/// Identity of a concrete operation instance, independent of its diagnostic name.
+#[derive(Clone, Debug)]
+pub struct StreamFailureScope {
+    operation: Arc<str>,
+}
+
+impl StreamFailureScope {
+    pub fn new(operation: impl Into<String>) -> Self {
+        Self {
+            operation: Arc::from(operation.into()),
+        }
+    }
+}
+
+/// Proof that the common handler accepted a nonterminal report.
+#[derive(Debug)]
+pub struct StreamContinuation {
+    issue: StreamIssue,
+    scope: Option<StreamFailureScope>,
+}
+
+impl StreamContinuation {
+    pub fn into_issue(self) -> StreamIssue {
+        self.issue
+    }
+
+    pub fn matches_scope(&self, scope: &StreamFailureScope) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|bound| Arc::ptr_eq(&bound.operation, &scope.operation))
+    }
+}
+
 /// Proof of an explicitly critical, valid failure with a nonempty reason.
 /// Fields are private: advisory/demoted reports cannot create this capability.
 /// This gates participating callers; native code may still bypass this API.
 #[derive(Debug)]
 pub struct StreamTermination {
     issue: StreamIssue,
+    scope: Option<StreamFailureScope>,
 }
 
 /// The final directive from the common failure handler. Lower layers report
@@ -116,7 +151,7 @@ pub struct StreamTermination {
 /// this directive instead of inventing another rejection policy.
 #[derive(Debug)]
 pub enum StreamFailureDecision {
-    Continue(StreamIssue),
+    Continue(StreamContinuation),
     Terminate(StreamTermination),
     Invalid(StreamIssue),
 }
@@ -128,13 +163,30 @@ pub struct StreamFailureHandler;
 
 impl StreamFailureHandler {
     pub fn decide(issue: StreamIssue) -> StreamFailureDecision {
-        if !issue.valid() || issue.reason.is_empty() {
+        Self::classify(issue, None)
+    }
+
+    pub fn decide_scoped(issue: StreamIssue, scope: &StreamFailureScope) -> StreamFailureDecision {
+        Self::classify(issue, Some(scope))
+    }
+
+    fn classify(issue: StreamIssue, scope: Option<&StreamFailureScope>) -> StreamFailureDecision {
+        if !issue.valid()
+            || issue.reason.is_empty()
+            || scope.is_some_and(|scope| issue.operation != scope.operation.as_ref())
+        {
             return StreamFailureDecision::Invalid(issue);
         }
         if issue.is_critical() {
-            StreamFailureDecision::Terminate(StreamTermination { issue })
+            StreamFailureDecision::Terminate(StreamTermination {
+                issue,
+                scope: scope.cloned(),
+            })
         } else {
-            StreamFailureDecision::Continue(issue)
+            StreamFailureDecision::Continue(StreamContinuation {
+                issue,
+                scope: scope.cloned(),
+            })
         }
     }
 }
@@ -145,9 +197,8 @@ impl TryFrom<StreamIssue> for StreamTermination {
     fn try_from(issue: StreamIssue) -> Result<Self, Self::Error> {
         match StreamFailureHandler::decide(issue) {
             StreamFailureDecision::Terminate(permit) => Ok(permit),
-            StreamFailureDecision::Continue(issue) | StreamFailureDecision::Invalid(issue) => {
-                Err(issue)
-            }
+            StreamFailureDecision::Continue(continuation) => Err(continuation.into_issue()),
+            StreamFailureDecision::Invalid(issue) => Err(issue),
         }
     }
 }
@@ -155,6 +206,12 @@ impl TryFrom<StreamIssue> for StreamTermination {
 impl StreamTermination {
     pub fn issue(&self) -> &StreamIssue {
         &self.issue
+    }
+
+    pub fn matches_scope(&self, scope: &StreamFailureScope) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|bound| Arc::ptr_eq(&bound.operation, &scope.operation))
     }
 
     /// Authorize several effects belonging to this same reported failure.

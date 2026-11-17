@@ -420,6 +420,7 @@ impl Controller {
             local,
             media_binds,
             expires,
+            admission_expires: expires,
             next_status: expires,
             observation_stale_at: expires.saturating_add(OBSERVATION_STALE_MS),
             failure: None,

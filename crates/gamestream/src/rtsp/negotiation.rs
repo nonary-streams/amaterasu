@@ -6,9 +6,13 @@ mod validation;
 use super::{Method, Request, serialize_response};
 use crate::sdp;
 use amaterasu_contracts::media_profile::VideoProfileSnapshot;
+use amaterasu_module_sdk::stream_lifecycle::{
+    StreamContinuation, StreamFailureScope, StreamTermination,
+};
 
 pub struct TrustedLaunch {
     pub epoch: u64,
+    pub operation: String,
     pub rtsp_target: String,
     pub session_token: String,
     pub encrypted_rtsp: bool,
@@ -149,6 +153,8 @@ struct Pending {
     ticket: u64,
     cseq: u32,
     success: State,
+    failure_scope: StreamFailureScope,
+    retry: Option<Request>,
 }
 
 pub struct Negotiation {
@@ -156,6 +162,7 @@ pub struct Negotiation {
     capabilities: Capabilities,
     state: State,
     last_cseq: Option<u32>,
+    last_reply: Option<(Request, Vec<u8>)>,
     pending: Option<Pending>,
     profile_offer: Option<VideoProfileSnapshot>,
 }
@@ -168,6 +175,7 @@ impl Negotiation {
             capabilities,
             state: State::Options,
             last_cseq: None,
+            last_reply: None,
             pending: None,
             profile_offer: None,
         })
@@ -203,6 +211,13 @@ impl Negotiation {
         if self.pending.is_some() {
             return Err(Error::Pending);
         }
+        if let Some((previous, reply)) = &self.last_reply
+            && request == previous
+        {
+            // The transport authenticated this new envelope. A byte-equivalent
+            // parsed request can receive its previous reply without replaying an effect.
+            return Ok(Step::Reply(reply.clone()));
+        }
         if self
             .last_cseq
             .is_some_and(|previous| request.cseq <= previous)
@@ -213,14 +228,22 @@ impl Negotiation {
         self.validate_session(request)?;
         let (step, next) = self.transition(request)?;
         self.last_cseq = Some(request.cseq);
-        if let Step::Action { ticket, .. } = &step {
-            self.pending = Some(Pending {
-                ticket: *ticket,
-                cseq: request.cseq,
-                success: next,
-            });
-        } else {
-            self.state = next;
+        self.last_reply = None;
+        match &step {
+            Step::Action { ticket, action } => {
+                self.pending = Some(Pending {
+                    ticket: *ticket,
+                    cseq: request.cseq,
+                    success: next,
+                    failure_scope: StreamFailureScope::new(self.launch.operation.clone()),
+                    retry: matches!(action, Action::Announce(_) | Action::ExtensionAnnounce(_))
+                        .then(|| request.clone()),
+                });
+            }
+            Step::Reply(reply) => {
+                self.state = next;
+                self.last_reply = Some((request.clone(), reply.clone()));
+            }
         }
         Ok(step)
     }
@@ -238,8 +261,17 @@ impl Negotiation {
     pub fn complete(&mut self, epoch: u64, ticket: u64) -> Result<Vec<u8>, Error> {
         let (response, next) = self.completion(epoch, ticket, 200)?;
         self.state = next;
-        self.pending = None;
+        self.last_reply = self
+            .pending
+            .take()
+            .and_then(|pending| pending.retry)
+            .map(|request| (request, response.clone()));
         Ok(response)
+    }
+
+    /// Failure decisions must bind to the exact pending action that owns them.
+    pub fn failure_scope(&self, epoch: u64, ticket: u64) -> Result<&StreamFailureScope, Error> {
+        Ok(&self.pending_action(epoch, ticket)?.failure_scope)
     }
 
     /// Only the central failure decision can authorize terminal rejection.
@@ -256,13 +288,14 @@ impl Negotiation {
         &mut self,
         epoch: u64,
         ticket: u64,
-        permit: &amaterasu_module_sdk::stream_lifecycle::StreamTermination,
+        permit: &StreamTermination,
     ) -> Result<Vec<u8>, Error> {
+        if !permit.matches_scope(self.failure_scope(epoch, ticket)?) {
+            return Err(Error::InvalidFailureReport);
+        }
         let (response, _) = self.completion(epoch, ticket, 503)?;
-        permit.authorize(|_| {
-            self.state = State::Failed;
-            self.pending = None;
-        });
+        self.state = State::Failed;
+        self.pending = None;
         Ok(response)
     }
 
@@ -272,13 +305,9 @@ impl Negotiation {
         &mut self,
         epoch: u64,
         ticket: u64,
-        report: amaterasu_module_sdk::stream_lifecycle::StreamIssue,
+        continuation: &StreamContinuation,
     ) -> Result<Vec<u8>, Error> {
-        use amaterasu_module_sdk::stream_lifecycle::{StreamFailureDecision, StreamFailureHandler};
-        if !matches!(
-            StreamFailureHandler::decide(report),
-            StreamFailureDecision::Continue(_)
-        ) {
+        if !continuation.matches_scope(self.failure_scope(epoch, ticket)?) {
             return Err(Error::InvalidFailureReport);
         }
         let (response, _) = self.completion(epoch, ticket, 455)?;
@@ -286,14 +315,18 @@ impl Negotiation {
         Ok(response)
     }
 
-    fn completion(&self, epoch: u64, ticket: u64, status: u16) -> Result<(Vec<u8>, State), Error> {
+    fn pending_action(&self, epoch: u64, ticket: u64) -> Result<&Pending, Error> {
         if epoch != self.launch.epoch {
             return Err(Error::WrongEpoch);
         }
-        let pending = self.pending.as_ref().ok_or(Error::WrongTicket)?;
-        if pending.ticket != ticket {
-            return Err(Error::WrongTicket);
-        }
+        self.pending
+            .as_ref()
+            .filter(|pending| pending.ticket == ticket)
+            .ok_or(Error::WrongTicket)
+    }
+
+    fn completion(&self, epoch: u64, ticket: u64, status: u16) -> Result<(Vec<u8>, State), Error> {
+        let pending = self.pending_action(epoch, ticket)?;
         Ok((
             self.response(status, pending.cseq, &[], &[])?,
             pending.success,
