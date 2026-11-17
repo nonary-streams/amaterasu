@@ -54,6 +54,12 @@ jobs:
       - name: Lint capture with Linux features
         if: runner.os == 'Linux'
         run: cargo clippy --manifest-path modules/capture-vkms/capture/Cargo.toml --locked --all-features --all-targets -- -D warnings
+      - name: Format stream failure audit
+        run: cargo fmt --manifest-path scripts/stream-failure-audit/Cargo.toml --check
+      - name: Test stream failure audit fixtures
+        run: cargo test --manifest-path scripts/stream-failure-audit/Cargo.toml --locked -- --nocapture
+      - name: Lint stream failure audit
+        run: cargo clippy --manifest-path scripts/stream-failure-audit/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
