@@ -1,4 +1,5 @@
 use super::*;
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
 
 impl Controller {
     pub(super) fn poll_transport(&mut self, now: u64) {
@@ -192,11 +193,27 @@ impl Controller {
                     error.status()
                 );
                 let replied = self.reply_status(connection, request.cseq, error.status());
-                record.close(Some("negotiation_failed"));
-                if replied {
-                    record.revoke_after = Some(connection);
+                if error.is_critical() {
+                    record.close(Some(error.code()));
+                    if replied {
+                        record.revoke_after = Some(connection);
+                    } else {
+                        self.revoke_ticket(record.id);
+                    }
                 } else {
-                    self.revoke_ticket(record.id);
+                    record.issues.push(
+                        StreamIssue::advisory(
+                            record.config.operation_id.clone(),
+                            LifecycleLayer::Rtsp,
+                            "negotiate",
+                            "negotiation_request_rejected",
+                        )
+                        .because(error.code()),
+                    );
+                    if !replied {
+                        record.close(Some("response_unavailable"));
+                        self.revoke_ticket(record.id);
+                    }
                 }
             }
         }

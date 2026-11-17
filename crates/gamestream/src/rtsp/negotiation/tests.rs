@@ -500,3 +500,31 @@ fn extension_attribute_rules_bound_optional_hints_and_reject_unsupported_modes()
     ambiguous.profiles[0].wire_attributes.push(optional);
     assert!(!ambiguous.validate());
 }
+
+#[test]
+fn negotiation_failure_criticality_is_explicit_and_reasons_are_stable() {
+    for error in [Error::InvalidSequence, Error::WrongState, Error::Pending] {
+        assert!(!error.is_critical(), "{error:?}");
+        assert!(!error.code().is_empty());
+    }
+    for error in [
+        Error::InvalidLaunch,
+        Error::WrongEpoch,
+        Error::WrongSession,
+        Error::InvalidTarget,
+        Error::InvalidHeaders,
+        Error::InvalidBody,
+        Error::UnsupportedTransport,
+        Error::UnsupportedMedia,
+        Error::WrongTicket,
+        Error::Serialization,
+    ] {
+        assert!(error.is_critical(), "{error:?}");
+        assert!(
+            error
+                .code()
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        );
+    }
+}

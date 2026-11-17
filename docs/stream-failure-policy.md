@@ -69,3 +69,21 @@ case-by-case review before any further failure is demoted. In particular,
 optional audio/input fallback (streaming video-only or view-only when hardware
 devices are absent) remains gated by explicit user/session contracts unless
 opt-in fallback policy is configured.
+
+## RTSP request refusals
+
+`amaterasu_gamestream::rtsp::negotiation::Error::is_critical` owns the
+classification of negotiation errors. `InvalidSequence`, `WrongState` and
+`Pending` reject only the current request: negotiation has made no state change,
+and the prepared or playing ticket retains its resources and deadlines. RTSP
+records `negotiation_request_rejected` through the SDK lifecycle outbox with a
+stable reason. A compatible retry may continue. A refusal response is never
+reported as successful negotiation.
+
+Epoch/session authentication, required wire/media validation, internal ticket
+corruption and serialization failures remain critical. Failure to deliver a
+refusal still closes the ticket as `response_unavailable`; disconnect and
+ownership retirement fences still apply. Backend acceptance remains a separate
+obligation: recoverable media hints must be negotiated before completing an
+ANNOUNCE, rather than passing `false` to `Negotiation::complete`, whose failure
+is terminal. The PyroWave bitrate negotiation repair is a separate change.

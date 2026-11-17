@@ -72,6 +72,45 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether this error prevents a correct, authorized stream from continuing.
+    /// Sequence, state and in-flight request refusals leave the negotiation and
+    /// prepared resources intact. Refuse the request, then allow a valid retry;
+    /// the RTSP status alone must not decide whether to retire the stream.
+    pub fn is_critical(self) -> bool {
+        match self {
+            Self::InvalidSequence | Self::WrongState | Self::Pending => false,
+            Self::InvalidLaunch
+            | Self::WrongEpoch
+            | Self::WrongSession
+            | Self::InvalidTarget
+            | Self::InvalidHeaders
+            | Self::InvalidBody
+            | Self::UnsupportedTransport
+            | Self::UnsupportedMedia
+            | Self::WrongTicket
+            | Self::Serialization => true,
+        }
+    }
+
+    /// Stable, bounded lifecycle reason; never includes peer input or secrets.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidLaunch => "invalid_launch",
+            Self::WrongEpoch => "wrong_epoch",
+            Self::WrongSession => "wrong_session",
+            Self::InvalidSequence => "invalid_sequence",
+            Self::InvalidTarget => "invalid_target",
+            Self::InvalidHeaders => "invalid_headers",
+            Self::InvalidBody => "invalid_body",
+            Self::UnsupportedTransport => "unsupported_transport",
+            Self::UnsupportedMedia => "unsupported_media",
+            Self::WrongState => "wrong_state",
+            Self::Pending => "pending",
+            Self::WrongTicket => "wrong_ticket",
+            Self::Serialization => "serialization",
+        }
+    }
+
     pub fn status(self) -> u16 {
         match self {
             Self::WrongEpoch => 403,

@@ -4648,3 +4648,5 @@ fn extension_projection_preserves_explicit_software_requirements() {
 
 mod extension_start;
 mod lifecycle_issues;
+
+mod failure_policy;
