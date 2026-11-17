@@ -9,6 +9,7 @@ fn wire_expired(controller: &Controller) { controller.reply_status(1, 2, 454); }
 fn wire_sequence(controller: &Controller) { controller.reply_status(1, 2, 455); }
 fn wire_busy(controller: &Controller) { controller.reply_status(1, 2, 503); }
 fn wire_dynamic(controller: &Controller, error: E) { controller.reply_status(1, 2, error.status()); }
+fn wire_with_failure_report(controller: &Controller) { controller.reply_status(1, 2, 455u16, StreamFailure::advisory("request_wrong_state")); }
 fn timeout(job: &mut Job, record: &mut Record) { job.fail(record, "deadline_expired", 12); }
 fn failed_state(record: &mut Record) { record.state = State::Failed; }
 fn stopping_state(record: &mut Record) { record.state = State::Stopping; }
@@ -52,6 +53,7 @@ fn string_only() { let text = r#"Err("failed"); reply_status(1, 2, 503)"#; }
 fn optional_fallback() { provider().unwrap_or_default(); }
 fn optional_caught() { if let Err(_) = provider() { warn!("optional history unavailable"); } }
 fn healthy_wire(controller: &Controller) { controller.reply_status(1, 2, 200); }
+fn healthy_wire_with_report(controller: &Controller) { controller.reply_status(1, 2, 200u16, StreamFailure::advisory("healthy")); }
 fn healthy_json() { json!({"ok": true}); }
 fn healthy_json_string() { json!({"text": "ok: false", "ok": true}); }
 fn format_message() { format!("rejected: {}", 503); }

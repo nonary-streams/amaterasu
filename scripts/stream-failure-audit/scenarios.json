@@ -1,0 +1,865 @@
+{
+  "schema_version": 1,
+  "curation": "Analyst-reviewed distinct cause/effect groups; variants and uncertain propagation are explicit. This catalog is selective, not exhaustive.",
+  "scenarios": [
+    {
+      "id": "S01",
+      "title": "Encrypted RTSP request fails ticket authentication",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "connection rejection; authenticated ticket cleanup is conditional",
+      "trigger": "No matching peer ticket verifies the encrypted envelope.",
+      "variants": [
+        "bad key/tag",
+        "wrong peer",
+        "replayed or invalid envelope"
+      ],
+      "behavior": "Tickets::authenticate returns request_authentication_failed. Legacy Connection::read returns Step::Close; the typed policy version reports Step::Failure to the common handler, whose permit authorizes Transport::close. An unauthenticated connection does not identify an active stream ticket.",
+      "reason": "Authorization and authenticated sequence state must remain protected; an invalid connection is not proof that a legitimate active stream failed.",
+      "next_action": "Route the original authentication failure to the final network decision boundary while retaining fail-closed verification and ticket-scoped effects.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/transport/tickets.rs",
+          "role": "trigger",
+          "kind": "error_origin",
+          "literals": [
+            "request_authentication_failed"
+          ],
+          "function": "authenticate"
+        },
+        {
+          "file": "modules/rtsp/src/transport/connection.rs",
+          "role": "support",
+          "kind": "function_excerpt",
+          "function": "read",
+          "contains": [
+            "tickets.authenticate"
+          ],
+          "contains_any": [
+            "Step::Close",
+            "Step::Failure"
+          ]
+        },
+        {
+          "file": "modules/rtsp/src/transport.rs",
+          "role": "support",
+          "kind": "function_excerpt",
+          "contains": [
+            "self.close("
+          ],
+          "function_any": [
+            "poll",
+            "poll_with_request_budget"
+          ],
+          "contains_any": [
+            "Step::Close",
+            "Step::Failure"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S02",
+      "title": "A ticket ID or encryption key is reused",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "prepared-ticket admission rejection",
+      "trigger": "Tickets::add sees a previously used ID or key.",
+      "variants": [
+        "ticket_id_reused",
+        "ticket_key_reused"
+      ],
+      "behavior": "Ticket admission returns an explicit error before inserting the new ticket. Caller handling remains visible as candidate paths in the raw evidence.",
+      "reason": "Reuse protection participates in identity/crypto safety; do not discard its retained history to make startup succeed.",
+      "next_action": "Preserve the refusal and trace the authenticated launch reply through the owner; centralize the decision without reusing nonce/identity state.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/transport/tickets.rs",
+          "role": "trigger",
+          "kind": "error_origin",
+          "literals": [
+            "ticket_id_reused"
+          ],
+          "function": "add"
+        },
+        {
+          "file": "modules/rtsp/src/transport/tickets.rs",
+          "role": "trigger",
+          "kind": "error_origin",
+          "literals": [
+            "ticket_key_reused"
+          ],
+          "function": "add"
+        }
+      ],
+      "path_status": "source_confirmed_admission_error_with_candidate_owner_path"
+    },
+    {
+      "id": "S03",
+      "title": "Active prepared-ticket capacity is exhausted",
+      "category": "unresolved",
+      "priority": "P1",
+      "scope": "new ticket/startup refusal; existing streams may continue",
+      "trigger": "The active ticket count reaches MAX_TICKETS.",
+      "variants": [
+        "ticket_limit"
+      ],
+      "behavior": "Tickets::add returns ticket_limit. It does not itself remove an existing ticket.",
+      "reason": "A bounded-capacity refusal can be transient; this does not justify terminating existing streams or ignoring the bound.",
+      "next_action": "Confirm caller retry behavior and report a request-scoped capacity refusal centrally; retain the existing capacity cap.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/transport/tickets.rs",
+          "role": "trigger",
+          "kind": "error_origin",
+          "literals": [
+            "ticket_limit"
+          ],
+          "function": "add"
+        }
+      ],
+      "path_status": "source_confirmed_admission_error_with_candidate_owner_path"
+    },
+    {
+      "id": "S04",
+      "title": "Retained ticket identity history is exhausted",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "new-ticket admission refusal",
+      "trigger": "The anti-reuse history reaches MAX_TICKET_HISTORY.",
+      "variants": [
+        "ticket_history_limit"
+      ],
+      "behavior": "Ticket admission returns ticket_history_limit rather than recycling retained identifiers.",
+      "reason": "This limit protects history used for reuse checks; treating it like an expendable diagnostic cache is unsafe without a proven new epoch policy.",
+      "next_action": "Keep the fence; review safe epoch/retirement and owner recovery before changing admission.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/transport/tickets.rs",
+          "role": "trigger",
+          "kind": "error_origin",
+          "literals": [
+            "ticket_history_limit"
+          ],
+          "function": "add"
+        }
+      ],
+      "path_status": "source_confirmed_admission_error_with_candidate_owner_path"
+    },
+    {
+      "id": "S05",
+      "title": "RTSP pending-request backlog is full",
+      "category": "unresolved",
+      "priority": "P1",
+      "scope": "one RTSP request receives 503",
+      "trigger": "The controller is busy and pending_network has reached MAX_PENDING_NETWORK.",
+      "variants": [
+        "backlog saturation"
+      ],
+      "behavior": "In the populated-main and ed2 reference sources, poll_transport replies 503 directly. The newer policy working source uses a request budget/backpressure instead; absence of the old refusal anchor is reported per snapshot and is not an active bypass finding.",
+      "reason": "Queue saturation needs a request-level decision and retry contract; it is not proof that the active stream must end.",
+      "next_action": "For a version that still refuses here, centralize the final decision while retaining bounded storage and existing tickets. For the newer budget path, test backpressure and connection deadlines separately.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "trigger",
+          "kind": "wire_status_candidate",
+          "function": "poll_transport",
+          "contains": [
+            "503"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S06",
+      "title": "Shutdown/quiescence refuses a new PLAY",
+      "category": "unresolved",
+      "priority": "P1",
+      "scope": "new start refusal while prepared ownership is retained",
+      "trigger": "A Ready record receives PLAY after shutdown_deadline was announced.",
+      "variants": [
+        "shutdown admission fence"
+      ],
+      "behavior": "handle_network sends 503, reinserts the record and returns before the common handler.",
+      "reason": "The host must stop admitting native starts during quiescence; whether the client can retry is distinct from resource retirement.",
+      "next_action": "Centralize this admission decision while retaining DAG-ordered quiescence and prepared ownership until normal cleanup.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "trigger",
+          "kind": "wire_status_candidate",
+          "function": "handle_network",
+          "contains": [
+            "503"
+          ],
+          "guards": [
+            "shutdown_deadline"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S07",
+      "title": "Negotiation sequence/pending/state refusal preserves the stream",
+      "category": "recoverable_proposed",
+      "priority": "P1",
+      "scope": "request rejection with stream retained in policy-owner snapshot",
+      "trigger": "Negotiation rejects InvalidSequence, WrongState or Pending without changing negotiation state.",
+      "variants": [
+        "InvalidSequence",
+        "WrongState",
+        "Pending"
+      ],
+      "behavior": "The populated-main snapshot closes on every negotiation error. In policy snapshots with the reviewed Error::is_critical predicate, the three unchanged-state variants are noncritical and the common handler retains the stream while refusing the request. Evidence is labeled by source snapshot.",
+      "reason": "The owner regression work establishes unchanged negotiation state and retry behavior for these variants; it does not allow malformed security/media input.",
+      "next_action": "Integrate and qualify the owner fix once; exercise an invalid request followed by a valid retry and verify the ticket remains live.",
+      "selectors": [
+        {
+          "file": "crates/gamestream/src/rtsp/negotiation.rs",
+          "role": "trigger",
+          "kind": "function_excerpt",
+          "function": "is_critical",
+          "owner": "Error",
+          "contains": [
+            "Self::InvalidSequence | Self::WrongState | Self::Pending => false"
+          ]
+        },
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "version_context",
+          "kind": "termination_candidate",
+          "literals": [
+            "negotiation_failed"
+          ],
+          "function": "handle_network",
+          "optional": true
+        },
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "support",
+          "kind": "function_excerpt",
+          "function": "handle_network",
+          "contains": [
+            "StreamFailureHandler::decide"
+          ],
+          "optional": true
+        }
+      ],
+      "path_status": "source_confirmed_versioned_behavior"
+    },
+    {
+      "id": "S08",
+      "title": "A controller record is not Ready or Playing",
+      "category": "unresolved",
+      "priority": "P1",
+      "scope": "request-only RTSP 455",
+      "trigger": "An existing record is in another state before negotiation is called.",
+      "variants": [
+        "record-state guard"
+      ],
+      "behavior": "The controller sends 455, reinserts the record and returns. This is a separate early branch from Negotiation::WrongState.",
+      "reason": "The state may represent preparation or cleanup. A request refusal is not automatically a recoverable stream condition.",
+      "next_action": "Keep the state/ownership guard, establish allowed client retry states, and route the final response through the common decision boundary.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "trigger",
+          "kind": "wire_status_candidate",
+          "function": "handle_network",
+          "contains": [
+            "455"
+          ],
+          "guards": [
+            "! matches"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S09",
+      "title": "A prepared ticket expires before PLAY",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "RTSP 454 plus ticket closure/revocation",
+      "trigger": "A Ready record reaches its preparation expiry.",
+      "variants": [
+        "prepare_expired"
+      ],
+      "behavior": "The same guarded branch sends 454, closes the record with prepare_expired and revokes the ticket. These observations form one expiry scenario.",
+      "reason": "Expired admission/ownership must not be silently extended; resource cleanup remains required.",
+      "next_action": "Centralize the expiry decision and test exact ticket retirement; do not bypass the expiry fence to accept late PLAY.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "trigger",
+          "kind": "termination_candidate",
+          "literals": [
+            "prepare_expired"
+          ],
+          "function": "handle_network"
+        },
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "effect",
+          "kind": "wire_status_candidate",
+          "function": "handle_network",
+          "contains": [
+            "454"
+          ],
+          "guards": [
+            "expires"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S10",
+      "title": "A network request has no controller ticket record",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "RTSP 454 request refusal",
+      "trigger": "records.remove(ticket) returns None.",
+      "variants": [
+        "unknown or retired record"
+      ],
+      "behavior": "The let-else branch sends 454 and returns without creating a replacement record.",
+      "reason": "The request has no established owner state. Accepting it would bypass admission identity.",
+      "next_action": "Preserve refusal; pass the missing-owner condition to the final handler without fabricating ownership.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "trigger",
+          "kind": "wire_status_candidate",
+          "function": "handle_network",
+          "contains": [
+            "454"
+          ],
+          "guards": [
+            "let-else"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S11",
+      "title": "An authenticated connection disappears during work",
+      "category": "unresolved",
+      "priority": "P1",
+      "scope": "ticket closure with pending-operation settlement",
+      "trigger": "Disconnected has a known ticket and the reason is not response_complete.",
+      "variants": [
+        "network_disconnected",
+        "connection_deadline",
+        "pending native mutation versus already-playing media"
+      ],
+      "behavior": "disconnected cancels retained broker work, closes the record and revokes the ticket. The policy owner still has this separate terminal path.",
+      "reason": "An authenticated RTSP transaction can end while media still runs. A one-request TCP socket/timeout is not automatically loss of the required media/control transport; uncertain native mutation still requires settlement and retirement proof.",
+      "next_action": "Trace the connection fault origin, record state and pending operation. Distinguish an aborted request from required transport loss before letting the final handler terminate the stream; preserve exact operation identity and retirement fences.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "trigger",
+          "kind": "termination_candidate",
+          "literals": [
+            "network_disconnected"
+          ],
+          "function": "disconnected"
+        },
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "effect",
+          "kind": "function_excerpt",
+          "function": "disconnected",
+          "contains": [
+            "job.call.cancel()",
+            "self.revoke_ticket(ticket)"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S12",
+      "title": "A selected audio contract cannot be opened",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "stream startup failure path",
+      "trigger": "An enabled/selected audio resource returns an incompatible negotiated format.",
+      "variants": [
+        "unsupported_audio_format",
+        "unsupported_audio_processing_format",
+        "unsupported_audio_packet"
+      ],
+      "behavior": "opened returns an explicit error for the selected audio/processing contract; its caller routes an opened error to Job::fail.",
+      "reason": "A selected required format may not be replaced or disabled without an explicit fallback contract.",
+      "next_action": "Verify stream_audio and required-resource guards, preserve the selected contract, and trace the precise failure report to the central owner.",
+      "selectors": [
+        {
+          "file": "modules/stream-session/src/pipeline/lifecycle.rs",
+          "role": "trigger",
+          "kind": "error_origin",
+          "literals": [
+            "unsupported_audio_format"
+          ],
+          "function": "opened"
+        },
+        {
+          "file": "modules/stream-session/src/pipeline/lifecycle.rs",
+          "role": "trigger",
+          "kind": "failure_boundary",
+          "function": "consume",
+          "contains": [
+            "job . fail"
+          ],
+          "guards": [
+            "opened"
+          ],
+          "optional": true
+        }
+      ],
+      "path_status": "source_confirmed_error_with_candidate_terminal_propagation"
+    },
+    {
+      "id": "S13",
+      "title": "Required video startup reports failure",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "stream startup failure path",
+      "trigger": "A video readiness response reports startup failure.",
+      "variants": [
+        "video_startup_failed"
+      ],
+      "behavior": "The consume readiness closure returns video_startup_failed; its terminal propagation must be checked separately from the error-origin evidence.",
+      "reason": "Video is required for this stream contract; an unverified provider result cannot establish a running stream.",
+      "next_action": "Test the startup response and timeout at the selected provider boundary and preserve central handling of required-video failure.",
+      "selectors": [
+        {
+          "file": "modules/stream-session/src/pipeline/lifecycle.rs",
+          "role": "trigger",
+          "kind": "error_origin",
+          "literals": [
+            "video_startup_failed"
+          ],
+          "function": "consume"
+        }
+      ],
+      "path_status": "uncertain_candidate_terminal_propagation"
+    },
+    {
+      "id": "S14",
+      "title": "Lifecycle ownership journal cannot be persisted",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "startup/cleanup failure with ownership fence",
+      "trigger": "The journal write or its validated response fails.",
+      "variants": [
+        "lifecycle_journal_write_failed"
+      ],
+      "behavior": "The journal failure path invokes Job::fail; this leads to a concrete stopping state through the stream-session workflow sink.",
+      "reason": "Durable ownership cannot be inferred after an unsuccessful write; warning-only treatment could permit unsafe reuse.",
+      "next_action": "Retain the ownership fence and exact cleanup identity; make the handler decide from the original storage failure rather than a generic lower-layer severity guess.",
+      "selectors": [
+        {
+          "file": "modules/stream-session/src/pipeline/lifecycle.rs",
+          "role": "trigger",
+          "kind": "failure_boundary",
+          "literals": [
+            "lifecycle_journal_write_failed"
+          ],
+          "function": "journal_write_failed"
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S15",
+      "title": "The active capture binding is invalid",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "required capture/startup or active-session failure",
+      "trigger": "The lifecycle capture-binding validation branch fails.",
+      "variants": [
+        "capture_binding_invalid",
+        "specific retained lifecycle_invalid_reason"
+      ],
+      "behavior": "consume sends the concrete capture binding failure to Job::fail.",
+      "reason": "Capture authorization/identity is required; keep the original invalidation reason and ownership proof.",
+      "next_action": "Confirm the failing binding generation and route its report centrally; do not substitute an unrelated display/capture source.",
+      "selectors": [
+        {
+          "file": "modules/stream-session/src/pipeline/lifecycle.rs",
+          "role": "trigger",
+          "kind": "failure_boundary",
+          "literals": [
+            "capture_binding_invalid"
+          ],
+          "function": "consume"
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S16",
+      "title": "Capture observation cannot establish the selected source",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "required-source admission failure",
+      "trigger": "The required lifecycle capture observation is unavailable.",
+      "variants": [
+        "capture_observation_unavailable"
+      ],
+      "behavior": "consume invokes Job::fail for the required observation branch.",
+      "reason": "No observation does not establish authorized source ownership; a read failure and successful native retirement are different facts.",
+      "next_action": "Review bounded retry versus real denial, retaining required capture authorization before allowing startup.",
+      "selectors": [
+        {
+          "file": "modules/stream-session/src/pipeline/lifecycle.rs",
+          "role": "trigger",
+          "kind": "failure_boundary",
+          "literals": [
+            "capture_observation_unavailable"
+          ],
+          "function": "consume"
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S17",
+      "title": "Optional stream maintenance is unavailable",
+      "category": "recoverable_proposed",
+      "priority": "P1",
+      "scope": "active stream continues with bounded fallback in owner snapshot",
+      "trigger": "A nonallocating maintenance operation times out, is absent, refuses, or returns malformed optional data.",
+      "variants": [
+        "ForceIdr",
+        "FeedbackPeek",
+        "FeedbackAck",
+        "PollGamepadFeedback"
+      ],
+      "behavior": "The owner maintenance path skips or backs off, settles bookkeeping independently, emits a demoted report and calls the common handler. Security/recovery exceptions are a separate scenario.",
+      "reason": "These operations have explicit compatible fallbacks in this snapshot; the four operation variants are listed, not counted as four copies of every Err/cancel/report observation.",
+      "next_action": "Qualify the four operation fallbacks and their bounded settlement queue; retain original permission and ownership exceptions.",
+      "selectors": [
+        {
+          "file": "modules/stream-session/src/pipeline/maintenance.rs",
+          "role": "trigger",
+          "kind": "declared_disposition",
+          "literals": [
+            "maintenance_unavailable"
+          ],
+          "function": "skip_maintenance"
+        },
+        {
+          "file": "modules/stream-session/src/pipeline/maintenance.rs",
+          "role": "effect",
+          "kind": "function_excerpt",
+          "function": "skip_maintenance",
+          "contains": [
+            "await_next_keyframe",
+            "skip_feedback",
+            "retry_feedback_ack",
+            "StreamFailureHandler::decide"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed_non_rejecting_recovery"
+    },
+    {
+      "id": "S18",
+      "title": "Maintenance reports a real permission or recovery failure",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "active stream may stop through central critical gate",
+      "trigger": "The maintenance result explicitly requires cleanup/recovery, or a protected operation returns permission_denied.",
+      "variants": [
+        "maintenance_recovery_required",
+        "ForceIdr permission denial",
+        "PollGamepadFeedback permission denial"
+      ],
+      "behavior": "The owner uses StreamFailure::critical and Job::fail for these exceptions instead of the ordinary skip path.",
+      "reason": "Optional scheduling does not make authorization and unresolved native ownership optional.",
+      "next_action": "Keep exception tests separate from availability/fallback tests; preserve central critical handling and exact retirement proof.",
+      "selectors": [
+        {
+          "file": "modules/stream-session/src/pipeline/maintenance.rs",
+          "role": "trigger",
+          "kind": "failure_boundary",
+          "literals": [
+            "maintenance_recovery_required"
+          ],
+          "function": "advance_maintenance"
+        },
+        {
+          "file": "modules/stream-session/src/pipeline/maintenance.rs",
+          "role": "effect",
+          "kind": "failure_boundary",
+          "literals": [
+            "dependency_rejected"
+          ],
+          "function": "advance_maintenance"
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S19",
+      "title": "History release fails after the media decision",
+      "category": "recoverable_proposed",
+      "priority": "P1",
+      "scope": "background retry; application/stream decision is retained",
+      "trigger": "A history-only release is rejected or unconfirmed.",
+      "variants": [
+        "paused history release",
+        "rejected-resume history release",
+        "cleanup history release"
+      ],
+      "behavior": "demote_history_release reports a bounded demotion, retains a background retry identity and removes history as an admission blocker.",
+      "reason": "This is a diagnostic/history operation, provided actual RTSP/application/native retirement remains independently fenced.",
+      "next_action": "Verify exact activity ID, bounded retry and non-history cleanup proof; do not treat this fallback as evidence of native retirement.",
+      "selectors": [
+        {
+          "file": "modules/nvhttp/src/launch/workflow.rs",
+          "role": "trigger",
+          "kind": "function_excerpt",
+          "function": "demote_history_release",
+          "contains": [
+            "defer_history_release_to_background_retry",
+            "record.history_release_required = false"
+          ]
+        },
+        {
+          "file": "modules/nvhttp/src/launch/workflow.rs",
+          "role": "effect",
+          "kind": "function_excerpt",
+          "function": "demote_record_warning",
+          "contains": [
+            "StreamIssue::demoted"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed_non_rejecting_recovery"
+    },
+    {
+      "id": "S20",
+      "title": "Frame-limiter planning has no usable optional backend",
+      "category": "recoverable_proposed",
+      "priority": "P1",
+      "scope": "no-op plan with warning in populated provider snapshot",
+      "trigger": "The read-only optional frame-limiter planning path cannot provide a backend.",
+      "variants": [
+        "frame_limiter_unavailable",
+        "noop_frame_limiter"
+      ],
+      "behavior": "demote_to_no_op constructs a demoted issue with noop_frame_limiter. The provider is unavailable as a symlink in the policy-owner worktree.",
+      "reason": "The permitted fallback is planning-only and does not establish retirement of a previously applied native effect.",
+      "next_action": "Review the planning-only caller guard and retain mutation/recovery failures as critical.",
+      "selectors": [
+        {
+          "file": "modules/frame-limiter/src/lifecycle.rs",
+          "role": "trigger",
+          "kind": "declared_disposition",
+          "literals": [
+            "frame_limiter_unavailable",
+            "noop_frame_limiter"
+          ],
+          "function": "demote_to_no_op"
+        }
+      ],
+      "path_status": "source_confirmed_non_rejecting_recovery"
+    },
+    {
+      "id": "S21",
+      "title": "Display snapshot or verification fails on resume",
+      "category": "unresolved",
+      "priority": "P2",
+      "scope": "resume refusal versus startup cleanup depends on retained state",
+      "trigger": "The required display snapshot is unavailable before resuming.",
+      "variants": [
+        "display_snapshot_unavailable"
+      ],
+      "behavior": "The call goes through fail_before_resume_stream, which chooses reject_resume for the retained-session case and fail_record otherwise.",
+      "reason": "A failed resume and an instruction to destroy a retained application are different effects; the helper contains that distinction.",
+      "next_action": "Test both retained-session and initial-start branches. Centralize the original display condition without collapsing them into one terminal action.",
+      "selectors": [
+        {
+          "file": "modules/nvhttp/src/launch/workflow.rs",
+          "role": "trigger",
+          "kind": "failure_boundary",
+          "literals": [
+            "display_snapshot_unavailable"
+          ]
+        },
+        {
+          "file": "modules/nvhttp/src/launch/workflow.rs",
+          "role": "effect",
+          "kind": "function_excerpt",
+          "function": "fail_before_resume_stream",
+          "contains": [
+            "reject_resume",
+            "fail_record"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed"
+    },
+    {
+      "id": "S22",
+      "title": "An input authorization lease has expired",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "input renewal rejection; whole-stream effect needs caller review",
+      "trigger": "The input renewal response has expired relative to now.",
+      "variants": [
+        "input_lease_expired"
+      ],
+      "behavior": "accept_input_renewal returns input_lease_expired. A static caller chain alone does not prove whole-stream termination.",
+      "reason": "Do not silently extend input authorization or infer a view-only fallback that was not requested.",
+      "next_action": "Follow renewal failure through the central owner and test any explicitly configured view-only fallback separately.",
+      "selectors": [
+        {
+          "file": "modules/stream-session/src/pipeline/input.rs",
+          "role": "trigger",
+          "kind": "error_origin",
+          "literals": [
+            "input_lease_expired"
+          ],
+          "function": "accept_input_renewal"
+        }
+      ],
+      "path_status": "source_confirmed_authorization_error_with_candidate_terminal_path"
+    },
+    {
+      "id": "S23",
+      "title": "Processing-provider composition is invalid",
+      "category": "critical_proposed",
+      "priority": "P0",
+      "scope": "provider startup propagation; stream impact unconfirmed",
+      "trigger": "A selected processing composition fails its contract validation.",
+      "variants": [
+        "invalid_processing_composition"
+      ],
+      "behavior": "The raw candidate chain reaches this error from Video::start through the SDK composition validator. It is not proof of the final wire rejection.",
+      "reason": "Required contract identity and allocation ownership must not be bypassed to admit an invalid provider composition.",
+      "next_action": "Confirm whether the host catches or escalates this ModuleResult, then connect the exact stream decision across the module boundary.",
+      "selectors": [
+        {
+          "file": "crates/contracts/src/processing_composition.rs",
+          "role": "trigger",
+          "kind": "error_origin",
+          "literals": [
+            "invalid_processing_composition"
+          ],
+          "function": "validate"
+        }
+      ],
+      "path_status": "uncertain_candidate_module_boundary"
+    },
+    {
+      "id": "S24",
+      "title": "The client explicitly tears down the stream",
+      "category": "expected_stop",
+      "priority": "P2",
+      "scope": "authorized stop, excluded from failure counts",
+      "trigger": "A valid negotiation action requests Teardown.",
+      "variants": [
+        "Action::Teardown"
+      ],
+      "behavior": "The controller closes with no failure reason and schedules Stop. This must not be counted as a critical startup error.",
+      "reason": "Normal requested shutdown has separate authorization and retirement requirements.",
+      "next_action": "Keep it outside the failure triage queue and verify ordinary retirement without inventing a failure classification.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "role": "trigger",
+          "kind": "termination_candidate",
+          "function": "handle_network",
+          "contains": [
+            "close (None)"
+          ],
+          "guards": [
+            "Teardown"
+          ]
+        }
+      ],
+      "path_status": "source_confirmed_expected_stop"
+    },
+    {
+      "id": "S25",
+      "title": "The requested streaming mode is explicitly disabled",
+      "priority": "P0",
+      "category": "critical_proposed",
+      "scope": "new stream admission refusal",
+      "path_status": "source_confirmed",
+      "trigger": "The selected mode has no enabled stream configuration.",
+      "variants": [
+        "desktop start",
+        "auxiliary join"
+      ],
+      "behavior": "The distinct branches both call fail_record with streaming_disabled, which forwards the failure to Record::request_cleanup. They are one policy cause with two branch variants, not two copies of every cleanup observation.",
+      "reason": "An explicit disabling policy must be honored; it is not an optional diagnostic failure.",
+      "next_action": "Keep admission disabled, report the exact disabled mode to the final handler and preserve retained-session cleanup semantics.",
+      "selectors": [
+        {
+          "file": "modules/nvhttp/src/launch/workflow.rs",
+          "kind": "failure_boundary",
+          "literals": [
+            "streaming_disabled"
+          ],
+          "role": "trigger"
+        }
+      ]
+    },
+    {
+      "id": "S26",
+      "title": "ANNOUNCE does not match the accepted media/profile contract",
+      "priority": "P1",
+      "category": "unresolved",
+      "scope": "ANNOUNCE refusal and conditional ticket closure",
+      "path_status": "source_confirmed_conditional_rejection",
+      "trigger": "The media/profile acceptance predicate reports failure: legacy success=false completion, or a typed Err outcome at finish_network_result.",
+      "variants": [
+        "configuration_mismatch",
+        "unsupported_video_format",
+        "required contract versus compatible lower bitrate"
+      ],
+      "behavior": "The legacy helper maps an acceptance boolean to unsuccessful completion/closure. The typed policy version carries Result<NetworkCompletion, StreamFailure> into finish_network_result; the common decision selects critical rejection/closure or operation-scoped refusal. A mismatch label alone still does not identify the failing field.",
+      "reason": "An error label alone cannot distinguish an invalid selected format/encryption contract from a compatible lower bitrate. The acceptance predicate and requested/effective values require review.",
+      "next_action": "Trace each rejecting field predicate through Config::negotiate_announce; test a compatible lower bitrate separately from codec, geometry, encryption and transport violations. Do not classify every mismatch as critical or disable security checks.",
+      "selectors": [
+        {
+          "file": "modules/rtsp/src/controller/network.rs",
+          "kind": "function_excerpt",
+          "contains": [
+            "negotiation"
+          ],
+          "role": "trigger",
+          "function_any": [
+            "finish_immediate_action",
+            "finish_network_result"
+          ],
+          "contains_any": [
+            "if !success",
+            "outcome: Result"
+          ]
+        },
+        {
+          "file": "modules/rtsp/src/controller/record.rs",
+          "kind": "function_excerpt",
+          "function": "accept_announce",
+          "contains": [
+            "let accepted = negotiated_video.is_some();"
+          ],
+          "role": "support"
+        }
+      ]
+    }
+  ]
+}

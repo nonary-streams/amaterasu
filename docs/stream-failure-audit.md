@@ -1,119 +1,142 @@
-# Auditing stream rejection and termination
+# Stream rejection scenario audit
 
-Run the read-only source inventory from a checkout with the provider sources
-available. It uses a Rust AST, rather than matching log text or only status 503.
-It does not contact a host, start a stream, change runtime policy, or load a plugin.
-
-```sh
-python scripts/audit_stream_failures.py --root . \
-  --json /tmp/stream-failures.json --markdown /tmp/stream-failures.md
-```
-
-The Python launcher builds only the standalone analysis crate with Cargo's
-`--offline --locked` flags. Its dependencies must already be cached; otherwise
-fetch the analyzer's locked dependencies in an environment with registry access.
-Use `CARGO_TARGET_DIR` for your approved build volume. The standalone crate keeps
-`syn`, `quote` and the analysis executable out of production module dependencies.
-You can also build once and run `amaterasu-stream-failure-audit` directly.
-
-The central failure decision should have final authority over RTSP/network
-rejection. Lower layers should report conditions to it. To inspect structural
-references to a proposed central function, supply its exact function ID from the
-JSON or `package_name::Type::method` (hyphens become underscores):
+The default output is a scenario report, not a count of generic errors. It starts
+at reviewed stream-owner rejection/termination APIs, keeps their guards and
+source-local effect paths, and groups repeated cause codes across sites. A small,
+reviewable catalog adds semantic cause/effect explanations and priorities.
 
 ```sh
 python scripts/audit_stream_failures.py --root . \
-  --decision-symbol amaterasu_rtsp::Controller::handle_network \
-  --json /tmp/stream-decisions.json --markdown /tmp/stream-decisions.md
+  --json /tmp/stream-scenarios.json --markdown /tmp/stream-scenarios.md
 ```
 
-This example selects a network handler for inspection; it does **not** assert
-that it is already the desired universal policy handler. Prefer a full function
-ID when the same type/method name exists in several modules. Multiple
-`--decision-symbol` options can compare candidates. Unmatched symbols produce
-exit status 2 so a misspelled policy name cannot appear to pass.
+This writes scenario JSON (schema 2), a Markdown review report and the complete
+supporting AST inventory at `/tmp/stream-scenarios.raw.json.gz` (raw schema 1).
+`--raw-json PATH` chooses the retained evidence path. The original inventory is
+still available explicitly:
 
-## Reviewing the evidence
+```sh
+python scripts/audit_stream_failures.py --root . --raw-inventory \
+  --json /tmp/stream-observations.json --markdown /tmp/stream-observations.md
+```
 
-The Markdown queue prioritizes stream-scope boundary candidates. The JSON is the
-complete inventory: locations, source excerpts, literal reasons, enclosing
-if/match/let-else conditions, function IDs, candidate caller chains, indexed
-call edges, unresolved dispatch, API metadata, file digests, and Git provenance.
-`--markdown-limit` defaults to 200; omissions are stated in the report. Bounds
-(`--max-depth 5`, `--max-paths 3`) apply to displayed caller paths, not the source
-inventory. Truncated paths are marked and the full indexed edge list remains.
-Function/edge indexes refer to arrays in the same JSON report; finding IDs include
-the source position and expression, so they may change after edits.
+The launcher builds only the standalone Rust analyzer with `--offline --locked`;
+its locked dependencies must already be cached. `CARGO_TARGET_DIR` is honored;
+use the approved build volume. The analysis crate is outside production host and
+module dependency graphs. Python postprocessing uses only the standard library.
+Directly invoking the Rust binary continues to produce the raw inventory.
+Neither stage contacts the running host, opens sockets, loads plugins, changes
+runtime policy or modifies source files.
 
-Observations distinguish explicit error origins (`Err`), `?` propagation,
-`map_err`/`ok_or` conversions, negative JSON replies, wire status candidates,
-failure/termination method calls, failed lifecycle assignments, false/None
-returns, panic hazards, and opaque macro/module/indirect dispatch boundaries.
-Constant successful `reply_status` responses are filtered. An `Err` pattern in
-a caught optional fallback, a log containing “failed”, or a string containing
-“503” does not create an error origin. Shutdown names can still refer to local
-resources or normal client teardown; candidates must be reviewed.
+## Reading the default report
 
-Classifications are deliberately tentative:
+The reviewed catalog covers 26 cause/effect groups, with explicit variants and
+critical/recoverable/unresolved proposals. It is selective, not an assertion that
+there are only 24 possible failures. Expected client teardown is separate from
+failure triage. Missing required evidence downgrades a catalog entry to unresolved.
 
-- `critical_proposed`: an explicit `StreamIssue::critical` declaration or a
-  recognized security/ownership reason. Confirm the real contract and effect.
-- `superficial_proposed`: the source explicitly declares an advisory/demotion.
-  Confirm a safe compatible fallback and exact lifecycle reporting.
-- `normal_teardown_proposed`: `close(None)` supplies no failure reason. Confirm
-  the initiating request and resource retirement.
-- `unresolved`: no reliable decision follows from syntax. This includes optional
-  errors whose fallbacks have not been verified.
+The automatic decision list starts at known RTSP, stream-session and NVHTTP sink
+APIs. Generic `Err`, `?`, logs, warnings, panics and arbitrary methods named `close`
+are not counted as stream rejection scenarios. Shared sink implementations are
+supporting machinery, not separate causes. Source excerpts from the catalog can
+supplement AST blind spots such as enum-based connection-close outcomes; a source
+file's SHA-256 must agree with the raw scan before using such an excerpt. If the
+working file has changed, a local `git show` of the recorded commit is accepted
+only if its bytes also match the recorded digest.
 
-Central-decision labels distinguish a site inside the configured symbol, a
-resolved policy reference in the same function, and no resolved policy reference.
-None proves dominance or compliance. A call can be in the wrong branch, ignore
-the result, or report diagnostics after rejecting. Treat unreferenced RTSP reply,
-ticket revocation and stop sites as a review queue for the centralized design.
-Do not duplicate policy in lower layers to satisfy this inventory, and never
-weaken authentication, encryption, required media contracts, ownership or native
-retirement fences based on a proposed demotion.
+The automatic list distinguishes:
 
-## Coverage and blind spots
+- `source_confirmed_rejection_sites`: explicit negative RTSP reply or a call to a
+  reviewed stream-owner API with a retained local path to a concrete state or
+  response effect. This is a source fact under the recorded guards, not a claim
+  of runtime execution, compiler proof, successful remote delivery or policy
+  correctness. Central directives and callbacks still condition the effect.
+- `uncertain_candidate`: dynamic cause, untyped/ambiguous dispatch, or no established
+  local terminal effect. These remain a separate queue, not confirmed causes.
+- `mixed_confirmed_and_uncertain_variants`: per-variant evidence remains separate.
 
-All local Rust under `crates/` and `modules/` is considered, including available
-nested provider repositories. Failure/termination and wire names use a finite
-vocabulary; custom wrappers, status constants, non-JSON encodings, silent thread
-exit, deadlocks and other error conventions can still be missed. Expand the
-fixtures when adding conventions. The analyzer retains non-test platform/feature
-branches together. It excludes explicit `#[test]`/`#[cfg(test)]` declarations,
-test directories/files, examples, build scripts, fixtures and vendored sources.
-Every scanned file has a SHA-256 digest; excluded paths, parse/I/O errors, missing
-submodule source and skipped symlinks are listed. Re-run after concurrent edits;
-the scan is not an atomic source snapshot. Successful parsing is not coverage of
-all runtime scenarios.
+Repeated specific reason codes are grouped by component and effect scope;
+different phases, predicates and snapshots remain visible as variants. Generic
+reasons such as `dependency_rejected` keep their branch context because they do
+not identify a distinct root cause. The automatic list receives a reviewed
+category only when all its anchors are covered by the corresponding catalog case.
+A source-confirmed rejection may still be classified `unresolved`: knowing that a
+branch stops a stream does not establish whether doing so is necessary.
 
-Name/receiver matching is not compiler resolution. Same-name ambiguity, aliases,
-trait objects, generics, callbacks, queues, workers, cancellation and IPC leave
-paths unresolved. A caller chain does not prove that a returned error reaches a
-shutdown: it may be caught or retried. Async/closure guards flag their separate
-execution boundaries. Metadata lists advertised APIs but cannot establish a
-selected provider or runtime service route. Native C/C++/ABI, generated code,
-unexpanded macros, OS/hardware failures, external/replacement plugins and installed
-package selection require separate inspection and runtime qualification.
+P0 prioritizes security/ownership fences; P1 prioritizes recovery and admission
+behavior; P2 prioritizes missing contract/propagation evidence. None of these
+labels authorizes demotion. Keep authentication, encryption, required selected
+media, ownership persistence and native retirement checks intact.
 
-Exit status 0 means the requested inventory was written without parse/I/O errors
-or unmatched policy symbols. Missing providers/symlinks are explicit coverage
-gaps, even with exit 0. Exit 2 means invalid options, parsing/read/write failure,
-or unmatched policy symbols. Findings never fail CI on their own and never
-authorize changing security behavior.
+## Replaying saved evidence and comparing snapshots
 
-## Validation
+Raw JSON or gzip reports are immutable inputs to the summarizer:
+
+```sh
+python scripts/summarize_stream_failures.py \
+  --report baseline=/tmp/stream-observations.json \
+  --report policy=/tmp/stream-policy.raw.json.gz \
+  --json /tmp/compared-scenarios.json --markdown /tmp/compared-scenarios.md
+```
+
+`scripts/stream-failure-audit/scenarios.json` is a human-reviewable semantic
+catalog. `--catalog PATH` selects an alternate catalog. IDs define scenario
+identity; selectors match AST observations or hash-verified function excerpts.
+Overlapping primary anchors and missing evidence are reported. Call paths carry
+source positions and confidence. Their name/annotation edges do not establish
+that errors escape catches or retries, cross module IPC, or reach the wire.
+
+## Reviewing centralized decision authority
+
+To inspect structural references to the common policy handler, supply its symbol
+(or an exact function ID from raw JSON) in a checkout that contains it:
+
+```sh
+python scripts/audit_stream_failures.py --root . \
+  --decision-symbol amaterasu_module_sdk::StreamFailureHandler::decide \
+  --json /tmp/policy-scenarios.json --markdown /tmp/policy-scenarios.md
+```
+
+A same-function reference does not prove dominance: an early return may reject a
+request before the handler, or a caller may ignore the directive. Lower layers
+should carry the original facts to the final failure decision rather than repeat
+severity policy. Raw structural labels do not prove compliance or a bypass.
+Unmatched symbols fail with exit 2. Findings never enforce or change policy.
+
+## Limits and validation
+
+Raw scanning covers local Rust under `crates/` and `modules/`, including available
+provider repositories. Tests, examples, build scripts, fixtures, vendored code and
+symlink targets are excluded. All non-test platform/feature branches are retained
+together. File digests, exclusions, missing providers, parse/I/O errors and Git
+provenance are retained. Source reads are not an atomic snapshot.
+
+The sink registry and catalog are incomplete. Native/ABI, generated code, macros,
+OS/hardware, selected installed packages, replacement plugins, workers, queues,
+callbacks and dynamic IPC need further source/runtime qualification. Unselected
+raw evidence remains a backlog. Exit 0 means the requested reports were produced;
+coverage gaps and missing catalog evidence can remain explicit. Exit 2 means
+invalid options, unmatched policy symbols, parse/read/write failure or a failed
+analyzer build.
 
 ```sh
 cargo fmt --manifest-path scripts/stream-failure-audit/Cargo.toml --check
 cargo test --manifest-path scripts/stream-failure-audit/Cargo.toml --locked -- --nocapture
 cargo clippy --manifest-path scripts/stream-failure-audit/Cargo.toml --all-targets --locked -- -D warnings
+python scripts/test_summarize_stream_failures.py
 ```
 
-The manually labeled Rust fixture measures recall of observable constructs and
-false positives on negative controls. It is not a measurement of repository-wide
-scenario recall or real stream criticality. Tests also verify indirect call paths,
-receiver disambiguation, conditions, tentative classification, policy-reference
-limits, parse failure reporting, missing provider detection, deterministic output
-and CLI error behavior. These checks run with the existing component CI tooling.
+The Rust fixture measures recall/false positives for labeled syntax constructs.
+Python tests verify sink specificity, causal-effect requirements, deduplication,
+uncertain origins, evidence hash checks and preservation of raw inputs. An
+end-to-end test runs the actual analyzer/default launcher against this checkout
+and checks real rejection causes (streaming disabled, failed lifecycle journal,
+invalid capture binding, and RTSP backlog refusal or its newer backpressure replacement), while rejecting promotion of
+generic processing errors and optional warning origins into confirmed stream
+rejections. These are regression examples, not measurements of total scenario
+recall, criticality accuracy or real client playback.
+
+For a separate policy worktree, set `AMATERASU_AUDIT_TEST_ROOT=/path/to/policy-worktree`
+when running the Python suite; only source is read there, and tool builds remain
+in `CARGO_TARGET_DIR`. The suite must not require an old rejection branch to
+remain after its deliberate replacement by backpressure.

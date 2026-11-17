@@ -33,6 +33,7 @@ fn labeled_recall_and_false_positive_controls() {
         ("wire_sequence", "wire_status_candidate"),
         ("wire_busy", "wire_status_candidate"),
         ("wire_dynamic", "wire_status_candidate"),
+        ("wire_with_failure_report", "wire_status_candidate"),
         ("timeout", "failure_boundary"),
         ("failed_state", "lifecycle_transition"),
         ("stopping_state", "lifecycle_transition"),
@@ -74,6 +75,7 @@ fn labeled_recall_and_false_positive_controls() {
         "optional_fallback",
         "optional_caught",
         "healthy_wire",
+        "healthy_wire_with_report",
         "healthy_json",
         "healthy_json_string",
         "format_message",
@@ -122,6 +124,10 @@ fn labeled_recall_and_false_positive_controls() {
     );
     assert!(!by_name.contains_key("test_function"));
     assert!(!by_name.contains_key("fake_failure"));
+    let wire = &by_name["wire_with_failure_report"].observations[0];
+    assert_eq!(wire.literal_status, Some(455));
+    assert_eq!(wire.arguments.len(), 4);
+    assert_eq!(wire.arguments[2], "455u16");
 }
 
 #[test]

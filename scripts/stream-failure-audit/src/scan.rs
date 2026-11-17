@@ -387,6 +387,8 @@ impl Body<'_> {
             evidence,
             guards: self.guards.clone(),
             literals: literals(node.to_token_stream()),
+            arguments: Vec::new(),
+            literal_status: None,
         });
     }
     fn call(
@@ -561,6 +563,7 @@ impl<'ast> Visit<'ast> for Body<'_> {
         syn::visit::visit_expr(self, node);
     }
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        let start = self.observations.len();
         if let Expr::Path(path) = &*node.func {
             let expanded = expand_import(
                 &path
@@ -595,9 +598,16 @@ impl<'ast> Visit<'ast> for Body<'_> {
         } else {
             self.observe("indirect_dispatch", node, node.span());
         }
+        for observation in &mut self.observations[start..] {
+            observation.arguments = node.args.iter().map(tokens).collect();
+            if observation.kind == "wire_status_candidate" {
+                observation.literal_status = status_literal(&node.args);
+            }
+        }
         syn::visit::visit_expr_call(self, node);
     }
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let start = self.observations.len();
         let name = node.method.to_string();
         let receiver = tokens(&node.receiver);
         let receiver_type = if let Expr::Path(path) = &*node.receiver {
@@ -622,6 +632,12 @@ impl<'ast> Visit<'ast> for Body<'_> {
             self.observe("module_boundary", node, node.span());
         }
         self.call(name, receiver, receiver_type, true, node.span());
+        for observation in &mut self.observations[start..] {
+            observation.arguments = node.args.iter().map(tokens).collect();
+            if observation.kind == "wire_status_candidate" {
+                observation.literal_status = status_literal(&node.args);
+            }
+        }
         syn::visit::visit_expr_method_call(self, node);
     }
     fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
@@ -794,7 +810,19 @@ fn sentinel(expr: &Expr) -> bool {
 }
 
 fn success_status(args: &syn::punctuated::Punctuated<Expr, syn::Token![,]>) -> bool {
-    matches!(args.last(), Some(Expr::Lit(n)) if matches!(&n.lit, syn::Lit::Int(i) if i.base10_parse::<u16>().is_ok_and(|v| (100..400).contains(&v))))
+    status_literal(args).is_some_and(|v| (100..400).contains(&v))
+}
+
+fn status_literal(args: &syn::punctuated::Punctuated<Expr, syn::Token![,]>) -> Option<u16> {
+    // RTSP's status is the third argument, including the newer fourth failure
+    // report argument. Short status helpers retain their last-argument form.
+    match args.iter().nth(2).or_else(|| args.last()) {
+        Some(Expr::Lit(n)) => match &n.lit {
+            syn::Lit::Int(value) => value.base10_parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 trait ExprAttrs {

@@ -60,6 +60,8 @@ jobs:
         run: cargo test --manifest-path scripts/stream-failure-audit/Cargo.toml --locked -- --nocapture
       - name: Lint stream failure audit
         run: cargo clippy --manifest-path scripts/stream-failure-audit/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test stream rejection scenarios against the checkout
+        run: python scripts/test_summarize_stream_failures.py
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
