@@ -2,7 +2,11 @@
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version = '0.1.0',
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [switch]$SideBySide,
+    [ValidateRange(1029, 65514)]
+    [int]$BasePort = 48989,
+    [string]$DxgiOutputId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,7 +17,7 @@ function Get-ApprovedPlayniteExtension {
 
     $expectedHashes = [ordered]@{
         'extension.yaml' = '0E3507A22AC5C24F1E0573CAAFF52F572BC1AF9C1C18270905B2694EBFEBA72D'
-        'AmaterasuPlaynite.psm1' = 'AD18C7BD3DDAFFDA44A1BF9713A8DC5B9AD987626F367EBCDEF6614C01BC6D7C'
+        'AmaterasuPlaynite.psm1' = 'D196587ACB2CBAC81A75B455F341968139BD1D21D00D7AD701E0F6EC2744C07F'
     }
     $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
     $approved = [ordered]@{}
@@ -62,10 +66,13 @@ function Get-CargoReleaseDirectory {
 }
 
 $repository = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if ($SideBySide) {
+    Write-Warning 'Side-by-side installer construction is experimental; first-run setup and live streaming validation are not complete.'
+}
 $playniteSource = Join-Path $repository 'modules\playnite\extension'
 $approvedPlayniteFiles = Get-ApprovedPlayniteExtension $playniteSource
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $OutputDirectory = Join-Path $repository 'target\installer'
+    $OutputDirectory = Join-Path $repository $(if ($SideBySide) { 'target\installer-side-by-side' } else { 'target\installer' })
 }
 $output = [System.IO.Path]::GetFullPath($OutputDirectory)
 $stage = Join-Path $output 'stage'
@@ -102,8 +109,20 @@ if (Test-Path $stage) {
 New-Item -ItemType Directory -Path (Join-Path $stage 'tools') -Force | Out-Null
 Write-ApprovedPlayniteExtension $approvedPlayniteFiles $stage
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'enable-plugin-installer.ps1') -Destination (Join-Path $stage 'tools\enable-plugin-installer.ps1')
+if ($SideBySide) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'show-first-admin-code.ps1') -Destination (Join-Path $stage 'tools\show-first-admin-code.ps1')
+}
 
 $releaseDirectory = Get-CargoReleaseDirectory $repository $env:CARGO_TARGET_DIR
+if ($SideBySide -and [string]::IsNullOrWhiteSpace($DxgiOutputId)) {
+    $enumerated = & (Join-Path $releaseDirectory 'amaterasu-dxgi-outputs.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'DXGI output enumeration failed.' }
+    $attached = @($enumerated | ConvertFrom-Json | Where-Object { $_.attached })
+    if ($attached.Count -ne 1) {
+        throw 'Side-by-side packaging needs -DxgiOutputId when there is not exactly one attached DXGI output.'
+    }
+    $DxgiOutputId = [string]$attached[0].id
+}
 $installerSigner = $env:AMATERASU_INSTALLER_SIGNING_KEY
 if ([string]::IsNullOrWhiteSpace($installerSigner)) {
     $signerDirectory = Join-Path $env:LOCALAPPDATA 'Amaterasu\installer'
@@ -125,7 +144,12 @@ Copy-Item -LiteralPath (Join-Path $releaseDirectory 'amaterasu-migration.exe') -
 Copy-Item -LiteralPath (Join-Path $releaseDirectory 'amaterasu-release.exe') -Destination (Join-Path $stage 'tools\amaterasu-release.exe')
 Copy-Item -LiteralPath (Join-Path $releaseDirectory 'amaterasu-pairing-import.exe') -Destination (Join-Path $stage 'tools\amaterasu-pairing-import.exe')
 Copy-Item -LiteralPath (Join-Path $releaseDirectory 'amaterasu-authentication-import.exe') -Destination (Join-Path $stage 'tools\amaterasu-authentication-import.exe')
-& (Join-Path $releaseDirectory 'amaterasu-release.exe') prepare-installer $releaseDirectory (Join-Path $repository 'frontend\dist') (Join-Path $stage 'seed')
+if ($SideBySide) {
+    & (Join-Path $releaseDirectory 'amaterasu-release.exe') prepare-side-by-side-installer $releaseDirectory (Join-Path $repository 'frontend\dist') (Join-Path $stage 'seed') $BasePort $DxgiOutputId
+}
+else {
+    & (Join-Path $releaseDirectory 'amaterasu-release.exe') prepare-installer $releaseDirectory (Join-Path $repository 'frontend\dist') (Join-Path $stage 'seed')
+}
 if ($LASTEXITCODE -ne 0) { throw 'Installer seed preparation failed.' }
 if (Test-Path (Join-Path $stage 'seed\development-key.json')) {
     throw 'Installer seed must not contain a signing private key.'
@@ -135,12 +159,19 @@ if (Test-Path (Join-Path $stage 'seed\development-key.json')) {
 if ($LASTEXITCODE -ne 0) { throw 'WiX seed harvesting failed.' }
 
 $common = @('-nologo', '-arch', 'x64', "-dProductVersion=$Version", "-dStageDir=$stage", '-ext', 'WixUtilExtension')
+if ($SideBySide) { $common += '-dSideBySide=1' }
 & (Join-Path $wix 'candle.exe') @common "-dSeedDir=$(Join-Path $stage 'seed')" (Join-Path $PSScriptRoot 'Product.wxs') (Join-Path $output 'InstallerSeed.wxs') -out "$output\"
 if ($LASTEXITCODE -ne 0) { throw 'WiX compilation failed.' }
 
-$msi = Join-Path $output "Amaterasu-$Version-x64.msi"
+$msiName = if ($SideBySide) { "Amaterasu-$Version-side-by-side-x64.msi" } else { "Amaterasu-$Version-x64.msi" }
+$msi = Join-Path $output $msiName
 & (Join-Path $wix 'light.exe') -nologo -ext WixUtilExtension -out $msi (Join-Path $output 'Product.wixobj') (Join-Path $output 'InstallerSeed.wixobj')
 if ($LASTEXITCODE -ne 0) { throw 'WiX linking failed.' }
+
+if ($SideBySide) {
+    Write-Output "Built $msi"
+    return
+}
 
 $bundle = Join-Path $output "Amaterasu-$Version-Setup.exe"
 $bundleCommon = @('-nologo', '-arch', 'x64', "-dProductVersion=$Version", "-dProjectDir=$repository", "-dMsiPath=$msi", "-dMigrationToolPath=$(Join-Path $releaseDirectory 'amaterasu-migration.exe')", "-dReleaseToolPath=$(Join-Path $releaseDirectory 'amaterasu-release.exe')", '-ext', 'WixBalExtension')

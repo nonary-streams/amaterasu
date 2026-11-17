@@ -42,6 +42,42 @@ pub enum PairingSeedOutcome {
     ExistingAmaterasuState,
 }
 
+/// Initialize a distinct host identity without copying another server's clients.
+/// Existing pairing state is preserved by the same locked seed transaction used
+/// by migration, including during concurrent initialization attempts.
+pub fn seed_new_pairing_identity(state_root: &Path) -> Result<PairingSeedOutcome, &'static str> {
+    let identity = crate::crypto::generate_identity()?;
+    let import = LegacyPairingImport {
+        document: Document {
+            identity: Some(identity),
+            clients: Vec::new(),
+            permission_mode_enabled: false,
+        },
+    };
+    let outcome = seed_pairing_state(state_root, &import)?;
+    if outcome == PairingSeedOutcome::ExistingAmaterasuState {
+        let _lock = RootLock::acquire(state_root).map_err(|_| "legacy_pairing_state_busy")?;
+        let namespace = read_namespace(&pairing_namespace_path(state_root))?;
+        let value = namespace
+            .values
+            .get(PAIRING_STATE_KEY)
+            .ok_or("legacy_pairing_invalid_identity")?;
+        let document: Document =
+            serde_json::from_value(value.clone()).map_err(|_| "legacy_pairing_invalid_identity")?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "legacy_pairing_clock_failure")?
+            .as_secs();
+        if namespace.revision == 0 || document.identity.is_none() {
+            return Err("legacy_pairing_invalid_identity");
+        }
+        document
+            .validate(now)
+            .map_err(|_| "legacy_pairing_invalid_identity")?;
+    }
+    Ok(outcome)
+}
+
 /// Converts the standard current Sunshine/Vibeshine pairing configuration.
 ///
 /// `source_root` must be the copied predecessor configuration root, not an
@@ -860,6 +896,56 @@ mod tests {
             import_legacy_pairing(&fixture.0, fixture_now()),
             Err("legacy_pairing_state_ambiguous")
         ));
+    }
+
+    #[test]
+    fn fresh_identity_seed_is_distinct_and_preserves_existing_state() {
+        let first = TemporaryDirectory::new();
+        let second = TemporaryDirectory::new();
+        assert_eq!(
+            seed_new_pairing_identity(&first.0).unwrap(),
+            PairingSeedOutcome::Seeded
+        );
+        assert_eq!(
+            seed_new_pairing_identity(&second.0).unwrap(),
+            PairingSeedOutcome::Seeded
+        );
+        let first_bytes = std::fs::read(pairing_namespace_path(&first.0)).unwrap();
+        let second_bytes = std::fs::read(pairing_namespace_path(&second.0)).unwrap();
+        let first_namespace: StateNamespace = serde_json::from_slice(&first_bytes).unwrap();
+        let second_namespace: StateNamespace = serde_json::from_slice(&second_bytes).unwrap();
+        let first_document: Document =
+            serde_json::from_value(first_namespace.values[PAIRING_STATE_KEY].clone()).unwrap();
+        let second_document: Document =
+            serde_json::from_value(second_namespace.values[PAIRING_STATE_KEY].clone()).unwrap();
+        assert_ne!(
+            first_document.identity.unwrap().host_id,
+            second_document.identity.unwrap().host_id
+        );
+        assert!(first_document.clients.is_empty());
+        assert_eq!(
+            seed_new_pairing_identity(&first.0).unwrap(),
+            PairingSeedOutcome::ExistingAmaterasuState
+        );
+        assert_eq!(
+            std::fs::read(pairing_namespace_path(&first.0)).unwrap(),
+            first_bytes
+        );
+    }
+
+    #[test]
+    fn fresh_identity_seed_rejects_existing_uninitialized_namespace() {
+        let state = TemporaryDirectory::new();
+        let path = pairing_namespace_path(&state.0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"format_version":1,"revision":1,"values":{"other":"value"}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(seed_new_pairing_identity(&state.0).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[test]

@@ -68,6 +68,27 @@ service.
 bundle from a release workspace build. Their definitions are tracked here;
 generated WiX fragments and artifacts remain under `target/installer`.
 
+### Experimental side-by-side build
+
+`build-installer.ps1 -SideBySide` builds a separate MSI without the predecessor
+import, handoff or retirement actions. It signs a Windows streaming profile
+with Moonlight HTTP at base port 48989 by default, HTTPS at base minus five,
+RTSP at base plus 21, and loopback management at base plus one. `-BasePort`
+changes the base. When exactly one DXGI output is attached it selects its
+current provider ID; otherwise pass an enumerated `-DxgiOutputId`.
+
+On a fresh side-by-side install the installer seeds a distinct pairing identity
+and a ten-minute first-administrator enrollment code in the machine-private
+pending state. The selected interactive worker copies that seed into its own
+SID-scoped state root. `tools/show-first-admin-code.ps1` reads the current user's
+handoff, and the local management page accepts that code for first enrollment.
+An existing administrator or pairing identity is preserved. To refresh an expired
+code, stop the Amaterasu service and run `show-first-admin-code.ps1 -Refresh` as
+the same interactive user, then restart the service. The state-store lock refuses
+refresh while its provider is running. End-to-end Windows streaming qualification remains open;
+this build path is experimental and must not be treated as a qualified release.
+It does not build or run the predecessor-retirement bundle.
+
 The MSI has a stable Amaterasu upgrade code and performs transactional major
 upgrades of earlier Amaterasu packages. It finds Sunshine, Apollo, Vibeshine,
 and Vibepollo configuration below the selected Program Files root, runs a

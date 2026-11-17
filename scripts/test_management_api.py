@@ -304,6 +304,7 @@ def test_auth_and_crud(console, api):
         "authentication_verifier": True,
         "catalog_loaded": True,
         "pairing_identity": True,
+        "host_id": identity["host_id"],
     }, status
     deadline = time.monotonic() + 5
     nvhttp = None

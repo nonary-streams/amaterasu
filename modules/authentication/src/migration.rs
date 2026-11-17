@@ -4,12 +4,17 @@ use crate::legacy_tokens::{
     LegacyApiToken, LegacyApiTokenScope, LegacyApiTokenStore, MAX_LEGACY_API_TOKEN_METHODS,
     MAX_LEGACY_API_TOKEN_SCOPES, MAX_LEGACY_API_TOKENS,
 };
-use crate::protocol::{Credential, Document, SessionDocument, valid_digest};
-use amaterasu_storage::{RootLock, create_private_directory, read_bounded, write_json_atomically};
+use crate::protocol::{Credential, Document, Enrollment, Operation, SessionDocument, valid_digest};
+use amaterasu_storage::{
+    RootLock, create_private_directory, protect_machine_private_file, read_bounded,
+    write_atomically, write_json_atomically,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATE_FILES: &[&str] = &[
     "apollo_state.json",
@@ -34,6 +39,197 @@ pub struct LegacyAuthenticationImport {
 pub enum AuthenticationSeedOutcome {
     Seeded,
     ExistingAmaterasuState,
+}
+
+/// Create an initial local administrator using the ordinary setup validation
+/// and password hasher. Existing authentication state is never replaced.
+/// The state-store lock rejects concurrent use of the same root. Callers must
+/// still choose an installer-owned seed or the correct stopped user-state root.
+pub fn seed_initial_administrator(
+    state_root: &Path,
+    username: &str,
+    password: &str,
+) -> Result<AuthenticationSeedOutcome, &'static str> {
+    Operation::Setup {
+        username: username.into(),
+        password: password.into(),
+    }
+    .validate()?;
+    let import = LegacyAuthenticationImport {
+        document: Document {
+            credential: Some(Credential {
+                username: username.into(),
+                password_hash: crate::crypto::hash_password(password)?,
+                legacy_salt: None,
+                case_insensitive_username: false,
+            }),
+            tokens: Vec::new(),
+            accounts: Vec::new(),
+            enrollment: None,
+        },
+        legacy_api_tokens: LegacyApiTokenStore::default(),
+    };
+    seed_authentication_state(state_root, &import)
+}
+
+/// Seed a short-lived first-administrator enrollment token into an offline,
+/// installer-owned state root. Its private handoff file is copied to the
+/// selected interactive user with the rest of the protected seed. The token
+/// itself is never returned to the installer or written to its logs.
+pub fn seed_initial_enrollment(
+    state_root: &Path,
+) -> Result<AuthenticationSeedOutcome, &'static str> {
+    create_private_directory(state_root).map_err(|_| "initial_enrollment_unavailable")?;
+    let _lock = RootLock::acquire(state_root).map_err(|_| "initial_enrollment_busy")?;
+    let path = namespace_path(state_root);
+    let mut namespace = read_namespace(&path)?;
+    validate_existing_session_sidecar(&namespace)?;
+    validate_existing_legacy_api_token_sidecar(&namespace)?;
+    let mut document = match namespace.values.get(STATE_KEY) {
+        Some(value) => {
+            if namespace.revision == 0 {
+                return Err("initial_enrollment_invalid_state");
+            }
+            serde_json::from_value::<Document>(value.clone())
+                .map_err(|_| "initial_enrollment_invalid_state")?
+        }
+        None if namespace.values.is_empty() => Document::default(),
+        None => return Err("initial_enrollment_invalid_state"),
+    };
+    document.validate()?;
+    if document.credential.is_some() || !document.accounts.is_empty() {
+        return Ok(AuthenticationSeedOutcome::ExistingAmaterasuState);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "clock_failure")?
+        .as_secs();
+    let handoff = state_root.join("first-admin-enrollment.json");
+    let pending = state_root.join("first-admin-enrollment.pending.json");
+    let current = read_enrollment_handoff(&handoff)?;
+    let mut next = read_enrollment_handoff(&pending)?;
+    if let Some(enrollment) = &document.enrollment {
+        let current_matches = current
+            .as_ref()
+            .is_some_and(|value| value.matches(enrollment));
+        let pending_matches = next.as_ref().is_some_and(|value| value.matches(enrollment));
+        if !current_matches && !pending_matches {
+            return Err("initial_enrollment_invalid_state");
+        }
+        if enrollment.expires_at > now && !pending_matches {
+            if next.is_some() {
+                return Err("initial_enrollment_invalid_state");
+            }
+            if enrollment.expires_at > now.saturating_add(600) {
+                return Err("initial_enrollment_invalid_state");
+            }
+            return Ok(AuthenticationSeedOutcome::Seeded);
+        }
+    } else if current.is_some() && next.is_none() {
+        return Err("initial_enrollment_invalid_state");
+    }
+    if next.as_ref().is_some_and(|value| value.expires_at <= now) {
+        std::fs::remove_file(&pending).map_err(|_| "initial_enrollment_unavailable")?;
+        next = None;
+    }
+    if next.is_none() {
+        let (code, _) = crate::crypto::issue_bearer()?;
+        let handoff_value = EnrollmentHandoff {
+            code,
+            expires_at: now.checked_add(600).ok_or("clock_failure")?,
+        };
+        write_new_enrollment_handoff(&pending, &handoff_value)?;
+        next = Some(handoff_value);
+    }
+    let next = next.ok_or("initial_enrollment_unavailable")?;
+    if next.expires_at <= now || next.expires_at > now.saturating_add(600) {
+        return Err("initial_enrollment_expired_recovery_required");
+    }
+    if let Some(enrollment) = &document.enrollment
+        && enrollment.expires_at > now
+        && !next.matches(enrollment)
+    {
+        return Err("initial_enrollment_invalid_state");
+    }
+    if !document
+        .enrollment
+        .as_ref()
+        .is_some_and(|value| next.matches(value))
+    {
+        document.enrollment = Some(Enrollment {
+            code_digest: crate::crypto::token_digest(&next.code),
+            expires_at: next.expires_at,
+        });
+        document.validate()?;
+        namespace.revision = namespace
+            .revision
+            .checked_add(1)
+            .ok_or("initial_enrollment_unavailable")?;
+        namespace.values.insert(
+            STATE_KEY.into(),
+            serde_json::to_value(document).map_err(|_| "initial_enrollment_unavailable")?,
+        );
+        let directory = path.parent().ok_or("initial_enrollment_unavailable")?;
+        create_private_directory(directory).map_err(|_| "initial_enrollment_unavailable")?;
+        write_json_atomically(&path, &namespace).map_err(|_| "initial_enrollment_unavailable")?;
+    }
+    let bytes = serde_json::to_vec(&next).map_err(|_| "initial_enrollment_unavailable")?;
+    write_atomically(&handoff, &bytes).map_err(|_| "initial_enrollment_unavailable")?;
+    protect_machine_private_file(&handoff).map_err(|_| "initial_enrollment_unavailable")?;
+    std::fs::remove_file(pending).map_err(|_| "initial_enrollment_unavailable")?;
+    Ok(AuthenticationSeedOutcome::Seeded)
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentHandoff {
+    code: String,
+    expires_at: u64,
+}
+
+impl EnrollmentHandoff {
+    fn matches(&self, enrollment: &Enrollment) -> bool {
+        self.expires_at == enrollment.expires_at
+            && crate::crypto::token_digest(&self.code) == enrollment.code_digest
+    }
+}
+
+fn read_enrollment_handoff(path: &Path) -> Result<Option<EnrollmentHandoff>, &'static str> {
+    if !path
+        .try_exists()
+        .map_err(|_| "initial_enrollment_unavailable")?
+    {
+        return Ok(None);
+    }
+    let bytes = read_bounded(path, 4096).map_err(|_| "initial_enrollment_unavailable")?;
+    let value: EnrollmentHandoff =
+        serde_json::from_slice(&bytes).map_err(|_| "initial_enrollment_invalid_state")?;
+    if !value.code.strip_prefix("ama_").is_some_and(valid_digest) {
+        return Err("initial_enrollment_invalid_state");
+    }
+    Ok(Some(value))
+}
+
+fn write_new_enrollment_handoff(
+    path: &Path,
+    value: &EnrollmentHandoff,
+) -> Result<(), &'static str> {
+    let bytes = serde_json::to_vec(value).map_err(|_| "initial_enrollment_unavailable")?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| "initial_enrollment_unavailable")?;
+    let result = file
+        .write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "initial_enrollment_unavailable");
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result?;
+    protect_machine_private_file(path).map_err(|_| "initial_enrollment_unavailable")
 }
 
 pub fn import_legacy_authentication(
@@ -655,6 +851,206 @@ mod tests {
             Sha256::digest(format!("{password}{salt}").as_bytes())
         );
         serde_json::json!({"username":username,"password":hash,"salt":salt}).to_string()
+    }
+
+    #[test]
+    fn first_administrator_seed_validates_and_never_replaces_an_existing_account() {
+        let root = temporary_directory("fresh-administrator");
+        assert!(seed_initial_administrator(&root, "bad user", "a long test password").is_err());
+        assert!(seed_initial_administrator(&root, "admin", "short").is_err());
+        assert!(!namespace_path(&root).exists());
+        assert_eq!(
+            seed_initial_administrator(&root, "admin", "a long test password").unwrap(),
+            AuthenticationSeedOutcome::Seeded
+        );
+        let before = std::fs::read(namespace_path(&root)).unwrap();
+        let state: Namespace = serde_json::from_slice(&before).unwrap();
+        let document: Document = serde_json::from_value(state.values[STATE_KEY].clone()).unwrap();
+        let credential = document.credential.unwrap();
+        assert_eq!(credential.username, "admin");
+        assert!(credential.legacy_salt.is_none());
+        assert!(crate::crypto::verify_password(
+            "a long test password",
+            &credential.password_hash
+        ));
+        assert!(!String::from_utf8_lossy(&before).contains("a long test password"));
+        assert_eq!(
+            seed_initial_administrator(&root, "other", "another long password").unwrap(),
+            AuthenticationSeedOutcome::ExistingAmaterasuState
+        );
+        assert_eq!(std::fs::read(namespace_path(&root)).unwrap(), before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn first_enrollment_handoff_contains_a_short_lived_code_only_once() {
+        let root = temporary_directory("fresh-enrollment");
+        assert_eq!(
+            seed_initial_enrollment(&root).unwrap(),
+            AuthenticationSeedOutcome::Seeded
+        );
+        let handoff_path = root.join("first-admin-enrollment.json");
+        let handoff: Value =
+            serde_json::from_slice(&std::fs::read(&handoff_path).unwrap()).unwrap();
+        let code = handoff["code"].as_str().unwrap();
+        let namespace = read_namespace(&namespace_path(&root)).unwrap();
+        let stored: Document = serde_json::from_value(namespace.values[STATE_KEY].clone()).unwrap();
+        let enrollment = stored.enrollment.unwrap();
+        assert_eq!(enrollment.code_digest, crate::crypto::token_digest(code));
+        assert_eq!(handoff["expires_at"], enrollment.expires_at);
+        assert!(
+            !std::fs::read_to_string(namespace_path(&root))
+                .unwrap()
+                .contains(code)
+        );
+        assert_eq!(
+            seed_initial_enrollment(&root).unwrap(),
+            AuthenticationSeedOutcome::Seeded
+        );
+        assert_eq!(
+            std::fs::read(&handoff_path).unwrap(),
+            serde_json::to_vec(&handoff).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn seeded_code_is_accepted_once_by_the_real_enrollment_engine() {
+        let root = temporary_directory("seeded-enrollment-engine");
+        seed_initial_enrollment(&root).unwrap();
+        let handoff = read_enrollment_handoff(&root.join("first-admin-enrollment.json"))
+            .unwrap()
+            .unwrap();
+        let namespace = read_namespace(&namespace_path(&root)).unwrap();
+        let document: Document =
+            serde_json::from_value(namespace.values[STATE_KEY].clone()).unwrap();
+        let operation = Operation::EnrollFirstAdmin {
+            code: handoff.code,
+            username: "admin".into(),
+            password: "a long test password".into(),
+        };
+        let mut engine = crate::engine::Engine::new(crate::protocol::Settings::default());
+        let now = handoff.expires_at - 1;
+        engine
+            .admit("amaterasu.management", &operation, now)
+            .unwrap();
+        let result = engine
+            .apply(
+                "amaterasu.management",
+                operation,
+                document,
+                SessionDocument::default(),
+                LegacyApiTokenStore::default(),
+                now,
+            )
+            .unwrap();
+        let crate::engine::Change::WriteDocument { document, .. } = result else {
+            panic!("enrollment did not commit a document")
+        };
+        assert!(document.enrollment.is_none());
+        assert_eq!(document.accounts.len(), 1);
+        assert_eq!(document.accounts[0].username, "admin");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn first_enrollment_does_not_touch_an_existing_administrator() {
+        let root = temporary_directory("existing-admin-enrollment");
+        seed_initial_administrator(&root, "admin", "a long test password").unwrap();
+        let before = std::fs::read(namespace_path(&root)).unwrap();
+        assert_eq!(
+            seed_initial_enrollment(&root).unwrap(),
+            AuthenticationSeedOutcome::ExistingAmaterasuState
+        );
+        assert_eq!(std::fs::read(namespace_path(&root)).unwrap(), before);
+        assert!(!root.join("first-admin-enrollment.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn first_enrollment_refuses_tampered_handoff_and_orphaned_state() {
+        let root = temporary_directory("tampered-enrollment");
+        seed_initial_enrollment(&root).unwrap();
+        let namespace_before = std::fs::read(namespace_path(&root)).unwrap();
+        let handoff = root.join("first-admin-enrollment.json");
+        std::fs::write(&handoff, br#"{"code":"tampered","expires_at":1}"#).unwrap();
+        assert!(seed_initial_enrollment(&root).is_err());
+        assert_eq!(
+            std::fs::read(namespace_path(&root)).unwrap(),
+            namespace_before
+        );
+        let _ = std::fs::remove_dir_all(root);
+
+        let root = temporary_directory("orphaned-enrollment");
+        let path = namespace_path(&root);
+        create_private_directory(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"format_version":1,"revision":1,"values":{"unrelated":{}}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(seed_initial_enrollment(&root).is_err());
+        assert!(!root.join("first-admin-enrollment.json").exists());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_enrollment_is_renewed_and_interrupted_publish_is_recovered() {
+        let root = temporary_directory("renew-enrollment");
+        seed_initial_enrollment(&root).unwrap();
+        let path = namespace_path(&root);
+        let handoff_path = root.join("first-admin-enrollment.json");
+        let mut handoff: EnrollmentHandoff =
+            serde_json::from_slice(&std::fs::read(&handoff_path).unwrap()).unwrap();
+        let mut namespace = read_namespace(&path).unwrap();
+        let mut document: Document =
+            serde_json::from_value(namespace.values[STATE_KEY].clone()).unwrap();
+        document.enrollment.as_mut().unwrap().expires_at = 1;
+        handoff.expires_at = 1;
+        namespace
+            .values
+            .insert(STATE_KEY.into(), serde_json::to_value(document).unwrap());
+        write_json_atomically(&path, &namespace).unwrap();
+        write_json_atomically(&handoff_path, &handoff).unwrap();
+        seed_initial_enrollment(&root).unwrap();
+        let renewed = read_enrollment_handoff(&handoff_path).unwrap().unwrap();
+        assert_ne!(renewed.code, handoff.code);
+        assert!(renewed.expires_at > 1);
+
+        let pending_path = root.join("first-admin-enrollment.pending.json");
+        let (code, code_digest) = crate::crypto::issue_bearer().unwrap();
+        let pending = EnrollmentHandoff {
+            code,
+            expires_at: renewed.expires_at,
+        };
+        write_new_enrollment_handoff(&pending_path, &pending).unwrap();
+        let mut namespace = read_namespace(&path).unwrap();
+        let mut document: Document =
+            serde_json::from_value(namespace.values[STATE_KEY].clone()).unwrap();
+        document.enrollment = Some(Enrollment {
+            code_digest,
+            expires_at: pending.expires_at,
+        });
+        namespace
+            .values
+            .insert(STATE_KEY.into(), serde_json::to_value(document).unwrap());
+        namespace.revision += 1;
+        write_json_atomically(&path, &namespace).unwrap();
+        seed_initial_enrollment(&root).unwrap();
+        assert_eq!(
+            read_enrollment_handoff(&handoff_path)
+                .unwrap()
+                .unwrap()
+                .code,
+            pending.code
+        );
+        assert!(!pending_path.exists());
+        let lock = RootLock::acquire(&root).unwrap();
+        assert!(seed_initial_enrollment(&root).is_err());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

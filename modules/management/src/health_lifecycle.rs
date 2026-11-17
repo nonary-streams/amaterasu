@@ -40,6 +40,8 @@ pub(crate) struct OperationalHealth {
     child: Child,
     finishing: Option<Value>,
     parent_finished: bool,
+    authentication_verifier: bool,
+    pairing_host_id: Option<String>,
 }
 
 impl OperationalHealth {
@@ -52,6 +54,8 @@ impl OperationalHealth {
             child: Child::None,
             finishing: None,
             parent_finished: false,
+            authentication_verifier: false,
+            pairing_host_id: None,
         }
     }
 
@@ -185,9 +189,11 @@ impl OperationalHealth {
                         } else if let Some(next) = self.next_probe() {
                             self.probe = next;
                         } else {
-                            self.finishing = Some(
-                                json!({"ok":true,"authentication_verifier":true,"catalog_loaded":true,"pairing_identity":true}),
-                            );
+                            self.finishing = Some(if self.authentication_verifier {
+                                json!({"ok":true,"authentication_verifier":true,"catalog_loaded":true,"pairing_identity":true,"host_id":self.pairing_host_id})
+                            } else {
+                                json!({"ok":false,"code":"first_administrator_not_configured","authentication_verifier":false,"catalog_loaded":true,"pairing_identity":true,"host_id":self.pairing_host_id})
+                            });
                         }
                     }
                 } else {
@@ -261,14 +267,26 @@ impl OperationalHealth {
         }
     }
 
-    fn healthy(&self, payload: &Value) -> bool {
+    fn healthy(&mut self, payload: &Value) -> bool {
         payload.get("ok").and_then(Value::as_bool) == Some(true)
             && match self.probe {
                 Probe::Authentication => {
-                    payload.get("verifier_available").and_then(Value::as_bool) == Some(true)
+                    match payload.get("verifier_available").and_then(Value::as_bool) {
+                        Some(available) => {
+                            self.authentication_verifier = available;
+                            true
+                        }
+                        None => false,
+                    }
                 }
                 Probe::Catalog => payload.get("entries").and_then(Value::as_array).is_some(),
-                Probe::Pairing => payload.get("host_id").and_then(Value::as_str).is_some(),
+                Probe::Pairing => {
+                    self.pairing_host_id = payload
+                        .get("host_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    self.pairing_host_id.is_some()
+                }
             }
     }
 
@@ -368,6 +386,47 @@ mod tests {
             .filter(|c| matches!(c, Command::ReleaseResult { request: 1 }))
             .count();
         assert_eq!(first_releases, 2);
+    }
+
+    #[test]
+    fn reports_uninitialized_administrator_only_after_catalog_and_pairing_are_verified() {
+        let now = Instant::now();
+        let mut check = OperationalHealth::new(7, 5_000, now);
+        let mut next_id = 0;
+        let mut completed = None;
+        let mut send = |command: Command| {
+            Ok(match command {
+                Command::Request { .. } => {
+                    next_id += 1;
+                    Response::Accepted { id: next_id }
+                }
+                Command::TakeResult { request } => Response::Result {
+                    payload: match request {
+                        1 => json!({"ok":true,"verifier_available":false}),
+                        2 => json!({"ok":true,"entries":[]}),
+                        _ => json!({"ok":true,"host_id":"host"}),
+                    },
+                },
+                Command::ReleaseResult { .. } => Response::Ok,
+                Command::Complete { payload, .. } => {
+                    completed = Some(payload);
+                    Response::Ok
+                }
+                _ => panic!("unexpected command"),
+            })
+        };
+        for _ in 0..30 {
+            if check.advance(now, &mut send) {
+                break;
+            }
+        }
+        assert_eq!(
+            completed,
+            Some(
+                json!({"ok":false,"code":"first_administrator_not_configured","authentication_verifier":false,"catalog_loaded":true,"pairing_identity":true,"host_id":"host"})
+            )
+        );
+        assert_eq!(next_id, 3);
     }
 
     #[test]
