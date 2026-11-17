@@ -94,6 +94,29 @@ impl Pipeline {
                             action,
                         });
                     }
+                    Ok(Response::Pending)
+                        if matches!(
+                            &action,
+                            HostResultAction::Readiness
+                                | HostResultAction::Get
+                                | HostResultAction::PairingState
+                        ) =>
+                    {
+                        // The provider may stop admitting queued work during its
+                        // own shutdown announcement. These exact reads have no
+                        // mutation/retirement authority: cancel their broker
+                        // bookkeeping, then retain the release acknowledgement.
+                        // Delivered provider work still drains at that provider.
+                        if result_released(send(Command::Cancel { request })) {
+                            self.host_result = Some(RetainedHostResult {
+                                request,
+                                response: Response::error("cancelled", "shutdown read cancelled"),
+                                action,
+                            });
+                        } else {
+                            ready = false;
+                        }
+                    }
                     _ => ready = false,
                 }
             }
@@ -556,6 +579,143 @@ mod retained_read_tests {
         );
         assert!(pipeline.quiesce_broker(|command| {
             assert!(matches!(command, Command::ReleaseResult { request: 92 }));
+            Ok(Response::Ok)
+        }));
+    }
+}
+
+#[cfg(test)]
+mod queued_host_read_tests {
+    use super::*;
+    use amaterasu_contracts::{Grants, RuntimeConfig};
+    use amaterasu_runtime::Broker;
+
+    fn broker_read(delivered: bool, action: &HostResultAction) -> (Broker, u64) {
+        let (service, payload) = match action {
+            HostResultAction::Readiness => {
+                (HOST_CONFIGURATION_SERVICE, json!({"action":"readiness"}))
+            }
+            HostResultAction::Get => (HOST_CONFIGURATION_SERVICE, json!({"action":"get"})),
+            HostResultAction::PairingState => (STATE_SERVICE, json!({"action":"snapshot"})),
+            HostResultAction::MarkerDelete => panic!("mutation is not a read fixture"),
+        };
+        let mut config = RuntimeConfig::default();
+        config.principals.insert(
+            "pairing".into(),
+            Grants {
+                call: [service.into()].into(),
+                ..Default::default()
+            },
+        );
+        config.principals.insert(
+            "host".into(),
+            Grants {
+                provide: [service.into()].into(),
+                ..Default::default()
+            },
+        );
+        let mut broker = Broker::new(config).unwrap();
+        assert!(matches!(
+            broker.dispatch(
+                "host",
+                Command::Register {
+                    service: service.into()
+                }
+            ),
+            Response::Ok
+        ));
+        let Response::Accepted { id } = broker.dispatch(
+            "pairing",
+            Command::Request {
+                service: service.into(),
+                payload,
+                timeout_ms: HOST_CONFIGURATION_TIMEOUT_MS,
+                operation_id: "shutdown-read".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("read must be admitted")
+        };
+        if delivered {
+            assert!(
+                matches!(broker.dispatch("host", Command::Poll {}), Response::Request { id: actual, .. } if actual == id)
+            );
+        }
+        (broker, id)
+    }
+
+    #[test]
+    fn shutdown_retires_queued_and_delivered_reads_without_a_provider_poll() {
+        for delivered in [false, true] {
+            for action in [
+                HostResultAction::Readiness,
+                HostResultAction::Get,
+                HostResultAction::PairingState,
+            ] {
+                let (mut broker, request) = broker_read(delivered, &action);
+                let mut pipeline = Pipeline::new(Settings::default());
+                pipeline.host_configuration = match action {
+                    HostResultAction::Readiness => {
+                        HostConfigurationState::WaitingReadiness(request)
+                    }
+                    HostResultAction::Get => HostConfigurationState::WaitingGet(request),
+                    _ => HostConfigurationState::WaitingPairingState {
+                        request,
+                        snapshot: PairingStateSnapshot {
+                            paths: EffectiveIdentityPaths {
+                                provider_revision: 1,
+                                certificate_path: "cert".into(),
+                                private_key_path: "key".into(),
+                            },
+                            revision: None,
+                            cursor: None,
+                            values: Map::new(),
+                        },
+                    },
+                };
+                pipeline.prepare_shutdown();
+                assert!(
+                    pipeline.quiesce_broker(|command| Ok(broker.dispatch("pairing", command))),
+                    "delivered={delivered}"
+                );
+                assert!(matches!(
+                    pipeline.host_configuration,
+                    HostConfigurationState::Disabled
+                ));
+                assert!(pipeline.host_result.is_none());
+                assert!(matches!(
+                    broker.dispatch("host", Command::Poll {}),
+                    Response::Pending
+                ));
+                assert!(
+                    matches!(broker.dispatch("pairing", Command::TakeResult { request }), Response::Error { code, .. } if code == "not_found")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_retains_read_until_cancel_and_release_are_acknowledged() {
+        let mut pipeline = Pipeline::new(Settings::default());
+        pipeline.host_configuration = HostConfigurationState::WaitingReadiness(97);
+        assert!(!pipeline.quiesce_broker(|command| match command {
+            Command::TakeResult { request: 97 } => Ok(Response::Pending),
+            Command::Cancel { request: 97 } => Err("lost cancel acknowledgement".into()),
+            _ => panic!("uncertain cancel must not release"),
+        }));
+        assert!(matches!(
+            pipeline.host_configuration,
+            HostConfigurationState::WaitingReadiness(97)
+        ));
+        assert!(!pipeline.quiesce_broker(|command| match command {
+            Command::TakeResult { request: 97 } => Ok(Response::Pending),
+            Command::Cancel { request: 97 } => Ok(Response::Ok),
+            Command::ReleaseResult { request: 97 } => Err("lost release acknowledgement".into()),
+            _ => panic!("unexpected command"),
+        }));
+        assert!(pipeline.host_result.is_some());
+        assert!(pipeline.quiesce_broker(|command| {
+            assert!(matches!(command, Command::ReleaseResult { request: 97 }));
             Ok(Response::Ok)
         }));
     }
