@@ -871,10 +871,16 @@ fn authenticated_start_accepts_matching_encryption_snapshot_and_rejects_mismatch
     let mut mismatched = arm(id);
     mismatched["configuration"]["encrypt_video"] = json!(false);
     mismatched["configuration"]["encrypt_audio"] = json!(true);
-    assert_eq!(
-        host.response(2, mismatched)["code"],
-        "encryption_configuration_mismatch"
-    );
+    let refusal = host.response(2, mismatched);
+    assert_eq!(refusal["code"], "encryption_configuration_mismatch");
+    assert_eq!(refusal["stream_failure"]["operation"], format!("ss-{id:x}"));
+    assert_eq!(refusal["stream_failure"]["layer"], "stream_session");
+    assert_eq!(refusal["stream_failure"]["phase"], "start");
+    assert_eq!(refusal["state"], "prepared");
+    let report: amaterasu_module_sdk::stream_lifecycle::StreamIssue =
+        serde_json::from_value(refusal["stream_failure"].clone()).unwrap();
+    assert!(!report.is_critical());
+    assert!(report.valid());
     assert_eq!(host.pipeline.records[&id].state, State::Prepared);
     assert!(host.pipeline.records[&id].start.is_none());
 

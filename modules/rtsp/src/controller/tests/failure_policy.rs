@@ -274,31 +274,63 @@ fn noncritical_reports_cannot_close_or_fence_a_playing_rtsp_ticket() {
 #[test]
 fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
     use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
-    for scenario in ["warning", "critical", "wrong_scope"] {
+    for scenario in [
+        "warning",
+        "critical",
+        "wrong_scope",
+        "local_warning",
+        "local_critical",
+        "wrong_local_id",
+        "wrong_local_layer",
+        "wrong_local_phase",
+        "local_with_history",
+        "local_external",
+        "local_missing_session",
+        "local_wrong_reply_session",
+        "local_cleanup_error",
+    ] {
+        let continues = matches!(scenario, "warning" | "local_warning");
         let (mut controller, action) = prepared_controller();
         let mut record = controller.records.remove(&5).unwrap();
         record.state = State::Arming;
-        let operation = if scenario == "wrong_scope" {
-            "other-stream".into()
-        } else {
-            record.config.operation_id.clone()
+        record.config.history_activity_id = None;
+        if scenario == "local_with_history" {
+            record.config.history_activity_id = Some(record.config.operation_id.clone());
+        }
+        let prepare = record.config.prepare(&record.operation(), None);
+        if matches!(scenario, "local_warning" | "local_critical") {
+            assert!(prepare["history_activity_id"].is_null());
+            assert!(
+                prepare["rtsp_operation_id"].is_null(),
+                "exercise the real managed no-history payload"
+            );
+        }
+        if scenario == "local_external" {
+            record.config.lifecycle_capture_mode =
+                amaterasu_extension_api::CaptureBindingMode::External;
+        }
+        let operation = match scenario {
+            "wrong_scope" => "other-stream".into(),
+            "wrong_local_id" => "ss-18".into(),
+            "warning" | "critical" => record.config.operation_id.clone(),
+            _ => "ss-17".into(),
         };
-        let report = if scenario == "critical" {
-            StreamIssue::critical(
-                operation,
-                LifecycleLayer::StreamSession,
-                "start",
-                "required_resource_failed",
-            )
-            .because("native_failure")
+        let layer = if scenario == "wrong_local_layer" {
+            LifecycleLayer::Input
         } else {
-            StreamIssue::advisory(
-                operation,
-                LifecycleLayer::StreamSession,
-                "start",
-                "request_adjustment",
-            )
-            .because("retry_prepared_request")
+            LifecycleLayer::StreamSession
+        };
+        let phase = if scenario == "wrong_local_phase" {
+            "cleanup"
+        } else {
+            "start"
+        };
+        let report = if matches!(scenario, "critical" | "local_critical") {
+            StreamIssue::critical(operation, layer, phase, "required_resource_failed")
+                .because("native_failure")
+        } else {
+            StreamIssue::advisory(operation, layer, phase, "request_adjustment")
+                .because("retry_prepared_request")
         };
         let mut sealer = RtspSealer::new(&KEY, Direction::ClientToHost).unwrap();
         let mut client =
@@ -320,6 +352,19 @@ fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(1));
         };
+        let response_session = if scenario == "local_wrong_reply_session" {
+            Some(24)
+        } else if scenario == "local_missing_session" {
+            record.session = None;
+            None
+        } else {
+            Some(23)
+        };
+        let cleanup_error = if scenario == "local_cleanup_error" {
+            Some("native_cleanup_unconfirmed")
+        } else {
+            None
+        };
         controller.armed(
             &mut record,
             Job {
@@ -335,11 +380,11 @@ fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
                 network: Some((connection, action)),
                 deadline: 1000,
             },
-            &json!({"ok":false,"session":23,"state":"prepared","cleanup_error":null,
+            &json!({"ok":false,"session":response_session,"state":"prepared","cleanup_error":cleanup_error,
                 "code":report.code,"stream_failure":report}),
             10,
         );
-        if scenario == "warning" {
+        if continues {
             assert_eq!(record.state, State::Ready);
             assert_eq!(record.failure, None);
             assert_eq!(record.session, Some(23));
@@ -366,7 +411,7 @@ fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
             .open(&bytes)
             .unwrap()
             .plaintext;
-        let expected = if scenario == "warning" {
+        let expected = if continues {
             b"RTSP/1.0 455 ".as_slice()
         } else {
             b"RTSP/1.0 503 ".as_slice()
@@ -376,7 +421,7 @@ fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
             "{scenario}: {}",
             String::from_utf8_lossy(&reply)
         );
-        if scenario == "warning" {
+        if continues {
             assert_retained(&controller, State::Ready);
         }
     }

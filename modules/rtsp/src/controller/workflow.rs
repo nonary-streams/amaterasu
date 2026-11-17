@@ -577,7 +577,22 @@ impl Controller {
                     .ok()
                 })
                 .filter(|report| {
-                    report.operation == record.config.operation_id
+                    // Older managed preparations without optional history carry
+                    // only the selected session's local report identity. Bind
+                    // that exact child to this owner; never accept an arbitrary
+                    // advisory scope or infer native retirement from a report.
+                    let local_prepared_scope = record.config.history_activity_id.is_none()
+                        && record.config.lifecycle_capture_mode.is_managed()
+                        && record.session.is_some_and(|session| {
+                            response_session(payload) == Some(session)
+                                && report.operation == format!("ss-{session:x}")
+                        })
+                        && report.layer
+                            == amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession
+                        && report.phase == "start"
+                        && state == Some("prepared")
+                        && payload["cleanup_error"].is_null();
+                    (report.operation == record.config.operation_id || local_prepared_scope)
                         && report.valid()
                         && !report.reason.is_empty()
                 });

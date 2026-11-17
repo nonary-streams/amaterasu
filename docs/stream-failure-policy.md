@@ -135,3 +135,13 @@ condition; the SDK cannot infer a safe fallback from arbitrary provider code.
 The static inventory is a review aid, not a dominance proof, and skips symlinked
 provider source. Provider/platform paths need separate source and runtime review
 before claiming universal coverage.
+
+
+History-free managed preparations keep their existing wire schema. A prepared
+start refusal can be attributed by the selected provider's exact local session
+identity (`ss-<hex>`) when the reply matches the already owned session, layer and
+start phase, and confirms unchanged Prepared state with no cleanup error. The
+owner binds that report to its stream before the common decision. Another
+session, foreign scope, external capture or history-bound local alias is refused;
+a critical report remains critical. Optional history is not an identity or
+admission requirement.
