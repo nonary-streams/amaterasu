@@ -2313,6 +2313,15 @@ fn video_open_next_step(record: &Record) -> Step {
     }
 }
 
+fn invalidate_active_binding(record: &mut Record, job: &mut Job, code: &'static str, now: u64) {
+    record.plane = None;
+    record.input_events.clear();
+    record.input_timing.clear_queue();
+    record.lifecycle_delivery_permit = false;
+    record.lifecycle_control_permit = false;
+    job.fail(record, StreamFailure::requirement_failed(code), now);
+}
+
 #[cfg(test)]
 mod diagnostic_code_tests {
     use super::safe_dependency_code;
@@ -2337,13 +2346,4 @@ mod diagnostic_code_tests {
             "unavailable"
         );
     }
-}
-
-fn invalidate_active_binding(record: &mut Record, job: &mut Job, code: &'static str, now: u64) {
-    record.plane = None;
-    record.input_events.clear();
-    record.input_timing.clear_queue();
-    record.lifecycle_delivery_permit = false;
-    record.lifecycle_control_permit = false;
-    job.fail(record, StreamFailure::requirement_failed(code), now);
 }

@@ -506,15 +506,15 @@ impl Controller {
         let accepted = job.caller.is_some_and(|request| {
             rpc::active(runtime, request) && rpc::complete(runtime, request, record.response())
         });
-        if !accepted {
-            if record.close(Some(
+        if !accepted
+            && record.close(Some(
                 amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "completion_unavailable",
                 ),
-            )) {
-                self.revoke_ticket(record.id);
-                self.schedule_stop(record, None, now);
-            }
+            ))
+        {
+            self.revoke_ticket(record.id);
+            self.schedule_stop(record, None, now);
         }
     }
 
