@@ -10,11 +10,10 @@ adapter; existing v1 providers remain usable.
 These summaries are debug records. A window is written every ten seconds
 whether or not anything happened, and a full set of them is about a megabyte a
 minute, which would push real events out of the rolled host log within
-minutes. A host records them when its minimum log level is `debug`: set
-`min_log_level` to `debug` in the bootstrap's `global` settings, or run a
-prerelease build, whose default it is. The default log keeps events, including
-the slow flows and spans of [flow tracing](flow-tracing.md). A module emits a
-window with `diagnostics::log_window`, which applies this level.
+minutes. To record them, select **Debug** as the host log level or set
+`min_log_level` to `debug` in the bootstrap's `global` settings. The
+[flow tracing](flow-tracing.md) reports also use Debug in the log. A module
+emits a window with `diagnostics::log_window`, which applies this level.
 
 These records are per-module aggregates. To follow one input event or frame
 across modules, and to see which module held the host thread while it waited,

@@ -341,8 +341,7 @@ fn validate_configuration_shape(payload: &Value) -> Result<(), String> {
         return Err("host configuration minimum log level is invalid".into());
     }
     let effective_level = effective.get("min_log_level").and_then(Value::as_str);
-    // The host configuration provider resolves product_default using its own
-    // product channel. Diagnostics may be built at a different package version.
+    // Older host configuration providers can resolve a prerelease default to debug.
     let matches_selection = match selected_level {
         Some("product_default") => matches!(effective_level, Some("info" | "debug")),
         Some(selected) => effective_level == Some(selected),

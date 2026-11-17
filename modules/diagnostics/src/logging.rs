@@ -58,7 +58,7 @@ impl LoggingSettings {
 
         let minimum_level = raw
             .min_log_level
-            .unwrap_or_else(|| default_minimum_level(env!("CARGO_PKG_VERSION_PRE")));
+            .unwrap_or(MinimumLevel::PRODUCT_DEFAULT.value());
         if minimum_level > 6 {
             return Err("host minimum log level must be between 0 and 6".into());
         }
@@ -100,13 +100,12 @@ impl LoggingSettings {
             .get("effective")
             .and_then(Value::as_object)
             .ok_or("host configuration effective values are not an object")?;
-        let default_level = MinimumLevel::default_for_version(env!("CARGO_PKG_VERSION"));
         let minimum_level = MinimumLevel::parse_checked(
             effective
                 .get("min_log_level")
                 .and_then(Value::as_str)
                 .ok_or("host configuration omitted effective min_log_level")?,
-            default_level,
+            MinimumLevel::PRODUCT_DEFAULT,
         )?
         .value();
         let state_root = state_root
@@ -119,10 +118,6 @@ impl LoggingSettings {
             "state_root":state_root,
         }))
     }
-}
-
-fn default_minimum_level(prerelease: &str) -> u8 {
-    MinimumLevel::default_for_prerelease(prerelease).value()
 }
 
 #[derive(Default)]
@@ -617,22 +612,10 @@ mod tests {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn default_minimum_level_matches_stable_and_prerelease_channels() {
-        assert_eq!(default_minimum_level(""), 2);
-        assert_eq!(default_minimum_level("stable.4"), 2);
-        assert_eq!(default_minimum_level("StAbLe.rc1"), 2);
-        assert_eq!(default_minimum_level("alpha.1"), 1);
-        assert_eq!(default_minimum_level("1.0"), 1);
-    }
-
-    #[test]
-    fn from_value_uses_the_package_version_channel_by_default() {
+    fn from_value_defaults_to_info() {
         let settings = LoggingSettings::from_value(json!({})).unwrap();
 
-        assert_eq!(
-            settings.minimum_level,
-            default_minimum_level(env!("CARGO_PKG_VERSION_PRE"))
-        );
+        assert_eq!(settings.minimum_level, 2);
     }
 
     #[test]

@@ -328,7 +328,6 @@ impl Transport {
                 let Ok(connection) = Connection::new(socket, peer.ip(), self.now) else {
                     continue;
                 };
-                eprintln!("amaterasu rtsp connection accepted");
                 self.next_connection = id;
                 self.connections.insert(id, connection);
             }

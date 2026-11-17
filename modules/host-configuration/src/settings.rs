@@ -17,9 +17,8 @@ pub enum MinLogLevel {
 }
 
 impl MinLogLevel {
-    pub fn for_product_channel(self, package_version: &str) -> Self {
+    pub fn effective(self) -> Self {
         match self {
-            Self::ProductDefault if is_prerelease_channel(package_version) => Self::Debug,
             Self::ProductDefault => Self::Info,
             level => level,
         }
@@ -113,14 +112,6 @@ fn validate_path(field: &str, value: &str, empty_allowed: bool) -> Result<(), St
     Ok(())
 }
 
-pub fn is_prerelease_channel(package_version: &str) -> bool {
-    let Some((_, prerelease)) = package_version.split_once('-') else {
-        return false;
-    };
-    let identifier = prerelease.split(['.', '+']).next().unwrap_or_default();
-    !identifier.is_empty() && !identifier.eq_ignore_ascii_case("stable")
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
@@ -192,14 +183,8 @@ mod tests {
         assert_eq!(settings.cert, "credentials/cacert.pem");
         assert_eq!(settings.log_path, "amaterasu.log");
         assert_eq!(settings.min_log_level, MinLogLevel::ProductDefault);
-        assert_eq!(
-            settings.min_log_level.for_product_channel("1.2.3-stable.1"),
-            MinLogLevel::Info
-        );
-        assert_eq!(
-            settings.min_log_level.for_product_channel("1.2.3-beta.1"),
-            MinLogLevel::Debug
-        );
+        assert_eq!(settings.min_log_level.effective(), MinLogLevel::Info);
+        assert_eq!(MinLogLevel::Debug.effective(), MinLogLevel::Debug);
     }
 
     #[test]

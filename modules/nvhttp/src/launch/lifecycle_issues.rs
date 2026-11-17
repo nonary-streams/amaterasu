@@ -122,7 +122,7 @@ pub(super) fn label(value: impl Debug) -> String {
     label
 }
 
-fn plain_code(code: &str) -> bool {
+pub(super) fn plain_code(code: &str) -> bool {
     !code.is_empty()
         && code.len() <= PROVIDER_CODE_LIMIT
         && code

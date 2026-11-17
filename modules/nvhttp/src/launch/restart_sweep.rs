@@ -8,10 +8,11 @@
 //! separate broker call and never delays a launch.
 use super::Send;
 use super::call::{Call, Outcome};
+use super::lifecycle_issues::plain_code;
 use amaterasu_module_sdk::LogLevel;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const LIFECYCLE_SERVICE: &str = "amaterasu.session-lifecycle/1";
@@ -23,9 +24,9 @@ const MAX_CANDIDATES: usize = 128;
 /// A truncated listing is resumed only after progress, and at most this often,
 /// so sessions the coordinator keeps refusing cannot loop the sweep.
 const MAX_LISTING_ROUNDS: u8 = 8;
+const MAX_LOGGED_REASONS: usize = 8;
 
-/// Fixed, identity-free events for the controller's log.
-pub(super) type SweepEvent = (LogLevel, &'static str);
+pub(super) type SweepEvent = (LogLevel, String);
 
 /// A session this owner created in an earlier host epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,11 +51,8 @@ enum Step {
         attempts: u8,
     },
     Abandoning {
-        current_epoch: String,
-        remaining: VecDeque<StrandedSession>,
-        active: Option<ActiveCall>,
-        listing_truncated: bool,
-        abandoned_any: bool,
+        round: Abandoning,
+        active: Option<AbandonmentCall>,
     },
     Idle,
 }
@@ -64,7 +62,28 @@ struct Abandoning {
     current_epoch: String,
     remaining: VecDeque<StrandedSession>,
     listing_truncated: bool,
-    abandoned_any: bool,
+    accepted: usize,
+    failures: BTreeMap<(&'static str, String), usize>,
+    other_failures: usize,
+}
+
+impl Abandoning {
+    fn record_failure(&mut self, source: &'static str, reason: &str) {
+        let key = (source, reason.to_owned());
+        if let Some(count) = self.failures.get_mut(&key) {
+            *count += 1;
+        } else if self.failures.len() < MAX_LOGGED_REASONS {
+            self.failures.insert(key, 1);
+        } else {
+            self.other_failures += 1;
+        }
+    }
+}
+
+struct AbandonmentCall {
+    active: ActiveCall,
+    operation_id: String,
+    generation: u64,
 }
 
 pub(super) struct RestartSweep {
@@ -124,30 +143,14 @@ impl RestartSweep {
                 None
             }
             Step::Snapshot { active, attempts } => self.poll_snapshot(active, attempts, now, send),
-            Step::Abandoning {
-                current_epoch,
-                remaining,
-                active,
-                listing_truncated,
-                abandoned_any,
-            } => self.poll_abandoning(
-                Abandoning {
-                    current_epoch,
-                    remaining,
-                    listing_truncated,
-                    abandoned_any,
-                },
-                active,
-                now,
-                send,
-            ),
+            Step::Abandoning { round, active } => self.poll_abandoning(round, active, now, send),
         }
     }
 
     pub(super) fn shutdown(&mut self, send: &mut Send<'_>) {
         let active = match &mut self.step {
             Step::Snapshot { active, .. } => Some(active),
-            Step::Abandoning { active, .. } => active.as_mut(),
+            Step::Abandoning { active, .. } => active.as_mut().map(|attempt| &mut attempt.active),
             _ => None,
         };
         if let Some(active) = active {
@@ -189,20 +192,34 @@ impl RestartSweep {
             Outcome::Result(payload) => {
                 active.call.release_result(send);
                 let Some((current_epoch, stranded)) = stranded_sessions(&payload) else {
-                    return Some((LogLevel::Warning, "restart_sweep snapshot_invalid"));
+                    let reason = if payload["status"] == "ok" {
+                        "invalid_snapshot"
+                    } else {
+                        provider_reason(&payload)
+                    };
+                    return Some((
+                        LogLevel::Warning,
+                        format!(
+                            "Restart recovery could not list sessions. source=coordinator reason={reason}"
+                        ),
+                    ));
                 };
                 if stranded.is_empty() {
-                    return Some((LogLevel::Debug, "restart_sweep none_stranded"));
+                    return None;
                 }
                 self.listing_rounds = self.listing_rounds.saturating_add(1);
                 self.step = Step::Abandoning {
-                    current_epoch,
-                    remaining: stranded.into(),
+                    round: Abandoning {
+                        current_epoch,
+                        remaining: stranded.into(),
+                        listing_truncated: payload["truncated"] == true,
+                        accepted: 0,
+                        failures: BTreeMap::new(),
+                        other_failures: 0,
+                    },
                     active: None,
-                    listing_truncated: payload["truncated"] == true,
-                    abandoned_any: false,
                 };
-                Some((LogLevel::Info, "restart_sweep abandoning_stranded_sessions"))
+                None
             }
             Outcome::Rejected | Outcome::Settled if attempts < MAX_SNAPSHOT_ATTEMPTS => {
                 // Session lifecycle may not have registered its service yet.
@@ -212,16 +229,20 @@ impl RestartSweep {
                 };
                 None
             }
-            Outcome::Rejected | Outcome::Settled | Outcome::Uncertain => {
-                Some((LogLevel::Warning, "restart_sweep lifecycle_unavailable"))
-            }
+            outcome @ (Outcome::Rejected | Outcome::Settled | Outcome::Uncertain) => Some((
+                LogLevel::Warning,
+                format!(
+                    "Restart recovery could not list sessions. source=broker reason={} attempts={attempts}",
+                    broker_reason(&outcome, &active.call),
+                ),
+            )),
         }
     }
 
     fn poll_abandoning(
         &mut self,
         mut round: Abandoning,
-        active: Option<ActiveCall>,
+        active: Option<AbandonmentCall>,
         now: Instant,
         send: &mut Send<'_>,
     ) -> Option<SweepEvent> {
@@ -234,38 +255,76 @@ impl RestartSweep {
                 abandon_call(&round.current_epoch, &session, now)
             }
         };
-        let (active, event) = match poll_call(&mut active, now, send) {
-            Outcome::Waiting => (Some(active), None),
-            Outcome::Result(payload) => {
-                active.call.release_result(send);
-                round.abandoned_any |= abandonment_accepted(&payload);
-                (None, Some(abandonment_event(&payload)))
+        let outcome = poll_call(&mut active.active, now, send);
+        let (source, reason) = match &outcome {
+            Outcome::Waiting => {
+                self.step = Step::Abandoning {
+                    round,
+                    active: Some(active),
+                };
+                return None;
             }
-            Outcome::Rejected | Outcome::Settled | Outcome::Uncertain => (
-                None,
-                Some((LogLevel::Warning, "restart_sweep abandonment_unconfirmed")),
-            ),
+            Outcome::Result(payload) => {
+                active.active.call.release_result(send);
+                if abandonment_accepted(payload) {
+                    round.accepted += 1;
+                    self.step = Step::Abandoning {
+                        round,
+                        active: None,
+                    };
+                    return None;
+                }
+                ("coordinator", provider_reason(payload))
+            }
+            outcome => ("broker", broker_reason(outcome, &active.active.call)),
         };
+        round.record_failure(source, reason);
         self.step = Step::Abandoning {
-            current_epoch: round.current_epoch,
-            remaining: round.remaining,
-            active,
-            listing_truncated: round.listing_truncated,
-            abandoned_any: round.abandoned_any,
+            round,
+            active: None,
         };
-        event
+        Some((
+            LogLevel::Debug,
+            format!(
+                "Restart recovery request failed. operation={} generation={} source={source} reason={reason}",
+                active.operation_id, active.generation,
+            ),
+        ))
     }
 
     /// Ask for the rest of a truncated listing once this round made progress.
     fn finish_round(&mut self, round: &Abandoning) -> SweepEvent {
-        if round.listing_truncated
-            && round.abandoned_any
-            && self.listing_rounds < MAX_LISTING_ROUNDS
-        {
+        let will_continue = round.listing_truncated
+            && round.accepted > 0
+            && self.listing_rounds < MAX_LISTING_ROUNDS;
+        if will_continue {
             self.step = awaiting_snapshot();
-            return (LogLevel::Info, "restart_sweep listing_continues");
         }
-        (LogLevel::Info, "restart_sweep complete")
+        let failed = round.failures.values().sum::<usize>() + round.other_failures;
+        let mut reasons = round
+            .failures
+            .iter()
+            .map(|((source, reason), count)| format!("{source}.{reason}={count}"))
+            .collect::<Vec<_>>();
+        if round.other_failures > 0 {
+            reasons.push(format!("other={}", round.other_failures));
+        }
+        let level = if failed > 0 || (round.listing_truncated && !will_continue) {
+            LogLevel::Warning
+        } else {
+            LogLevel::Debug
+        };
+        (
+            level,
+            format!(
+                "Restart recovery processed stranded sessions. round={} accepted={} failed={failed} listing_truncated={} will_continue={} reasons=[{}]",
+                self.listing_rounds,
+                round.accepted,
+                round.listing_truncated,
+                will_continue,
+                reasons.join(", "),
+            ),
+        )
     }
 }
 
@@ -317,14 +376,23 @@ fn stranded_sessions(payload: &Value) -> Option<(String, Vec<StrandedSession>)> 
 
 /// The operation ID is derived from the exact target, so a retried sweep in
 /// the same epoch replays the coordinator's receipt instead of acting twice.
-fn abandon_call(current_epoch: &str, session: &StrandedSession, now: Instant) -> ActiveCall {
+fn abandon_call(current_epoch: &str, session: &StrandedSession, now: Instant) -> AbandonmentCall {
     let operation_id = abandonment_operation_id(current_epoch, session);
     let payload = json!({"operation":"recover_session","restart_abandonment":true,"operation_id":operation_id,
         "target":{"kind":"session","host_epoch":current_epoch,
             "session_id":session.session_id,"generation":session.generation}});
-    ActiveCall {
-        call: Call::new(LIFECYCLE_SERVICE, payload, operation_id, CALL_TIMEOUT_MS),
-        deadline: now + CALL_DEADLINE,
+    AbandonmentCall {
+        active: ActiveCall {
+            call: Call::new(
+                LIFECYCLE_SERVICE,
+                payload,
+                operation_id.clone(),
+                CALL_TIMEOUT_MS,
+            ),
+            deadline: now + CALL_DEADLINE,
+        },
+        operation_id,
+        generation: session.generation,
     }
 }
 
@@ -350,17 +418,89 @@ fn abandonment_accepted(payload: &Value) -> bool {
     matches!(payload["status"].as_str(), Some("pending" | "succeeded"))
 }
 
-fn abandonment_event(payload: &Value) -> SweepEvent {
-    if abandonment_accepted(payload) {
-        (LogLevel::Info, "restart_sweep session_abandoned")
-    } else {
-        (LogLevel::Warning, "restart_sweep abandonment_refused")
+fn provider_reason(payload: &Value) -> &str {
+    payload["reason"]
+        .as_str()
+        .filter(|code| plain_code(code))
+        .unwrap_or("no_reason_code")
+}
+
+fn broker_reason<'a>(outcome: &Outcome, call: &'a Call) -> &'a str {
+    match outcome {
+        Outcome::Rejected => call
+            .rejection_code()
+            .filter(|code| plain_code(code))
+            .unwrap_or("request_rejected"),
+        Outcome::Settled => "request_settled_without_result",
+        _ => "request_settlement_unconfirmed",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amaterasu_module_sdk::{Command, Response};
+
+    #[test]
+    fn recovery_logs_one_warning_with_bounded_provider_and_broker_reasons() {
+        let mut sweep = RestartSweep::disabled("test".into());
+        sweep.enable();
+        let sessions: Vec<_> = (1..=5)
+            .map(|generation| {
+                json!({
+                    "session_id": format!("private-session-{generation}"),
+                    "host_epoch":"previous","generation":generation,"phase":"recovery_required"
+                })
+            })
+            .collect();
+        let now = Instant::now();
+        let events: Vec<_> = (0..32)
+            .filter_map(|_| sweep.poll(now, &mut |command| {
+                let reply = match command {
+                    Command::Request { payload, .. } if payload["operation"] == "snapshot" =>
+                        Response::Accepted { id: 10 },
+                    Command::Request { payload, .. } => {
+                        let id = payload["target"]["generation"].as_u64().unwrap();
+                        if id == 4 {
+                            Response::error("permission_denied", "private broker diagnostic")
+                        } else {
+                            Response::Accepted { id }
+                        }
+                    }
+                    Command::TakeResult { request } => Response::Result {
+                        payload: match request {
+                            10 => json!({"status":"ok","host_epoch":"current","sessions":sessions}),
+                            1 | 2 => json!({"status":"rejected","reason":"release_work_unavailable"}),
+                            3 => json!({"status":"rejected","reason":"private failure payload\n"}),
+                            5 => json!({"status":"pending"}),
+                            _ => panic!("unexpected request {request}"),
+                        },
+                    },
+                    Command::ReleaseResult { .. } => Response::Ok,
+                    unexpected => panic!("unexpected command: {unexpected:?}"),
+                };
+                Ok(reply)
+            }))
+            .collect();
+        assert_eq!(events.len(), 5);
+        assert!(
+            events[..4]
+                .iter()
+                .all(|(level, message)| *level == LogLevel::Debug
+                    && message.contains("operation=nvhttp-restart-abandon-"))
+        );
+        let (level, summary) = &events[4];
+        assert_eq!(*level, LogLevel::Warning);
+        assert!(summary.contains("accepted=1 failed=4"));
+        assert!(summary.contains("broker.permission_denied=1"));
+        assert!(summary.contains("coordinator.no_reason_code=1"));
+        assert!(summary.contains("coordinator.release_work_unavailable=2"));
+        assert!(
+            events
+                .iter()
+                .all(|(_, message)| !message.contains("private"))
+        );
+    }
 
     #[test]
     fn only_old_epoch_recovery_sessions_are_stranded() {

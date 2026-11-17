@@ -19,6 +19,7 @@ pub struct Call {
     result: Option<Value>,
     attempted: bool,
     first_sent: Option<Instant>,
+    rejection_code: Option<String>,
 }
 
 impl Call {
@@ -31,6 +32,7 @@ impl Call {
             result: None,
             attempted: false,
             first_sent: None,
+            rejection_code: None,
         }
     }
     pub fn release_result(&mut self, send: &mut Send<'_>) -> bool {
@@ -58,7 +60,12 @@ impl Call {
             result: None,
             attempted: false,
             first_sent: None,
+            rejection_code: None,
         }
+    }
+
+    pub(super) fn rejection_code(&self) -> Option<&str> {
+        self.rejection_code.as_deref()
     }
 
     pub fn cancel(&mut self) {
@@ -123,7 +130,10 @@ impl Call {
                     self.failures = 0;
                     Outcome::Waiting
                 }
-                Ok(Response::Error { .. }) if !self.cancelling => Outcome::Rejected,
+                Ok(Response::Error { code, .. }) if !self.cancelling => {
+                    self.rejection_code = Some(code);
+                    Outcome::Rejected
+                }
                 _ => {
                     // Admission may have committed. Only look up the exact
                     // operation; never dispatch a new mutation during cleanup.

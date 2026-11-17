@@ -77,10 +77,9 @@ The host reads `global.min_log_level` and `global.log_path` from its verified
 bootstrap policy once when each worker starts. `min_log_level` accepts
 `verbose`, `debug`, `info`, `warning`, `error`, `fatal`, and `none`, plus a
 numeric string beginning with `0` through `6`. Names are lowercase and exact;
-an unrecognized value keeps the default. The default is `debug` for a Cargo
-package version with a non-`stable` prerelease suffix, and `info` for stable
-versions. A `log_path` absent from configuration defaults to
-`<state_root>/amaterasu.log`. Relative custom paths resolve beneath the
+an unrecognized value keeps the default of `info`. A `log_path` absent
+from configuration defaults to `<state_root>/amaterasu.log`. Relative custom
+paths resolve beneath the
 protected state root; parent traversal and symlink escapes are rejected.
 Absolute custom paths are allowed. A path that names an existing directory,
 or a path without an extension, selects a log directory. A file path selects a
@@ -160,10 +159,10 @@ durable update. Only the broker identity `amaterasu.host-configuration` may use
 this action. Diagnostics validates the full response shape, positive revision,
 effective log path against its trusted state root, and sink readiness before
 swapping the active policy. Success returns `{"ok":true,"applied_revision":N}`.
-Explicit saved log levels must match the effective level; `product_default`
-accepts the host provider's stable `info` or prerelease `debug` result. Windows
-reparse points, including junctions, are rejected at the state root and in
-existing relative log path components.
+Explicit saved log levels must match the effective level. Diagnostics accepts
+`info` for `product_default` and also accepts `debug` from older prerelease
+host configuration providers. Windows reparse points, including junctions,
+are rejected at the state root and in existing relative log path components.
 An identical revision and policy is idempotent without reopening the sink;
 the acknowledgement requires healthy disk delivery (or an intentionally
 disabled sink). A failed sink returns `logging_unavailable` until a later

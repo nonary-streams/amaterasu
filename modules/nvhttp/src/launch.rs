@@ -937,7 +937,7 @@ impl Controller {
         if let Some((level, event)) = self.restart_sweep.poll(now, send)
             && let Some(logger) = &self.logger
         {
-            let _ = logger.emit(level, "launch", event);
+            let _ = logger.emit(level, "launch", &event);
         }
     }
 

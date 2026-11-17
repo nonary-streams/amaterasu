@@ -5,7 +5,6 @@
 //! those, so this module reduces the retained history to what a person reads:
 //! the last minute merged into one summary, a half-hour trend as plain number
 //! columns, and the most recent slow moments.
-use super::collector::SLOW_SPAN_US;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -29,20 +28,6 @@ const HOST_WAIT: &str = "host.wait";
 
 fn count(value: &Value) -> u64 {
     value.as_u64().unwrap_or(0)
-}
-
-/// Whether a collected report belongs in the default log. A window is written
-/// every ten seconds whatever happened, and a flow or span only just over its
-/// limit is routine on a busy host; both are debug records. A flow or span at
-/// least twice over its limit is a pause a person would notice.
-pub(super) fn is_notable(target: &str, body: &Value) -> bool {
-    match target {
-        "trace.slow_flow" => {
-            count(&body["total_us"]) >= count(&body["budget_us"]).saturating_mul(2)
-        }
-        "trace.slow_span" => count(&body["us"]) >= SLOW_SPAN_US * 2,
-        _ => false,
-    }
 }
 
 /// Calls, total and worst of one stage, merged across windows. The 95th

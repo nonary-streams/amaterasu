@@ -61,9 +61,7 @@ pub fn effective_settings(
         pkey: resolve_path(&root, &settings.pkey)?,
         cert: resolve_path(&root, &settings.cert)?,
         log_path: resolve_path(&root, &settings.log_path)?,
-        min_log_level: settings
-            .min_log_level
-            .for_product_channel(env!("CARGO_PKG_VERSION")),
+        min_log_level: settings.min_log_level.effective(),
     })
 }
 

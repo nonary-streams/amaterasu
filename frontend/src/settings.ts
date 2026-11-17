@@ -3478,7 +3478,7 @@ namespace Amaterasu {
         });
         refresh.disabled = !context.api.allows("diagnostics.read");
         form.append(
-          field("Minimum log level", level, "Product default uses the release channel's policy. Diagnostic records below this level are filtered."),
+          field("Minimum log level", level, "Select Debug to include detailed performance diagnostics."),
           field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records when diagnostics confirms the policy."),
           el("p", "muted", settingsTextLiteral(`Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`)),
           el("p", "muted", "The host confirms logging application during save; diagnostics status checks disk delivery. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."),

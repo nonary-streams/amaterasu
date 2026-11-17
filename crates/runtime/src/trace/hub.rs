@@ -189,8 +189,7 @@ impl TraceHub {
         // The broker lock is taken once per batch of reports, never per record.
         if let Ok(mut broker) = broker.lock() {
             for report in reports {
-                let notable = report::is_notable(report.target, &report.body);
-                broker.record_diagnostic(notable, report.target, report.body.to_string());
+                broker.record_diagnostic(report.target, report.body.to_string());
             }
         }
     }
