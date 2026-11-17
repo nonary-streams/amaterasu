@@ -313,7 +313,8 @@ def exercise_private_peers():
             # The same actual LAN peer can read settings but not operational health.
             health = pc.request("GET", "/healthz")
             assert health == (200, {"ok": True, "authentication_verifier": True,
-                                    "catalog_loaded": True, "pairing_identity": True}), health
+                                    "catalog_loaded": True, "pairing_identity": True,
+                                    "host_id": identity["host_id"]}), health
             denied_health = lan.request("GET", "/healthz")
             assert denied_health == (403, {"ok": False, "code": "peer_denied"}), denied_health
             assert lan.request("POST", "/v1/management_settings/get")[0] == 401

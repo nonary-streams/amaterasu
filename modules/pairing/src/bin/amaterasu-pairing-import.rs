@@ -4,7 +4,9 @@
 //! converter without loading more than one `amaterasu_module_v1` export into a
 //! process. Errors deliberately contain no predecessor values or key material.
 
-use amaterasu_pairing::migration::{PairingSeedOutcome, import_legacy_pairing, seed_pairing_state};
+use amaterasu_pairing::migration::{
+    PairingSeedOutcome, import_legacy_pairing, seed_new_pairing_identity, seed_pairing_state,
+};
 use std::path::PathBuf;
 
 fn main() {
@@ -25,6 +27,18 @@ fn run() -> Result<(), &'static str> {
             "--state" => state = Some(PathBuf::from(arguments.next().ok_or("usage")?)),
             _ => return Err("usage"),
         }
+    }
+    if command == "initialize" && source.is_none() {
+        return match seed_new_pairing_identity(&state.ok_or("usage")?)? {
+            PairingSeedOutcome::Seeded => {
+                println!("seeded");
+                Ok(())
+            }
+            PairingSeedOutcome::ExistingAmaterasuState => {
+                println!("existing_amaterasu_state");
+                Ok(())
+            }
+        };
     }
     let source = source.ok_or("usage")?;
     let now = std::time::SystemTime::now()

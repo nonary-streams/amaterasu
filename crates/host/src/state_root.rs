@@ -13,6 +13,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 mod management_tls;
+mod runtime_access;
 mod seed;
 pub(crate) use management_tls::apply_staged_tls;
 pub(crate) use management_tls::protect_development_files;
@@ -222,7 +223,7 @@ pub(crate) fn validate_management_tls_acl(path: &Path) -> PackageResult<()> {
 }
 
 fn set_tls_stage_dacl(path: &Path, sid: &str) -> PackageResult<()> {
-    let sddl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;{sid})");
+    let sddl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;{sid})");
     apply_dacl(path, &sddl)?;
     validate_tls_stage_acl(path, sid)
 }
@@ -232,7 +233,7 @@ fn validate_tls_stage_acl(path: &Path, sid: &str) -> PackageResult<()> {
         path,
         &["S-1-5-18"],
         &[
-            (sid, 0x8000_0000),
+            (sid, 0x0012_0089),
             ("S-1-5-18", FILE_ALL_ACCESS),
             ("S-1-5-32-544", FILE_ALL_ACCESS),
         ],
@@ -396,6 +397,7 @@ pub(crate) fn prepare(
     if package.digest != digest || !package.signed {
         return Err("selected management TLS package is not authenticated".into());
     }
+    runtime_access::prepare(&root, digest, &sid)?;
     let active_tls = crate::loading::management_tls::active_file_names(&package.runtime_config)?;
     management_tls::stage_for_user(&root, &container, &sid, active_tls.as_ref())?;
 

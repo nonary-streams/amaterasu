@@ -598,6 +598,43 @@ fn prepare_installer_assets_with_key(
     output: &Path,
     signing_key: &SigningKey,
 ) -> PackageResult<()> {
+    let keys = BTreeMap::from([(
+        INSTALLER_KEY_ID.into(),
+        encode_hex(signing_key.verifying_key().as_bytes()),
+    )]);
+    let policy = installer_policy(WEB_DIRECTORY_TOKEN, keys.clone());
+    prepare_installer_assets_with_policy(artifacts, web_source, output, signing_key, keys, policy)
+}
+
+pub fn prepare_side_by_side_installer_assets(
+    artifacts: &Path,
+    web_source: &Path,
+    output: &Path,
+    base_port: u16,
+    capture_output: &str,
+) -> PackageResult<()> {
+    let signing_key = installer_signing_key()?;
+    let keys = BTreeMap::from([(
+        INSTALLER_KEY_ID.into(),
+        encode_hex(signing_key.verifying_key().as_bytes()),
+    )]);
+    let policy = crate::profiles::windows_side_by_side::policy(
+        WEB_DIRECTORY_TOKEN,
+        keys.clone(),
+        base_port,
+        capture_output,
+    )?;
+    prepare_installer_assets_with_policy(artifacts, web_source, output, &signing_key, keys, policy)
+}
+
+fn prepare_installer_assets_with_policy(
+    artifacts: &Path,
+    web_source: &Path,
+    output: &Path,
+    signing_key: &SigningKey,
+    trusted_keys: BTreeMap<String, String>,
+    policy: amaterasu_contracts::RuntimeConfig,
+) -> PackageResult<()> {
     if output.try_exists().map_err(|error| error.to_string())? {
         return Err("installer asset output already exists".into());
     }
@@ -605,17 +642,8 @@ fn prepare_installer_assets_with_key(
     let bootstrap = BootstrapConfig {
         development: false,
         allow_unsigned: false,
-        trusted_keys: BTreeMap::from([(
-            INSTALLER_KEY_ID.into(),
-            encode_hex(signing_key.verifying_key().as_bytes()),
-        )]),
-        policy: installer_policy(
-            WEB_DIRECTORY_TOKEN,
-            BTreeMap::from([(
-                INSTALLER_KEY_ID.into(),
-                encode_hex(signing_key.verifying_key().as_bytes()),
-            )]),
-        ),
+        trusted_keys,
+        policy,
     };
     write_json_atomically(&output.join("bootstrap-template.json"), &bootstrap)?;
     build_signed_package(
@@ -3600,6 +3628,25 @@ mod provision_tests {
     }
 
     #[test]
+    fn unprovision_preserves_first_run_pairing_seed() {
+        let root = fixture("rollback-first-run-seed");
+        fs::create_dir_all(root.join("data/state/namespaces/pairing")).unwrap();
+        let seed = root.join("data/state/namespaces/pairing/state.json");
+        fs::write(&seed, b"new pairing identity").unwrap();
+        fs::write(root.join("bootstrap.json"), b"bootstrap").unwrap();
+        let mut journal = ProvisionJournal {
+            directories: vec![PathBuf::from("data"), PathBuf::from("data/state")],
+            ..ProvisionJournal::default()
+        };
+        record_journal_file(&root, Path::new("bootstrap.json"), &mut journal).unwrap();
+        write_journal(&root, &mut journal).unwrap();
+        unprovision_if_created(&root).unwrap();
+        assert!(!root.join("bootstrap.json").exists());
+        assert_eq!(fs::read(seed).unwrap(), b"new pairing identity");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn unprovision_rejects_a_changed_journaled_file() {
         let root = fixture("changed");
         fs::write(root.join("bootstrap.json"), b"original").unwrap();
@@ -3622,6 +3669,78 @@ mod provision_tests {
         finalize_installer_provision(&root).unwrap();
         assert!(root.join("bootstrap.json").exists());
         assert!(!root.join(PROVISION_JOURNAL).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn side_by_side_seed_provisions_signed_policy_with_distinct_ports() {
+        let root = fixture("side-by-side-seed");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let web = root.join("web-source");
+        fs::create_dir_all(&web).unwrap();
+        fs::write(
+            web.join("index.html"),
+            "<html><head></head><body>Amaterasu</body></html>",
+        )
+        .unwrap();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let keys = BTreeMap::from([(
+            INSTALLER_KEY_ID.into(),
+            encode_hex(signing_key.verifying_key().as_bytes()),
+        )]);
+        let policy = crate::profiles::windows_side_by_side::policy(
+            WEB_DIRECTORY_TOKEN,
+            keys.clone(),
+            48989,
+            "display-1",
+        )
+        .unwrap();
+        let seed = root.join("seed");
+        prepare_installer_assets_with_policy(&artifacts, &web, &seed, &signing_key, keys, policy)
+            .unwrap();
+        let runtime = root.join("runtime");
+        provision_installer_root(
+            &seed.join("bootstrap-template.json"),
+            &seed.join("package"),
+            &runtime,
+        )
+        .unwrap();
+        let bootstrap: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        assert!(!bootstrap.development && !bootstrap.allow_unsigned);
+        assert_eq!(
+            bootstrap.policy.settings["amaterasu.nvhttp"]["http_bind"],
+            "0.0.0.0:48989"
+        );
+        assert_eq!(
+            bootstrap.policy.settings["amaterasu.management"]["bind"],
+            "127.0.0.1:48990"
+        );
+        let selection: ActivationState = read_json(&runtime.join("selection.json")).unwrap();
+        let active = selection.active.as_deref().unwrap();
+        let verified = verify_package(
+            &package_directory(&runtime, active).unwrap(),
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: true,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(verified.signed);
+        assert_eq!(
+            verified.runtime_config.settings["amaterasu.nvhttp"]["http_bind"],
+            "0.0.0.0:48989"
+        );
+        assert_eq!(
+            verified.runtime_config.settings["amaterasu.rtsp"]["bind"],
+            "0.0.0.0:49010"
+        );
+        assert_eq!(
+            verified.runtime_config.settings["amaterasu.stream-session"]["enabled"],
+            true
+        );
         let _ = fs::remove_dir_all(root);
     }
 

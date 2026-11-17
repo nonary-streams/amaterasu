@@ -61,6 +61,9 @@
       <ComponentRef Id="AuthenticationImportTool" />
       <ComponentRef Id="ReleaseTool" />
       <ComponentRef Id="PluginInstallerProvisioning" />
+      <?ifdef SideBySide?>
+      <ComponentRef Id="FirstAdminCodeTool" />
+      <?endif?>
       <ComponentRef Id="PlayniteExtensionFiles" />
       <ComponentRef Id="DataDirectory" />
     </Feature>
@@ -76,7 +79,7 @@
                   HideTarget="yes" />
     <CustomAction Id="ValidateInstallerPaths"
                   BinaryKey="MigrationGuardBinary"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand="[ValidateInstallerPaths]"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check"
@@ -88,7 +91,7 @@
                   HideTarget="yes" />
     <CustomAction Id="RequireNoPredecessor"
                   BinaryKey="MigrationGuardBinary"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand="[RequireNoPredecessor]"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check"
@@ -130,6 +133,35 @@
                   Impersonate="no"
                   Return="check"
                   HideTarget="yes" />
+    <?ifdef SideBySide?>
+    <!-- Generate a new identity in the machine-private pending user seed. The
+         helper never replaces existing pairing state and writes no key to MSI
+         output. The active user's worker later consumes this seed. -->
+    <CustomAction Id="SetInitializeSideBySidePairing"
+                  Property="InitializeSideBySidePairing"
+                  Value="&quot;[INSTALLFOLDER]tools\amaterasu-pairing-import.exe&quot; initialize --state &quot;[AMATERASU_DATA]runtime\data\state&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="InitializeSideBySidePairing"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <CustomAction Id="SetPrepareSideBySideEnrollment"
+                  Property="PrepareSideBySideEnrollment"
+                  Value="&quot;[INSTALLFOLDER]tools\amaterasu-authentication-import.exe&quot; prepare-enrollment --state &quot;[AMATERASU_DATA]runtime\data\state&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="PrepareSideBySideEnrollment"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <?endif?>
     <!-- The release helper consumes an authenticated journal. It is a rollback
          action, not an uninstall cleanup: it can remove only unchanged files
          created by this installation attempt and preserves preexisting data. -->
@@ -178,11 +210,19 @@
          reaches the selected interactive worker's loopback management health
          and NVHTTP server-info endpoints, requiring imported administrator,
          catalog, and pairing state before any predecessor can be retired. -->
+    <?ifdef SideBySide?>
+    <CustomAction Id="SetVerifyAmaterasuOperationalReady"
+                  Property="VerifyAmaterasuOperationalReady"
+                  Value="&quot;[INSTALLFOLDER]amaterasu.exe&quot; first-run-ready &quot;[AMATERASU_DATA]runtime&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <?else?>
     <CustomAction Id="SetVerifyAmaterasuOperationalReady"
                   Property="VerifyAmaterasuOperationalReady"
                   Value="&quot;[INSTALLFOLDER]amaterasu.exe&quot; operational-ready &quot;[AMATERASU_DATA]runtime&quot;"
                   Execute="immediate"
                   HideTarget="yes" />
+    <?endif?>
     <CustomAction Id="VerifyAmaterasuOperationalReady"
                   BinaryKey="WixCA"
                   DllEntry="WixQuietExec"
@@ -237,28 +277,45 @@
            evaluated; AMATERASU_BUNDLE_COORDINATED never bypasses it. -->
       <Custom Action="SetValidateInstallerPaths" After="InstallInitialize">NOT Installed AND NOT REMOVE</Custom>
       <Custom Action="ValidateInstallerPaths" After="SetValidateInstallerPaths">NOT Installed AND NOT REMOVE</Custom>
+      <?ifndef SideBySide?>
       <Custom Action="SetRequireNoPredecessor" After="ValidateInstallerPaths">NOT Installed AND NOT REMOVE</Custom>
       <Custom Action="RequireNoPredecessor" Before="InstallFiles">NOT Installed AND NOT REMOVE</Custom>
       <!-- The installed migration program is available from this point onward. -->
       <Custom Action="SetLegacyProgramFiles" After="InstallFiles">NOT Installed AND NOT REMOVE AND NOT LEGACY_PROGRAM_FILES</Custom>
       <Custom Action="SetProvisionInstallerRuntime" After="SetLegacyProgramFiles">NOT Installed AND NOT REMOVE</Custom>
+      <?else?>
+      <Custom Action="SetProvisionInstallerRuntime" After="InstallFiles">NOT Installed AND NOT REMOVE</Custom>
+      <?endif?>
       <Custom Action="SetRollbackProvisionInstallerRuntime" After="SetProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
       <Custom Action="RollbackProvisionInstallerRuntime" After="SetRollbackProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
       <Custom Action="ProvisionInstallerRuntime" After="RollbackProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+      <?ifdef SideBySide?>
+      <Custom Action="SetInitializeSideBySidePairing" After="ProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="InitializeSideBySidePairing" After="SetInitializeSideBySidePairing">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="SetPrepareSideBySideEnrollment" After="InitializeSideBySidePairing">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="PrepareSideBySideEnrollment" After="SetPrepareSideBySideEnrollment">NOT Installed AND NOT REMOVE</Custom>
+      <?endif?>
+      <?ifndef SideBySide?>
       <Custom Action="SetImportLegacyConfiguration" After="ProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
       <Custom Action="ImportLegacyConfiguration" After="SetImportLegacyConfiguration">NOT Installed AND NOT REMOVE</Custom>
       <Custom Action="SetRollbackPredecessorHandoff" After="ImportLegacyConfiguration">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
       <Custom Action="RollbackPredecessorHandoff" After="SetRollbackPredecessorHandoff">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
       <Custom Action="SetHandoffPredecessor" After="RollbackPredecessorHandoff">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
       <Custom Action="HandoffPredecessor" Before="StartServices">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
+      <?endif?>
       <Custom Action="SetVerifyAmaterasuServiceReady" After="StartServices">NOT Installed AND NOT REMOVE</Custom>
       <Custom Action="VerifyAmaterasuServiceReady" After="SetVerifyAmaterasuServiceReady">NOT Installed AND NOT REMOVE</Custom>
       <Custom Action="SetVerifyAmaterasuOperationalReady" After="VerifyAmaterasuServiceReady">NOT Installed AND NOT REMOVE</Custom>
       <Custom Action="VerifyAmaterasuOperationalReady" After="SetVerifyAmaterasuOperationalReady">NOT Installed AND NOT REMOVE</Custom>
+      <?ifndef SideBySide?>
       <Custom Action="SetFinalizePredecessorHandoff" After="VerifyAmaterasuOperationalReady">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
       <Custom Action="FinalizePredecessorHandoff" After="SetFinalizePredecessorHandoff">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
       <Custom Action="SetFinalizeInstallerProvision" After="FinalizePredecessorHandoff">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
       <Custom Action="FinalizeInstallerProvision" After="SetFinalizeInstallerProvision">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+      <?else?>
+      <Custom Action="SetFinalizeInstallerProvision" After="VerifyAmaterasuOperationalReady">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="FinalizeInstallerProvision" After="SetFinalizeInstallerProvision">NOT Installed AND NOT REMOVE</Custom>
+      <?endif?>
     </InstallExecuteSequence>
   </Product>
 
@@ -275,6 +332,11 @@
         </Component>
       </Directory>
       <Directory Id="MIGRATIONTOOLS" Name="tools">
+        <?ifdef SideBySide?>
+        <Component Id="FirstAdminCodeTool" Guid="*" Win64="yes">
+          <File Id="FirstAdminCodeScript" Source="$(var.StageDir)\tools\show-first-admin-code.ps1" KeyPath="yes" />
+        </Component>
+        <?endif?>
         <Component Id="MigrationTool" Guid="*" Win64="yes">
           <File Id="MigrationToolExe" Source="$(var.StageDir)\tools\amaterasu-migration.exe" KeyPath="yes" />
         </Component>

@@ -15,7 +15,7 @@ BUNDLE = (ROOT / "installer" / "Bundle.wxs").read_text(encoding="utf-8")
 BUILD = (ROOT / "installer" / "build-installer.ps1").read_text(encoding="utf-8")
 PLAYNITE_HASHES = {
     "extension.yaml": "0E3507A22AC5C24F1E0573CAAFF52F572BC1AF9C1C18270905B2694EBFEBA72D",
-    "AmaterasuPlaynite.psm1": "AD18C7BD3DDAFFDA44A1BF9713A8DC5B9AD987626F367EBCDEF6614C01BC6D7C",
+    "AmaterasuPlaynite.psm1": "D196587ACB2CBAC81A75B455F341968139BD1D21D00D7AD701E0F6EC2744C07F",
 }
 MIGRATION = (ROOT / "crates" / "package" / "src" / "migration.rs").read_text(encoding="utf-8")
 MIGRATION_TESTS = (
@@ -126,7 +126,7 @@ def test_preinstall_guards_do_not_trust_the_public_bundle_property():
     for action in ("ValidateInstallerPaths", "RequireNoPredecessor"):
         definition = PRODUCT.split(f'Id="{action}"', 1)[1].split('/>', 1)[0]
         assert 'BinaryKey="MigrationGuardBinary"' in definition
-        assert 'ExeCommand="[CustomActionData]"' in definition
+        assert f'ExeCommand="[{action}]"' in definition
         assert 'Execute="deferred"' in definition
         assert 'Impersonate="no"' in definition
         assert 'HideTarget="yes"' in definition

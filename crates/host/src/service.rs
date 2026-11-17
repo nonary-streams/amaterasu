@@ -63,19 +63,83 @@ pub fn probe_service_readiness(root: &Path) -> PackageResult<()> {
 /// bounded loopback probe; it never starts a competing worker or obtains an
 /// administrator session.
 pub fn probe_operational_readiness(root: &Path) -> PackageResult<()> {
+    probe_installation_readiness(root, false)
+}
+
+/// Side-by-side fresh installs may finish before their first administrator is
+/// enrolled, but only after the live worker confirms catalog and identity.
+pub fn probe_first_run_readiness(root: &Path) -> PackageResult<()> {
+    probe_installation_readiness(root, true)
+}
+
+fn probe_installation_readiness(root: &Path, allow_first_run: bool) -> PackageResult<()> {
     probe_service_readiness(root)?;
     let configuration = selected_runtime_config(root)?;
     let management = loopback_address(&configuration, "amaterasu.management", "bind")?;
-    let nvhttp = loopback_address(&configuration, "amaterasu.nvhttp", "http_bind")?;
+    let nvhttp = nvhttp_probe_address(&configuration)?;
     let deadline = Instant::now() + OPERATIONAL_TIMEOUT;
 
     let health = loopback_get(management, "/healthz", deadline)?;
-    let health = json_response(&health)?;
-    if health.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
-        || health
+    let health = health_response(&health, allow_first_run)?;
+    validate_management_health(&health, allow_first_run)?;
+
+    let server_info = loopback_get(nvhttp, "/serverinfo", deadline)?;
+    if !server_info.starts_with("HTTP/1.1 200 ")
+        || !server_info.contains("status_code=\"200\"")
+        || !server_info.contains("<uniqueid>")
+    {
+        return Err("NVHTTP server information is not operational".into());
+    }
+    if allow_first_run {
+        validate_server_identity(&health, &server_info)?;
+    }
+    Ok(())
+}
+
+fn validate_server_identity(health: &serde_json::Value, server_info: &str) -> PackageResult<()> {
+    let host_id = health
+        .get("host_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| valid_health_host_id(id))
+        .ok_or("management did not report a valid pairing identity")?;
+    if !server_info.contains(&format!("<uniqueid>{host_id}</uniqueid>")) {
+        return Err("NVHTTP listener belongs to a different host identity".into());
+    }
+    if !server_info.contains("<StreamingSupported>1</StreamingSupported>") {
+        return Err("NVHTTP listener does not report streaming support".into());
+    }
+    Ok(())
+}
+
+fn valid_health_host_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn validate_management_health(
+    health: &serde_json::Value,
+    allow_first_run: bool,
+) -> PackageResult<()> {
+    let configured = health.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+        && health
             .get("authentication_verifier")
             .and_then(serde_json::Value::as_bool)
-            != Some(true)
+            == Some(true);
+    let first_run = allow_first_run
+        && health.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+        && health.get("code").and_then(serde_json::Value::as_str)
+            == Some("first_administrator_not_configured")
+        && health
+            .get("authentication_verifier")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    if (!configured && !first_run)
         || health
             .get("catalog_loaded")
             .and_then(serde_json::Value::as_bool)
@@ -88,13 +152,6 @@ pub fn probe_operational_readiness(root: &Path) -> PackageResult<()> {
         return Err("management operational health is incomplete".into());
     }
 
-    let server_info = loopback_get(nvhttp, "/serverinfo", deadline)?;
-    if !server_info.starts_with("HTTP/1.1 200 ")
-        || !server_info.contains("status_code=\"200\"")
-        || !server_info.contains("<uniqueid>")
-    {
-        return Err("NVHTTP server information is not operational".into());
-    }
     Ok(())
 }
 
@@ -137,6 +194,50 @@ fn loopback_address(
     Ok(address)
 }
 
+/// Probe an IPv4 wildcard listener through loopback, without contacting the LAN.
+/// Only accept the explicit wildcard policy that NVHTTP resolves to 0.0.0.0;
+/// a concrete interface or a different address family may not include loopback.
+fn nvhttp_probe_address(
+    configuration: &amaterasu_contracts::RuntimeConfig,
+) -> PackageResult<SocketAddr> {
+    let settings = configuration
+        .settings
+        .get("amaterasu.nvhttp")
+        .ok_or("selected package lacks NVHTTP settings")?;
+    let address: SocketAddr = settings
+        .get("http_bind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("selected package lacks a required listener")?
+        .parse()
+        .map_err(|_| "selected listener address is invalid")?;
+    let bind_address = settings
+        .get("bind_address")
+        .and_then(serde_json::Value::as_str);
+    let wildcard = settings
+        .get("allow_remote")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && settings
+            .get("address_family")
+            .and_then(serde_json::Value::as_str)
+            == Some("ipv4")
+        && bind_address.is_some_and(|value| value.trim().is_empty());
+    if wildcard && address.port() != 0 {
+        return Ok(SocketAddr::from(([127, 0, 0, 1], address.port())));
+    }
+    if bind_address.is_some_and(|value| !value.trim().is_empty())
+        || settings
+            .get("allow_remote")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return Err(
+            "operational readiness cannot probe the selected NVHTTP listener on loopback".into(),
+        );
+    }
+    loopback_address(configuration, "amaterasu.nvhttp", "http_bind")
+}
+
 fn loopback_get(address: SocketAddr, path: &str, deadline: Instant) -> PackageResult<String> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -167,11 +268,12 @@ fn loopback_get(address: SocketAddr, path: &str, deadline: Instant) -> PackageRe
     String::from_utf8(response).map_err(|_| "operational listener response is not UTF-8".into())
 }
 
-fn json_response(response: &str) -> PackageResult<serde_json::Value> {
+fn health_response(response: &str, allow_first_run: bool) -> PackageResult<serde_json::Value> {
     let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or("operational health response is malformed")?;
-    if !head.starts_with("HTTP/1.1 200 ") {
+    if !head.starts_with("HTTP/1.1 200 ") && !(allow_first_run && head.starts_with("HTTP/1.1 503 "))
+    {
         return Err("management operational health is unavailable".into());
     }
     serde_json::from_str(body).map_err(|_| "management operational health is malformed".into())
@@ -1205,6 +1307,66 @@ fn apply_worker_action(
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
+
+    #[test]
+    fn first_run_readiness_does_not_relax_existing_operational_gate() {
+        let first = json!({"ok":false,"code":"first_administrator_not_configured","authentication_verifier":false,"catalog_loaded":true,"pairing_identity":true});
+        let wire = format!("HTTP/1.1 503 Service Unavailable\r\n\r\n{first}");
+        assert!(health_response(&wire, false).is_err());
+        assert!(validate_management_health(&first, false).is_err());
+        assert!(validate_management_health(&health_response(&wire, true).unwrap(), true).is_ok());
+        let mut missing = first.clone();
+        missing["pairing_identity"] = json!(false);
+        assert!(validate_management_health(&missing, true).is_err());
+        missing = first.clone();
+        missing["code"] = json!("required_service_unavailable");
+        assert!(validate_management_health(&missing, true).is_err());
+    }
+
+    #[test]
+    fn first_run_rejects_a_different_server_on_the_candidate_port() {
+        let health = json!({"host_id":"12345678-1234-4234-8234-123456789abc"});
+        assert!(
+            validate_server_identity(
+                &health,
+            "<uniqueid>12345678-1234-4234-8234-123456789abc</uniqueid><StreamingSupported>1</StreamingSupported>"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_server_identity(
+                &health,
+                "<uniqueid>87654321-1234-4234-8234-123456789abc</uniqueid>"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_server_identity(&json!({"host_id":"</uniqueid>"}), "<uniqueid></uniqueid>")
+                .is_err()
+        );
+        assert!(validate_server_identity(&health, "<uniqueid>12345678-1234-4234-8234-123456789abc</uniqueid><StreamingSupported>0</StreamingSupported>").is_err());
+    }
+
+    #[test]
+    fn nvhttp_readiness_probes_only_known_loopback_reachable_listeners() {
+        let mut config = amaterasu_contracts::RuntimeConfig::default();
+        config.settings.insert(
+            "amaterasu.nvhttp".into(),
+            json!({
+                "http_bind":"127.0.0.1:48989", "allow_remote":true,
+                "address_family":"ipv4", "bind_address":""
+            }),
+        );
+        assert_eq!(
+            nvhttp_probe_address(&config).unwrap(),
+            "127.0.0.1:48989".parse().unwrap()
+        );
+        config.settings.get_mut("amaterasu.nvhttp").unwrap()["bind_address"] = json!("192.0.2.5");
+        assert!(nvhttp_probe_address(&config).is_err());
+        config.settings.get_mut("amaterasu.nvhttp").unwrap()["bind_address"] = json!("");
+        config.settings.get_mut("amaterasu.nvhttp").unwrap()["http_bind"] = json!("127.0.0.1:0");
+        assert!(nvhttp_probe_address(&config).is_err());
+    }
 
     #[test]
     fn readiness_requires_the_service_owned_marker_to_match_active_selection() {
