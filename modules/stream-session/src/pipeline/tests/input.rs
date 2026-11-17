@@ -2270,6 +2270,13 @@ fn provider_without_optional_extension_keeps_legacy_feedback() {
         host.response_from(2, "test.protocol", request)["state"],
         "active"
     );
+    host.pipeline
+        .records
+        .get_mut(&session)
+        .unwrap()
+        .config
+        .rtsp_operation_id = Some("launch-feedback".into());
+    host.pipeline.enable_stream_issue_reports();
     let feedback = amaterasu_gamestream::control::HostFeedback::Rumble {
         controller: 0,
         low_frequency: 1,
@@ -2283,6 +2290,23 @@ fn provider_without_optional_extension_keeps_legacy_feedback() {
     }
     assert!(host.pipeline.records[&session].feedback_contributions_unsupported);
     assert_eq!(host.plane.borrow().feedback, vec![feedback]);
+    let warnings: Vec<_> = host
+        .broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Publish { topic, payload }
+                if topic == "amaterasu.stream.report/1"
+                    && payload["kind"] == "issue"
+                    && payload["code"] == "input_feedback_unsupported" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["disposition"], "advisory_warning");
 }
 
 #[test]

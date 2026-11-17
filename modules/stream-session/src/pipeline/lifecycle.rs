@@ -24,8 +24,11 @@ impl Pipeline {
                 // No broker request was issued, so there is no late write to
                 // fence. Retire the expired workflow without claiming one.
                 if job.cleanup {
-                    record.cleanup_error = Some("cleanup_deadline");
-                    record.state = State::CleanupFailed;
+                    record.fail_cleanup(
+                        lifecycle_issues::step_layer(job.step),
+                        &lifecycle_issues::step_label(job.step),
+                        "cleanup_deadline",
+                    );
                     self.reply(record, job, send);
                     return false;
                 }
@@ -44,8 +47,11 @@ impl Pipeline {
             }
             self.journal.failed = true;
             self.recovery_blocked = true;
-            record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
-            record.state = State::CleanupFailed;
+            record.fail_cleanup(
+                amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                "persist_journal",
+                "lifecycle_journal_write_unconfirmed",
+            );
             self.reply(record, job, send);
             // Keep this separately from any uncertain dependent operation,
             // while releasing the workflow so status/stop remain available.
@@ -83,6 +89,10 @@ impl Pipeline {
                 .request
                 .is_some_and(|request| !rpc::active(send, request))
         {
+            if matches!(job.step, Step::ProbeAudioReconfiguration(_)) {
+                let pending = job.pending.take();
+                return self.abandon_audio_probe(record, job, pending, None, send);
+            }
             job.fail(record, "request_cancelled", now);
         }
         if now >= job.deadline {
@@ -92,10 +102,34 @@ impl Pipeline {
                     record.uncertain = Some(pending);
                     record.uncertain_step = Some(job.step);
                 }
-                record.cleanup_error = Some("cleanup_deadline");
-                record.state = State::CleanupFailed;
+                record.fail_cleanup(
+                    lifecycle_issues::step_layer(job.step),
+                    &lifecycle_issues::step_label(job.step),
+                    "cleanup_deadline",
+                );
                 self.reply(record, job, send);
                 return false;
+            }
+            if matches!(job.step, Step::ProbeAudioReconfiguration(_)) {
+                let pending = job.pending.take();
+                return self.abandon_audio_probe(
+                    record,
+                    job,
+                    pending,
+                    Some("audio_probe_unconfirmed"),
+                    send,
+                );
+            }
+            if job.step == Step::ProbeExtensionSource {
+                if let Some(mut pending) = job.pending.take()
+                    && pending.was_sent()
+                {
+                    pending.cancel();
+                    record.shutdown_observations.push(pending);
+                }
+                record.extension_checked = true;
+                record.report_extension_probe_fallback("probe_deadline");
+                return self.deliver_success(record, job, now, send);
             }
             if matches!(
                 job.step,
@@ -116,17 +150,31 @@ impl Pipeline {
                     return true;
                 }
                 rpc::Progress::Unresolved => {
+                    if matches!(job.step, Step::ProbeAudioReconfiguration(_)) {
+                        return self.abandon_audio_probe(
+                            record,
+                            job,
+                            Some(pending),
+                            Some("audio_probe_unconfirmed"),
+                            send,
+                        );
+                    }
                     if job.step == Step::ProbeExtensionSource {
-                        let _ = pending.shutdown(send);
+                        pending.cancel();
+                        record.shutdown_observations.push(pending);
                         record.extension_checked = true;
+                        record.report_extension_probe_fallback("probe_unconfirmed");
                         return self.deliver_success(record, job, now, send);
                     }
                     if job.step == Step::PersistJournal {
                         self.retain_uncertain_journal(record, job, pending, now);
                         self.journal.failed = true;
                         self.recovery_blocked = true;
-                        record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
-                        record.state = State::CleanupFailed;
+                        record.fail_cleanup(
+                            amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                            "persist_journal",
+                            "lifecycle_journal_write_unconfirmed",
+                        );
                         self.reply(record, job, send);
                         return false;
                     }
@@ -160,8 +208,11 @@ impl Pipeline {
                     record.uncertain_step = Some(job.step);
                     record.plane = None;
                     record.audio_recovery_needed = false;
-                    record.cleanup_error = Some("request_cancellation_unconfirmed");
-                    record.state = State::CleanupFailed;
+                    record.fail_cleanup(
+                        lifecycle_issues::step_layer(job.step),
+                        &lifecycle_issues::step_label(job.step),
+                        "request_cancellation_unconfirmed",
+                    );
                     self.reply(record, job, send);
                     return false;
                 }
@@ -212,8 +263,24 @@ impl Pipeline {
                 }
                 rpc::Progress::Failed => {
                     if job.step == Step::ProbeExtensionSource {
+                        if !pending.admission_rejected() && pending.request_id().is_none() {
+                            pending.cancel();
+                            record.shutdown_observations.push(pending);
+                        }
                         record.extension_checked = true;
+                        record.report_extension_probe_fallback("probe_unavailable");
                         return self.deliver_success(record, job, now, send);
+                    }
+                    if matches!(job.step, Step::ProbeAudioReconfiguration(_)) {
+                        let unsettled =
+                            !pending.admission_rejected() && pending.request_id().is_none();
+                        return self.abandon_audio_probe(
+                            record,
+                            job,
+                            unsettled.then_some(pending),
+                            Some("audio_probe_unavailable"),
+                            send,
+                        );
                     }
                     if job.step == Step::PollGamepadFeedback
                         && matches!(
@@ -251,16 +318,14 @@ impl Pipeline {
                             self.retain_uncertain_journal(record, job, pending, now);
                             self.journal.failed = true;
                             self.recovery_blocked = true;
-                            record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
-                            record.state = State::CleanupFailed;
+                            record.fail_cleanup(amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession, "persist_journal", "lifecycle_journal_write_unconfirmed");
                             self.reply(record, job, send);
                             return false;
                         }
                         self.journal.failed = true;
                         self.recovery_blocked = true;
                         if job.cleanup {
-                            record.cleanup_error = Some("lifecycle_journal_write_failed");
-                            record.state = State::CleanupFailed;
+                            record.fail_cleanup(amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession, "persist_journal", "lifecycle_journal_write_failed");
                             self.reply(record, job, send);
                             return false;
                         }
@@ -356,8 +421,11 @@ impl Pipeline {
                 Ok(transferred) => transferred,
                 Err(()) => {
                     self.journal_waiting_stops.insert(record.id);
-                    record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
-                    record.state = State::CleanupFailed;
+                    record.fail_cleanup(
+                        amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                        "persist_journal",
+                        "lifecycle_journal_write_unconfirmed",
+                    );
                     self.reply(record, job, send);
                     return false;
                 }
@@ -521,8 +589,11 @@ impl Pipeline {
             if job.cleanup {
                 self.journal_waiting_stops.insert(record.id);
             }
-            record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
-            record.state = State::CleanupFailed;
+            record.fail_cleanup(
+                amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                "persist_journal",
+                "lifecycle_journal_write_unconfirmed",
+            );
             self.reply(record, job, send);
             return false;
         }
@@ -576,6 +647,30 @@ impl Pipeline {
         true
     }
 
+    fn abandon_audio_probe(
+        &self,
+        record: &mut Record,
+        job: &Job,
+        pending: Option<rpc::Pending>,
+        code: Option<&'static str>,
+        send: &mut Send<'_>,
+    ) -> bool {
+        if let Some(mut pending) = pending
+            && pending.was_sent()
+        {
+            pending.cancel();
+            record.shutdown_observations.push(pending);
+        }
+        record.pending_audio = None;
+        if let Some(code) = code {
+            record.report_request_warning("reconfigure_audio", code);
+            if let Some(request) = job.request {
+                rpc::complete(send, request, error(code));
+            }
+        }
+        false
+    }
+
     fn retain_uncertain_journal(
         &self,
         record: &mut Record,
@@ -622,6 +717,14 @@ impl Pipeline {
                     "amaterasu extension source preflight rejected code={:?}",
                     payload["code"].as_str().unwrap_or("invalid_response")
                 );
+            }
+            if record.extension_limits.is_none() {
+                let reason = if payload["ok"] != true {
+                    safe_dependency_code(&payload)
+                } else {
+                    "probe_unusable"
+                };
+                record.report_extension_probe_fallback(reason);
             }
             return self.deliver_success(record, job, now, send);
         }
@@ -1093,6 +1196,7 @@ impl Pipeline {
             }
             if matches!(job.step, Step::ProbeAudioReconfiguration(_)) {
                 record.pending_audio = None;
+                record.report_request_warning("reconfigure_audio", "unsupported_audio_format");
                 if let Some(request) = job.request {
                     rpc::complete(send, request, error("unsupported_audio_format"));
                 }
@@ -1111,6 +1215,14 @@ impl Pipeline {
                         )
                     {
                         record.feedback_contributions_unsupported = true;
+                        if !record.feedback_warning_reported {
+                            record.feedback_warning_reported = true;
+                            record.report_input_warning(
+                                "feedback_peek",
+                                "input_feedback_unsupported",
+                                "unsupported",
+                            );
+                        }
                     }
                 }
                 record.feedback_poll_at = now.saturating_add(100);
@@ -1224,6 +1336,7 @@ impl Pipeline {
                 });
                 if !supported {
                     record.pending_audio = None;
+                    record.report_request_warning("reconfigure_audio", "unsupported_audio_format");
                     if let Some(request) = job.request {
                         rpc::complete(send, request, error("unsupported_audio_format"));
                     }
@@ -1666,6 +1779,7 @@ impl Pipeline {
                     job.step = Step::WaitDrain;
                     Ok(true)
                 } else {
+                    record.report_audio_recovery();
                     Ok(false)
                 }
             }
@@ -1955,8 +2069,19 @@ impl Pipeline {
                 .as_ref()
                 .is_some_and(|config| config.valid_extension_probe())
             {
-                job.step = Step::ProbeExtensionSource;
-                return true;
+                let outstanding_reads: usize = self
+                    .records
+                    .values()
+                    .map(|other| other.shutdown_observations.len())
+                    .sum::<usize>()
+                    + record.shutdown_observations.len();
+                if outstanding_reads >= MAX_DEFERRED_READ_SETTLEMENTS {
+                    record.extension_checked = true;
+                    record.report_extension_probe_fallback("probe_settlement_pending");
+                } else {
+                    job.step = Step::ProbeExtensionSource;
+                    return true;
+                }
             }
             record.extension_checked = true;
         }
@@ -2038,7 +2163,11 @@ impl Pipeline {
     ) -> bool {
         record.cleanup_error = Some("lifecycle_journal_write_failed");
         if job.cleanup {
-            record.state = State::CleanupFailed;
+            record.fail_cleanup(
+                amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                "persist_journal",
+                "lifecycle_journal_write_failed",
+            );
             self.reply(record, job, send);
             return false;
         }

@@ -58,6 +58,7 @@ struct Work {
     completed: bool,
     list_required: bool,
     cancellation_reply: Option<Reply>,
+    launch_handed_off: bool,
 }
 
 pub(super) struct DispatchSubmission {
@@ -258,6 +259,7 @@ impl PresentationRouter {
                 completed: false,
                 list_required: false,
                 cancellation_reply: None,
+                launch_handed_off: false,
             },
         );
         Ok(self.next_job)
@@ -470,14 +472,11 @@ impl PresentationRouter {
                     };
                     work.cancelled = false;
                 } else {
-                    if let Some(connection) = work.connection {
-                        replies.push((
-                            connection,
-                            work.cancellation_reply
-                                .take()
-                                .unwrap_or_else(|| xml::error(503, "session request ended")),
-                        ));
-                    }
+                    let reply = work
+                        .cancellation_reply
+                        .take()
+                        .unwrap_or_else(|| xml::error(503, "session request ended"));
+                    finish(&work, reply, launches, &mut replies);
                     continue;
                 }
             }
@@ -506,6 +505,7 @@ impl PresentationRouter {
                         finish(
                             &work,
                             xml::error(503, "session cleanup could not be verified"),
+                            launches,
                             &mut replies,
                         );
                         work.connection = None;
@@ -515,7 +515,7 @@ impl PresentationRouter {
                     }
                     Ok(true) => {
                         if let Some(reply) = self.complete_stop(&mut work, launches, now) {
-                            finish(&work, reply, &mut replies);
+                            finish(&work, reply, launches, &mut replies);
                             continue;
                         }
                         if !matches!(work.stage, Stage::Observe { .. } | Stage::Release { .. })
@@ -539,7 +539,7 @@ impl PresentationRouter {
                         })
                     }
                     Err(reply) => {
-                        finish(&work, reply, &mut replies);
+                        finish(&work, reply, launches, &mut replies);
                         continue;
                     }
                 }
@@ -561,7 +561,7 @@ impl PresentationRouter {
                 continue;
             }
             if let Some(reply) = self.accept(&mut work, result, launches, config, now, receive) {
-                finish(&work, reply, &mut replies);
+                finish(&work, reply, launches, &mut replies);
             } else if !work.completed
                 && (work.connection.is_some()
                     || matches!(work.stage, Stage::Observe { .. } | Stage::Release { .. }))
@@ -909,7 +909,7 @@ impl PresentationRouter {
                     ),
                     None => launches.launch_for_route(connection, request, peer, response, now),
                 };
-                self.handoff_reply(work, reply)
+                self.handoff_reply(work, reply, launches)
             }
             Decision::ResumeApplication {
                 application_id,
@@ -938,6 +938,7 @@ impl PresentationRouter {
                 self.handoff_reply(
                     work,
                     reply.map(|reply| private_reply(reply, Permission::View)),
+                    launches,
                 )
             }
             Decision::Auxiliary { plan } | Decision::ResumeAuxiliary { plan } => {
@@ -964,7 +965,11 @@ impl PresentationRouter {
                 let reply = launches
                     .launch_auxiliary_for_route(connection, request, peer, plan, response, now);
                 launches.set_presentation_delivery_permission(connection, permission.clone());
-                self.handoff_reply(work, reply.map(|reply| private_reply(reply, permission)))
+                self.handoff_reply(
+                    work,
+                    reply.map(|reply| private_reply(reply, permission)),
+                    launches,
+                )
             }
             Decision::StopApplication {
                 application_id,
@@ -1081,6 +1086,14 @@ impl PresentationRouter {
                 message,
             } => {
                 let mut reply = xml::error(valid_status(status_code), &bounded_message(&message));
+                if work.intent != Some(DispatchIntent::Cancel) {
+                    launches.record_semantic_request_failure(
+                        &mut reply,
+                        valid_status(status_code),
+                        "presentation rejected request",
+                        "presentation_dispatch",
+                    );
+                }
                 reply.status = 200;
                 Some(private_reply(reply, Permission::Paired))
             }
@@ -1124,7 +1137,7 @@ impl PresentationRouter {
                     ),
                     None => launches.launch_for_route(connection, request, *peer, response, now),
                 };
-                self.handoff_reply(work, reply)
+                self.handoff_reply(work, reply, launches)
             }
             Completion::Control(completion) => {
                 let reply = work.cancellation_reply.take().unwrap_or_else(|| {
@@ -1188,8 +1201,15 @@ impl PresentationRouter {
         }
     }
 
-    fn handoff_reply(&mut self, work: &mut Work, reply: Option<Reply>) -> Option<Reply> {
-        if let Some(reply) = reply {
+    fn handoff_reply(
+        &mut self,
+        work: &mut Work,
+        reply: Option<Reply>,
+        launches: &mut Controller,
+    ) -> Option<Reply> {
+        work.launch_handed_off = true;
+        if let Some(mut reply) = reply {
+            launches.record_refusal(&mut reply, "launch_admission");
             self.fail_with_release(work, reply)
         } else {
             work.connection = None;
@@ -1274,6 +1294,7 @@ impl PresentationRouter {
                     completed: false,
                     list_required: false,
                     cancellation_reply: None,
+                    launch_handed_off: false,
                 },
             );
         }
@@ -1319,17 +1340,23 @@ impl PresentationRouter {
                     completed: false,
                     list_required: false,
                     cancellation_reply: None,
+                    launch_handed_off: false,
                 },
             );
         }
     }
 
-    pub(super) fn cancel(&mut self, connection: u64) {
+    pub(super) fn cancel(&mut self, connection: u64) -> bool {
+        let mut stream_request = false;
         for work in self
             .jobs
             .values_mut()
             .filter(|work| work.connection == Some(connection))
         {
+            stream_request |= matches!(
+                work.intent,
+                Some(DispatchIntent::Launch | DispatchIntent::Resume)
+            ) && !work.launch_handed_off;
             work.connection = None;
             if !matches!(
                 work.stage,
@@ -1338,6 +1365,7 @@ impl PresentationRouter {
                 work.cancelled = true;
             }
         }
+        stream_request
     }
 
     pub(super) fn quiesce(&mut self) -> bool {
@@ -1546,8 +1574,27 @@ fn numeric_id(id: &str) -> Result<u32, Reply> {
     Ok(value)
 }
 
-fn finish(work: &Work, reply: Reply, replies: &mut Vec<(u64, Reply)>) {
+fn finish(
+    work: &Work,
+    mut reply: Reply,
+    launches: &mut Controller,
+    replies: &mut Vec<(u64, Reply)>,
+) {
     if let Some(connection) = work.connection {
+        if matches!(
+            work.intent,
+            Some(DispatchIntent::Launch | DispatchIntent::Resume)
+        ) && !work.launch_handed_off
+            && reply.status >= 400
+        {
+            let status = reply.status;
+            launches.record_request_failure(
+                &mut reply,
+                status,
+                "presentation request failed",
+                "presentation_dispatch",
+            );
+        }
         replies.push((connection, reply));
     }
 }
@@ -1663,7 +1710,15 @@ impl Router {
                     }
                 };
                 if !permitted {
-                    return Some(xml::error(403, "session operation permission denied"));
+                    return Some(if intent == DispatchIntent::Cancel {
+                        xml::error(403, "session operation permission denied")
+                    } else {
+                        self.launches.refuse_stream_request(
+                            403,
+                            "session operation permission denied",
+                            "request_authorization",
+                        )
+                    });
                 }
                 let request = if intent == DispatchIntent::Cancel {
                     if let Err(error) = query.require_only(&["uniqueid", "uuid"]) {
@@ -1678,12 +1733,25 @@ impl Router {
                     };
                     match parsed {
                         Ok(request) => Some(request),
-                        Err(error) => return Some(xml::error(400, error)),
+                        Err(error) => {
+                            return Some(self.launches.refuse_stream_request(
+                                400,
+                                error,
+                                "request_parsing",
+                            ));
+                        }
                     }
                 };
                 let identity = match peer.identity() {
                     Ok(identity) => identity,
-                    Err(error) => return Some(xml::error(401, error)),
+                    Err(error) => {
+                        return Some(if intent == DispatchIntent::Cancel {
+                            xml::error(401, error)
+                        } else {
+                            self.launches
+                                .refuse_stream_request(401, error, "stream_identity")
+                        });
+                    }
                 };
                 let certificate_pem = match pem_rfc7468::encode_string(
                     "CERTIFICATE",
@@ -1691,9 +1759,19 @@ impl Router {
                     &certificate,
                 ) {
                     Ok(pem) => pem,
-                    Err(_) => return Some(xml::error(401, "client certificate is unavailable")),
+                    Err(_) => {
+                        return Some(if intent == DispatchIntent::Cancel {
+                            xml::error(401, "client certificate is unavailable")
+                        } else {
+                            self.launches.refuse_stream_request(
+                                401,
+                                "client certificate is unavailable",
+                                "stream_identity",
+                            )
+                        });
+                    }
                 };
-                self.queue(
+                let queued = self.queue(
                     Some(connection),
                     Purpose::PresentationIdentity {
                         request,
@@ -1704,9 +1782,15 @@ impl Router {
                     json!({"action":"check_client_certificate","certificate_pem":certificate_pem}),
                     now + super::SERVICE_TIMEOUT,
                     now,
-                )
-                .err()
-                .map(|message| xml::error(503, message))
+                );
+                queued.err().map(|message| {
+                    if intent == DispatchIntent::Cancel {
+                        xml::error(503, message)
+                    } else {
+                        self.launches
+                            .refuse_stream_request(503, message, "presentation_identity")
+                    }
+                })
             }
             _ => Some(xml::error(404, "unknown presentation route")),
         }

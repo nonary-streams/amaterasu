@@ -4888,6 +4888,99 @@ fn missing_owner_lookup_never_retires_an_uncertain_open() {
 }
 
 #[test]
+fn uncertain_startup_mutation_reports_critical_before_cleanup() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    let id = *controller.records.keys().next().unwrap();
+    controller.records.get_mut(&id).unwrap().state = super::record::State::Starting;
+    let mut call = Call::new("service/1", json!({}), "uncertain-start".into(), 1000);
+    for _ in 0..3 {
+        assert!(matches!(
+            call.poll(&mut |_| Ok(Response::Pending)),
+            Outcome::Waiting
+        ));
+    }
+    let mut job = Job {
+        record: id,
+        phase: Phase::BindPresentationApplication,
+        call,
+        deadline: now + Duration::from_secs(1),
+    };
+    controller.advance(
+        &mut job,
+        now,
+        &mut |_| Ok(Response::Pending),
+        &mut Vec::new(),
+    );
+    let record = controller.records.get_mut(&id).unwrap();
+    assert_eq!(record.state, super::record::State::Stopping);
+    let reports: Vec<_> = record.issues.drain().collect();
+    assert!(
+        reports
+            .iter()
+            .any(|report| matches!(report, StreamReport::Issue(issue)
+        if issue.code == "broker_settlement_unconfirmed"
+            && issue.reason == "broker_settlement_unconfirmed"
+            && issue.disposition == IssueDisposition::CriticalFailure
+            && issue.valid()))
+    );
+}
+
+#[test]
+fn missing_application_during_startup_reports_critical_issue() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    let id = *controller.records.keys().next().unwrap();
+    controller.records.get_mut(&id).unwrap().state = super::record::State::Starting;
+    let job = Job {
+        record: id,
+        phase: Phase::LookupApplication,
+        call: Call::new("service/1", json!({}), "lookup".into(), 1000),
+        deadline: now,
+    };
+    controller.consume(&job, json!({"ok":false,"code":"launch_not_found"}), now, &mut Vec::new());
+    let record = controller.records.get_mut(&id).unwrap();
+    assert_eq!(record.state, super::record::State::Stopping);
+    assert!(record.issues.drain().any(|report| matches!(report, StreamReport::Issue(issue)
+        if issue.code == "application_launch_unavailable"
+            && issue.disposition == IssueDisposition::CriticalFailure
+            && !issue.reason.is_empty() && issue.valid())));
+}
+
+#[test]
+fn terminal_provider_during_startup_records_critical_issue() {
+    for (phase, service, expected) in [
+        (Phase::LookupApplication, "amaterasu.launch/1", "application_ended"),
+        (Phase::OpenRtsp, "amaterasu.rtsp/1", "rtsp_not_ready"),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker::default();
+        launch_ready(&mut controller, &mut broker, now);
+        let id = *controller.records.keys().next().unwrap();
+        controller.records.get_mut(&id).unwrap().state = super::record::State::Starting;
+        let mut payload = broker.response(service, &json!({"action":"status"}));
+        if phase == Phase::LookupApplication {
+            payload["launch"]["state"] = json!("stopped");
+        } else {
+            payload["state"] = json!("failed");
+            payload["failure"] = json!("provider_failed");
+        }
+        let job = Job { record: id, phase, call: Call::new(service, json!({}), "lookup".into(), 1000), deadline: now };
+        controller.consume(&job, payload, now, &mut Vec::new());
+        let record = controller.records.get_mut(&id).unwrap();
+        assert_eq!(record.state, super::record::State::Stopping);
+        assert!(record.issues.drain().any(|report| matches!(report, StreamReport::Issue(issue)
+            if issue.code == expected && issue.disposition == IssueDisposition::CriticalFailure && issue.valid())));
+    }
+}
+
+
+#[test]
 fn natural_application_exit_closes_the_stream_and_releases_the_application() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
@@ -6105,6 +6198,33 @@ fn a_refused_launch_is_recorded_with_the_line_that_refused_it() {
     assert_eq!(root.issue.phase, "launch_admission");
     assert_eq!(root.issue.reason, "http_503");
     assert!(root.issue.site.contains("launch.rs:"), "{}", root.issue.site);
+    let status = controller.management_status(None);
+    assert_eq!(status["recent_refusals"][0]["root_cause"]["issue"]["code"], "stream_settings_are_loading");
+}
+
+#[test]
+fn malformed_stream_request_is_recorded_before_launch_admission() {
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let reply = controller.refuse_stream_request(400, "missing query field", "request_parsing");
+    assert_eq!(reply.status, 400);
+    let issue = &controller.stream_lifecycle.stream("refused.1").unwrap().root_cause().unwrap().issue;
+    assert_eq!(issue.code, "missing_query_field");
+    assert_eq!(issue.phase, "request_parsing");
+    assert_eq!(issue.reason, "http_400");
+}
+
+#[test]
+fn recent_refusals_are_visible_and_bounded_when_no_launch_exists() {
+    let mut controller = Controller::new(Some(config())).unwrap();
+    for _ in 0..20 {
+        controller.refuse_stream_request(400, "missing query field", "request_parsing");
+    }
+    let status = controller.management_status(None);
+    assert!(status["launch"].is_null());
+    let refusals = status["recent_refusals"].as_array().unwrap();
+    assert_eq!(refusals.len(), 16);
+    assert_eq!(refusals[0]["root_cause"]["issue"]["operation"], "refused.20");
+    assert_eq!(refusals[15]["root_cause"]["issue"]["operation"], "refused.5");
 }
 
 #[test]

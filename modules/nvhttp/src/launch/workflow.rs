@@ -924,6 +924,12 @@ impl Controller {
                     record.stop_application_after_stream_retirement =
                         record.application_session.is_none() && record.stop_on_stream_end;
                 }
+                if entering_cleanup {
+                    record.record_failure_because(
+                        "broker_settlement_unconfirmed",
+                        "broker_settlement_unconfirmed",
+                    );
+                }
                 record.state = State::Stopping;
                 record.stage = Stage::Cleanup;
                 if entering_cleanup {
@@ -2210,6 +2216,9 @@ impl Controller {
                     Ok((launch_id, _, _)) => {
                         record.application_launch = Some(launch_id);
                         record.failure.get_or_insert("application_ended");
+                        if record.state == State::Starting {
+                            record.record_failure("application_ended");
+                        }
                         record.request_cleanup(None, now);
                     }
                     Err("launch_not_found") if job.phase == Phase::LookupApplication => {
@@ -2226,6 +2235,9 @@ impl Controller {
                         record
                             .failure
                             .get_or_insert("application_launch_unavailable");
+                        if record.state == State::Starting {
+                            record.record_failure("application_launch_unavailable");
+                        }
                         record.request_cleanup(None, now);
                     }
                     Err(code) => fail_record(record, code, now),
@@ -2283,6 +2295,12 @@ impl Controller {
                         safe_rtsp_provider_code(&payload["cleanup_error"]),
                     );
                     record.rtsp_ticket = Some(ticket);
+                    if record.state == State::Starting {
+                        record.record_failure_because(
+                            "rtsp_not_ready",
+                            safe_rtsp_provider_code(&payload["failure"]),
+                        );
+                    }
                     record.request_cleanup(None, now);
                 }
                 Err("ticket_not_found") if job.phase == Phase::LookupRtsp => {

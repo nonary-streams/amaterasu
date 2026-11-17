@@ -53,15 +53,26 @@ impl Pipeline {
 
 impl Pipeline {
     pub(super) fn progress_shutdown_observations(&mut self, now: u64, send: &mut Send<'_>) {
-        if !self
+        if self
             .shutdown_deadline
-            .is_some_and(|deadline| now < deadline)
+            .is_some_and(|deadline| now >= deadline)
         {
             return;
         }
         for record in self.records.values_mut() {
             record.shutdown_observations.retain_mut(|pending| {
                 match pending.poll(send, now) {
+                    rpc::Progress::Failed
+                        if pending.was_sent()
+                            && pending.request_id().is_none()
+                            && !pending.admission_rejected()
+                            && !pending.admission_window_expired(now) =>
+                    {
+                        // A conflicting or expired admission is not proof
+                        // that the earlier read-only request has retired.
+                        pending.retry();
+                        true
+                    }
                     rpc::Progress::Failed => false,
                     rpc::Progress::Result(_) => !pending.release_result(send),
                     rpc::Progress::Waiting => true,

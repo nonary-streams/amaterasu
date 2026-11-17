@@ -192,8 +192,9 @@ pub(super) struct Record {
     pub uncertain: Option<rpc::Pending>,
     pub uncertain_step: Option<Step>,
     pub journal_uncertain: Option<UncertainJournalWrite>,
-    /// At most one read-only observation can be in flight when shutdown begins.
-    /// Its broker bookkeeping cannot keep native resources alive after teardown.
+    /// Read-only operations whose exact broker settlements remain pending.
+    /// They do not hold native stream resources, but must remain bounded and
+    /// be retired independently of the stream's forward progress.
     pub shutdown_observations: Vec<rpc::Pending>,
     pub plane: Option<Box<dyn Drive>>,
     pub audio_recovery_needed: bool,
@@ -215,6 +216,7 @@ pub(super) struct Record {
     pub audio_peer_port: Option<u16>,
     pub error: Option<&'static str>,
     pub cleanup_error: Option<&'static str>,
+    pub reported_cleanup_failures: Vec<&'static str>,
     pub audio_endpoint: Option<String>,
     pub force_idr: bool,
     pub control_messages: u64,
@@ -258,6 +260,9 @@ pub(super) struct Record {
     pub feedback_ack_through: Option<u64>,
     pub feedback_peek_generation: Option<u64>,
     pub feedback_contributions_unsupported: bool,
+    pub input_batch_warning_mask: u8,
+    pub controller_warning_reported: bool,
+    pub feedback_warning_reported: bool,
     pub rumble_pending: BTreeMap<u16, (RumbleCommand, Option<u64>)>,
     pub rumble_active_until: BTreeMap<u16, u64>,
     pub rumble_shutdown_deadline: Option<u64>,
@@ -473,6 +478,7 @@ impl Record {
             audio_peer_port: None,
             error: None,
             cleanup_error: None,
+            reported_cleanup_failures: Vec::new(),
             audio_endpoint: None,
             force_idr: false,
             control_messages: 0,
@@ -516,6 +522,9 @@ impl Record {
             feedback_ack_through: None,
             feedback_peek_generation: None,
             feedback_contributions_unsupported: false,
+            input_batch_warning_mask: 0,
+            controller_warning_reported: false,
+            feedback_warning_reported: false,
             rumble_pending: BTreeMap::new(),
             rumble_active_until: BTreeMap::new(),
             rumble_shutdown_deadline: None,

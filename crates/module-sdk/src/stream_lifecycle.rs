@@ -49,6 +49,9 @@ use std::panic::Location;
 /// needs the topic's `publish` grant; the launch owner holds its `subscribe`
 /// grant.
 pub const STREAM_REPORTS: Topic<StreamReport> = Topic::new("amaterasu.stream.report/1");
+/// Phase for a confirmed fallback whose operation names the exact failed attempt.
+/// Emit only after that attempt is retired or definitively held no resources.
+pub const PROVIDER_FALLBACK_CONFIRMED: &str = "provider_fallback_confirmed";
 
 /// One event on [`STREAM_REPORTS`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -293,12 +296,18 @@ impl StreamIssue {
         fallback: Option<String>,
         site: &Location<'_>,
     ) -> Self {
+        let code = code.into();
+        let reason = if disposition == IssueDisposition::AdvisoryWarning {
+            String::new()
+        } else {
+            code.clone()
+        };
         Self {
             operation: operation.into(),
             layer,
             phase: phase.into(),
-            code: code.into(),
-            reason: String::new(),
+            code,
+            reason,
             disposition,
             fallback,
             site: format!("{}:{}", site.file(), site.line()),
@@ -310,7 +319,10 @@ impl StreamIssue {
     }
 
     pub fn because(mut self, reason: impl Into<String>) -> Self {
-        self.reason = reason.into();
+        let reason = reason.into();
+        if !reason.is_empty() || self.disposition == IssueDisposition::AdvisoryWarning {
+            self.reason = reason;
+        }
         self
     }
 

@@ -915,6 +915,36 @@ fn cancelled_or_lost_initial_arm_completion_rolls_back_but_retry_does_not() {
 }
 
 #[test]
+fn lost_arm_completion_reports_critical_lifecycle_issue() {
+    use amaterasu_module_sdk::stream_lifecycle::{IssueDisposition, StreamReport};
+
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    host.pipeline
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .config
+        .rtsp_operation_id = Some("stream-one".into());
+    host.broker.enqueue(2, "owner", arm(id));
+    host.broker.fail_completion = true;
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    Pipeline::arm(record, 2, host.now, &mut |command| {
+        host.broker.send(command)
+    });
+    let reports: Vec<_> = record.issues.drain().collect();
+    assert!(
+        reports
+            .iter()
+            .any(|report| matches!(report, StreamReport::Issue(issue)
+        if issue.code == "completion_unavailable"
+            && issue.reason == "completion_unavailable"
+            && issue.disposition == IssueDisposition::CriticalFailure
+            && issue.valid()))
+    );
+}
+
+#[test]
 fn autonomous_capture_failure_uses_existing_confirmed_cleanup() {
     let mut host = Harness::new();
     host.broker.authenticated = false;

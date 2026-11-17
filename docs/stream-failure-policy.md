@@ -61,6 +61,8 @@ event.
 | Frame limiter planning (`frame-limiter`) | Unavailable policy, context, or non-recovery backend during read-only planning demotes to a no-op `Planned` response with a lifecycle warning. |
 | Media transport audio config (`media-transport`) | Audio packet/channel/wire validation is skipped when `stream_audio` is `false`. |
 | Optional lifecycle participants (`session-lifecycle`) | `ParticipantSettings::optional` prevents unapproved optional providers from stalling `approvals_complete` and skips read-only `ResourcePlan` rejections without failing the stream. |
+| Optional extension and audio renegotiation probes (`stream-session`) | Rejected, timed-out or unconfirmed read-only probes leave the prepared session intact and report a warning. Unsettled broker operations remain bounded and retire independently; an unadmitted read-only probe is forgotten after the broker's 300-second admission recovery horizon. No format substitution is made. |
+| Batch-scoped input refusals and unsupported optional feedback (`stream-session`) | The affected input or optional feedback is dropped while the stream continues. The session records bounded advisory issues for distinct refusal reasons. |
 
 ## Remaining boundary
 

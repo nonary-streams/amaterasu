@@ -303,6 +303,8 @@ pub struct Broker {
     pub fail_cancel: bool,
     pub fail_open: Option<String>,
     pub unsupported_audio_probe: Option<String>,
+    pub reject_audio_probe_admission: Option<String>,
+    pub audio_probe_admission_conflict: bool,
     pub fail_audio_reconfigure: Option<String>,
     pub fail_close: Option<String>,
     pub cleanup_failure: Option<(String, String)>,
@@ -730,6 +732,19 @@ impl Broker {
                 operation_id,
                 ..
             } => {
+                if payload["action"] == "probe"
+                    && self.reject_audio_probe_admission.as_deref() == Some(&service)
+                {
+                    return Ok(Response::Error {
+                        code: if self.audio_probe_admission_conflict {
+                            "conflict"
+                        } else {
+                            "service_unavailable"
+                        }
+                        .into(),
+                        message: String::new(),
+                    });
+                }
                 if service == "amaterasu.input/1"
                     && payload["action"] == "poll_gamepad_feedback"
                     && let Some(code) = &self.gamepad_admission_error
@@ -866,6 +881,7 @@ impl Broker {
                 }
                 Ok(Response::Ok)
             }
+            Command::Publish { .. } => Ok(Response::Ok),
             _ => panic!("unexpected broker operation"),
         }
     }

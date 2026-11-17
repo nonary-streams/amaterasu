@@ -168,6 +168,14 @@ impl Pending {
         self.first_sent_at.is_some()
     }
 
+    /// The broker no longer guarantees an uncertain admission can be looked
+    /// up without risking a reused operation. Only read-only observations may
+    /// be forgotten at this boundary; mutations still need retirement proof.
+    pub fn admission_window_expired(&self, now: u64) -> bool {
+        self.first_sent_at
+            .is_some_and(|started| now.saturating_sub(started) >= ADMISSION_RECOVERY_MS)
+    }
+
     pub fn admission_rejected(&self) -> bool {
         self.admission_rejected
     }
@@ -205,10 +213,7 @@ impl Pending {
             return Progress::Unresolved;
         }
         let Some(request) = self.request else {
-            if self
-                .first_sent_at
-                .is_some_and(|started| now.saturating_sub(started) >= ADMISSION_RECOVERY_MS)
-            {
+            if self.admission_window_expired(now) {
                 return Progress::Failed;
             }
             self.first_sent_at.get_or_insert(now);
