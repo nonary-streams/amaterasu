@@ -719,9 +719,8 @@ pub(super) fn accept_acknowledged_input_batch(
 }
 
 /// Refusals scoped to one batch. The input lease survives them, so the
-/// session drops the refused events and keeps streaming; the input provider
-/// reports each refusal itself. A refusal that ends or never reached the
-/// lease stays fatal.
+/// session drops the refused events and keeps streaming. A refusal that ends
+/// or never reached the lease stays fatal.
 const BATCH_SCOPED_REFUSALS: [&str; 7] = [
     "invalid_sequence",
     "invalid_event",
@@ -740,10 +739,13 @@ pub(super) fn drop_refused_input_batch(
     payload: &Value,
 ) -> Result<(), &'static str> {
     let code = payload["error"]["code"].as_str().unwrap_or_default();
-    if !BATCH_SCOPED_REFUSALS.contains(&code)
-        || payload["recovery_required"] == true
-        || record.input_inflight == 0
-    {
+    let Some(refusal_index) = BATCH_SCOPED_REFUSALS
+        .iter()
+        .position(|candidate| *candidate == code)
+    else {
+        return Err("dependency_rejected");
+    };
+    if payload["recovery_required"] == true || record.input_inflight == 0 {
         return Err("dependency_rejected");
     }
     eprintln!(
@@ -764,6 +766,11 @@ pub(super) fn drop_refused_input_batch(
             .lifecycle_input_sequence
             .checked_add(1)
             .ok_or("lifecycle_sequence_exhausted")?;
+    }
+    let warning_bit = 1_u8 << refusal_index;
+    if record.input_batch_warning_mask & warning_bit == 0 {
+        record.input_batch_warning_mask |= warning_bit;
+        record.report_input_warning("input_batch", code, code);
     }
     Ok(())
 }
@@ -807,6 +814,14 @@ pub(super) fn accept_controller_batch_failure(
     record.unsupported_controls = record.unsupported_controls.saturating_add(1);
     record.input_inflight = 0;
     record.input_timing.acknowledge(true);
+    if !record.controller_warning_reported {
+        record.controller_warning_reported = true;
+        record.report_input_warning(
+            "input_batch",
+            "controller_unavailable",
+            "controller_unavailable",
+        );
+    }
     Ok(())
 }
 

@@ -607,6 +607,9 @@ impl ManagedModule for NvhttpModule {
                     )
                 })
             });
+            for failure in events.rejected_stream_requests {
+                router.record_protocol_rejection(failure);
+            }
             for closed in events.closed {
                 if closed.response_delivered {
                     router.reply_delivered(closed.id);

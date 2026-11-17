@@ -1302,6 +1302,13 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
             .iter()
             .any(|(request, response)| *request == 21 && response["code"] == "operation_conflict")
     );
+    assert!(controller.stream_issues.drain().any(|report| matches!(
+        report,
+        amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue)
+            if issue.code == "operation_conflict"
+                && issue.disposition == amaterasu_module_sdk::stream_lifecycle::IssueDisposition::AdvisoryWarning
+                && issue.valid()
+    )));
     assert_eq!(controller.records.len(), 1);
 }
 
@@ -1754,6 +1761,13 @@ fn quiescence_cancels_pending_display_verification_without_waiting_for_result() 
     assert!(controller.display_admission.is_some());
 
     assert!(!controller.quiesce(&runtime, 2));
+    assert!(controller.stream_issues.drain().any(|report| matches!(
+        report,
+        amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue)
+            if issue.code == "module_quiescing"
+                && issue.reason == "module_quiescing"
+                && issue.disposition == amaterasu_module_sdk::stream_lifecycle::IssueDisposition::AdvisoryWarning
+    )));
     controller.advance_display_cleanup(&runtime);
 
     assert!(controller.display_cleanup.is_empty());

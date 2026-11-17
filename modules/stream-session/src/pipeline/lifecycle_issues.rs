@@ -53,7 +53,8 @@ pub(super) fn step_layer(step: Step) -> LifecycleLayer {
         | IssueLifecycleInputBinding
         | AckLifecycleInput => LifecycleLayer::SessionLifecycle,
         ProbeExtensionSource | WaitVideoReady => LifecycleLayer::EncodeVideo,
-        AcquireAudio | RecoverAudio => LifecycleLayer::Audio,
+        AcquireAudio => LifecycleLayer::Audio,
+        RecoverAudio => LifecycleLayer::AudioEncode,
         AcquireInput | FindInput | ReleaseInput | RenewInput | InputBatch | FeedbackPeek
         | FeedbackAck | PollGamepadFeedback | RumbleDrain => LifecycleLayer::Input,
         Activate | WaitDrain | StopSession | FinishSession | PersistJournal => {
@@ -108,25 +109,160 @@ pub(super) fn step_label(step: Step) -> String {
 }
 
 impl Record {
+    #[track_caller]
+    pub(super) fn report_input_warning(&mut self, phase: &str, code: &str, reason: &str) {
+        let Some(operation) = self.config.rtsp_operation_id.clone() else {
+            return;
+        };
+        self.issues.push(
+            StreamIssue::advisory(operation, LifecycleLayer::StreamSession, phase, code)
+                .because(reason)
+                .caused_by(LifecycleLayer::Input),
+        );
+    }
+    #[track_caller]
+    pub(super) fn report_extension_probe_fallback(&mut self, reason: &str) {
+        let Some(operation) = self.config.rtsp_operation_id.clone() else {
+            return;
+        };
+        self.issues.push(
+            StreamIssue::advisory(
+                operation,
+                LifecycleLayer::StreamSession,
+                "probe_extension_source",
+                "extension_source_unavailable",
+            )
+            .because(reason)
+            .caused_by(LifecycleLayer::EncodeVideo),
+        );
+    }
+    #[track_caller]
+    pub(super) fn report_audio_recovery(&mut self) {
+        let Some(operation) = self.config.rtsp_operation_id.clone() else {
+            return;
+        };
+        self.issues.push(
+            StreamIssue::demoted(
+                operation,
+                LifecycleLayer::StreamSession,
+                "recover_audio",
+                "audio_encoder_failed",
+                "reset_audio_encoder",
+            )
+            .because("audio_encoder_failed")
+            .caused_by(LifecycleLayer::AudioEncode),
+        );
+    }
+    /// A rejected request does not itself terminate an existing session.
+    #[track_caller]
+    pub(super) fn report_request_warning(&mut self, phase: &str, code: &str) {
+        let Some(operation) = self.config.rtsp_operation_id.clone() else {
+            return;
+        };
+        self.issues.push(
+            StreamIssue::advisory(operation, LifecycleLayer::StreamSession, phase, code)
+                .because(code),
+        );
+    }
+
     /// Record a failure that stops this session, under this module's own
     /// layer. `dependency` names the layer it was reacting to; that layer
     /// reports its own failure. Sessions no launch owner named have nowhere
     /// to report and record nothing.
     #[track_caller]
     pub(super) fn report_failure(&mut self, dependency: LifecycleLayer, phase: &str, code: &str) {
+        self.report_failure_because(dependency, phase, code, code);
+    }
+
+    #[track_caller]
+    pub(super) fn report_failure_because(
+        &mut self,
+        dependency: LifecycleLayer,
+        phase: &str,
+        code: &str,
+        reason: &str,
+    ) {
         let Some(operation) = self.config.rtsp_operation_id.clone() else {
             return;
         };
         let mut issue =
-            StreamIssue::critical(operation, LifecycleLayer::StreamSession, phase, code);
+            StreamIssue::critical(operation, LifecycleLayer::StreamSession, phase, code)
+                .because(reason);
         if dependency != LifecycleLayer::StreamSession {
             issue = issue.caused_by(dependency);
         }
         self.issues.push(issue);
     }
+
+    #[track_caller]
+    pub(super) fn fail_cleanup(
+        &mut self,
+        dependency: LifecycleLayer,
+        phase: &str,
+        code: &'static str,
+    ) {
+        if self.state != super::State::CleanupFailed || self.cleanup_error != Some(code) {
+            self.report_failure_because(dependency, phase, "cleanup_failed", code);
+            self.remember_cleanup_failure("cleanup_failed");
+        }
+        self.cleanup_error = Some(code);
+        self.state = super::State::CleanupFailed;
+    }
+
+    pub(super) fn remember_cleanup_failure(&mut self, code: &'static str) {
+        if !self.reported_cleanup_failures.contains(&code)
+            && self.reported_cleanup_failures.len() < 64
+        {
+            self.reported_cleanup_failures.push(code);
+        }
+    }
+
+    #[track_caller]
+    pub(super) fn report_confirmed_cleanup(&mut self) {
+        let Some(operation) = self.config.rtsp_operation_id.clone() else {
+            self.reported_cleanup_failures.clear();
+            return;
+        };
+        for code in self.reported_cleanup_failures.drain(..) {
+            self.issues.push(
+                StreamIssue::demoted(
+                    operation.clone(),
+                    LifecycleLayer::StreamSession,
+                    "cleanup",
+                    code,
+                    "cleanup_confirmed",
+                )
+                .because(code),
+            );
+        }
+    }
 }
 
 impl Pipeline {
+    #[track_caller]
+    pub(super) fn report_prepare_refusal(
+        &mut self,
+        owner: &str,
+        operation: Option<&str>,
+        code: &str,
+    ) {
+        if !self.settings.lifecycle_admitters.contains(owner)
+            || !self
+                .settings
+                .allowed_principals
+                .iter()
+                .any(|allowed| allowed == owner)
+        {
+            return;
+        }
+        if let Some(operation) = operation {
+            self.admission_issues.push(
+                StreamIssue::advisory(operation, LifecycleLayer::StreamSession, "prepare", code)
+                    .because(code),
+            );
+        }
+    }
+
     /// Report on the launch owner's topic. Off by default so a pipeline in a
     /// test sends only the commands that test scripts.
     pub fn enable_stream_issue_reports(&mut self) {
@@ -136,6 +272,14 @@ impl Pipeline {
     /// Publish what each session recorded. A refused publication keeps the
     /// rest for the next tick; the outbox is bounded either way.
     pub(super) fn publish_stream_issues(&mut self, send: &mut Send<'_>) {
+        if !self.report_stream_issues {
+            self.admission_issues.drain().for_each(drop);
+        } else if let Err(error) = self
+            .admission_issues
+            .flush_with(&mut |command| send(command))
+        {
+            eprintln!("amaterasu session admission issue report failed error={error}");
+        }
         for record in self.records.values_mut() {
             if !self.report_stream_issues {
                 record.issues.drain().for_each(drop);

@@ -65,6 +65,8 @@ fn reconnect_wait_is_bounded_and_connection_close_cancels_admission() {
     assert!(controller.resume(90, request(3), &peer(1), now).is_none());
     controller.connection_closed(90, now);
     assert!(controller.deferred_launch.is_none());
+    let status = controller.management_status(None);
+    assert_eq!(status["recent_refusals"][0]["root_cause"]["issue"]["code"], "connection_closed");
 }
 
 #[test]

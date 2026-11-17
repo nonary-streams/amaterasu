@@ -138,9 +138,12 @@ fn input_job_due(record: &Record) -> bool {
     !record.input_events.is_empty() && !record.input_direct_active
 }
 
+const MAX_DEFERRED_READ_SETTLEMENTS: usize = 8;
+
 pub struct Pipeline {
     /// Publish recorded stream issues to the launch owner.
     report_stream_issues: bool,
+    admission_issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
     settings: Settings,
     service: String,
     records: BTreeMap<u64, Record>,
@@ -183,6 +186,7 @@ impl Pipeline {
         settings.providers.validate_for_owner(&service)?;
         Ok(Self {
             report_stream_issues: false,
+            admission_issues: Default::default(),
             settings,
             service,
             records: BTreeMap::new(),
@@ -1034,6 +1038,11 @@ impl Pipeline {
         if step == Step::ObserveActiveBinding {
             let record = self.records.get_mut(&id).expect("selected record");
             let Some(next) = record.lifecycle_validation_sequence.checked_add(1) else {
+                record.report_failure(
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                    "observe_active_binding",
+                    "lifecycle_sequence_exhausted",
+                );
                 record.state = State::Stopping;
                 record.outcome = State::Failed;
                 record.error = Some("lifecycle_sequence_exhausted");
@@ -1110,6 +1119,11 @@ impl Pipeline {
             if matches!(record.state, State::Prepared | State::Armed)
                 && now >= record.prepared_until
             {
+                record.report_failure(
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                    "prepare",
+                    "prepare_expired",
+                );
                 record.state = State::Stopping;
                 record.outcome = State::Failed;
                 record.error = Some("prepare_expired");
@@ -1140,6 +1154,11 @@ impl Pipeline {
                     .values()
                     .any(|(command, _)| command.low_frequency == 0 && command.high_frequency == 0)
             {
+                record.report_failure(
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
+                    "rumble",
+                    "rumble_zero_delivery_timeout",
+                );
                 record.rumble_stop_unconfirmed = true;
                 record.error.get_or_insert("rumble_zero_delivery_timeout");
                 record.outcome = State::Failed;
@@ -1165,6 +1184,7 @@ impl Pipeline {
             if record.error == Some("rumble_zero_delivery_timeout") {
                 plane.stop();
             }
+            let mut rumble_delivery_failed = false;
             if let Some((slot, (command, expires_at))) = record
                 .rumble_pending
                 .first_key_value()
@@ -1187,6 +1207,7 @@ impl Pipeline {
                     }
                     Ok(false) => {}
                     Err(_) => {
+                        rumble_delivery_failed = true;
                         record.rumble_stop_unconfirmed = true;
                         record.rumble_pending.clear();
                         record.rumble_active_until.clear();
@@ -1200,6 +1221,13 @@ impl Pipeline {
             }
             let media_active = matches!(record.state, State::Active | State::Stopping);
             let result = plane.tick(media_active, control_budget);
+            if rumble_delivery_failed {
+                record.report_failure(
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
+                    "rumble",
+                    "rumble_delivery_failed",
+                );
+            }
             match result {
                 Ok(progress) => {
                     record.history.observe_encode_timing(progress.encode_timing);
@@ -1210,6 +1238,11 @@ impl Pipeline {
                         if let Err(code) =
                             input::configure_translator(record, record.input_absolute_pointer)
                         {
+                            record.report_failure(
+                                amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
+                                "configure_translator",
+                                code,
+                            );
                             record.error = Some(code);
                             record.state = State::Stopping;
                             record.outcome = State::Failed;

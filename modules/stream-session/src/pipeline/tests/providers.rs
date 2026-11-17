@@ -122,6 +122,7 @@ fn replacement_input_provider_handles_mixed_batches_and_partial_failure() {
     payload.as_object_mut().unwrap().remove("action");
     let config = serde_json::from_value(payload).unwrap();
     let mut record = Record::new(42, "owner".into(), config, 30_000);
+    record.config.rtsp_operation_id = Some("launch-input".into());
     let mut lease_reply = json!({"ok":true,"state":"active",
         "operation_id":record.input_operation(),"lease":"replacement-lease",
         "ttl_ms":record.input_ttl_ms,"expires_in_ms":record.input_ttl_ms,
@@ -225,6 +226,11 @@ fn replacement_input_provider_handles_mixed_batches_and_partial_failure() {
     record_batch_failure(&mut failure, "replacement-lease", 3, 1, true).unwrap();
     let response = exchange(&mut broker, &record, "mixed-partial", failure);
     super::super::input::accept_controller_batch_failure(&mut record, &response).unwrap();
+    assert!(record.issues.drain().any(|report| matches!(report,
+        amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue)
+            if issue.code == "controller_unavailable"
+                && issue.disposition == amaterasu_module_sdk::stream_lifecycle::IssueDisposition::AdvisoryWarning
+                && issue.caused_by == Some(amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input))));
     assert_eq!(record.input_events.len(), 1);
     assert_eq!(record.input_events[0]["kind"], "key");
     assert_eq!(record.input_events_sent, 1);

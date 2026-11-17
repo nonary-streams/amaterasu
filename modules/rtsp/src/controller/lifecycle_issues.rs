@@ -172,6 +172,16 @@ fn with_cause(issue: StreamIssue, cause: Option<Cause<'_>>) -> StreamIssue {
 }
 
 impl Controller {
+    #[track_caller]
+    pub(super) fn report_open_warning(&mut self, caller: &str, operation: &str, code: &str) {
+        if caller == self.settings.launch_owner {
+            self.stream_issues.push(
+                StreamIssue::advisory(operation, LifecycleLayer::Rtsp, OPEN_PHASE, code)
+                    .because(code),
+            );
+        }
+    }
+
     /// Report on the launch owner's topic. Off by default so a controller in
     /// a test sends only the commands that test scripts.
     pub fn enable_stream_issue_reports(&mut self) {

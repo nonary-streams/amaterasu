@@ -421,7 +421,11 @@ impl Pipeline {
                 true
             }
             _ => {
-                record.state = State::CleanupFailed;
+                record.fail_cleanup(
+                    lifecycle_issues::step_layer(job.step),
+                    &lifecycle_issues::step_label(job.step),
+                    "component_cleanup_failed",
+                );
                 self.reply(record, job, send);
                 false
             }
@@ -460,12 +464,18 @@ impl Pipeline {
             job.step = Step::PersistJournal;
             return true;
         }
-        record.state = if clean {
+        if clean {
+            record.report_confirmed_cleanup();
             record.cleanup_error = None;
-            record.outcome
+            record.state = record.outcome;
         } else {
-            State::CleanupFailed
-        };
+            let code = record.cleanup_error.unwrap_or("cleanup_unconfirmed");
+            record.fail_cleanup(
+                lifecycle_issues::step_layer(job.step),
+                &lifecycle_issues::step_label(job.step),
+                code,
+            );
+        }
         self.reply(record, job, send);
         false
     }

@@ -20,6 +20,7 @@ pub(super) const NVHTTP_PUBLISHER: &str = "amaterasu.nvhttp";
 /// Reported issues read per poll; the rest wait for the next tick.
 const FEED_READS_PER_POLL: usize = 32;
 const PROVIDER_CODE_LIMIT: usize = 64;
+const RECENT_REFUSALS_LIMIT: usize = 16;
 
 /// The job a failure recorded now belongs to: its phase, and the code the
 /// provider replied with when it gave one.
@@ -225,6 +226,11 @@ impl Record {
 }
 
 impl Controller {
+    #[cfg(test)]
+    pub(crate) fn refusal_snapshot(&self, key: &str) -> Option<StreamLifecycleSnapshot> {
+        self.stream_lifecycle.snapshot(key)
+    }
+
     /// Read issues other layers publish. Off by default so a controller in a
     /// test speaks only the commands that test scripts.
     pub fn enable_stream_issue_feed(&mut self) {
@@ -275,20 +281,88 @@ impl Controller {
 
     /// A refusal sent before any launch record existed is a stream of its
     /// own in the store: one entry naming the line that refused.
-    pub(super) fn record_refusal(&mut self, reply: &mut Reply, phase: &str) {
+    pub(crate) fn record_refusal(&mut self, reply: &mut Reply, phase: &str) {
+        self.record_refusal_with_status_kind(reply, phase, "http");
+    }
+
+    fn record_refusal_with_status_kind(
+        &mut self,
+        reply: &mut Reply,
+        phase: &str,
+        status_kind: &str,
+    ) {
         let Some(rejection) = reply.rejection.take() else {
             return;
         };
         self.sequence = self.sequence.saturating_add(1);
         let key = format!("refused.{}", self.sequence);
-        self.stream_lifecycle.open(&key);
+        let tracked = self.stream_lifecycle.open_transient(&key);
+        let layer = if phase.starts_with("presentation_") {
+            LifecycleLayer::Presentation
+        } else {
+            LifecycleLayer::Nvhttp
+        };
+        let reason = if status_kind == "transport" {
+            rejection.code.clone()
+        } else {
+            format!("{status_kind}_{}", rejection.status)
+        };
         let mut issue =
-            StreamIssue::critical(key.clone(), LifecycleLayer::Nvhttp, phase, rejection.code)
-                .because(format!("http_{}", rejection.status));
+            StreamIssue::critical(key.clone(), layer, phase, rejection.code).because(reason);
         issue.site = format!("{}:{}", rejection.site.file(), rejection.site.line());
         self.stream_lifecycle
             .commit_logged(self.logger.as_ref(), NVHTTP_PUBLISHER, issue);
         self.stream_lifecycle.end(&key);
+        if tracked {
+            self.recent_refusals.push_back(key);
+            if self.recent_refusals.len() > RECENT_REFUSALS_LIMIT {
+                self.recent_refusals.pop_front();
+            }
+        }
+    }
+
+    /// Record a failed request while preserving its original protocol reply.
+    #[track_caller]
+    pub(crate) fn record_request_failure(
+        &mut self,
+        reply: &mut Reply,
+        status: u16,
+        code: &str,
+        phase: &str,
+    ) {
+        reply.rejection = Some(crate::wire::Rejection {
+            status,
+            code: super::rejection_code(code),
+            site: std::panic::Location::caller(),
+        });
+        self.record_refusal(reply, phase);
+    }
+
+    #[track_caller]
+    pub(crate) fn record_semantic_request_failure(
+        &mut self,
+        reply: &mut Reply,
+        status: u16,
+        code: &str,
+        phase: &str,
+    ) {
+        reply.rejection = Some(crate::wire::Rejection {
+            status,
+            code: super::rejection_code(code),
+            site: std::panic::Location::caller(),
+        });
+        self.record_refusal_with_status_kind(reply, phase, "protocol");
+    }
+
+    #[track_caller]
+    pub(crate) fn record_transport_failure(&mut self, code: &str) {
+        let mut reply = crate::wire::xml::error(400, "request transport failed");
+        reply.rejection = Some(crate::wire::Rejection {
+            status: 0,
+            code: super::rejection_code(code),
+            site: std::panic::Location::caller(),
+        });
+        self.record_refusal_with_status_kind(&mut reply, "request_transport", "transport");
     }
 }
 

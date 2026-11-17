@@ -164,7 +164,13 @@ impl Controller {
             .iter()
             .any(|allowed| allowed == &caller)
         {
-            rpc::complete(runtime, request, error("permission_denied"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "permission_denied",
+            );
             return;
         }
         if self
@@ -241,6 +247,9 @@ impl Controller {
             } else {
                 error("operation_conflict")
             };
+            if existing.config != config {
+                self.report_open_warning(&caller, &config.operation_id, "operation_conflict");
+            }
             rpc::complete(runtime, request, response);
             return;
         }

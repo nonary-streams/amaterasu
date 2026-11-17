@@ -92,6 +92,17 @@ impl Controller {
         }
         if let Some(mut admission) = self.display_admission.take() {
             rpc::complete(runtime, admission.request, error("module_quiescing"));
+            if admission.caller == self.settings.launch_owner {
+                self.stream_issues.push(
+                    amaterasu_module_sdk::stream_lifecycle::StreamIssue::advisory(
+                        &admission.config.operation_id,
+                        amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Rtsp,
+                        "display_admission",
+                        "module_quiescing",
+                    )
+                    .because("module_quiescing"),
+                );
+            }
             if !admission.verified {
                 // The verifier only reads the existing Launch admission; the
                 // stream ticket is created after verification succeeds.

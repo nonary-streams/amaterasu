@@ -33,6 +33,9 @@ StreamIssue::demoted(operation, LifecycleLayer::FrameLimiter, "resource_plan",
 
 The constructors record the caller's `file:line` (`#[track_caller]`), so a
 helper that builds issues for its callers should be `#[track_caller]` too.
+Critical and demoted constructors use their code as the reason unless the
+reporter supplies a more specific reason. Older reports without a reason
+remain accepted for compatibility.
 
 Code that has no runtime at the point of failure, such as a record method,
 pushes into a `StreamIssueOutbox` and flushes it from the module's tick with
@@ -40,7 +43,8 @@ pushes into a `StreamIssueOutbox` and flushes it from the module's tick with
 is dropped and counted.
 
 `operation` is the operation ID the module was called with for the stream.
-Every module reports its own failures; no module relays another's.
+Owners report their own reaction when a dependency fails; providers may add
+their own reports when they support the lifecycle topic.
 
 A module that calls providers for a stream under operation IDs of its own
 publishes a binding first, so those providers' reports reach the stream:
@@ -77,10 +81,10 @@ runtime refuses the event; the module's own log line remains.
 
 ## Who reports what
 
-Every module reports under its own layer. A module that fails or degrades a
-stream because a dependency failed reports its reaction with `caused_by` that
-dependency's layer and the dependency's code as `reason`; the dependency
-reports its own failure. NVHTTP keeps only its own stream warnings in the
+The stream owner reports failures and fallbacks it observes from dependencies,
+with `caused_by` identifying the dependency when known. A provider may also
+report its own failure, but capture providers do not need lifecycle reporting
+for the video owner to report a capture failure. NVHTTP keeps only its own stream warnings in the
 store; warnings it relays for history were reported by their module.
 
 ## Dispositions
@@ -90,9 +94,19 @@ store; warnings it relays for history were reported by their module.
   reporter (no `caused_by`), by commit order; a reaction stands in only until
   the origin's report arrives. Cleanup failures caused by it appear beside it.
   A critical failure stops being the root cause when it is recovered from:
-  its reporter later demotes the same code for the same operation, or a
+  its reporter later demotes the same layer and code for the same operation, or a
   caller demotes with `caused_by` its layer and its code as `reason` (a
   fallback to another encoder or capture provider).
+  A fallback with phase `provider_fallback_confirmed` names the failed
+  provider attempt as its operation. Emit it only after that attempt is retired
+  or definitively held no resources. Only that attempt is recovered, even if
+  its report arrives late or names a more specific provider error; failures
+  from other attempts remain critical.
+  A capability skipped before any provider attempt starts is a local fallback
+  and must not mark the operation of the subsequently opened provider retired.
+  Recovery of a secondary failure is retained while that failure remains in
+  the bounded history, including when an earlier report is attached after its
+  stream binding arrives.
 - `demoted_warning`: a failure the stream survived. `fallback` names what it
   did instead and is required.
 - `advisory_warning`: something worth knowing that needed no fallback, such
@@ -112,6 +126,13 @@ store; warnings it relays for history were reported by their module.
   the line that refused and the HTTP status.
 - A history release that will not be retried is an advisory issue on its
   stream.
+- Stream-session prepare and start requests that are refused without stopping
+  an existing session report an advisory issue when the caller is authorized
+  to name that stream. A caller that cannot continue reports its own critical
+  reaction. A lost initial arm completion that requires rollback is critical.
+- The stream session reports an audio-encoder reset as a demoted warning only
+  after the reset succeeds. Unconfirmed cleanup is critical; a later confirmed
+  cleanup demotes that cleanup failure without erasing an earlier launch failure.
 
 ## Reading it
 
@@ -119,7 +140,10 @@ store; warnings it relays for history were reported by their module.
 `launch.lifecycle` with `root_cause`, `warnings`, `entries` (the last 64
 commits), `committed`, `entries_dropped` and `audit_gap`. The reply also
 carries `unattributed_issues` (reports that named no tracked stream, last 32)
-and `lifecycle_feed_gaps`.
+and `lifecycle_feed_gaps`. `recent_refusals` contains up to 16 retained
+pre-launch refusal snapshots, newest first, even when no launch was created.
+Refusals do not evict an open stream: if all store slots are occupied by open
+streams, the refusal appears among the bounded `unattributed_issues` instead.
 
 Each entry names the `publisher` (the runtime-authenticated module) and the
 issue's `layer` (the part of the stream it concerns). They differ when a module

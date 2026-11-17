@@ -135,11 +135,25 @@ impl Job {
     pub fn fail(&mut self, record: &mut Record, code: &'static str, now: u64) {
         eprintln!("amaterasu session failed step={:?} code={code}", self.step);
         if code != "request_cancelled" {
-            record.report_failure(
+            let cleanup_failure = self.cleanup
+                || (record.state == State::Stopping && record.outcome == State::Stopped);
+            record.report_failure_because(
                 super::lifecycle_issues::step_layer(self.step),
                 &super::lifecycle_issues::step_label(self.step),
-                code,
+                if cleanup_failure {
+                    "cleanup_step_failed"
+                } else {
+                    code
+                },
+                if self.step == Step::RecoverAudio {
+                    "audio_encoder_failed"
+                } else {
+                    code
+                },
             );
+            if cleanup_failure {
+                record.remember_cleanup_failure("cleanup_step_failed");
+            }
         }
         if code == "request_cancelled" {
             self.stop_failed_or_cancelled(record, code, now);

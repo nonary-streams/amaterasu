@@ -85,6 +85,7 @@ impl Pipeline {
                 !pinned.contains(id)
                     && record.uncertain.is_none()
                     && record.journal_uncertain.is_none()
+                    && record.shutdown_observations.is_empty()
                     && !record.shared_capture_attached
                     && !record.history.has_work()
             },
