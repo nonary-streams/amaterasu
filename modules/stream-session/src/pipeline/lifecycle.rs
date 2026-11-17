@@ -86,6 +86,17 @@ impl Pipeline {
             job.fail(record, "request_cancelled", now);
         }
         if now >= job.deadline {
+            if job.step == Step::ProbeExtensionSource {
+                if let Some(mut pending) = job.pending.take()
+                    && pending.was_sent()
+                {
+                    pending.cancel();
+                    record.shutdown_observations.push(pending);
+                }
+                record.extension_checked = true;
+                record.report_extension_probe_fallback("probe_deadline");
+                return self.deliver_success(record, job, now, send);
+            }
             if job.cleanup {
                 if let Some(mut pending) = job.pending.take() {
                     pending.cancel();
@@ -117,8 +128,10 @@ impl Pipeline {
                 }
                 rpc::Progress::Unresolved => {
                     if job.step == Step::ProbeExtensionSource {
-                        let _ = pending.shutdown(send);
+                        pending.cancel();
+                        record.shutdown_observations.push(pending);
                         record.extension_checked = true;
+                        record.report_extension_probe_fallback("probe_unconfirmed");
                         return self.deliver_success(record, job, now, send);
                     }
                     if job.step == Step::PersistJournal {
@@ -213,6 +226,7 @@ impl Pipeline {
                 rpc::Progress::Failed => {
                     if job.step == Step::ProbeExtensionSource {
                         record.extension_checked = true;
+                        record.report_extension_probe_fallback("probe_unavailable");
                         return self.deliver_success(record, job, now, send);
                     }
                     if job.step == Step::PollGamepadFeedback
@@ -617,11 +631,13 @@ impl Pipeline {
                     }
                 };
             }
-            if payload["ok"] != true {
-                eprintln!(
-                    "amaterasu extension source preflight rejected code={:?}",
-                    payload["code"].as_str().unwrap_or("invalid_response")
-                );
+            if record.extension_limits.is_none() {
+                let reason = if payload["ok"] != true {
+                    safe_dependency_code(&payload)
+                } else {
+                    "probe_unusable"
+                };
+                record.report_extension_probe_fallback(reason);
             }
             return self.deliver_success(record, job, now, send);
         }

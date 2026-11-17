@@ -53,9 +53,9 @@ impl Pipeline {
 
 impl Pipeline {
     pub(super) fn progress_shutdown_observations(&mut self, now: u64, send: &mut Send<'_>) {
-        if !self
+        if self
             .shutdown_deadline
-            .is_some_and(|deadline| now < deadline)
+            .is_some_and(|deadline| now >= deadline)
         {
             return;
         }

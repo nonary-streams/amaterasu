@@ -108,6 +108,24 @@ pub(super) fn step_label(step: Step) -> String {
 }
 
 impl Record {
+    #[track_caller]
+    pub(super) fn report_extension_probe_fallback(&mut self, reason: &str) {
+        let Some(operation) = self.config.rtsp_operation_id.clone() else {
+            return;
+        };
+        self.issues.push_logged(
+            None,
+            StreamIssue::demoted(
+                operation,
+                LifecycleLayer::StreamSession,
+                "probe_extension_source",
+                "extension_source_unavailable",
+                "negotiate_standard_video",
+            )
+            .because(reason)
+            .caused_by(LifecycleLayer::EncodeVideo),
+        );
+    }
     /// Record a failure that stops this session, under this module's own
     /// layer. `dependency` names the layer it was reacting to; that layer
     /// reports its own failure. Sessions no launch owner named have nowhere

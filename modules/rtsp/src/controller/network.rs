@@ -1,4 +1,5 @@
 use super::*;
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
 
 impl Controller {
     pub(super) fn poll_transport(&mut self, now: u64) {
@@ -99,6 +100,22 @@ impl Controller {
                     "configuration_mismatch",
                 );
                 if completed && success {
+                    if record.extension_offer.is_some()
+                        && request.header("x-amaterasu-codec-fallback")
+                            == Some("pyrowave_bitstream_mismatch")
+                    {
+                        record.issues.push_logged(
+                            None,
+                            StreamIssue::demoted(
+                                record.config.operation_id.clone(),
+                                LifecycleLayer::Rtsp,
+                                "announce",
+                                "client_codec_fallback",
+                                "standard_video",
+                            )
+                            .because("client_reported_pyrowave_bitstream_mismatch"),
+                        );
+                    }
                     for adjustment in &record.adjustments {
                         if self.pending_adjustment_logs.len() < 64 {
                             self.pending_adjustment_logs.push_back(

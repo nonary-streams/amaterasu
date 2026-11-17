@@ -866,6 +866,9 @@ impl Broker {
                 }
                 Ok(Response::Ok)
             }
+            Command::Publish { topic, .. } if topic == "amaterasu.stream.report/1" => {
+                Ok(Response::Ok)
+            }
             _ => panic!("unexpected broker operation"),
         }
     }

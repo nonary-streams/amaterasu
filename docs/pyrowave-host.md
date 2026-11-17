@@ -40,10 +40,19 @@ ten-bit RGB capture; HDR requires capture-owned PQ provenance. HDR metadata uses
 the existing reliable control channel and requires the selected video's metadata
 interface. Processing and capture provenance checks remain enforced.
 
-Eight-bit encoding remains available in the SDK. The current composition offers
-one selected wire profile per launch. 4:4:4, adaptive FEC, bandwidth calibration
-and automatic profile fallback are not implemented. Existing bitrate limits
-remain in effect. Tests and a signed candidate do not establish client playback.
+The host offers one PyroWave profile per launch. When its optional probe
+fails, the host records a warning and offers the standard codecs supported for
+that launch. Moonlight must honor the launch's DESCRIBE to choose a standard
+codec before ANNOUNCE. When the client asks for HDR, the fallback needs a
+compatible 10-bit codec. Once both sides agree on a format, startup requires
+a keyframe in that format.
+
+The VKMS snapshotter tries renderable scanout layouts if it cannot allocate a
+renderable linear buffer. This preserves RGB precision and provides a shared
+DMA-BUF layout on GPUs whose render-only buffers cannot be imported by
+Vulkan. SDR PyroWave can use either 8-bit or 10-bit RGB capture while keeping
+the selected wire precision. 4:4:4, adaptive FEC and bandwidth calibration
+remain unimplemented.
 
 For a compatible installed source set, `scripts/prepare_pyrowave_update.py ROOT
 OUTPUT` prepares a signed candidate and exact proposed policy without changing
