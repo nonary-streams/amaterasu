@@ -173,3 +173,122 @@ fn extension_lifecycle_capture_must_match_exact_geometry_range_and_generation() 
         }
     }
 }
+
+#[test]
+fn extension_accepts_the_client_bandwidth_rate_below_the_launch_ceiling() {
+    for hdr in [false, true] {
+        let mut record = extension_record(hdr);
+        let mut announce = record.extension_announce.clone().unwrap();
+        // The failed 4K60 launch announced 19,600 kbps against a 100,000 kbps
+        // prepared ceiling. Geometry and the exact offered codec are unchanged.
+        announce.video.bitrate_kbps = 19_600;
+        assert!(record.accept_extension_announce(&announce));
+        let payload = record.authenticated_start_payload(23).unwrap();
+        assert_eq!(
+            payload["configuration"]["configuration"]["bitrate"],
+            19_600_000
+        );
+        for invalid in [0, 99, 100_001, u32::MAX] {
+            announce.video.bitrate_kbps = invalid;
+            assert!(!record.accept_extension_announce(&announce));
+            assert!(record.authenticated_start_payload(23).is_none());
+        }
+    }
+}
+
+#[test]
+fn four_k_pyrowave_bandwidth_announcement_returns_200_and_reaches_play() {
+    for hdr in [false, true] {
+        let mut record = extension_record(hdr);
+        record.config.profile.width = 3840;
+        record.config.profile.height = 2160;
+        record.config.profile.fps = 60;
+        let snapshot = VideoProfileSnapshot {
+            profiles: vec![record.extension_offer.clone().unwrap()],
+        };
+        let mut negotiation = Negotiation::with_video_profiles(
+            TrustedLaunch {
+                epoch: record.id,
+                rtsp_target: record.url.clone(),
+                session_token: record.session_token.clone(),
+                encrypted_rtsp: true,
+                audio_port: 49000,
+                video_port: 49002,
+                control_port: 49004,
+                control_connect_data: record.config.connect_data,
+                udp_discovery: None,
+            },
+            record.capabilities(),
+            snapshot.clone(),
+            snapshot,
+        )
+        .unwrap();
+        negotiation
+            .handle(record.id, &request(Method::Options, &record.url, 1, false))
+            .unwrap();
+        let mut describe = request(Method::Describe, &record.url, 2, false);
+        describe
+            .headers
+            .push(("accept".into(), "application/sdp".into()));
+        negotiation.handle(record.id, &describe).unwrap();
+        for (cseq, target) in [
+            (3, "streamid=audio/0/0"),
+            (4, "streamid=video/0/0"),
+            (5, "streamid=control/13/0"),
+        ] {
+            let mut setup = request(Method::Setup, target, cseq, cseq > 3);
+            setup.headers.push((
+                "transport".into(),
+                "unicast;X-GS-ClientPort=50000-50001".into(),
+            ));
+            negotiation.handle(record.id, &setup).unwrap();
+        }
+        let mut announcement = request(Method::Announce, "streamid=control/13/0", 6, true);
+        announcement
+            .headers
+            .push(("content-type".into(), "application/sdp".into()));
+        let fixture = include_str!(
+            "../../../../../crates/gamestream/src/sdp/fixtures/moonlight-pyrowave10.sdp"
+        );
+        let fixture = fixture
+            .replace("2560", "3840")
+            .replace("1440", "2160")
+            .replace("maxFPS:120", "maxFPS:60")
+            .replace("100000", "19600");
+        announcement.body = if hdr {
+            fixture
+        } else {
+            fixture.replace("dynamicRangeMode:1", "dynamicRangeMode:0")
+        }
+        .into_bytes();
+        let NegotiationStep::Action {
+            ticket,
+            action: Action::ExtensionAnnounce(announce),
+        } = negotiation.handle(record.id, &announcement).unwrap()
+        else {
+            panic!("expected extension ANNOUNCE");
+        };
+        let accepted = record.accept_extension_announce(&announce);
+        let reply = negotiation.complete(record.id, ticket, accepted).unwrap();
+        assert!(
+            reply.starts_with(b"RTSP/1.0 200 "),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(matches!(
+            negotiation
+                .handle(record.id, &request(Method::Play, "/", 7, true))
+                .unwrap(),
+            NegotiationStep::Action {
+                action: Action::Play,
+                ..
+            }
+        ));
+        let start = record.authenticated_start_payload(23).unwrap();
+        assert_eq!(start["configuration"]["configuration"]["width"], 3840);
+        assert_eq!(
+            start["configuration"]["configuration"]["bitrate"],
+            19_600_000
+        );
+    }
+}

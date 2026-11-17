@@ -260,6 +260,8 @@ impl Record {
                     format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr,
                 )
             });
+            payload["configuration"]["configuration"]["bitrate"] =
+                json!(announce.video.bitrate_kbps.checked_mul(1_000)?);
             payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
             return Some(payload);
         }
