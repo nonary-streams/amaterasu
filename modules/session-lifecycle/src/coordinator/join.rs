@@ -361,15 +361,6 @@ pub(super) fn freeze_source(
     if session.phase != SessionPhase::Ready {
         return Err("join_source_unavailable".into());
     }
-    if settings.participants.is_empty()
-        || settings.participants.iter().any(|participant| {
-            (session.capture_binding_mode.is_managed()
-                && participant.contract_version != COMPOSITION_VERSION)
-                || !participant.capabilities.contains(STREAM_JOIN_CAPABILITY)
-        })
-    {
-        return Err("provider_join_unsupported".into());
-    }
     let mut candidates = session
         .streams
         .iter()
@@ -415,6 +406,22 @@ pub(super) fn freeze_source(
             binding: binding.cloned(),
         });
     source_output(journal, &context)?;
+    let (_, _, Some(source_id), _) = operations::target_parts(&context.source)? else {
+        return Err("invalid_join_source".into());
+    };
+    let graph = session.streams[source_id].provider_graph.as_ref();
+    let mut participants = settings.participants.iter().filter(|participant| {
+        graph.is_none_or(|graph| graph.dependencies.contains_key(&participant.provider))
+    });
+    if participants.clone().next().is_none()
+        || participants.any(|participant| {
+            (session.capture_binding_mode.is_managed()
+                && participant.contract_version != COMPOSITION_VERSION)
+                || !participant.capabilities.contains(STREAM_JOIN_CAPABILITY)
+        })
+    {
+        return Err("provider_join_unsupported".into());
+    }
     Ok(context)
 }
 

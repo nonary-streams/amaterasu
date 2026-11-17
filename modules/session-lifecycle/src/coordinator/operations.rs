@@ -413,8 +413,24 @@ impl Coordinator {
                         if reprepare.is_some() {
                             return Err("join_source_unavailable".into());
                         }
-                        current.join_context =
-                            Some(super::join::freeze_source(&self.settings, &next, session)?);
+                        let context = super::join::freeze_source(&self.settings, &next, session)?;
+                        let (_, _, Some(source_id), _) = target_parts(&context.source)? else {
+                            return Err("invalid_join_source".into());
+                        };
+                        if let Some(retained) = &session.streams[source_id].provider_graph {
+                            let configured = current
+                                .provider_graph
+                                .as_ref()
+                                .ok_or("join_source_graph_changed")?;
+                            if !configured
+                                .is_compatible_with_retained(retained, &self.settings.participants)
+                            {
+                                return Err("join_source_graph_changed".into());
+                            }
+                            current.providers = retained.order.clone();
+                            current.provider_graph = Some(retained.clone());
+                        }
+                        current.join_context = Some(context);
                     } else if super::join::session_has_shared_lease(&next, &session_id) {
                         return Err("shared_source_in_use".into());
                     } else if session.streams.values().any(|stream| {
@@ -425,11 +441,19 @@ impl Coordinator {
                     }) {
                         return Err("join_intent_required".into());
                     }
-                    if reprepare.is_some()
-                        && serde_json::to_value(&current.provider_graph).ok()
-                            != serde_json::to_value(&session.provider_graph).ok()
-                    {
-                        return Err("resource_reprepare_graph_changed".into());
+                    if reprepare.is_some() {
+                        let (Some(configured), Some(retained)) =
+                            (&current.provider_graph, &session.provider_graph)
+                        else {
+                            return Err("resource_reprepare_graph_changed".into());
+                        };
+                        if !configured
+                            .is_compatible_with_retained(retained, &self.settings.participants)
+                        {
+                            return Err("resource_reprepare_graph_changed".into());
+                        }
+                        current.providers = retained.order.clone();
+                        current.provider_graph = Some(retained.clone());
                     }
                     let mode = current.video.as_ref().ok_or("negotiated_video_required")?;
                     if mode.width == 0 || mode.height == 0 || mode.refresh_millihz == 0 {
@@ -529,6 +553,7 @@ impl Coordinator {
                             &payload,
                         )?;
                         preparation.providers = vec![owner.clone()];
+                        preparation.provider_graph = current.provider_graph.clone();
                         preparation.intent = None;
                         preparation.reason = None;
                         preparation.video = None;

@@ -141,6 +141,20 @@ rights until the callback settles, including across asynchronous status polling.
 Native capture evidence is provider-specific; the coordinator preserves it and
 checks the common negotiated mode and exact binding identity.
 
+### Optional lifecycle participants
+
+Trusted startup composition can put a registered auxiliary provider in
+`optional_lifecycle_participants`. Omit the field for compatibility with an
+older consumer. An admitted owner or provider required by another participant,
+a selected policy or a control/finalization contract cannot be omitted.
+
+The coordinator can omit an independent leaf after approval discovery confirms
+it is unavailable, or when its read-only plan records a typed no-effect
+refusal. It commits the reduced graph with the preparing generation so that
+finalization, joins, reprepare and retirement use the actual participants.
+Uncertain callbacks and admitted effects retain their original cleanup
+obligations.
+
 ### Dependent-provider composition
 
 The split uses separately approved `nonary.virtual-screen/2` and

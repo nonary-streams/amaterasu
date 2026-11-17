@@ -128,6 +128,35 @@ struct ProviderGraph {
     dependencies: BTreeMap<String, Vec<String>>,
 }
 
+impl ProviderGraph {
+    fn is_compatible_with_retained(
+        &self,
+        retained: &Self,
+        participants: &[crate::ParticipantSettings],
+    ) -> bool {
+        self.order
+            .iter()
+            .filter(|provider| retained.dependencies.contains_key(*provider))
+            .eq(retained.order.iter())
+            && self.dependencies.iter().all(|(provider, deps)| {
+                retained.dependencies.get(provider).map_or_else(
+                    || {
+                        participants
+                            .iter()
+                            .any(|p| p.provider == *provider && p.optional)
+                    },
+                    |retained_deps| {
+                        retained_deps == deps
+                            && deps
+                                .iter()
+                                .all(|dependency| retained.dependencies.contains_key(dependency))
+                    },
+                )
+            })
+            && retained.dependencies.len() == retained.order.len()
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Work {
@@ -184,6 +213,12 @@ struct ReprepareContinuation {
 }
 
 impl Work {
+    fn includes_provider(&self, provider: &str) -> bool {
+        self.provider_graph
+            .as_ref()
+            .is_none_or(|graph| graph.dependencies.contains_key(provider))
+    }
+
     fn valid_reprepare_shape(&self) -> bool {
         let Some(continuation) = &self.reprepare else {
             return true;

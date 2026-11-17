@@ -632,6 +632,9 @@ impl Coordinator {
         let shared = self.shared.borrow();
         let snapshots = frozen_settings(&shared.value, &work.target)?;
         let mut settings = self.settings.clone();
+        settings
+            .participants
+            .retain(|participant| work.includes_provider(&participant.provider));
         for participant in &mut settings.participants {
             let snapshot = snapshots
                 .get(&participant.provider)
@@ -648,9 +651,21 @@ impl Coordinator {
         send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
     ) -> ModuleResult<bool> {
         let job_key = serde_json::to_string(&work.target).map_err(|_| "invalid_target")?;
-        if frozen_settings(&self.shared.borrow().value, &work.target)?.len()
-            == self.settings.participants.len()
-        {
+        let participants: Vec<_> = self
+            .settings
+            .participants
+            .iter()
+            .filter(|participant| work.includes_provider(&participant.provider))
+            .cloned()
+            .collect();
+        let settings_ready = {
+            let shared = self.shared.borrow();
+            let snapshots = frozen_settings(&shared.value, &work.target)?;
+            participants
+                .iter()
+                .all(|participant| snapshots.contains_key(&participant.provider))
+        };
+        if settings_ready {
             return Ok(true);
         }
         if work.recovery_authorized_epoch.is_some() {
@@ -671,9 +686,7 @@ impl Coordinator {
             }
             // Historical values and contracts may come only from retained
             // preparation evidence, never today's installed policy defaults.
-            if self
-                .settings
-                .participants
+            if participants
                 .iter()
                 .any(|participant| !snapshots.contains_key(&participant.provider))
             {
@@ -683,16 +696,23 @@ impl Coordinator {
             return Ok(true);
         }
         if !self.settings_jobs.contains_key(&job_key) {
+            let static_providers = self
+                .settings
+                .static_processing_settings
+                .iter()
+                .filter(|provider| work.includes_provider(provider))
+                .cloned()
+                .collect();
             self.settings_jobs.insert(
                 job_key.clone(),
                 super::settings_snapshot::SettingsSnapshotJob::new_with_static(
                     self.settings.settings_registry_service.as_deref(),
-                    &self.settings.participants,
+                    &participants,
                     super::settings_snapshot::SnapshotScopes::from_work(
                         &self.shared.borrow().value,
                         work,
                     )?,
-                    &self.settings.static_processing_settings,
+                    &static_providers,
                 )?,
             );
         }
@@ -1446,6 +1466,31 @@ impl Coordinator {
             {
                 continue;
             }
+            if !cleanup && work.index == 0 && work.states.is_empty() {
+                let unavailable = self.settings.participants.iter().find(|participant| {
+                    participant.optional
+                        && work.includes_provider(&participant.provider)
+                        && !self.provider_approvals_complete(&participant.provider)
+                });
+                if let Some(unavailable) = unavailable {
+                    if !discovery_complete {
+                        continue;
+                    }
+                    let provider = unavailable.provider.clone();
+                    if self.omit_optional_provider(&key, &provider)? {
+                        self.record_provider_issue(
+                            &key,
+                            &provider,
+                            work.phase,
+                            "optional_provider_unavailable",
+                            Some("skip_optional_provider"),
+                        );
+                    } else {
+                        self.fail_work(&key, "provider_approval_unavailable")?;
+                    }
+                    continue;
+                }
+            }
             if work.waiting_retirement {
                 if !self.retirement_ready(&work)? {
                     continue;
@@ -2073,24 +2118,6 @@ impl Coordinator {
                 } else {
                     "provider_plan_rejected"
                 };
-                if participant.optional
-                    && !self.provider_effect_unsettled(&key, provider)
-                    && !matches!(
-                        work.phase,
-                        LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
-                    )
-                {
-                    self.record_provider_issue(
-                        &key,
-                        provider,
-                        work.phase,
-                        "optional_provider_skipped",
-                        Some("skip_optional_provider"),
-                    );
-                    self.skip_optional_provider(&key)?;
-                    self.drivers.remove(&runtime_key);
-                    continue;
-                }
                 if matches!(
                     work.phase,
                     LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
@@ -2407,7 +2434,17 @@ impl Coordinator {
                 state.phase,
                 PreparePhase::Rejected | PreparePhase::RecoveryRequired
             ) {
-                if matches!(
+                if state.phase == PreparePhase::Rejected
+                    && self.omit_optional_provider(&key, provider)?
+                {
+                    self.record_provider_issue(
+                        &key,
+                        provider,
+                        work.phase,
+                        "optional_provider_skipped",
+                        Some("skip_optional_provider"),
+                    );
+                } else if matches!(
                     work.phase,
                     LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
                 ) {
@@ -3095,15 +3132,95 @@ impl Coordinator {
             .is_none_or(PrepareState::effect_unsettled)
     }
 
-    fn skip_optional_provider(&self, key: &str) -> ModuleResult<()> {
+    fn omit_optional_provider(&self, key: &str, provider: &str) -> ModuleResult<bool> {
         let mut next = self.shared.borrow().value.clone();
-        let work = next
-            .receipts
-            .get_mut(key)
-            .and_then(|r| r.work.as_mut())
-            .ok_or("unknown_transition")?;
-        work.index += 1;
-        save(&self.shared, next)
+        let receipt = next.receipts.get_mut(key).ok_or("unknown_transition")?;
+        let work = receipt.work.as_mut().ok_or("unknown_transition")?;
+        let Some(graph) = work.provider_graph.as_mut() else {
+            return Ok(false);
+        };
+        let Some(position) = work.providers.iter().position(|entry| entry == provider) else {
+            return Ok(false);
+        };
+        let no_effect = work.states.get(provider).is_none_or(|state| {
+            state.request.operation == ProviderOperation::ResourcePlan
+                && state.admission_id.is_none()
+                && matches!(
+                    state.phase,
+                    PreparePhase::Plan | PreparePhase::PlanStatus | PreparePhase::Rejected
+                )
+        });
+        if receipt.response["status"] != "pending"
+            || !matches!(
+                work.phase,
+                LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+            )
+            || work.reprepare.is_some()
+            || work.recovery_authorized_epoch.is_some()
+            || work.join_context.is_some()
+            || position < work.index
+            || graph.order != work.providers
+            || graph.order.len() <= 1
+            || !graph.dependencies.contains_key(provider)
+            || graph
+                .dependencies
+                .values()
+                .any(|deps| deps.iter().any(|dep| dep == provider))
+            || !no_effect
+            || !self
+                .settings
+                .participants
+                .iter()
+                .any(|p| p.provider == provider && p.optional)
+            || self
+                .settings
+                .finalize_policies
+                .iter()
+                .any(|policy| policy.owner_provider == provider)
+            || self.settings.control_policies.iter().any(|policy| {
+                policy.owner_provider == provider || policy.dependent_provider == provider
+            })
+            || self
+                .settings
+                .processing_policy
+                .as_ref()
+                .is_some_and(|policy| {
+                    policy.provider == provider || policy.source_mode_providers.contains(provider)
+                })
+        {
+            return Ok(false);
+        }
+        let (epoch, session_id, stream_id, generation) =
+            super::operations::target_parts(&work.target)?;
+        let session = next.sessions.get_mut(session_id).ok_or("unknown_session")?;
+        if session.host_epoch != epoch {
+            return Ok(false);
+        }
+        let retained_graph = if let Some(stream_id) = stream_id {
+            let stream = session.streams.get_mut(stream_id).ok_or("unknown_stream")?;
+            if stream.phase != StreamPhase::Preparing
+                || stream.generation != generation
+                || stream.preparation_transition != work.transition_id
+            {
+                return Ok(false);
+            }
+            &mut stream.provider_graph
+        } else {
+            if session.phase != SessionPhase::Preparing || session.generation != generation {
+                return Ok(false);
+            }
+            &mut session.provider_graph
+        };
+        if retained_graph.as_ref() != Some(graph) {
+            return Ok(false);
+        }
+        graph.order.remove(position);
+        graph.dependencies.remove(provider);
+        work.providers.remove(position);
+        work.states.remove(provider);
+        *retained_graph = Some(graph.clone());
+        save(&self.shared, next)?;
+        Ok(true)
     }
 
     fn cleanup_failure(&self, key: &str, reason: &str) -> ModuleResult<()> {
@@ -3280,6 +3397,103 @@ impl Coordinator {
 #[cfg(test)]
 mod admission_target_tests {
     use super::*;
+
+    #[test]
+    fn optional_leaf_is_removed_from_persisted_preparation_and_release_graph() {
+        let dir = std::env::temp_dir().join(format!("optional-graph-{}", identifier().unwrap()));
+        std::fs::create_dir(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = dir.join("journal.json");
+        let mut coordinator = Coordinator::open(&path).unwrap();
+        let method = json!({"service":"optional/1","method":"plan","interface_major":1,
+            "interface_minor":0,"schema_revision":1});
+        coordinator.settings.participants.push(
+            serde_json::from_value(json!({"provider":"optional","depends_on":[],
+                "plan_method":method,"callback_method":method,"status_method":method,
+                "capabilities":[],"cleanup_methods":[],"settings_revision":"revision",
+                "settings":{},"optional":true}))
+            .unwrap(),
+        );
+        let mut journal = coordinator.shared.borrow().value.clone();
+        let epoch = journal.host_epoch.clone();
+        let graph = ProviderGraph {
+            order: vec!["optional".into(), "owner".into()],
+            dependencies: [
+                ("optional".into(), vec![]),
+                ("owner".into(), vec!["optional".into()]),
+            ]
+            .into(),
+        };
+        let target = LifecycleTarget::Session {
+            host_epoch: epoch.clone(),
+            session_id: "session".into(),
+            generation: 1,
+        };
+        let mut retained = session("session");
+        retained.host_epoch = epoch;
+        retained.phase = SessionPhase::Preparing;
+        retained.provider_graph = Some(graph.clone());
+        journal.sessions.insert("session".into(), retained);
+        let work: Work = serde_json::from_value(json!({"phase":"session.prepare","target":target,
+            "intent":null,"reason":null,"video":null,"transition_id":"transition",
+            "providers":graph.order,"provider_graph":graph,"index":0,"states":{},
+            "candidate":null,"waiting_retirement":false}))
+        .unwrap();
+        journal.receipts.insert(
+            "receipt".into(),
+            Receipt {
+                caller: "caller".into(),
+                initiator: "owner".into(),
+                request: json!({}),
+                response: json!({"status":"pending"}),
+                work: Some(work),
+                wait_target: None,
+            },
+        );
+        save(&coordinator.shared, journal).unwrap();
+        assert!(
+            !coordinator
+                .omit_optional_provider("receipt", "optional")
+                .unwrap()
+        );
+
+        let mut journal = coordinator.shared.borrow().value.clone();
+        let work = journal
+            .receipts
+            .get_mut("receipt")
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap();
+        work.provider_graph
+            .as_mut()
+            .unwrap()
+            .dependencies
+            .get_mut("owner")
+            .unwrap()
+            .clear();
+        journal.sessions.get_mut("session").unwrap().provider_graph = work.provider_graph.clone();
+        save(&coordinator.shared, journal).unwrap();
+        assert!(
+            coordinator
+                .omit_optional_provider("receipt", "optional")
+                .unwrap()
+        );
+
+        let persisted: Journal = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut work = persisted.receipts["receipt"].work.clone().unwrap();
+        assert_eq!(work.index, 0);
+        assert_eq!(work.providers, ["owner"]);
+        let frozen_graph = persisted.sessions["session"].provider_graph.clone();
+        assert!(work.provider_graph == frozen_graph);
+        work.use_release_graph(frozen_graph);
+        assert_eq!(work.providers, ["owner"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn failed_or_unknown_reprepare_preserves_session_and_generation_for_recovery() {

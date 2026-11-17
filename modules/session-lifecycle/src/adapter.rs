@@ -290,7 +290,11 @@ impl LifecycleSettings {
                 .insert("read_prepared_plans".into());
         }
         for registration in &composition.registrations {
-            let participant = ParticipantSettings::from(sdk::lifecycle_participant(registration)?);
+            let mut participant =
+                ParticipantSettings::from(sdk::lifecycle_participant(registration)?);
+            participant.optional = composition
+                .optional_lifecycle_participants
+                .contains(&participant.provider);
             if self
                 .participants
                 .iter()

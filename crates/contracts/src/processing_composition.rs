@@ -257,6 +257,9 @@ pub struct ProcessingComposition {
     pub prepared_context_consumers: BTreeSet<String>,
     pub lifecycle_admitters: BTreeSet<String>,
     pub history_owners: BTreeSet<String>,
+    /// Installed coordinator policy for registered providers that can be omitted.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub optional_lifecycle_participants: BTreeSet<String>,
     pub registrations: Vec<ProcessingRegistration>,
 }
 
@@ -279,6 +282,7 @@ impl Default for ProcessingComposition {
             prepared_context_consumers: BTreeSet::new(),
             lifecycle_admitters: BTreeSet::new(),
             history_owners: BTreeSet::new(),
+            optional_lifecycle_participants: BTreeSet::new(),
             registrations: Vec::new(),
         }
     }
@@ -334,6 +338,18 @@ impl ProcessingComposition {
             if !providers.insert(&registration.provider) {
                 return Err("duplicate_processing_registration");
             }
+        }
+        if !self.optional_lifecycle_participants.is_empty()
+            && (self.lifecycle.is_none()
+                || self.optional_lifecycle_participants.iter().any(|provider| {
+                    !providers.contains(provider)
+                        || self
+                            .processor
+                            .as_ref()
+                            .is_some_and(|binding| binding.principal == *provider)
+                }))
+        {
+            return Err("invalid_optional_lifecycle_participant");
         }
         Ok(())
     }
