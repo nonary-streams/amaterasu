@@ -138,6 +138,7 @@ pub(super) fn borrow_source(
     owner: &str,
     lifecycle_admitter: bool,
     config: &PrepareConfig,
+    video_service: &str,
 ) -> Result<Option<Source>, &'static str> {
     let Some(operation) = &config.shared_source_operation_id else {
         return Ok(None);
@@ -145,7 +146,7 @@ pub(super) fn borrow_source(
     if !lifecycle_admitter {
         return Err("permission_denied");
     }
-    let source = records
+    let (source, lender_video_service) = records
         .values()
         .find_map(|record| {
             let source = record.shared_capture.as_ref()?;
@@ -158,9 +159,12 @@ pub(super) fn borrow_source(
                 && config.lifecycle_session_target.as_ref() == Some(&source.session)
                 && source.output.is_some()
                 && record.virtual_display_output == source.output)
-                .then_some(source)
+                .then_some((source, record.providers.video.as_str()))
         })
         .ok_or("shared_capture_source_not_ready")?;
+    if lender_video_service != video_service {
+        return Err("shared_source_provider_profile_conflict");
+    }
     if !source.valid() {
         return Err("invalid_shared_source_reference");
     }

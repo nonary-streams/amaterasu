@@ -650,6 +650,9 @@ pub struct VideoEncryptionPolicySnapshot {
 #[serde(deny_unknown_fields)]
 pub struct Open {
     pub operation_id: String,
+    /// Allowlisted stream-session provider profile from the authenticated owner.
+    #[serde(default)]
+    pub provider_profile: Option<String>,
     /// Runtime observation persisted before this transport's admission.
     #[serde(default)]
     pub expected_runtime_epoch: Option<String>,
@@ -809,6 +812,11 @@ impl Open {
     }
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
+        if self.provider_profile.as_deref().is_some_and(|alias| {
+            !amaterasu_module_sdk::processing_composition::valid_stream_provider_profile(alias)
+        }) {
+            return Err("invalid_provider_profile");
+        }
         if self
             .source_capture_context
             .as_ref()
@@ -1163,8 +1171,13 @@ impl Open {
         {
             return Err("invalid_adapter_selection");
         }
-        if self.capture.constant_rate && self.capture.capture_provider != CaptureProvider::Wgc {
-            return Err("constant_rate_requires_wgc");
+        if self.capture.constant_rate
+            && !matches!(
+                self.capture.capture_provider,
+                CaptureProvider::Wgc | CaptureProvider::External(_)
+            )
+        {
+            return Err("capture_constant_rate_unsupported");
         }
         if !valid_label(&self.capture.output, 512)
             || (!self.capture.audio_endpoint.is_empty()
@@ -1246,6 +1259,9 @@ impl Open {
             "encrypt_audio": self.profile.encrypt_audio,
             "permit_legacy_audio_iv_wrap": self.profile.permit_legacy_audio_iv_wrap,
         });
+        if let Some(alias) = &self.provider_profile {
+            payload["provider_profile"] = alias.as_str().into();
+        }
         if !self.profile.codecs.is_empty() {
             payload["video"]["codecs"] = serde_json::json!(self.profile.codecs);
         } else if !self.profile.codec.is_default() {
@@ -3825,7 +3841,10 @@ mod tests {
         assert_eq!(configuration["output"], "portal-selected-session-source");
         assert_eq!(configuration["constant_rate"], false);
         request.capture.constant_rate = true;
-        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
+        assert_eq!(
+            request.validate(false),
+            Err("capture_constant_rate_unsupported")
+        );
     }
 
     #[test]
@@ -3839,7 +3858,10 @@ mod tests {
         assert_eq!(configuration["output"], "x11:DP-1/000000a4");
         assert_eq!(configuration["constant_rate"], false);
         request.capture.constant_rate = true;
-        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
+        assert_eq!(
+            request.validate(false),
+            Err("capture_constant_rate_unsupported")
+        );
     }
 
     #[test]
@@ -3856,11 +3878,27 @@ mod tests {
         );
         assert_eq!(configuration["constant_rate"], false);
         request.capture.constant_rate = true;
-        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
+        assert_eq!(
+            request.validate(false),
+            Err("capture_constant_rate_unsupported")
+        );
     }
 
     #[test]
-    fn constant_rate_capture_is_wgc_only_and_reaches_session_start() {
+    fn authenticated_open_forwards_only_the_provider_profile_alias() {
+        let mut request = open();
+        request.provider_profile = Some("alternate".into());
+        assert!(request.validate(false).is_ok());
+        assert_eq!(
+            request.prepare("operation", None)["provider_profile"],
+            "alternate"
+        );
+        request.provider_profile = Some("vendor/arbitrary/1".into());
+        assert_eq!(request.validate(false), Err("invalid_provider_profile"));
+    }
+
+    #[test]
+    fn constant_rate_capture_reaches_session_start_for_supported_routes() {
         let mut request = open();
         assert!(!request.capture.constant_rate);
         request.capture.capture_provider = CaptureProvider::Wgc;
@@ -3872,7 +3910,10 @@ mod tests {
         assert_eq!(arm["configuration"]["constant_rate"], true);
 
         request.capture.capture_provider = CaptureProvider::Dxgi;
-        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
+        assert_eq!(
+            request.validate(false),
+            Err("capture_constant_rate_unsupported")
+        );
     }
 
     #[test]

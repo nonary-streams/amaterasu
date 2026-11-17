@@ -45,6 +45,15 @@ impl RuntimeClient {
     }
 }
 
+/// Validate an opaque name from the trusted stream provider profile map.
+pub fn valid_stream_provider_profile(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 64
+        && alias.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
 /// Validate an interface family before using a selected alias. Native tables
 /// must still be bound with the runtime's typed native-contract check.
 pub fn require_contract<'a>(

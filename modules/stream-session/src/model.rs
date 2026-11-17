@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub providers: crate::providers::ProviderServices,
+    pub provider_profiles: std::collections::BTreeMap<String, crate::providers::ProviderServices>,
     #[serde(skip)]
     pub processing_plan: Option<ProcessingPlanProvider>,
     pub source_preparation: Option<SourcePreparation>,
@@ -30,6 +31,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             providers: Default::default(),
+            provider_profiles: Default::default(),
             processing_plan: None,
             source_preparation: None,
             extension_route: None,
@@ -83,6 +85,23 @@ impl OutboundPolicy {
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.providers.validate()?;
+        if self.provider_profiles.len() > 16 {
+            return Err("invalid_provider_profiles");
+        }
+        for (alias, providers) in &self.provider_profiles {
+            if !amaterasu_module_sdk::processing_composition::valid_stream_provider_profile(alias)
+                || providers.lifecycle != self.providers.lifecycle
+                || ((self.processing_plan.is_some()
+                    || self.source_preparation.is_some()
+                    || self.extension_route.is_some())
+                    && providers.video != self.providers.video)
+                || (self.extension_route.is_some()
+                    && providers.media_transport != self.providers.media_transport)
+            {
+                return Err("invalid_provider_profile");
+            }
+            providers.validate()?;
+        }
         if let Some(preparation) = &self.source_preparation
             && (!valid_name(&preparation.display_settings_service)
                 || preparation.hooks.is_empty()
@@ -565,6 +584,9 @@ impl DisplayRequest {
 #[serde(deny_unknown_fields)]
 pub struct PrepareConfig {
     pub peer_ip: IpAddr,
+    /// Alias from trusted startup configuration, selected by the stream owner.
+    #[serde(default)]
+    pub provider_profile: Option<String>,
     /// Coordinator-issued logical session selected by the transport adapter.
     #[serde(default)]
     pub lifecycle_session_target: Option<amaterasu_extension_api::LifecycleTarget>,
@@ -630,6 +652,11 @@ pub struct PrepareConfig {
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
+        if self.provider_profile.as_deref().is_some_and(|alias| {
+            !amaterasu_module_sdk::processing_composition::valid_stream_provider_profile(alias)
+        }) {
+            return Err("invalid_provider_profile");
+        }
         if self
             .source_capture_context
             .as_ref()
@@ -1496,8 +1523,13 @@ impl StartConfig {
         {
             return Err("owned_display_requires_pipewire");
         }
-        if self.constant_rate && self.capture_provider != CaptureProvider::Wgc {
-            return Err("constant_rate_requires_wgc");
+        if self.constant_rate
+            && !matches!(
+                self.capture_provider,
+                CaptureProvider::Wgc | CaptureProvider::External(_)
+            )
+        {
+            return Err("capture_constant_rate_unsupported");
         }
         if (self.source_id.is_none() && !valid_label(&self.output, 512))
             || (!self.audio_endpoint.is_empty() && !valid_label(&self.audio_endpoint, 4096))
@@ -1879,7 +1911,10 @@ mod tests {
             "pipewire"
         );
         start.constant_rate = true;
-        assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));
+        assert_eq!(
+            start.validate(false),
+            Err("capture_constant_rate_unsupported")
+        );
     }
 
     #[test]
@@ -1894,7 +1929,10 @@ mod tests {
             "x11"
         );
         start.constant_rate = true;
-        assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));
+        assert_eq!(
+            start.validate(false),
+            Err("capture_constant_rate_unsupported")
+        );
     }
 
     #[test]
@@ -1909,7 +1947,10 @@ mod tests {
             "kms"
         );
         start.constant_rate = true;
-        assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));
+        assert_eq!(
+            start.validate(false),
+            Err("capture_constant_rate_unsupported")
+        );
     }
 
     #[test]

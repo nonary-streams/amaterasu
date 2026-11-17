@@ -304,8 +304,24 @@ impl Pipeline {
             rpc::complete(send, request, error(code));
             return;
         }
-        if config.lifecycle_session_target.is_some() && self.settings.providers.lifecycle.is_none()
-        {
+        let providers = if let Some(alias) = &config.provider_profile {
+            let Some(providers) = self.settings.provider_profiles.get(alias) else {
+                rpc::complete(send, request, error("provider_profile_not_allowed"));
+                return;
+            };
+            providers.clone()
+        } else {
+            self.settings.providers.clone()
+        };
+        if config.borrowed_capture.is_some() && providers.video != self.settings.providers.video {
+            rpc::complete(
+                send,
+                request,
+                error("shared_source_provider_profile_conflict"),
+            );
+            return;
+        }
+        if config.lifecycle_session_target.is_some() && providers.lifecycle.is_none() {
             self.report_prepare_refusal(
                 &owner,
                 config.rtsp_operation_id.as_deref(),
@@ -319,7 +335,7 @@ impl Pipeline {
             .custom
             .as_ref()
             .is_some_and(|custom| custom.processing.is_some())
-            && self.settings.providers.audio_processor.is_none()
+            && providers.audio_processor.is_none()
         {
             self.report_prepare_refusal(
                 &owner,
@@ -418,6 +434,7 @@ impl Pipeline {
             &owner,
             lifecycle_admitter,
             &config,
+            &providers.video,
         ) {
             Ok(source) => source,
             Err(code) => {
@@ -430,7 +447,7 @@ impl Pipeline {
         record.shared_capture_attached = shared_capture.is_some();
         record.virtual_display_attempted = shared_capture.is_some();
         record.shared_capture = shared_capture;
-        record.providers = self.settings.providers.clone();
+        record.providers = providers;
         record.processing_plan_provider = self.settings.processing_plan.clone();
         record.source_preparation = self.settings.source_preparation.clone();
         if record.config.extension_probe.is_some()

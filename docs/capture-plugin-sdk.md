@@ -170,6 +170,18 @@ DMA-BUF input and implement encoder v1.1. Capture v1.5 optionally supplies
 presentation-driven pacing. A pinned external DMA-BUF provider fails when the
 required path is unavailable; it does not silently substitute another source.
 
+## Constant-rate Open
+
+A caller selects the existing `constant_rate` boolean on a known capture
+alias. Open includes `capture_cadence_millihz` for external providers. A
+provider that can deliver the cadence returns `constant_rate: true` and the
+exact cadence value in its successful reply. Video reads such providers at
+the stream cadence even without presentation notifications. A read can return
+a fresh or cached frame using the appropriate freshness metadata. Video
+closes the exact allocated capture if the acknowledgement is absent or
+different. The pointer tables and ordinary Open requests
+are unchanged.
+
 ## Negotiated resource delivery
 
 Capture v1.8 adds an optional resource interface after the v1.7 table. Check

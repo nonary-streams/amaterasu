@@ -194,7 +194,20 @@ Audio endpoints are leased under their resolved identity. Video capture leases
 identify provider, constant-rate mode, and output, not a canonical physical display
 across providers. Both are shared read leases. Display mutation, topology
 restoration and application launch integration remain separate work. The optional
-`constant_rate` start field is accepted only with WGC and defaults to false.
+`constant_rate` start field defaults to false. WGC supports this route, and an
+external capture provider can implement it by acknowledging both
+`constant_rate: true` and the requested `capture_cadence_millihz` in its Open reply. Video retires an allocated capture
+that omits or denies the requested capability before it starts encoding.
+
+An authenticated caller may supply `provider_profile` on RTSP Open or
+stream-session Prepare. It must name an entry in the signed startup
+`provider_profiles` map. Each entry uses the existing `providers` schema,
+with the same lifecycle service and any composition-pinned video and media
+transport services.
+The usual startup map applies when the alias is omitted. Calls and native
+bindings still need the applicable grants. The admission record and its
+journal carry the resolved map through later work and recovery.
+
 External `capture_provider` aliases use 1–64 lowercase ASCII letters, digits,
 underscores or hyphens. They are forwarded to Video, which resolves configured
 providers and rejects unknown aliases.

@@ -294,6 +294,75 @@ fn request_payload_cannot_replace_the_startup_selected_services() {
 }
 
 #[test]
+fn extension_profiles_cannot_replace_the_paired_video_or_media_service() {
+    let mut settings: Settings = serde_json::from_value(json!({
+        "extension_route": {
+            "profile": {
+                "codec":{"namespace_id":7,"value":8,"schema":1},
+                "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
+                "payload_type":100,"encoding_name":"EXAMPLE"
+            },
+            "source_id":42,"encoder_provider":"fixture",
+            "encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
+            "video_unit_service":"example.units/1","framer_service":"example.framer/1",
+            "plan_transport_service":"example.plan/1"
+        }
+    }))
+    .unwrap();
+    assert!(settings.validate().is_ok());
+    let alias = "alternate".to_owned();
+    settings
+        .provider_profiles
+        .insert(alias.clone(), settings.providers.clone());
+    assert!(settings.validate().is_ok());
+    settings.provider_profiles.get_mut(&alias).unwrap().video = "vendor.frames/1".into();
+    assert_eq!(settings.validate(), Err("invalid_provider_profile"));
+    let mut profile = settings.providers.clone();
+    profile.media_transport = "vendor.media/1".into();
+    settings.provider_profiles.insert(alias, profile);
+    assert_eq!(settings.validate(), Err("invalid_provider_profile"));
+}
+
+#[test]
+fn trusted_stream_profile_pins_the_resolved_services_for_cleanup() {
+    let mut host = Harness::new();
+    let mut profile = ProviderServices {
+        video: "vendor.frames/1".into(),
+        ..host.pipeline.settings.providers.clone()
+    };
+    host.pipeline
+        .settings
+        .provider_profiles
+        .insert("alternate".into(), profile.clone());
+    let mut request = prepare();
+    request["provider_profile"] = json!("unapproved");
+    assert_eq!(
+        host.response(1, request.clone())["code"],
+        "provider_profile_not_allowed"
+    );
+    request["provider_profile"] = json!("alternate");
+    let id = host.response(2, request)["session"].as_u64().unwrap();
+    assert_eq!(host.pipeline.records[&id].providers, profile);
+    profile.video = "vendor.other/1".into();
+    host.pipeline
+        .settings
+        .provider_profiles
+        .insert("alternate".into(), profile);
+    host.pipeline
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .resources
+        .insert(Resource::Video, 42);
+    assert_eq!(
+        Job::new(id, None, Step::Close(Resource::Video), 5000)
+            .command(&host.pipeline.records[&id])
+            .0,
+        "vendor.frames/1"
+    );
+}
+
+#[test]
 fn each_record_pins_startup_services_for_all_later_workflow_operations() {
     let mut host = Harness::new();
     let id = host.response(1, prepare())["session"].as_u64().unwrap();

@@ -38,6 +38,13 @@ pub use selector::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector}
 pub use source_format::{SourceCaptureContext, SourceFormat};
 pub use subscription::{CaptureNotice, CaptureNotifications, CaptureSubscription};
 
+/// Confirm the external capture provider admitted the exact requested cadence.
+pub fn constant_rate_confirmed(reply: &serde_json::Value, cadence_millihz: u32) -> bool {
+    cadence_millihz != 0
+        && reply["constant_rate"] == true
+        && reply["capture_cadence_millihz"] == cadence_millihz
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwapRequest {
     pub preferred_provider: Option<String>,

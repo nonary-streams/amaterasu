@@ -185,6 +185,9 @@ impl Pipeline {
     pub fn new(settings: Settings, service: String) -> Result<Self, &'static str> {
         settings.validate()?;
         settings.providers.validate_for_owner(&service)?;
+        for providers in settings.provider_profiles.values() {
+            providers.validate_for_owner(&service)?;
+        }
         Ok(Self {
             report_stream_issues: false,
             admission_issues: Default::default(),
