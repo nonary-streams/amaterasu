@@ -108,23 +108,20 @@ impl Controller {
                 }
             }
             Phase::LifecyclePrepare | Phase::LifecycleLookup => {
-                record.close_with_cause(
-                    Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                            "dependency_unavailable",
-                        ),
-                    ),
-                    Some(Cause::of_phase(job.phase)),
+                let failure = amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "dependency_unavailable",
                 );
+                let cause = Some(Cause::of_phase(job.phase));
                 if let Some((connection, action_ticket)) = job.network {
-                    self.fail_network_action(
+                    self.finish_network_result(
                         record,
                         connection,
                         action_ticket,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                            "dependency_unavailable",
-                        ),
+                        Err(failure),
+                        cause,
                     );
+                } else {
+                    record.close_with_cause(Some(failure), cause);
                 }
                 if job.phase == Phase::LifecyclePrepare && job.call.proven_not_dispatched() {
                     record.lifecycle_prepare_outstanding = false;
@@ -553,9 +550,6 @@ impl Controller {
                 safe_provider_code(&payload["error"]),
             );
         }
-        if same_session && let Some(state) = state {
-            record.stream_state = Some(state.into());
-        }
         let Some((connection, action_ticket)) = job.network else {
             record.close(Some(
                 amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
@@ -565,64 +559,88 @@ impl Controller {
             self.schedule_stop(record, job.caller, now);
             return;
         };
+        if record
+            .negotiation
+            .as_ref()
+            .is_some_and(|negotiation| negotiation.failure_scope(record.id, action_ticket).is_err())
+        {
+            return;
+        }
+        if same_session && let Some(state) = state {
+            record.stream_state = Some(state.into());
+        }
         let cause = (!valid).then(|| Cause::stream_session(provider_code(payload)));
-        let mut prepared_refusal = false;
-        let outcome = if valid {
-            Ok(super::network::NetworkCompletion::NativeStart)
-        } else {
-            let report = payload
-                .get("stream_failure")
-                .and_then(|value| {
-                    serde_json::from_value::<amaterasu_module_sdk::stream_lifecycle::StreamIssue>(
-                        value.clone(),
-                    )
-                    .ok()
-                })
-                .filter(|report| {
-                    // Older managed preparations without history use the
-                    // selected stream-session's local identity.
-                    let local_scope = same_session
-                        && record.config.history_activity_id.is_none()
-                        && record.config.lifecycle_capture_mode.is_managed()
-                        && record
-                            .session
-                            .is_some_and(|session| report.operation == format!("ss-{session:x}"));
-                    let owned_start = same_session
-                        && report.layer
-                            == amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession
-                        && report.phase == "start";
-                    let unchanged_preparation = payload["ok"] == false
-                        && record.state == State::Arming
-                        && state == Some("prepared")
-                        && payload["cleanup_error"].is_null();
-                    (report.operation == record.config.operation_id || local_scope)
-                        && owned_start
-                        && (report.is_critical() || unchanged_preparation)
-                        && report.valid()
-                        && !report.reason.is_empty()
-                });
-            Err(match report {
-                Some(report) => {
-                    prepared_refusal = !report.is_critical();
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::reported(
-                        "start_rejected",
-                        report,
-                    )
-                }
-                None => amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                    "start_rejected",
-                ),
-            })
+        use amaterasu_module_sdk::stream_lifecycle::{
+            LifecycleLayer, StreamFailure, StreamFailureEffect, StreamFailureFact, StreamIssue,
         };
-        if self.finish_network_result(record, connection, action_ticket, outcome, cause) {
+        if !valid {
+            let owns_report = |fact: &StreamFailureFact| {
+                let local_scope = record.config.history_activity_id.is_none()
+                    && record.config.lifecycle_capture_mode.is_managed()
+                    && record
+                        .session
+                        .is_some_and(|session| fact.operation == format!("ss-{session:x}"));
+                same_session
+                    && (fact.operation == record.config.operation_id || local_scope)
+                    && fact.layer == LifecycleLayer::StreamSession
+                    && fact.phase == "start"
+            };
+            let unchanged = payload["ok"] == false
+                && record.state == State::Arming
+                && state == Some("prepared")
+                && payload["cleanup_error"].is_null();
+            let report = match payload.get("stream_failure_fact") {
+                Some(fact) => serde_json::from_value::<StreamFailureFact>(fact.clone())
+                    .ok()
+                    .filter(owns_report)
+                    .map(|fact| (fact, unchanged)),
+                None => payload
+                    .get("stream_failure")
+                    .and_then(|report| serde_json::from_value::<StreamIssue>(report.clone()).ok())
+                    .filter(|report| report.valid() && !report.reason.is_empty())
+                    .and_then(|report| {
+                        let fact = StreamFailureFact::from(&report);
+                        owns_report(&fact).then_some((fact, unchanged && !report.is_critical()))
+                    }),
+            };
+            if let Some((fact, preparation_unchanged)) = report {
+                let effect = if preparation_unchanged {
+                    StreamFailureEffect::PreparationUnchanged
+                } else {
+                    StreamFailureEffect::RequiredStartUnverified
+                };
+                if self.finish_provider_start_failure(
+                    record,
+                    connection,
+                    action_ticket,
+                    fact,
+                    effect,
+                ) && record.state == State::Arming
+                {
+                    record.restore_admission();
+                }
+            } else {
+                self.finish_network_result(
+                    record,
+                    connection,
+                    action_ticket,
+                    Err(StreamFailure::critical("start_rejected")),
+                    cause,
+                );
+            }
+            return;
+        }
+        if self.finish_network_result(
+            record,
+            connection,
+            action_ticket,
+            Ok(super::network::NetworkCompletion::NativeStart),
+            cause,
+        ) {
             record.state = State::Playing;
             record.expires = u64::MAX;
             record.observation_stale_at = now.saturating_add(OBSERVATION_STALE_MS);
             record.next_status = now.saturating_add(STATUS_INTERVAL_MS);
-        } else if prepared_refusal && record.failure.is_none() && record.state == State::Arming {
-            // Exact selected provider confirms the same session is still only
-            // prepared. No retirement or media mutation is inferred from a log.
-            record.restore_admission();
         }
     }
 
@@ -683,12 +701,21 @@ impl Controller {
         if confirm_terminal(record, payload) {
             record.authenticated_disconnect_reason =
                 authenticated_disconnect_reason(record, payload);
-            if record.state != State::Closing {
-                record.close(Some(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+            // Confirmed retirement is an observation of a completed owner
+            // transition. Project its outcome without making a second decision.
+            if record.state != State::Closing && state == Some("failed") && record.failure.is_none()
+            {
+                use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+                record.failure = Some("stream_failed");
+                record.issues.push(
+                    StreamIssue::critical(
+                        &record.config.operation_id,
+                        LifecycleLayer::Rtsp,
+                        record.state.phase(),
                         "stream_failed",
-                    ),
-                ));
+                    )
+                    .caused_by(LifecycleLayer::StreamSession),
+                );
             }
             self.finish_cleanup_reply(record, job, runtime);
         } else if matches!(state, Some("cleanup_failed" | "failed" | "cancelled"))

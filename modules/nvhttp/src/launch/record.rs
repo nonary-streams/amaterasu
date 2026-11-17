@@ -91,6 +91,7 @@ pub enum ApplicationRetirementState {
 
 pub struct Record {
     failure_authority: Option<amaterasu_module_sdk::stream_lifecycle::StreamTermination>,
+    failure_scope: amaterasu_module_sdk::stream_lifecycle::StreamFailureScope,
     pub id: u64,
     /// Joining transports borrow the application/session retained by this root.
     /// Only the root may terminate the application or end the lifecycle session.
@@ -336,6 +337,9 @@ impl Record {
         let application_owner_client_id = super::fingerprint(peer.certificate());
         Self {
             failure_authority: None,
+            failure_scope: amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+                rtsp_operation.as_str(),
+            ),
             id,
             application_session: None,
             application_owner_client_id,
@@ -546,9 +550,7 @@ impl Record {
         reason: Option<&str>,
         effect: impl FnOnce(&mut Self) -> T,
     ) -> Option<T> {
-        use amaterasu_module_sdk::stream_lifecycle::{
-            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
-        };
+        use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamFailureHandler};
         let mut issue = self.attributed(failure.at(
             self.rtsp_operation.clone(),
             LifecycleLayer::Nvhttp,
@@ -557,7 +559,43 @@ impl Record {
         if let Some(reason) = reason {
             issue = issue.because(reason);
         }
-        match StreamFailureHandler::decide(issue) {
+        let decision = StreamFailureHandler::decide_scoped(issue, &self.failure_scope);
+        self.apply_failure_decision(decision, effect)
+    }
+
+    #[track_caller]
+    pub(super) fn request_preparation_failure(
+        &mut self,
+        mut fact: amaterasu_module_sdk::stream_lifecycle::StreamFailureFact,
+        code: &'static str,
+        now: Instant,
+    ) -> bool {
+        use amaterasu_module_sdk::stream_lifecycle::{
+            LifecycleLayer, StandardStreamFailurePolicy, StreamFailureEffect, StreamFailureHandler,
+        };
+        fact.operation.clone_from(&self.rtsp_operation);
+        let decision = StreamFailureHandler::adjudicate(
+            &StandardStreamFailurePolicy,
+            fact,
+            StreamFailureEffect::RequiredStartUnverified,
+            &self.failure_scope,
+            LifecycleLayer::Nvhttp,
+            code,
+        );
+        self.apply_failure_decision(decision, |record| {
+            record.failure.get_or_insert(code);
+            record.begin_cleanup(now);
+        })
+        .is_some()
+    }
+
+    fn apply_failure_decision<T>(
+        &mut self,
+        decision: amaterasu_module_sdk::stream_lifecycle::StreamFailureDecision,
+        effect: impl FnOnce(&mut Self) -> T,
+    ) -> Option<T> {
+        use amaterasu_module_sdk::stream_lifecycle::StreamFailureDecision;
+        match decision {
             StreamFailureDecision::Terminate(permit) => {
                 self.issues.push(permit.issue().clone());
                 if self.failure_authority.is_none() {
@@ -580,11 +618,13 @@ impl Record {
     ) -> Option<T> {
         self.failure_authority
             .as_ref()
-            .filter(|permit| permit.issue().operation == self.rtsp_operation)?;
+            .filter(|permit| permit.matches_scope(&self.failure_scope))?;
         Some(effect(self))
     }
 
     pub(super) fn begin_resume_operation(&mut self, operation: String) {
+        self.failure_scope =
+            amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(operation.as_str());
         self.rtsp_operation = operation;
         self.failure = None;
         self.failure_authority = None;

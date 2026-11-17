@@ -3033,6 +3033,12 @@ fn a_plan_refused_at_admission_fails_cleanly_and_does_not_block_the_next_session
     let refused = prepare_session(&mut harness, "refused");
     assert_eq!(refused["status"], "failed", "{refused}");
     assert_eq!(refused["cleanup_completed"], true, "{refused}");
+    assert_eq!(
+        refused["stream_failure_fact"]["operation"],
+        refused["operation_id"]
+    );
+    assert_eq!(refused["stream_failure_fact"]["phase"], "session_prepare");
+    assert!(refused["stream_failure_fact"].get("disposition").is_none());
     assert_eq!(refused["reason"], "provider_plan_rejected", "{refused}");
     let refused_id = refused["target"]["session_id"].as_str().unwrap().to_owned();
     let journal = journal_snapshot(&harness);

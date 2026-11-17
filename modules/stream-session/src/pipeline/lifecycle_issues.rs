@@ -176,8 +176,10 @@ impl Record {
             .unwrap_or_else(|| format!("ss-{:x}", self.id));
         let report = StreamIssue::advisory(operation, LifecycleLayer::StreamSession, phase, code)
             .because(code);
+        let fact = amaterasu_module_sdk::stream_lifecycle::StreamFailureFact::from(&report);
         let response = serde_json::json!({"ok":false, "code":code, "session":self.id,
-            "state":self.state, "cleanup_error":self.cleanup_error, "stream_failure":report});
+            "state":self.state, "cleanup_error":self.cleanup_error,
+            "stream_failure_fact":fact, "stream_failure":report});
         if self.config.rtsp_operation_id.is_some() {
             self.issues.push(report);
         }

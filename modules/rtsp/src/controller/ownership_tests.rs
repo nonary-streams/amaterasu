@@ -707,12 +707,25 @@ fn surround_open_prepare_announce_and_authenticated_start_use_exact_layout() {
             start["configuration"]["virtual_sink"],
             "Steam Streaming Speakers"
         );
+        let play = negotiation_request(Method::Play, "/", 7, Some(&record.session_token));
+        let NegotiationStep::Action {
+            ticket: action,
+            action: Action::Play,
+        } = record
+            .negotiation
+            .as_mut()
+            .unwrap()
+            .handle(ticket, &play)
+            .unwrap()
+        else {
+            panic!("PLAY did not create a pending action");
+        };
         controller.job = Some(Job {
             ticket,
             phase: Phase::Arm,
             call: Call::new(start, format!("surround-arm-{channels}"), None),
             caller: None,
-            network: Some((0, 0)),
+            network: Some((0, action)),
             deadline: 5_000,
         });
         tick(&mut controller, &runtime, 5);

@@ -30,7 +30,7 @@ impl ResumeSnapshot {
         stream.lifecycle_session_target = application.lifecycle_session_target.clone();
         stream.lifecycle_application_bound = application.lifecycle_application_bound;
         stream.lifecycle_launch_epoch_ready = true;
-        stream.rtsp_operation = operation;
+        stream.begin_resume_operation(operation);
         stream.launch_connection = Some(connection);
         stream.stage = super::Stage::VerifyResumeSession;
         stream.deadline = now + super::INITIAL_DEADLINE;

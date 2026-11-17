@@ -200,6 +200,7 @@ impl StartupRecovery {
 
 pub struct Controller {
     network: Network,
+    failure_policy: Box<dyn amaterasu_module_sdk::stream_lifecycle::StreamFailurePolicy>,
     settings: Settings,
     bootstrap_settings: Settings,
     network_base_port: Option<u16>,
@@ -251,6 +252,18 @@ impl Controller {
     }
 
     pub fn with_network(settings: Settings, network: Network) -> Result<Self, &'static str> {
+        Self::with_failure_policy(
+            settings,
+            network,
+            Box::new(amaterasu_module_sdk::stream_lifecycle::StandardStreamFailurePolicy),
+        )
+    }
+
+    pub fn with_failure_policy(
+        settings: Settings,
+        network: Network,
+        failure_policy: Box<dyn amaterasu_module_sdk::stream_lifecycle::StreamFailurePolicy>,
+    ) -> Result<Self, &'static str> {
         settings.validate()?;
         let mut epoch_bytes = [0; 16];
         getrandom::fill(&mut epoch_bytes).map_err(|_| "random_unavailable")?;
@@ -279,6 +292,7 @@ impl Controller {
             StartupRecovery::new(recovery_nonce, STARTUP_RECONCILIATION_TIMEOUT_MS);
         Ok(Self {
             network,
+            failure_policy,
             bootstrap_settings: settings.clone(),
             active_address_family: None,
             active_bind_address: None,

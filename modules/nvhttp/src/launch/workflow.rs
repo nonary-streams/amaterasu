@@ -2076,11 +2076,24 @@ impl Controller {
                     } else {
                         "lifecycle_prepare_failed"
                     };
-                    fail_record(
-                        record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(reason),
-                        now,
-                    );
+                    use amaterasu_module_sdk::stream_lifecycle::{
+                        LifecycleLayer, StreamFailure, StreamFailureFact,
+                    };
+                    let fact = payload
+                        .get("stream_failure_fact")
+                        .and_then(|fact| {
+                            serde_json::from_value::<StreamFailureFact>(fact.clone()).ok()
+                        })
+                        .filter(|fact| {
+                            fact.layer == LifecycleLayer::SessionLifecycle
+                                && fact.phase == "session_prepare"
+                                && payload["operation_id"].as_str() == Some(fact.operation.as_str())
+                        });
+                    if !fact
+                        .is_some_and(|fact| record.request_preparation_failure(fact, reason, now))
+                    {
+                        fail_record(record, StreamFailure::critical(reason), now);
+                    }
                 } else if payload["status"] == "succeeded"
                     && let Some(target) = lifecycle_session_target(&payload)
                     && serde_json::from_value::<

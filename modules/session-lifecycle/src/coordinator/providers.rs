@@ -3086,6 +3086,11 @@ impl Coordinator {
             );
         }
         response["operation_id"] = receipt.request["operation_id"].clone();
+        if work.failed_preparation.is_some()
+            && let Some(fact) = receipt.response.get("stream_failure_fact")
+        {
+            response["stream_failure_fact"] = fact.clone();
+        }
         receipt.response = response;
         receipt.work = ((deferred && shared_source_cleanup)
             || abandoned_release_deferred
@@ -3238,6 +3243,7 @@ impl Coordinator {
         save(&self.shared, next)
     }
 
+    #[track_caller]
     fn fail_work(&self, key: &str, reason: &str) -> ModuleResult<()> {
         let mut next = self.shared.borrow().value.clone();
         let work = next
@@ -3295,7 +3301,32 @@ impl Coordinator {
                 session.phase = SessionPhase::Ending;
                 session.application_retired = session.application.is_none();
             }
-            next.receipts.get_mut(key).unwrap().response["reason"] = json!(reason);
+            let receipt = next.receipts.get_mut(key).unwrap();
+            receipt.response["reason"] = json!(reason);
+            if let Some(operation) = receipt.response["operation_id"].as_str() {
+                use amaterasu_module_sdk::stream_lifecycle::{
+                    LifecycleLayer, StreamFailureFact, StreamIssue,
+                };
+                let phase = if work.phase == LifecyclePhase::SessionPrepare {
+                    "session_prepare"
+                } else {
+                    "stream_prepare"
+                };
+                let mut issue = StreamIssue::advisory(
+                    operation,
+                    LifecycleLayer::SessionLifecycle,
+                    phase,
+                    "provider_preparation_failed",
+                )
+                .because(reason);
+                if !issue.valid() {
+                    issue = issue.because("preparation_unavailable");
+                }
+                if issue.valid() {
+                    receipt.response["stream_failure_fact"] =
+                        json!(StreamFailureFact::from(&issue));
+                }
+            }
             if another_release {
                 // Transfer uncertain providers to the existing cleanup fence before
                 // it can run another callback. Its graph may predate this work;

@@ -145,3 +145,22 @@ owner binds that report to its stream before the common decision. Another
 session, foreign scope, external capture or history-bound local alias is refused;
 a critical report remains critical. Optional history is not an identity or
 admission requirement.
+
+### Prepared PLAY refusals
+
+Stream-session returns a structured `stream_failure_fact` without a
+disposition. RTSP verifies the provider's reply against the exact pending action
+and the owned preparation, then uses the SDK's owner policy to decide whether
+to refuse only the request or end that stream. An unverified native start
+cannot receive a continuation permit. A late action completion leaves the
+current action and its status alone. The old `stream_failure` reply remains for
+compatibility with older RTSP consumers.
+
+The coordinator also returns a preparation fact after it records a failed
+attempt and begins locally owned rollback. NVHTTP checks the exact operation
+and confirmed cleanup before adjudicating a required launch failure. A
+retirement receipt lets RTSP project an already completed owner outcome.
+
+These paths use the SDK's standard policy in the shipped worker. The Rust
+controller accepts an injected policy for authenticated PLAY refusals.
+Other lifecycle callers still use the original disposition API.

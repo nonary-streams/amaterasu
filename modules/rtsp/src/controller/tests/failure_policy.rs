@@ -460,6 +460,73 @@ fn undeliverable_negotiation_only_completion_preserves_ownership() {
 }
 
 #[test]
+fn provider_facts_follow_the_action_owners_policy() {
+    use amaterasu_module_sdk::stream_lifecycle::{
+        LifecycleLayer, StreamFailureAction, StreamFailureEffect, StreamFailureFact,
+        StreamFailurePolicy, StreamIssue,
+    };
+
+    struct EndOnRefusal;
+
+    impl StreamFailurePolicy for EndOnRefusal {
+        fn action(&self, _: &StreamFailureFact, _: StreamFailureEffect) -> StreamFailureAction {
+            StreamFailureAction::EndStream
+        }
+    }
+
+    for (terminate, changed, stale) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, false, true),
+    ] {
+        let (mut controller, action) = prepared_controller();
+        if terminate {
+            controller.failure_policy = Box::new(EndOnRefusal);
+        }
+        let mut record = controller.records.remove(&5).unwrap();
+        record.expires = 100;
+        record.config.ping_timeout_ms = 10_000;
+        record.begin_arm(99);
+        let prior_state = record.stream_state.clone();
+        let report = StreamIssue::critical(
+            record.config.operation_id.clone(),
+            LifecycleLayer::StreamSession,
+            "start",
+            "start_request_refused",
+        )
+        .because("request_unavailable");
+        let fact = StreamFailureFact::from(&report);
+        let action = if stale { action + 1 } else { action };
+        controller.armed(
+            &mut record,
+            Job {
+                ticket: 5,
+                phase: Phase::Arm,
+                call: Call::new(json!({}), "test-arm".into(), None),
+                caller: None,
+                network: Some((999, action)),
+                deadline: 10_099,
+            },
+            &json!({"ok":false,"session":23,"state":if changed { "starting" } else { "prepared" },
+                "stream_failure_fact":fact,"stream_failure":report}),
+            99,
+        );
+        if stale {
+            assert_eq!(record.stream_state, prior_state);
+            assert_eq!(record.state, State::Arming);
+            assert_eq!(record.failure, None);
+        } else if terminate || changed {
+            assert_eq!(record.state, State::Closing);
+            assert_eq!(record.failure, Some("start_rejected"));
+        } else {
+            assert_eq!(record.state, State::Ready);
+            assert_eq!(record.expires, 100);
+        }
+    }
+}
+
+#[test]
 fn recoverable_play_refusal_preserves_the_original_admission_deadline() {
     use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
     let (mut controller, action) = prepared_controller();

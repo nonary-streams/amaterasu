@@ -1,6 +1,7 @@
 use super::*;
 use amaterasu_module_sdk::stream_lifecycle::{
-    LifecycleLayer, StreamFailure, StreamFailureDecision, StreamFailureHandler, StreamIssue,
+    LifecycleLayer, StreamFailure, StreamFailureDecision, StreamFailureEffect, StreamFailureFact,
+    StreamFailureHandler, StreamIssue,
 };
 
 #[derive(Debug)]
@@ -499,6 +500,14 @@ impl Controller {
             }
             return false;
         };
+        if record
+            .negotiation
+            .as_ref()
+            .is_none_or(|negotiation| negotiation.failure_scope(record.id, action_ticket).is_err())
+        {
+            // This completion belongs to an action already retired or replaced.
+            return false;
+        }
         if let Ok(completion) = outcome {
             let native_start = matches!(completion, NetworkCompletion::NativeStart);
             let reply = record
@@ -533,7 +542,55 @@ impl Controller {
             failure,
             cause,
         );
+        self.apply_network_failure(record, connection, action_ticket, decision, code);
+        false
+    }
+
+    pub(super) fn finish_provider_start_failure(
+        &mut self,
+        record: &mut Record,
+        connection: u64,
+        action_ticket: u64,
+        mut fact: StreamFailureFact,
+        effect: StreamFailureEffect,
+    ) -> bool {
+        let Some(scope) = record
+            .negotiation
+            .as_ref()
+            .and_then(|negotiation| negotiation.failure_scope(record.id, action_ticket).ok())
+        else {
+            return false;
+        };
+        // The authenticated record proves the legacy local session alias is
+        // the same operation. Bind any resulting permit to the pending action.
+        fact.operation.clone_from(&record.config.operation_id);
+        let decision = StreamFailureHandler::adjudicate(
+            self.failure_policy.as_ref(),
+            fact,
+            effect,
+            scope,
+            LifecycleLayer::Rtsp,
+            "start_rejected",
+        );
+        self.apply_network_failure(
+            record,
+            connection,
+            action_ticket,
+            decision,
+            "start_rejected",
+        )
+    }
+
+    fn apply_network_failure(
+        &mut self,
+        record: &mut Record,
+        connection: u64,
+        action_ticket: u64,
+        decision: StreamFailureDecision,
+        code: &'static str,
+    ) -> bool {
         let negotiation = record.negotiation.as_mut().expect("known negotiation");
+        let continued = matches!(decision, StreamFailureDecision::Continue(_));
         match decision {
             StreamFailureDecision::Terminate(permit) => {
                 let reply = negotiation.reject(record.id, action_ticket, &permit).ok();
@@ -562,7 +619,7 @@ impl Controller {
                 self.revoke_ticket(record.id);
             }
         }
-        false
+        continued && record.failure.is_none()
     }
 
     #[track_caller]

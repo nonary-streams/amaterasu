@@ -104,6 +104,61 @@ impl StreamFailure {
     }
 }
 
+/// Failure evidence reported by a provider. The reporting contract cannot
+/// express a decision to keep or terminate its caller's stream.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamFailureFact {
+    pub operation: String,
+    pub layer: super::LifecycleLayer,
+    pub phase: String,
+    pub code: String,
+    pub reason: String,
+    pub site: String,
+}
+
+impl From<&StreamIssue> for StreamFailureFact {
+    fn from(issue: &StreamIssue) -> Self {
+        Self {
+            operation: issue.operation.clone(),
+            layer: issue.layer,
+            phase: issue.phase.clone(),
+            code: issue.code.clone(),
+            reason: issue.reason.clone(),
+            site: issue.site.clone(),
+        }
+    }
+}
+
+/// The owning consumer establishes this from its authenticated operation and
+/// its provider's current result. It is deliberately absent from the report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamFailureEffect {
+    PreparationUnchanged,
+    RequiredStartUnverified,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamFailureAction {
+    RefuseRequest,
+    EndStream,
+}
+
+pub trait StreamFailurePolicy: Send + Sync {
+    fn action(&self, fact: &StreamFailureFact, effect: StreamFailureEffect) -> StreamFailureAction;
+}
+
+pub struct StandardStreamFailurePolicy;
+
+impl StreamFailurePolicy for StandardStreamFailurePolicy {
+    fn action(&self, _: &StreamFailureFact, effect: StreamFailureEffect) -> StreamFailureAction {
+        match effect {
+            StreamFailureEffect::PreparationUnchanged => StreamFailureAction::RefuseRequest,
+            StreamFailureEffect::RequiredStartUnverified => StreamFailureAction::EndStream,
+        }
+    }
+}
+
 /// Identity of a concrete operation instance, independent of its diagnostic name.
 #[derive(Clone, Debug)]
 pub struct StreamFailureScope {
@@ -162,6 +217,39 @@ pub enum StreamFailureDecision {
 pub struct StreamFailureHandler;
 
 impl StreamFailureHandler {
+    /// Decide one scoped failure at its owner. A policy may reject a request
+    /// without ending a verified preparation, but cannot authorize a retry
+    /// across an unverified native start.
+    #[track_caller]
+    pub fn adjudicate(
+        policy: &dyn StreamFailurePolicy,
+        fact: StreamFailureFact,
+        effect: StreamFailureEffect,
+        scope: &StreamFailureScope,
+        owner: super::LifecycleLayer,
+        owner_code: &'static str,
+    ) -> StreamFailureDecision {
+        let mut evidence =
+            StreamIssue::advisory(&fact.operation, fact.layer, &fact.phase, &fact.code)
+                .because(&fact.reason);
+        evidence.site.clone_from(&fact.site);
+        if !evidence.valid()
+            || evidence.reason.is_empty()
+            || evidence.operation != scope.operation.as_ref()
+        {
+            return StreamFailureDecision::Invalid(evidence);
+        }
+        let mut issue = StreamIssue::advisory(&fact.operation, owner, &fact.phase, owner_code)
+            .because(&fact.code)
+            .caused_by(fact.layer);
+        if policy.action(&fact, effect) == StreamFailureAction::EndStream
+            || effect == StreamFailureEffect::RequiredStartUnverified
+        {
+            issue.disposition = super::IssueDisposition::CriticalFailure;
+        }
+        Self::classify(issue, Some(scope))
+    }
+
     pub fn decide(issue: StreamIssue) -> StreamFailureDecision {
         Self::classify(issue, None)
     }
