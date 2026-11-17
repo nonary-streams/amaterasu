@@ -115,16 +115,18 @@ impl Controller {
                         "dependency_unavailable",
                     );
                 let cause = Some(Cause::of_phase(job.phase));
-                if let Some((connection, action_ticket)) = job.network {
-                    self.finish_network_result(
-                        record,
-                        connection,
-                        action_ticket,
-                        Err(failure),
-                        cause,
-                    );
-                } else {
-                    record.close_with_cause(Some(failure), cause);
+                if record.admission() == Admission::Open {
+                    if let Some((connection, action_ticket)) = job.network {
+                        self.finish_network_result(
+                            record,
+                            connection,
+                            action_ticket,
+                            Err(failure),
+                            cause,
+                        );
+                    } else {
+                        record.close_with_cause(Some(failure), cause);
+                    }
                 }
                 if job.phase == Phase::LifecyclePrepare && job.call.proven_not_dispatched() {
                     record.lifecycle_prepare_outstanding = false;
@@ -148,7 +150,9 @@ impl Controller {
                 }
             }
             Phase::Arm => {
-                if let Some((connection, action_ticket)) = job.network {
+                if record.admission() == Admission::Ended {
+                    self.schedule_cleanup(record, job.caller, now);
+                } else if let Some((connection, action_ticket)) = job.network {
                     self.fail_network_action(
                         record,
                         connection,

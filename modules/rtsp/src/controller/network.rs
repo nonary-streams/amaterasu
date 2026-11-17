@@ -507,6 +507,9 @@ impl Controller {
         outcome: Result<NetworkCompletion, StreamFailure>,
         cause: Option<super::lifecycle_issues::Cause<'_>>,
     ) -> bool {
+        if record.admission() != Admission::Open {
+            return false;
+        }
         let Some(_) = record.negotiation.as_ref() else {
             let failure = outcome
                 .err()
@@ -577,6 +580,9 @@ impl Controller {
         (mut fact, effect): (StreamFailureFact, StreamFailureEffect),
         code: &'static str,
     ) -> bool {
+        if record.admission() != Admission::Open {
+            return false;
+        }
         let Some(scope) = record
             .negotiation
             .as_ref()

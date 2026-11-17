@@ -433,7 +433,7 @@ impl Record {
     /// Explicit verified caller cancellation is a control action, not a failure.
     pub fn cancel(&mut self) {
         self.failure.get_or_insert("request_cancelled");
-        self.state = State::Closing;
+        self.begin_closing();
     }
 
     #[track_caller]
@@ -448,9 +448,12 @@ impl Record {
         };
         let Some(failure) = failure else {
             // This entry point is used by authorized close/TEARDOWN operations.
-            self.state = State::Closing;
+            self.begin_closing();
             return true;
         };
+        if self.admission() != Admission::Open {
+            return false;
+        }
         let code = failure.code();
         let issue = super::lifecycle_issues::with_cause(
             failure.at(
@@ -479,6 +482,9 @@ impl Record {
         permit: amaterasu_module_sdk::stream_lifecycle::StreamTermination,
         code: &'static str,
     ) -> bool {
+        if self.admission() != Admission::Open {
+            return false;
+        }
         let scope = self.failure_scope.clone();
         permit
             .terminate(&scope, |issue| {
@@ -486,9 +492,16 @@ impl Record {
                     self.failure = Some(code);
                     self.issues.push(issue);
                 }
-                self.state = State::Closing;
+                self.begin_closing();
             })
             .is_some()
+    }
+
+    fn begin_closing(&mut self) {
+        if let Some(negotiation) = &mut self.negotiation {
+            negotiation.retire_opening_action();
+        }
+        self.state = State::Closing;
     }
 
     pub fn capabilities(&self) -> Capabilities {

@@ -278,6 +278,18 @@ impl Negotiation {
         Ok(response)
     }
 
+    /// Retire any superseded setup or start when the ticket begins closing.
+    /// An authenticated TEARDOWN still owns its completion during cleanup.
+    pub fn retire_opening_action(&mut self) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.success != State::Closed)
+        {
+            self.pending = None;
+        }
+    }
+
     /// Failure decisions must bind to the exact pending action that owns them.
     pub fn failure_scope(&self, epoch: u64, ticket: u64) -> Result<&StreamFailureScope, Error> {
         Ok(&self.pending_action(epoch, ticket)?.failure_scope)

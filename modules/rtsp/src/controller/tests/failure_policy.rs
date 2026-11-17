@@ -650,3 +650,30 @@ fn aborted_queued_requests_do_not_become_stream_transport_failures() {
         }
     }
 }
+
+#[test]
+fn closing_a_ticket_retires_pending_play_before_late_failure() {
+    use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
+    let (mut controller, action) = prepared_controller();
+    let mut record = controller.records.remove(&5).unwrap();
+    record.state = State::Arming;
+    assert!(record.close(None));
+    assert!(
+        record
+            .negotiation
+            .as_ref()
+            .unwrap()
+            .failure_scope(5, action)
+            .is_err()
+    );
+    assert!(!controller.finish_network_result(
+        &mut record,
+        999,
+        action,
+        Err(StreamFailure::requirement_failed("late_provider_failure")),
+        None,
+    ));
+    assert_eq!(record.state, State::Closing);
+    assert!(record.failure.is_none());
+    assert!(record.revoke_after.is_none());
+}
