@@ -3,6 +3,7 @@ mod auxiliary;
 mod cleanup_admission;
 mod display;
 mod display_order;
+mod extension_bitrate;
 mod harness;
 mod history;
 mod host_audio;

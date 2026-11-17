@@ -1088,7 +1088,12 @@ impl Open {
             && announce.video.width == profile.width
             && announce.video.height == profile.height
             && announce.video.fps == profile.fps
-            && announce.video.bitrate_kbps == profile.bitrate_kbps
+            // Moonlight reserves bandwidth before ANNOUNCE. The prepared
+            // rate is a ceiling; a smaller valid encoder budget is allowed.
+            && (100..=profile.bitrate_kbps).contains(&announce.video.bitrate_kbps)
+            && self.negotiation_bounds.is_none_or(|bounds| {
+                announce.video.bitrate_kbps <= bounds.max_bitrate_kbps
+            })
             && announce.video.max_reference_frames == profile.max_reference_frames
             && announce.video.slices_per_frame == 1
             // An opaque codec owns its color representation. This legacy

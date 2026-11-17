@@ -449,6 +449,12 @@ impl Pipeline {
                 .clone()
                 .expect("offered profile has probe configuration");
             expected.extension_profile = Some(profile);
+            // The authenticated ANNOUNCE may lower the rate from the probed
+            // ceiling. Preserve every other field of the preflight agreement.
+            let bitrate = configuration.configuration.bitrate;
+            if (100_000..=expected.bitrate).contains(&bitrate) {
+                expected.bitrate = bitrate;
+            }
             if configuration.configuration != expected
                 || configuration.source_id.is_some()
                 || configuration.encoder_provider.is_some()
