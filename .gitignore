@@ -11,3 +11,4 @@ __pycache__/
 
 # Optional codec sources and development SDK builds.
 /native-deps/
+/scripts/stream-failure-audit/target/
