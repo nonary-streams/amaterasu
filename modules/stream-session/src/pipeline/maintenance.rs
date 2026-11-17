@@ -5,9 +5,7 @@ use super::{
     record::{Record, State},
     rpc,
 };
-use amaterasu_module_sdk::stream_lifecycle::{
-    LifecycleLayer, StreamFailureDecision, StreamFailureHandler, StreamIssue,
-};
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
 
 pub(super) const MAX_RETIREMENTS: usize = 8;
 
@@ -78,7 +76,7 @@ impl Pipeline {
                 {
                     job.fail(
                         record,
-                        StreamFailure::critical("dependency_unavailable"),
+                        StreamFailure::requirement_failed("dependency_unavailable"),
                         now,
                     );
                     return true;
@@ -101,7 +99,7 @@ impl Pipeline {
                 if payload["recovery_required"] == true || payload["cleanup_required"] == true {
                     job.fail(
                         record,
-                        StreamFailure::critical("maintenance_recovery_required"),
+                        StreamFailure::requirement_failed("maintenance_recovery_required"),
                         now,
                     );
                     return true;
@@ -111,7 +109,11 @@ impl Pipeline {
                     && (payload["error"]["code"] == "permission_denied"
                         || payload["code"] == "permission_denied")
                 {
-                    job.fail(record, StreamFailure::critical("dependency_rejected"), now);
+                    job.fail(
+                        record,
+                        StreamFailure::requirement_failed("dependency_rejected"),
+                        now,
+                    );
                     return true;
                 }
                 if payload["ok"] != true {
@@ -223,22 +225,7 @@ impl Pipeline {
             )
             .because(reason)
             .caused_by(lifecycle_issues::step_layer(job.step));
-            match StreamFailureHandler::decide(report) {
-                StreamFailureDecision::Continue(continuation) => {
-                    record.issues.push(continuation.into_issue())
-                }
-                StreamFailureDecision::Terminate(permit) => {
-                    // Only the common handler can authorize a terminal effect.
-                    permit.terminate(|_| {
-                        job.fail(record, StreamFailure::critical("maintenance_failed"), now)
-                    });
-                    return true;
-                }
-                StreamFailureDecision::Invalid(_) => {
-                    // Invalid optional diagnostics do not create authority to
-                    // stop a healthy stream or change the media contract.
-                }
-            }
+            record.issues.push(report);
         }
         false
     }

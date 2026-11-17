@@ -141,6 +141,7 @@ pub(super) struct PendingVideoWarmup {
 }
 
 pub(super) struct Record {
+    pub failure_scope: amaterasu_module_sdk::stream_lifecycle::StreamFailureScope,
     /// Failures recorded for the launch owner, published from the tick.
     pub issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
     pub providers: crate::providers::ProviderServices,
@@ -179,14 +180,13 @@ pub(super) struct Record {
     pub lifecycle_delivery_permit: bool,
     pub lifecycle_control_permit: bool,
     pub lifecycle_validation_sequence: u64,
-    pub lifecycle_invalid_reason: Option<&'static str>,
     pub lifecycle_input_token: Option<String>,
     pub lifecycle_input_epoch: Option<String>,
     pub lifecycle_input_geometry_revision: Option<u64>,
     pub lifecycle_input_sequence: u64,
     pub lifecycle_input_required: Option<bool>,
     pub state: State,
-    pub outcome: State,
+    pub outcome: Option<State>,
     pub resources: BTreeMap<Resource, u64>,
     pub attempted: BTreeSet<Resource>,
     pub uncertain: Option<rpc::Pending>,
@@ -316,27 +316,47 @@ impl Record {
         effect: FailureEffect,
     ) -> bool {
         use amaterasu_module_sdk::stream_lifecycle::{
-            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
+            LifecycleLayer, StandardStreamFailurePolicy, StreamFailureDecision,
+            StreamFailureHandler,
         };
         let code = failure.code();
-        let operation = self
-            .config
-            .rtsp_operation_id
-            .as_deref()
-            .unwrap_or("local-stream-session");
-        let mut report = failure.at(operation, LifecycleLayer::StreamSession, phase);
+        let scope = self.failure_scope.clone();
+        let mut report = failure.at(scope.operation(), LifecycleLayer::StreamSession, phase);
         if dependency != LifecycleLayer::StreamSession {
             report = report.caused_by(dependency);
+        }
+        if self.outcome.is_some() && !matches!(effect, FailureEffect::CleanupUnconfirmed) {
+            let containment = report.requires_containment();
+            let report = if containment {
+                report.with_code("cleanup_step_failed")
+            } else {
+                report
+            };
+            let issue = report.into_diagnostic();
+            if !issue.valid() {
+                return false;
+            }
+            if self.config.rtsp_operation_id.is_some() {
+                self.issues.push(issue);
+            }
+            if containment {
+                self.remember_cleanup_failure("cleanup_step_failed");
+                if matches!(effect, FailureEffect::ReleaseBindings) {
+                    self.plane = None;
+                }
+            }
+            return containment;
         }
         let repeated_cleanup = matches!(effect, FailureEffect::CleanupUnconfirmed)
             && self.state == State::CleanupFailed
             && self.cleanup_error == Some(code);
-        if matches!(effect, FailureEffect::CleanupUnconfirmed) && report.is_critical() {
-            report.code = "cleanup_failed".into();
+        if matches!(effect, FailureEffect::CleanupUnconfirmed) && report.requires_containment() {
+            report = report.with_code("cleanup_failed");
         }
-        match StreamFailureHandler::decide(report) {
-            StreamFailureDecision::Terminate(permit) => {
-                permit.terminate(|issue| {
+        match StreamFailureHandler::adjudicate_report(&StandardStreamFailurePolicy, report, &scope)
+        {
+            StreamFailureDecision::Terminate(permit) => permit
+                .terminate(&scope, |issue| {
                     if self.config.rtsp_operation_id.is_some() && !repeated_cleanup {
                         self.issues.push(issue);
                     }
@@ -350,11 +370,12 @@ impl Record {
                         | FailureEffect::CancelUnconfirmed
                         | FailureEffect::ReleaseBindings => {
                             self.error.get_or_insert(code);
-                            self.outcome = if matches!(effect, FailureEffect::CancelUnconfirmed) {
-                                State::Cancelled
-                            } else {
-                                State::Failed
-                            };
+                            self.outcome =
+                                Some(if matches!(effect, FailureEffect::CancelUnconfirmed) {
+                                    State::Cancelled
+                                } else {
+                                    State::Failed
+                                });
                             self.history.stopping(code);
                             self.state = State::Stopping;
                             if let Some(plane) = self.plane.as_mut() {
@@ -365,9 +386,8 @@ impl Record {
                             }
                         }
                     }
-                });
-                true
-            }
+                })
+                .is_some(),
             StreamFailureDecision::Continue(continuation) => {
                 let issue = continuation.into_issue();
                 if self.config.rtsp_operation_id.is_some() {
@@ -488,7 +508,14 @@ impl Record {
                 ));
             }
         }
+        let failure_scope = amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+            config
+                .rtsp_operation_id
+                .as_deref()
+                .unwrap_or("local-stream-session"),
+        );
         Self {
+            failure_scope,
             issues,
             providers: Default::default(),
             extension_route: None,
@@ -526,14 +553,13 @@ impl Record {
             lifecycle_delivery_permit: false,
             lifecycle_control_permit: false,
             lifecycle_validation_sequence: 0,
-            lifecycle_invalid_reason: None,
             lifecycle_input_token: None,
             lifecycle_input_epoch: None,
             lifecycle_input_geometry_revision: None,
             lifecycle_input_sequence: 1,
             lifecycle_input_required: None,
             state: State::Preparing,
-            outcome: State::Failed,
+            outcome: None,
             resources: BTreeMap::new(),
             attempted: BTreeSet::new(),
             uncertain: None,

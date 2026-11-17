@@ -544,7 +544,7 @@ fn lifecycle_fence_rejection_cannot_report_retired() {
 }
 
 #[test]
-fn changed_active_observation_stops_delivery_and_reports_invalidation() {
+fn changed_active_observation_fences_delivery_and_requests_an_owned_pause() {
     let mut host = Harness::new();
     host.pipeline
         .settings
@@ -558,12 +558,16 @@ fn changed_active_observation_stops_delivery_and_reports_invalidation() {
         json!({"protocol":"wayland-wl-output","registry_global":5,"output_name":"Virtual-12"}),
     );
     host.idle();
-    assert_ne!(host.pipeline.records[&id].state, State::Active);
+    let record = &host.pipeline.records[&id];
+    assert_ne!(record.state, State::Active);
+    assert_eq!(record.error, Some("capture_binding_invalid"));
+    assert!(record.plane.is_none());
+    assert!(!record.lifecycle_delivery_permit);
     assert!(
         host.broker
             .calls
             .iter()
-            .any(|call| call.payload["operation"] == "capture_invalidated")
+            .any(|call| call.payload["operation"] == "pause_stream")
     );
 }
 

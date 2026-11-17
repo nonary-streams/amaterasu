@@ -223,6 +223,7 @@ fn four_k_pyrowave_bandwidth_announcement_returns_200_and_reaches_play() {
             snapshot.clone(),
             snapshot,
         )
+        .and_then(|negotiation| negotiation.with_failure_owner(&record.failure_scope))
         .unwrap();
         negotiation
             .handle(record.id, &request(Method::Options, &record.url, 1, false))

@@ -522,6 +522,7 @@ impl Coordinator {
                     next.sessions.get_mut(&session_id).unwrap().streams.insert(
                         stream_id,
                         StreamRecord {
+                            invalidation_fence: false,
                             borrowed_capture,
                             join_context: current.join_context.clone(),
                             provider_graph: current.provider_graph.clone(),
@@ -636,12 +637,39 @@ impl Coordinator {
                     stream.phase = StreamPhase::Active;
                     response["all_consumers_acknowledged"] = json!(true);
                 }
-                "pause_stream" | "capture_invalidated" | "resource_invalidated" => {
-                    if operation != "pause_stream"
-                        && super::join::session_has_shared_lease(&next, &session_id)
-                    {
+                "capture_invalidated" | "resource_invalidated" => {
+                    if super::join::session_has_shared_lease(&next, &session_id) {
                         return Err("shared_source_in_use".into());
                     }
+                    let stream_id = stream_id.ok_or("stream_target_required")?;
+                    let stream = next
+                        .sessions
+                        .get_mut(&session_id)
+                        .unwrap()
+                        .streams
+                        .get_mut(&stream_id)
+                        .unwrap();
+                    let plan_revision = stream
+                        .candidate
+                        .as_ref()
+                        .map(|binding| binding.plan_revision);
+                    if payload
+                        .get("plan_revision")
+                        .is_some_and(|expected| *expected != json!(plan_revision))
+                        || (plan_revision.is_some() && payload.get("plan_revision").is_none())
+                    {
+                        return Err("plan_revision_mismatch".into());
+                    }
+                    if matches!(stream.phase, StreamPhase::Active | StreamPhase::Ready) {
+                        stream.phase = StreamPhase::Quiescing;
+                        stream.invalidation_fence = true;
+                        self.fence_stream(&mut next, &target)?;
+                    } else if stream.phase != StreamPhase::Quiescing {
+                        return Err("invalid_stream_state".into());
+                    }
+                    response = json!({"status":"succeeded","target":target,"fenced":true,"plan_revision":plan_revision});
+                }
+                "pause_stream" => {
                     let stream_id = stream_id.ok_or("stream_target_required")?;
                     let stream = next
                         .sessions
@@ -659,17 +687,22 @@ impl Coordinator {
                     {
                         return Err("plan_revision_mismatch".into());
                     }
-                    if stream.phase == StreamPhase::Quiescing {
+                    let fenced_only =
+                        stream.phase == StreamPhase::Quiescing && stream.invalidation_fence;
+                    if stream.phase == StreamPhase::Quiescing && !fenced_only {
                         response = json!({"status":"pending","target":target,"fenced":true,"plan_revision":plan_revision});
                         wait_target = Some(target.clone());
                     } else {
-                        if !matches!(
-                            stream.phase,
-                            StreamPhase::Active | StreamPhase::Ready | StreamPhase::Preparing
-                        ) {
+                        if !fenced_only
+                            && !matches!(
+                                stream.phase,
+                                StreamPhase::Active | StreamPhase::Ready | StreamPhase::Preparing
+                            )
+                        {
                             return Err("invalid_stream_state".into());
                         }
                         stream.phase = StreamPhase::Quiescing;
+                        stream.invalidation_fence = false;
                         let mut current =
                             self.new_work(LifecyclePhase::StreamRelease, target.clone(), &payload)?;
                         current.join_context = stream.join_context.clone();
@@ -695,6 +728,9 @@ impl Coordinator {
                         .unwrap();
                     if stream.phase != StreamPhase::Quiescing {
                         return Err("stream_not_fenced".into());
+                    }
+                    if stream.invalidation_fence {
+                        return Err("stream_release_not_requested".into());
                     }
                     let evidence = payload
                         .get("retirement_receipt")
@@ -735,6 +771,7 @@ impl Coordinator {
                     for stream in session.streams.values_mut() {
                         if stream.phase != StreamPhase::Retired {
                             stream.phase = StreamPhase::Quiescing;
+                            stream.invalidation_fence = false;
                         }
                     }
                     let retiring: Vec<_> = session

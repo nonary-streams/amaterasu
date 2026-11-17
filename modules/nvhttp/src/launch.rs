@@ -2115,7 +2115,7 @@ impl Controller {
                         if record.resumed && record.lifecycle_session_target.is_some() {
                             record.request_transport_cleanup(
                                 Some(
-                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                         "launch_response_unavailable",
                                     ),
                                 ),
@@ -2124,7 +2124,7 @@ impl Controller {
                         } else {
                             record.request_cleanup(
                                 Some(
-                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                         "launch_response_unavailable",
                                     ),
                                 ),
@@ -2212,7 +2212,7 @@ impl Controller {
                     {
                         record.request_transport_cleanup(
                             Some(
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                     "client_revoked",
                                 ),
                             ),
@@ -2221,7 +2221,7 @@ impl Controller {
                     } else {
                         record.request_cleanup(
                             Some(
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                     "client_revoked",
                                 ),
                             ),
@@ -2264,7 +2264,7 @@ impl Controller {
                 }
                 record.request_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "host_stopping",
                         ),
                     ),

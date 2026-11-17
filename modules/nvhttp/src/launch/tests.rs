@@ -3923,7 +3923,8 @@ fn pending_history_warning_does_not_block_stream_monitoring() {
     for _ in 0..8 {
         controller.poll(now, &mut |command| broker.send(command));
     }
-    assert_ne!(controller.records[&1].state, State::Ready);
+    assert_eq!(controller.records[&1].state, State::Ready);
+    assert!(controller.records[&1].late_monitor_since.is_some());
 }
 
 #[test]
@@ -4780,7 +4781,7 @@ fn rtsp_cleanup_failure_still_stops_application_and_retains_failure() {
 }
 
 #[test]
-fn malformed_or_wrong_provider_identity_never_becomes_ready() {
+fn wrong_provider_identity_cannot_extend_the_live_observation_deadline() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
@@ -4788,6 +4789,14 @@ fn malformed_or_wrong_provider_identity_never_becomes_ready() {
     broker.wrong_application_id = true;
     for _ in 0..4 {
         controller.poll(now, &mut |command| broker.send(command));
+    }
+    assert_eq!(controller.current_game(&peer(1)), 1);
+    let first_lost = controller.records[&1]
+        .late_monitor_since
+        .expect("unconfirmed monitor");
+    let expired = first_lost + super::MONITOR_STALE_LIMIT;
+    for _ in 0..8 {
+        controller.poll(expired, &mut |command| broker.send(command));
     }
     assert_eq!(controller.current_game(&peer(1)), 0);
 }
@@ -6026,7 +6035,7 @@ fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
     payload["failure"] = json!("stream_failed");
     controller.consume(&job, payload, now, &mut Vec::new());
     queue.flush(&runtime);
-    assert!(matches!(&commands[..], [Command::Log { level: 3, target, message }] if target == "launch" && message.contains("MonitorRtsp") && message.contains("unhealthy")));
+    assert!(matches!(&commands[..], [Command::Log { level: 3, target, message }] if target == "launch" && message.contains("MonitorRtsp") && (message.contains("unhealthy") || message.contains("stream_failed"))));
 }
 
 #[test]
@@ -6375,11 +6384,14 @@ fn the_failing_provider_is_the_root_cause_through_each_callers_binding() {
         reports.events.push_back((publisher.into(), report));
     }
     controller.poll(now, &mut |command| reports.send(&mut broker, command));
-    controller
-        .records
-        .get_mut(&id)
-        .unwrap()
-        .request_cleanup(Some(amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("monitor_unavailable")), now);
+    controller.records.get_mut(&id).unwrap().request_cleanup(
+        Some(
+            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                "monitor_unavailable",
+            ),
+        ),
+        now,
+    );
     controller.poll(now, &mut |command| reports.send(&mut broker, command));
 
     let lifecycle = lifecycle_of(&controller, id);
@@ -6412,16 +6424,35 @@ fn warning_reports_cannot_stop_a_launch_or_change_cleanup_ownership() {
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let record = controller.records.get_mut(&1).unwrap();
-    let before = (record.state, record.transport_only_cleanup,
-        record.stop_application_after_stream_retirement, record.application_launch,
-        record.rtsp_ticket, record.deadline);
-    record.request_cleanup(Some(StreamFailure::advisory("advisory_hint")), now);
-    record.request_transport_cleanup(Some(StreamFailure::advisory("optional_hint")), now);
-    record.request_monitored_transport_cleanup(Some(StreamFailure::demoted("optional_unavailable", "continue")), now);
-    record.fail_cleanup(StreamFailure::advisory("diagnostic_unavailable"));
-    assert_eq!((record.state, record.transport_only_cleanup,
-        record.stop_application_after_stream_retirement, record.application_launch,
-        record.rtsp_ticket, record.deadline), before);
+    let before = (
+        record.state,
+        record.transport_only_cleanup,
+        record.stop_application_after_stream_retirement,
+        record.application_launch,
+        record.rtsp_ticket,
+        record.deadline,
+    );
+    record.request_cleanup(Some(StreamFailure::request_unchanged("advisory_hint")), now);
+    record.request_transport_cleanup(Some(StreamFailure::request_unchanged("optional_hint")), now);
+    record.request_monitored_transport_cleanup(
+        Some(StreamFailure::fallback_applied(
+            "optional_unavailable",
+            "continue",
+        )),
+        now,
+    );
+    record.fail_cleanup(StreamFailure::request_unchanged("diagnostic_unavailable"));
+    assert_eq!(
+        (
+            record.state,
+            record.transport_only_cleanup,
+            record.stop_application_after_stream_retirement,
+            record.application_launch,
+            record.rtsp_ticket,
+            record.deadline
+        ),
+        before
+    );
     assert_eq!(record.failure, None);
     assert_eq!(record.cleanup_error, None);
     assert!(!broker.rtsp_closed);
@@ -6443,7 +6474,10 @@ fn raw_error_fields_cannot_authorize_a_launch_503_but_a_critical_report_can() {
     assert!(replies.is_empty());
     assert_eq!(record.launch_connection, Some(77));
     record.failure = None;
-    record.request_cleanup(Some(StreamFailure::critical("authorization_lost")), now);
+    record.request_cleanup(
+        Some(StreamFailure::requirement_failed("authorization_lost")),
+        now,
+    );
     super::workflow::reply_failure(record, &mut replies);
     assert!(matches!(&replies[..], [(77, reply)] if reply.status == 503));
     assert_eq!(record.state, State::Stopping);

@@ -519,6 +519,7 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
     let plan: amaterasu_extension_api::ResourcePlan =
         serde_json::from_value(plan_value.clone()).unwrap();
     let stream = StreamRecord {
+        invalidation_fence: false,
         borrowed_capture: None,
         provider_graph: Some(graph.clone()),
         generation: 4,

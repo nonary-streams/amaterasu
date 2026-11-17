@@ -116,7 +116,9 @@ impl Controller {
                 input.request,
                 &input.caller,
                 &input.config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("module_quiescing"),
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                    "module_quiescing",
+                ),
             );
             return;
         }
@@ -137,7 +139,7 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "runtime_epoch_changed",
                 ),
             );
@@ -152,7 +154,7 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "startup_reconciliation_pending",
                 ),
             );
@@ -164,7 +166,9 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("disabled"),
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                    "disabled",
+                ),
             );
             return;
         }
@@ -179,7 +183,7 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "permission_denied",
                 ),
             );
@@ -194,7 +198,7 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "operation_retired",
                 ),
             );
@@ -206,7 +210,7 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
             );
             return;
         }
@@ -216,7 +220,7 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "lifecycle_provider_not_selected",
                 ),
             );
@@ -238,7 +242,7 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "history_activity_denied",
                 ),
             );
@@ -252,7 +256,7 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "display_admission_expired",
                 ),
             );
@@ -266,7 +270,7 @@ impl Controller {
                     request,
                     &caller,
                     &config.operation_id,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                 );
                 return;
             }
@@ -298,7 +302,7 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "capacity_exceeded",
                 ),
             );
@@ -311,7 +315,7 @@ impl Controller {
                     request,
                     &caller,
                     &config.operation_id,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "display_admission_unavailable",
                     ),
                 );
@@ -373,7 +377,7 @@ impl Controller {
                     request,
                     &caller,
                     &config.operation_id,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                 );
                 return;
             }
@@ -392,13 +396,16 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "media_port_capacity_exhausted",
                 ),
             );
             return;
         }
         let mut record = Record {
+            failure_scope: amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+                config.operation_id.as_str(),
+            ),
             id: ticket,
             owner: caller,
             config,
@@ -524,7 +531,7 @@ impl Controller {
                 self.refuse_display_admission(
                     runtime,
                     &admission,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "display_admission_unavailable",
                     ),
                 );
@@ -543,7 +550,7 @@ impl Controller {
                     self.refuse_display_admission(
                         runtime,
                         &admission,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "display_admission_unavailable",
                         ),
                     );
@@ -580,7 +587,7 @@ impl Controller {
                     self.refuse_display_admission(
                         runtime,
                         &admission,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "display_admission_denied",
                         ),
                     );
@@ -590,7 +597,7 @@ impl Controller {
                 self.refuse_display_admission(
                     runtime,
                     &admission,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "display_admission_unavailable",
                     ),
                 );
@@ -600,7 +607,7 @@ impl Controller {
                 self.refuse_display_admission(
                     runtime,
                     &admission,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "display_admission_unavailable",
                     ),
                 );

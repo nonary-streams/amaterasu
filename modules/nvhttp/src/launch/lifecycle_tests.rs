@@ -439,7 +439,7 @@ fn failed_retained_resume_cannot_authorize_the_next_resume_reply() {
     assert_eq!(replies.len(), 1);
     assert_eq!(record.launch_connection, Some(12));
     record.process_failure(
-        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("resume_failed"),
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed("resume_failed"),
         |_| {},
     );
     workflow::reply_failure(record, &mut replies);

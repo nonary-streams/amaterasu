@@ -330,7 +330,7 @@ impl Pipeline {
                 }) {
                     return self.cleanup_rejected(record, job, send);
                 }
-                let (outcome, reason) = match record.outcome {
+                let (outcome, reason) = match record.outcome.unwrap_or(State::Failed) {
                     State::Stopped => ("stopped", None),
                     State::Cancelled => ("cancelled", record.error),
                     _ => ("failed", record.error),
@@ -424,7 +424,7 @@ impl Pipeline {
                 record.fail_cleanup(
                     lifecycle_issues::step_layer(job.step),
                     &lifecycle_issues::step_label(job.step),
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "component_cleanup_failed",
                     ),
                 );
@@ -469,13 +469,13 @@ impl Pipeline {
         if clean {
             record.report_confirmed_cleanup();
             record.cleanup_error = None;
-            record.state = record.outcome;
+            record.state = record.outcome.unwrap_or(State::Failed);
         } else {
             let code = record.cleanup_error.unwrap_or("cleanup_unconfirmed");
             record.fail_cleanup(
                 lifecycle_issues::step_layer(job.step),
                 &lifecycle_issues::step_label(job.step),
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
             );
         }
         self.reply(record, job, send);

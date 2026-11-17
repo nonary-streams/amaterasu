@@ -1,6 +1,6 @@
 use super::lifecycle_issues::Cause;
 use super::*;
-use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
+use amaterasu_module_sdk::stream_lifecycle::{StreamFailureScope, StreamIssueOutbox};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +49,7 @@ impl Owner for Record {
 }
 
 pub(super) struct Record {
+    pub failure_scope: StreamFailureScope,
     pub id: u64,
     pub owner: String,
     pub config: Open,
@@ -422,11 +423,11 @@ impl Record {
     pub fn close(
         &mut self,
         failure: Option<amaterasu_module_sdk::stream_lifecycle::StreamFailure>,
-    ) {
+    ) -> bool {
         let cause = failure
             .as_ref()
             .and_then(|failure| Cause::of_close(failure.code()));
-        self.close_with_cause(failure, cause);
+        self.close_with_cause(failure, cause)
     }
 
     /// Explicit verified caller cancellation is a control action, not a failure.
@@ -440,14 +441,15 @@ impl Record {
         &mut self,
         failure: Option<amaterasu_module_sdk::stream_lifecycle::StreamFailure>,
         cause: Option<Cause<'_>>,
-    ) {
+    ) -> bool {
         use amaterasu_module_sdk::stream_lifecycle::{
-            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
+            LifecycleLayer, StandardStreamFailurePolicy, StreamFailureDecision,
+            StreamFailureHandler,
         };
         let Some(failure) = failure else {
             // This entry point is used by authorized close/TEARDOWN operations.
             self.state = State::Closing;
-            return;
+            return true;
         };
         let code = failure.code();
         let issue = super::lifecycle_issues::with_cause(
@@ -458,12 +460,17 @@ impl Record {
             ),
             cause,
         );
-        match StreamFailureHandler::decide(issue) {
+        match StreamFailureHandler::adjudicate_report(
+            &StandardStreamFailurePolicy,
+            issue,
+            &self.failure_scope,
+        ) {
             StreamFailureDecision::Terminate(permit) => self.close_reported(permit, code),
             StreamFailureDecision::Continue(continuation) => {
-                self.issues.push(continuation.into_issue())
+                self.issues.push(continuation.into_issue());
+                false
             }
-            StreamFailureDecision::Invalid(_) => {}
+            StreamFailureDecision::Invalid(_) => false,
         }
     }
 
@@ -471,14 +478,17 @@ impl Record {
         &mut self,
         permit: amaterasu_module_sdk::stream_lifecycle::StreamTermination,
         code: &'static str,
-    ) {
-        permit.terminate(|issue| {
-            if self.failure.is_none() {
-                self.failure = Some(code);
-                self.issues.push(issue);
-            }
-            self.state = State::Closing;
-        });
+    ) -> bool {
+        let scope = self.failure_scope.clone();
+        permit
+            .terminate(&scope, |issue| {
+                if self.failure.is_none() {
+                    self.failure = Some(code);
+                    self.issues.push(issue);
+                }
+                self.state = State::Closing;
+            })
+            .is_some()
     }
 
     pub fn capabilities(&self) -> Capabilities {

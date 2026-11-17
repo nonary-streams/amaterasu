@@ -1222,6 +1222,7 @@ mod tests {
     #[test]
     fn restore_requires_exact_quiescence_and_consumer_retirement() {
         let mut stream = StreamRecord {
+            invalidation_fence: false,
             borrowed_capture: None,
             join_context: None,
             provider_graph: None,

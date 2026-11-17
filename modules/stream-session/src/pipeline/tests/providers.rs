@@ -123,6 +123,8 @@ fn replacement_input_provider_handles_mixed_batches_and_partial_failure() {
     let config = serde_json::from_value(payload).unwrap();
     let mut record = Record::new(42, "owner".into(), config, 30_000);
     record.config.rtsp_operation_id = Some("launch-input".into());
+    record.failure_scope =
+        amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new("launch-input");
     let mut lease_reply = json!({"ok":true,"state":"active",
         "operation_id":record.input_operation(),"lease":"replacement-lease",
         "ttl_ms":record.input_ttl_ms,"expires_in_ms":record.input_ttl_ms,

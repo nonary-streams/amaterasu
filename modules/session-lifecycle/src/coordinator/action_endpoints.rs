@@ -2414,6 +2414,7 @@ mod tests {
         streams.insert(
             "stream".into(),
             super::super::StreamRecord {
+                invalidation_fence: false,
                 borrowed_capture: None,
                 provider_graph: None,
                 generation: 4,
@@ -2753,6 +2754,7 @@ mod tests {
         streams.insert(
             "stream".into(),
             super::super::StreamRecord {
+                invalidation_fence: false,
                 borrowed_capture: None,
                 provider_graph: None,
                 generation: 4,

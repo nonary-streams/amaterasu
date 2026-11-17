@@ -260,6 +260,7 @@ mod tests {
                 .insert(
                     "stream".into(),
                     StreamRecord {
+                        invalidation_fence: false,
                         borrowed_capture: None,
                         join_context: None,
                         provider_graph: None,

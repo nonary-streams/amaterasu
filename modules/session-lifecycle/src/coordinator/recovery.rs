@@ -320,6 +320,7 @@ impl Coordinator {
             .get_mut(stream_id)
             .unwrap();
         stream.phase = StreamPhase::Quiescing;
+        stream.invalidation_fence = false;
         stream.retirements.insert("capture".into());
         let response = json!({"status":"pending", "operation_id":payload["operation_id"],
             "target":target,"plan_revision":null,"transition_id":work.transition_id});
@@ -626,6 +627,7 @@ mod tests {
             streams: [(
                 "stream".into(),
                 StreamRecord {
+                    invalidation_fence: false,
                     borrowed_capture: None,
                     join_context: None,
                     provider_graph: None,

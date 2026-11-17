@@ -630,7 +630,7 @@ impl Pipeline {
     pub(super) fn arm(record: &mut Record, request: u64, now: u64, send: &mut Send<'_>) {
         if !rpc::active(send, request) {
             record.state = State::Stopping;
-            record.outcome = State::Cancelled;
+            record.outcome = Some(State::Cancelled);
             record.error = Some("request_cancelled");
             return;
         }
@@ -643,7 +643,7 @@ impl Pipeline {
             record.next_auth_poll = now;
         } else {
             record.raise_failure(
-                StreamFailure::critical("completion_unavailable"),
+                StreamFailure::requirement_failed("completion_unavailable"),
                 amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                 "arm",
                 super::record::FailureEffect::CancelUnconfirmed,
@@ -715,7 +715,7 @@ impl Pipeline {
             record.fail_cleanup(
                 amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                 "persist_journal",
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
             );
             self.journal_waiting_stops.insert(record.id);
             rpc::complete(send, request, record.response());
@@ -738,7 +738,7 @@ impl Pipeline {
                 record.fail_cleanup(
                     amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                     "persist_journal",
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "lifecycle_journal_write_failed",
                     ),
                 );
@@ -1071,8 +1071,10 @@ pub(super) fn stop_job(
         },
         now + drain_timeout_ms,
     );
-    record.outcome = State::Stopped;
-    record.history.stopping("stop_requested");
+    if record.outcome.is_none() {
+        record.outcome = Some(State::Stopped);
+        record.history.stopping("stop_requested");
+    }
     record.state = State::Stopping;
     record.cleanup_error = None;
     input::queue_rumble_zeros(record, now);

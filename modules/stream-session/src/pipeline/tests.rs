@@ -1013,7 +1013,7 @@ fn encoder_failure_while_draining_recovers_before_transport_cleanup() {
     {
         let record = host.pipeline.records.get_mut(&id).unwrap();
         record.state = State::Stopping;
-        record.outcome = State::Stopped;
+        record.outcome = Some(State::Stopped);
         record.plane.as_mut().unwrap().stop();
     }
     host.pipeline.job = Some(Job::new(id, None, Step::WaitDrain, host.now + 5000));

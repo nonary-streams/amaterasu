@@ -71,7 +71,7 @@ fn deliver(record: &mut Record, now: u64, direct: &mut DirectCall<'_>) -> bool {
                 record.input_direct_declines = 0;
                 if let Err(code) = accept_direct_reply(record, &reply) {
                     record.input_inflight = 0;
-                    stop_for_input_failure(record, StreamFailure::critical(code));
+                    stop_for_input_failure(record, StreamFailure::requirement_failed(code));
                     return false;
                 }
             }
@@ -89,7 +89,10 @@ fn deliver(record: &mut Record, now: u64, direct: &mut DirectCall<'_>) -> bool {
                 // The provider was entered and its outcome is unknown; a
                 // replay could inject the same events twice.
                 record.input_inflight = 0;
-                stop_for_input_failure(record, StreamFailure::critical("input_batch_failed"));
+                stop_for_input_failure(
+                    record,
+                    StreamFailure::requirement_failed("input_batch_failed"),
+                );
                 return false;
             }
         }

@@ -1,55 +1,44 @@
 //! A capability required by participating failure-driven stop boundaries.
 use super::StreamIssue;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-/// A lower-layer failure report with a stable local code. Unlike a string,
-/// this makes its criticality/fallback explicit before it reaches a boundary.
+/// A locally observed condition, with no authority over a stream.
 #[derive(Clone, Debug)]
 pub struct StreamFailure {
     code: &'static str,
     reason: &'static str,
-    disposition: super::IssueDisposition,
+    evidence: StreamFailureEffect,
     fallback: Option<&'static str>,
-    reported: Option<StreamIssue>,
 }
 
 impl StreamFailure {
-    pub fn critical(code: &'static str) -> Self {
+    pub fn requirement_failed(code: &'static str) -> Self {
         Self {
             code,
             reason: code,
-            disposition: super::IssueDisposition::CriticalFailure,
+            evidence: StreamFailureEffect::RequirementFailed,
             fallback: None,
-            reported: None,
         }
     }
-    pub fn advisory(code: &'static str) -> Self {
+
+    pub fn request_unchanged(code: &'static str) -> Self {
         Self {
             code,
             reason: code,
-            disposition: super::IssueDisposition::AdvisoryWarning,
+            evidence: StreamFailureEffect::RequestUnchanged,
             fallback: None,
-            reported: None,
         }
     }
-    pub fn demoted(code: &'static str, fallback: &'static str) -> Self {
+
+    pub fn fallback_applied(code: &'static str, fallback: &'static str) -> Self {
         Self {
             code,
             reason: code,
-            disposition: super::IssueDisposition::DemotedWarning,
+            evidence: StreamFailureEffect::FallbackApplied,
             fallback: Some(fallback),
-            reported: None,
-        }
-    }
-    /// Preserve a dependency's original classification at a caller boundary;
-    /// a failed RPC must not silently promote its warning into a critical error.
-    pub fn reported(local_code: &'static str, report: StreamIssue) -> Self {
-        Self {
-            code: local_code,
-            reason: local_code,
-            disposition: report.disposition,
-            fallback: None,
-            reported: Some(report),
         }
     }
 
@@ -57,49 +46,79 @@ impl StreamFailure {
         self.reason = reason;
         self
     }
+
     pub fn code(&self) -> &'static str {
         self.code
     }
+
     #[track_caller]
     pub fn at(
         self,
         operation: impl Into<String>,
         layer: super::LifecycleLayer,
         phase: impl Into<String>,
-    ) -> StreamIssue {
-        let operation = operation.into();
-        let phase = phase.into();
-        if let Some(mut report) = self.reported {
-            if !report.valid() || report.reason.is_empty() {
-                return report;
-            }
-            let dependency = report.layer;
-            let reason = report.code.clone();
-            report.operation = operation;
-            report.layer = layer;
-            report.phase = phase;
-            report.code = self.code.into();
-            report.reason = reason;
-            report.caused_by = Some(dependency);
-            return report;
+    ) -> StreamFailureReport {
+        // Reuse the bounded diagnostic shape. This never carries a decision.
+        let issue = StreamIssue::advisory(operation, layer, phase, self.code).because(self.reason);
+        StreamFailureReport {
+            issue,
+            evidence: self.evidence,
+            fallback: self.fallback,
         }
-        let mut issue = match self.disposition {
-            super::IssueDisposition::CriticalFailure => {
-                StreamIssue::critical(operation, layer, phase, self.code)
-            }
-            super::IssueDisposition::AdvisoryWarning => {
-                StreamIssue::advisory(operation, layer, phase, self.code)
-            }
-            super::IssueDisposition::DemotedWarning => StreamIssue::demoted(
-                operation,
-                layer,
-                phase,
-                self.code,
-                self.fallback
-                    .expect("demotion constructor supplies fallback"),
-            ),
+    }
+}
+
+/// Facts contextualized at their owner. Reporters cannot supply a disposition.
+pub struct StreamFailureReport {
+    issue: StreamIssue,
+    evidence: StreamFailureEffect,
+    fallback: Option<&'static str>,
+}
+
+impl StreamFailureReport {
+    pub fn because(mut self, reason: impl Into<String>) -> Self {
+        self.issue.reason = reason.into();
+        self
+    }
+
+    pub fn caused_by(mut self, layer: super::LifecycleLayer) -> Self {
+        self.issue.caused_by = Some(layer);
+        self
+    }
+
+    pub fn with_phase(mut self, phase: impl Into<String>) -> Self {
+        self.issue.phase = phase.into();
+        self
+    }
+
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.issue.code = code.into();
+        self
+    }
+
+    pub fn requires_containment(&self) -> bool {
+        self.evidence.requires_containment()
+    }
+
+    /// Diagnostic attribution for local containment, request-only refusal or
+    /// an already applied fallback. An issue never grants terminal authority.
+    pub fn into_diagnostic(self) -> StreamIssue {
+        self.classified(StreamFailureAction::RefuseRequest)
+    }
+
+    fn classified(self, action: StreamFailureAction) -> StreamIssue {
+        let mut issue = self.issue;
+        issue.fallback = self.fallback.map(str::to_owned);
+        issue.disposition = if self.evidence.requires_containment()
+            || (self.evidence == StreamFailureEffect::PreparationUnchanged
+                && action == StreamFailureAction::EndStream)
+        {
+            super::IssueDisposition::CriticalFailure
+        } else if issue.fallback.is_some() {
+            super::IssueDisposition::DemotedWarning
+        } else {
+            super::IssueDisposition::AdvisoryWarning
         };
-        issue.reason = self.reason.into();
         issue
     }
 }
@@ -136,6 +155,18 @@ impl From<&StreamIssue> for StreamFailureFact {
 pub enum StreamFailureEffect {
     PreparationUnchanged,
     RequiredStartUnverified,
+    RequirementFailed,
+    RequestUnchanged,
+    FallbackApplied,
+}
+
+impl StreamFailureEffect {
+    fn requires_containment(self) -> bool {
+        matches!(
+            self,
+            Self::RequiredStartUnverified | Self::RequirementFailed
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,9 +183,10 @@ pub struct StandardStreamFailurePolicy;
 
 impl StreamFailurePolicy for StandardStreamFailurePolicy {
     fn action(&self, _: &StreamFailureFact, effect: StreamFailureEffect) -> StreamFailureAction {
-        match effect {
-            StreamFailureEffect::PreparationUnchanged => StreamFailureAction::RefuseRequest,
-            StreamFailureEffect::RequiredStartUnverified => StreamFailureAction::EndStream,
+        if effect.requires_containment() {
+            StreamFailureAction::EndStream
+        } else {
+            StreamFailureAction::RefuseRequest
         }
     }
 }
@@ -163,13 +195,57 @@ impl StreamFailurePolicy for StandardStreamFailurePolicy {
 #[derive(Clone, Debug)]
 pub struct StreamFailureScope {
     operation: Arc<str>,
+    owner: Arc<()>,
+    instance: Arc<()>,
+    live_action: Option<Arc<AtomicBool>>,
 }
 
 impl StreamFailureScope {
     pub fn new(operation: impl Into<String>) -> Self {
+        let owner = Arc::new(());
         Self {
             operation: Arc::from(operation.into()),
+            instance: owner.clone(),
+            owner,
+            live_action: None,
         }
+    }
+
+    /// Create one pending action under the same terminal owner.
+    pub fn action(&self) -> Self {
+        Self {
+            operation: self.operation.clone(),
+            owner: self.owner.clone(),
+            instance: Arc::new(()),
+            live_action: Some(Arc::new(AtomicBool::new(true))),
+        }
+    }
+
+    /// Retire a pending action on successful completion, refusal or removal.
+    pub fn invalidate_action(&self) {
+        if let Some(live) = &self.live_action {
+            live.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn is_owner(&self) -> bool {
+        Arc::ptr_eq(&self.instance, &self.owner)
+    }
+
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.instance, &other.instance)
+            && self
+                .live_action
+                .as_ref()
+                .is_none_or(|live| live.load(Ordering::Acquire))
+    }
+
+    fn owns(&self, other: &Self) -> bool {
+        self.is_owner() && Arc::ptr_eq(&self.owner, &other.owner)
     }
 }
 
@@ -177,7 +253,7 @@ impl StreamFailureScope {
 #[derive(Debug)]
 pub struct StreamContinuation {
     issue: StreamIssue,
-    scope: Option<StreamFailureScope>,
+    scope: StreamFailureScope,
 }
 
 impl StreamContinuation {
@@ -186,9 +262,7 @@ impl StreamContinuation {
     }
 
     pub fn matches_scope(&self, scope: &StreamFailureScope) -> bool {
-        self.scope
-            .as_ref()
-            .is_some_and(|bound| Arc::ptr_eq(&bound.operation, &scope.operation))
+        self.scope.matches(scope)
     }
 }
 
@@ -198,11 +272,11 @@ impl StreamContinuation {
 #[derive(Debug)]
 pub struct StreamTermination {
     issue: StreamIssue,
-    scope: Option<StreamFailureScope>,
+    scope: StreamFailureScope,
 }
 
 /// The final directive from the common failure handler. Lower layers report
-/// facts/disposition; participating transport and lifecycle boundaries execute
+/// facts; participating transport and lifecycle boundaries execute
 /// this directive instead of inventing another rejection policy.
 #[derive(Debug)]
 pub enum StreamFailureDecision {
@@ -239,54 +313,60 @@ impl StreamFailureHandler {
         {
             return StreamFailureDecision::Invalid(evidence);
         }
-        let mut issue = StreamIssue::advisory(&fact.operation, owner, &fact.phase, owner_code)
+        let issue = StreamIssue::advisory(&fact.operation, owner, &fact.phase, owner_code)
             .because(&fact.code)
             .caused_by(fact.layer);
-        if policy.action(&fact, effect) == StreamFailureAction::EndStream
-            || effect == StreamFailureEffect::RequiredStartUnverified
-        {
-            issue.disposition = super::IssueDisposition::CriticalFailure;
+        let report = StreamFailureReport {
+            issue,
+            evidence: effect,
+            fallback: None,
+        };
+        Self::issue_decision(report, policy.action(&fact, effect), scope)
+    }
+
+    /// Decide a local report after its owner supplies the operation instance.
+    ///
+    /// ```compile_fail
+    /// use amaterasu_module_sdk::stream_lifecycle::{
+    ///     LifecycleLayer, StandardStreamFailurePolicy, StreamFailureHandler, StreamFailureScope,
+    ///     StreamIssue,
+    /// };
+    /// let issue = StreamIssue::critical("stream", LifecycleLayer::Capture, "open", "device_lost");
+    /// let scope = StreamFailureScope::new("stream");
+    /// StreamFailureHandler::adjudicate_report(&StandardStreamFailurePolicy, issue, &scope);
+    /// ```
+    pub fn adjudicate_report(
+        policy: &dyn StreamFailurePolicy,
+        report: StreamFailureReport,
+        scope: &StreamFailureScope,
+    ) -> StreamFailureDecision {
+        let fact = StreamFailureFact::from(&report.issue);
+        if !report.issue.valid() || fact.reason.is_empty() || fact.operation != scope.operation() {
+            return StreamFailureDecision::Invalid(report.issue);
         }
-        Self::classify(issue, Some(scope))
+        let action = policy.action(&fact, report.evidence);
+        Self::issue_decision(report, action, scope)
     }
 
-    pub fn decide(issue: StreamIssue) -> StreamFailureDecision {
-        Self::classify(issue, None)
-    }
-
-    pub fn decide_scoped(issue: StreamIssue, scope: &StreamFailureScope) -> StreamFailureDecision {
-        Self::classify(issue, Some(scope))
-    }
-
-    fn classify(issue: StreamIssue, scope: Option<&StreamFailureScope>) -> StreamFailureDecision {
-        if !issue.valid()
-            || issue.reason.is_empty()
-            || scope.is_some_and(|scope| issue.operation != scope.operation.as_ref())
-        {
+    fn issue_decision(
+        report: StreamFailureReport,
+        action: StreamFailureAction,
+        scope: &StreamFailureScope,
+    ) -> StreamFailureDecision {
+        let issue = report.classified(action);
+        if !issue.valid() {
             return StreamFailureDecision::Invalid(issue);
         }
         if issue.is_critical() {
             StreamFailureDecision::Terminate(StreamTermination {
                 issue,
-                scope: scope.cloned(),
+                scope: scope.clone(),
             })
         } else {
             StreamFailureDecision::Continue(StreamContinuation {
                 issue,
-                scope: scope.cloned(),
+                scope: scope.clone(),
             })
-        }
-    }
-}
-
-impl TryFrom<StreamIssue> for StreamTermination {
-    type Error = StreamIssue;
-
-    fn try_from(issue: StreamIssue) -> Result<Self, Self::Error> {
-        match StreamFailureHandler::decide(issue) {
-            StreamFailureDecision::Terminate(permit) => Ok(permit),
-            StreamFailureDecision::Continue(continuation) => Err(continuation.into_issue()),
-            StreamFailureDecision::Invalid(issue) => Err(issue),
         }
     }
 }
@@ -297,21 +377,42 @@ impl StreamTermination {
     }
 
     pub fn matches_scope(&self, scope: &StreamFailureScope) -> bool {
-        self.scope
-            .as_ref()
-            .is_some_and(|bound| Arc::ptr_eq(&bound.operation, &scope.operation))
+        self.scope.matches(scope)
     }
 
-    /// Authorize several effects belonging to this same reported failure.
-    /// The capability is immutable; it does not authorize another stream's
-    /// authentication, ownership, media substitution or native retirement.
-    pub fn authorize<T>(&self, effect: impl FnOnce(&StreamIssue) -> T) -> T {
-        effect(&self.issue)
+    /// Apply an effect at the exact action that the policy adjudicated.
+    pub fn authorize<T>(
+        &self,
+        scope: &StreamFailureScope,
+        effect: impl FnOnce(&StreamIssue) -> T,
+    ) -> Option<T> {
+        self.matches_scope(scope).then(|| effect(&self.issue))
     }
 
-    /// Run a terminal effect only after this capability was established.
-    pub fn terminate<T>(self, effect: impl FnOnce(StreamIssue) -> T) -> T {
-        effect(self.issue)
+    /// Hand the decision to its owner after verifying the current action.
+    /// Callers must supply the action that still owns the pending completion.
+    pub fn settle_action(
+        mut self,
+        action: &StreamFailureScope,
+        owner: &StreamFailureScope,
+    ) -> Option<Self> {
+        if !self.matches_scope(action)
+            || !owner.owns(action)
+            || !action.live_action.as_ref()?.swap(false, Ordering::AcqRel)
+        {
+            return None;
+        }
+        self.scope = owner.clone();
+        Some(self)
+    }
+
+    /// Consume a decision at its exact owner. Pending actions must settle first.
+    pub fn terminate<T>(
+        self,
+        owner: &StreamFailureScope,
+        effect: impl FnOnce(StreamIssue) -> T,
+    ) -> Option<T> {
+        (owner.is_owner() && self.matches_scope(owner)).then(|| effect(self.issue))
     }
 }
 
@@ -321,45 +422,130 @@ mod tests {
     use crate::stream_lifecycle::LifecycleLayer;
 
     #[test]
-    fn only_explicit_valid_critical_failure_with_reason_can_run_a_terminal_effect() {
-        let issue = StreamIssue::critical("stream", LifecycleLayer::Capture, "open", "unavailable")
-            .because("device_missing");
-        let mut effects = 0;
-        StreamTermination::try_from(issue)
-            .unwrap()
-            .terminate(|failure| {
-                assert_eq!(failure.reason, "device_missing");
-                effects += 1;
-            });
-        assert_eq!(effects, 1);
-        let mut no_reason =
-            StreamIssue::critical("stream", LifecycleLayer::Capture, "open", "failed");
-        no_reason.reason.clear();
-        let mut invalid =
-            StreamIssue::critical("stream", LifecycleLayer::Capture, "open", "failed")
-                .because("reason");
-        invalid.code = "secret payload!".into();
-        for issue in [
-            StreamIssue::advisory("stream", LifecycleLayer::Input, "feedback", "unavailable")
-                .because("provider_missing"),
-            StreamIssue::demoted(
+    fn a_decision_belongs_to_its_action_and_owner_instance() {
+        let prior = StreamFailureScope::new("stream");
+        let current = StreamFailureScope::new("stream");
+        let action = prior.action();
+        let report = StreamFailure::requirement_failed("device_unavailable").at(
+            "stream",
+            LifecycleLayer::Capture,
+            "open",
+        );
+        let StreamFailureDecision::Terminate(permit) =
+            StreamFailureHandler::adjudicate_report(&StandardStreamFailurePolicy, report, &action)
+        else {
+            panic!("required capture failed");
+        };
+        assert_eq!(permit.authorize(&action, |_| 1), Some(1));
+        assert_eq!(permit.authorize(&prior.action(), |_| 1), None);
+        assert_eq!(permit.terminate(&current, |_| unreachable!()), None::<()>);
+    }
+
+    #[test]
+    fn reflected_diagnostics_and_invalid_facts_confer_no_authority() {
+        let scope = StreamFailureScope::new("stream");
+        for fact in [
+            StreamFailure::request_unchanged("refused").at("stream", LifecycleLayer::Input, "send"),
+            StreamFailure::fallback_applied("unavailable", "skip").at(
                 "stream",
                 LifecycleLayer::Input,
-                "feedback",
-                "unavailable",
-                "skip_feedback",
-            )
-            .because("provider_missing"),
-            no_reason,
-            invalid,
+                "send",
+            ),
+            StreamFailure::requirement_failed("bad payload!").at(
+                "stream",
+                LifecycleLayer::Input,
+                "send",
+            ),
+            StreamFailure::requirement_failed("unavailable").at(
+                "other",
+                LifecycleLayer::Input,
+                "send",
+            ),
         ] {
-            if let Ok(permit) = StreamTermination::try_from(issue) {
-                permit.terminate(|_| effects += 1);
+            assert!(!matches!(
+                StreamFailureHandler::adjudicate_report(&StandardStreamFailurePolicy, fact, &scope),
+                StreamFailureDecision::Terminate(_)
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use crate::stream_lifecycle::LifecycleLayer;
+
+    fn decide(scope: &StreamFailureScope) -> StreamTermination {
+        let failure = StreamFailure::requirement_failed("device_lost").at(
+            scope.operation(),
+            LifecycleLayer::Capture,
+            "deliver",
+        );
+        let StreamFailureDecision::Terminate(permit) =
+            StreamFailureHandler::adjudicate_report(&StandardStreamFailurePolicy, failure, scope)
+        else {
+            panic!("required capture was lost");
+        };
+        permit
+    }
+
+    #[test]
+    fn only_a_live_exact_action_can_transfer_its_decision() {
+        let owner = StreamFailureScope::new("stream");
+        let successor = StreamFailureScope::new("stream");
+        let action = owner.action();
+        let another = owner.action();
+        assert!(decide(&action).terminate(&owner, |_| ()).is_none());
+        assert!(decide(&action).settle_action(&another, &owner).is_none());
+        assert!(decide(&action).settle_action(&action, &successor).is_none());
+        let stale = decide(&action);
+        action.invalidate_action();
+        assert!(stale.settle_action(&action, &owner).is_none());
+        let first = decide(&another);
+        let duplicate = decide(&another);
+        let settled = first.settle_action(&another, &owner).expect("live action");
+        assert!(duplicate.settle_action(&another, &owner).is_none());
+        assert_eq!(
+            settled.terminate(&owner, |issue| issue.code).as_deref(),
+            Some("device_lost")
+        );
+    }
+
+    #[test]
+    fn owner_policy_receives_original_provider_fact() {
+        struct Strict(StreamFailureFact);
+        impl StreamFailurePolicy for Strict {
+            fn action(
+                &self,
+                actual: &StreamFailureFact,
+                _: StreamFailureEffect,
+            ) -> StreamFailureAction {
+                assert_eq!(actual, &self.0);
+                StreamFailureAction::RefuseRequest
             }
         }
-        assert_eq!(
-            effects, 1,
-            "warnings or invalid reports ran a terminal effect"
+        let scope = StreamFailureScope::new("stream");
+        let issue = StreamIssue::advisory(
+            "stream",
+            LifecycleLayer::EncodeVideo,
+            "start",
+            "provider_code",
+        )
+        .because("selected_format_unavailable");
+        let fact = StreamFailureFact::from(&issue);
+        let decision = StreamFailureHandler::adjudicate(
+            &Strict(fact.clone()),
+            fact,
+            StreamFailureEffect::PreparationUnchanged,
+            &scope,
+            LifecycleLayer::Rtsp,
+            "owner_code",
         );
+        let StreamFailureDecision::Continue(continuation) = decision else {
+            panic!("unchanged preparation");
+        };
+        let issue = continuation.into_issue();
+        assert_eq!(issue.layer, LifecycleLayer::Rtsp);
+        assert_eq!(issue.caused_by, Some(LifecycleLayer::EncodeVideo));
     }
 }

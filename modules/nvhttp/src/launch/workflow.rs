@@ -641,7 +641,7 @@ impl Controller {
         {
             record.request_cleanup(
                 Some(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "launch_deadline_exceeded",
                     ),
                 ),
@@ -655,7 +655,7 @@ impl Controller {
         {
             if record.lifecycle_prepare_dispatched {
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "lifecycle_prepare_unconfirmed",
                     ),
                 );
@@ -663,7 +663,7 @@ impl Controller {
             } else {
                 record.request_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "launch_deadline_exceeded",
                         ),
                     ),
@@ -678,7 +678,7 @@ impl Controller {
         {
             record.request_cleanup(
                 Some(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "lifecycle_context_unavailable",
                     ),
                 ),
@@ -693,7 +693,7 @@ impl Controller {
         {
             record.request_cleanup(
                 Some(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "borrowed_capture_unverified",
                     ),
                 ),
@@ -708,7 +708,7 @@ impl Controller {
         {
             record.request_cleanup(
                 Some(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "legacy_display_policy_conflict",
                     ),
                 ),
@@ -825,7 +825,7 @@ impl Controller {
                         .expect("workflow record")
                         .request_cleanup(
                             Some(
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                     "launch_deadline_exceeded",
                                 ),
                             ),
@@ -841,7 +841,7 @@ impl Controller {
                     if record.state == State::Starting {
                         record.request_cleanup(
                             Some(
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                     "launch_deadline_exceeded",
                                 ),
                             ),
@@ -944,7 +944,7 @@ impl Controller {
                 record.cleanup_error = Some("broker_settlement_unconfirmed");
                 if record.resume_abandoned {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "resume_settlement_unconfirmed",
                         ),
                     );
@@ -995,7 +995,7 @@ impl Controller {
                     record.application_cleanup_blocked = false;
                     record.request_cleanup(
                         Some(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "application_launch_unconfirmed",
                             ),
                         ),
@@ -1008,7 +1008,7 @@ impl Controller {
                     record.rtsp_cleanup_blocked = false;
                     record.request_cleanup(
                         Some(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "rtsp_open_unconfirmed",
                             ),
                         ),
@@ -1032,7 +1032,7 @@ impl Controller {
                     | Phase::VerifyResumeApplication
                     | Phase::RefreshResumePolicy => {
                         record.fail_cleanup(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "lifecycle_prepare_unconfirmed",
                             ),
                         );
@@ -1075,7 +1075,7 @@ impl Controller {
                         record.application_session.is_none() && record.stop_on_stream_end;
                 }
                 record.process_failure(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "broker_settlement_unconfirmed",
                     ),
                     |record| {
@@ -1102,11 +1102,21 @@ impl Controller {
         replies: &mut Vec<(u64, Reply)>,
     ) {
         job.call.abandon_read(send);
-        let record = self.records.get_mut(&job.record).expect("workflow record");
+        self.unconfirmed_status(job.record, job.phase, now, replies);
+    }
+
+    fn unconfirmed_status(
+        &mut self,
+        record_id: u64,
+        phase: Phase,
+        now: Instant,
+        replies: &mut Vec<(u64, Reply)>,
+    ) {
+        let record = self.records.get_mut(&record_id).expect("workflow record");
         if record.state.terminal() || record.state == State::CleanupFailed {
             return;
         }
-        if job.phase.routine_monitor() && record.state != State::Stopping {
+        if phase.routine_monitor() && record.state != State::Stopping {
             // A late observation is not evidence of failed resources. Keep
             // retrying the same monitor phase within a bounded grace window.
             if record.late_monitor_since.is_none() {
@@ -1119,10 +1129,10 @@ impl Controller {
                 record.next_monitor = now + MONITOR_INTERVAL;
                 return;
             }
-            if job.phase == Phase::MonitorRtsp && record.lifecycle_session_target.is_some() {
+            if phase == Phase::MonitorRtsp && record.lifecycle_session_target.is_some() {
                 record.request_monitored_transport_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "stream_observation_lost",
                         ),
                     ),
@@ -1131,7 +1141,7 @@ impl Controller {
             } else {
                 record.request_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "stream_observation_lost",
                         ),
                     ),
@@ -1143,7 +1153,7 @@ impl Controller {
             // A cleanup verification is read again on a later pass, until the
             // cleanup deadline decides.
             record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
-            self.finish_or_retain(job.record, now, replies);
+            self.finish_or_retain(record_id, now, replies);
         }
     }
 
@@ -1153,19 +1163,19 @@ impl Controller {
         }
         if record.auxiliary.is_some() {
             match config {
-                Some(config) => {
-                    match super::auxiliary::prepare_auxiliary(record, &config.profile) {
-                        Ok(()) => record.stage = Stage::OpenRtsp,
-                        Err(code) => fail_record(
-                            record,
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
-                            now,
+                Some(config) => match super::auxiliary::prepare_auxiliary(record, &config.profile) {
+                    Ok(()) => record.stage = Stage::OpenRtsp,
+                    Err(code) => fail_record(
+                        record,
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                            code,
                         ),
-                    }
-                }
+                        now,
+                    ),
+                },
                 None => fail_record(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "streaming_disabled",
                     ),
                     now,
@@ -1184,7 +1194,7 @@ impl Controller {
         let Some(config) = config else {
             fail_record(
                 record,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "streaming_disabled",
                 ),
                 now,
@@ -1197,7 +1207,7 @@ impl Controller {
         {
             fail_record(
                 record,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                 now,
             );
             return;
@@ -1208,7 +1218,7 @@ impl Controller {
             Err(code) => {
                 fail_record(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                     now,
                 );
                 return;
@@ -1220,7 +1230,7 @@ impl Controller {
         {
             fail_record(
                 record,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "desktop_virtual_policy_unsupported",
                 ),
                 now,
@@ -1234,7 +1244,7 @@ impl Controller {
         if let Err(code) = route_capture(record, mode, intent.is_some()) {
             fail_record(
                 record,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                 now,
             );
             return;
@@ -1919,12 +1929,20 @@ impl Controller {
             self.finish_or_retain(job.record, now, replies);
             return;
         }
-        if job.phase == Phase::MonitorApplication
-            && application_response(&self.records[&job.record], &payload)
-                .is_ok_and(|(_, state, healthy)| state != "active" || !healthy)
-        {
-            self.end_application_group(job.record, now);
-            return;
+        if job.phase == Phase::MonitorApplication {
+            match application_response(&self.records[&job.record], &payload) {
+                Ok((_, "active", true)) => {}
+                Ok(_) if clean_application_terminal(&self.records[&job.record], &payload) => {
+                    // The application's owner already completed this
+                    // transition. Retire the corresponding client streams.
+                    self.end_application_group(job.record, now);
+                    return;
+                }
+                _ => {
+                    self.unconfirmed_status(job.record, job.phase, now, replies);
+                    return;
+                }
+            }
         }
         let application = self.records[&job.record].application_root();
         let other_live_stream = self.records.values().any(|record| {
@@ -1963,7 +1981,7 @@ impl Controller {
                     Ok(false) => {}
                     Err(()) => fail_record(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "presentation_application_unbound",
                         ),
                         now,
@@ -1985,7 +2003,7 @@ impl Controller {
                 } else {
                     fail_record(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "rtsp_runtime_epoch_unavailable",
                         ),
                         now,
@@ -2008,7 +2026,7 @@ impl Controller {
                     Ok(false) => {}
                     Err(()) => fail_record(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "presentation_transport_unbound",
                         ),
                         now,
@@ -2024,7 +2042,7 @@ impl Controller {
                 } else {
                     fail_record(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "borrowed_capture_unverified",
                         ),
                         now,
@@ -2039,7 +2057,7 @@ impl Controller {
                 } else {
                     fail_record(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "launch_epoch_unavailable",
                         ),
                         now,
@@ -2054,7 +2072,7 @@ impl Controller {
                 if payload["operation_id"] != format!("{}-lifecycle", record.application_operation)
                 {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "lifecycle_prepare_unconfirmed",
                         ),
                     );
@@ -2092,7 +2110,7 @@ impl Controller {
                     if !fact
                         .is_some_and(|fact| record.request_preparation_failure(fact, reason, now))
                     {
-                        fail_record(record, StreamFailure::critical(reason), now);
+                        fail_record(record, StreamFailure::requirement_failed(reason), now);
                     }
                 } else if payload["status"] == "succeeded"
                     && let Some(target) = lifecycle_session_target(&payload)
@@ -2111,7 +2129,7 @@ impl Controller {
                     record.lifecycle_prepare_pending = false;
                 } else {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "lifecycle_retirement_unavailable",
                         ),
                     );
@@ -2128,7 +2146,7 @@ impl Controller {
                     record.lifecycle_end_fenced = true;
                 } else {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "lifecycle_end_unconfirmed",
                         ),
                     );
@@ -2151,7 +2169,7 @@ impl Controller {
                     }
                 } else {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "lifecycle_application_binding_unconfirmed",
                         ),
                     );
@@ -2171,7 +2189,7 @@ impl Controller {
                     record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
                 } else {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "lifecycle_end_unconfirmed",
                         ),
                     );
@@ -2223,7 +2241,7 @@ impl Controller {
                 } else {
                     record.request_cleanup(
                         Some(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "retained_application_unavailable",
                             ),
                         ),
@@ -2292,111 +2310,110 @@ impl Controller {
                     Self::advance_after_history(self.config.as_ref(), record, now);
                 }
             }
-            Phase::PreflightApplication => {
-                match application_preflight_response(record, &payload) {
-                    Ok(ApplicationPreflight {
-                        token,
-                        catalog_revision,
-                        overrides: application_overrides,
-                        application_display_settings,
-                        executable_path,
-                        cleanup_budget_ms,
-                        stop_on_stream_end,
-                    }) if record.state == State::Starting => {
-                        let selected_capture_mode = record
-                            .peer
-                            .client_capture
-                            .or(application_overrides.capture)
-                            .unwrap_or(record.global_capture_mode);
-                        record.application_preflight_token = Some(token);
-                        record.application_catalog_revision = Some(catalog_revision);
-                        record.application_properties = payload.get("config_overrides").cloned();
-                        record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
-                        record.stop_on_stream_end = stop_on_stream_end;
-                        record.executable_path = executable_path;
-                        record.application_preflight_overrides = Some(application_overrides);
-                        record.application_display_overrides = Some(application_display_overrides(
-                            payload.get("config_overrides"),
-                        ));
-                        record.application_display_settings = application_display_settings;
-                        record.virtual_display_intent = match if record.shared_capture.is_some() {
-                            if super::shared_session::requested_resolution_only(&record.peer) {
-                                Err("private_catalog_requires_owned_virtual_display")
-                            } else {
-                                Ok(None)
-                            }
+            Phase::PreflightApplication => match application_preflight_response(record, &payload) {
+                Ok(ApplicationPreflight {
+                    token,
+                    catalog_revision,
+                    overrides: application_overrides,
+                    application_display_settings,
+                    executable_path,
+                    cleanup_budget_ms,
+                    stop_on_stream_end,
+                }) if record.state == State::Starting => {
+                    let selected_capture_mode = record
+                        .peer
+                        .client_capture
+                        .or(application_overrides.capture)
+                        .unwrap_or(record.global_capture_mode);
+                    record.application_preflight_token = Some(token);
+                    record.application_catalog_revision = Some(catalog_revision);
+                    record.application_properties = payload.get("config_overrides").cloned();
+                    record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
+                    record.stop_on_stream_end = stop_on_stream_end;
+                    record.executable_path = executable_path;
+                    record.application_preflight_overrides = Some(application_overrides);
+                    record.application_display_overrides = Some(application_display_overrides(
+                        payload.get("config_overrides"),
+                    ));
+                    record.application_display_settings = application_display_settings;
+                    record.virtual_display_intent = match if record.shared_capture.is_some() {
+                        if super::shared_session::requested_resolution_only(&record.peer) {
+                            Err("private_catalog_requires_owned_virtual_display")
                         } else {
-                            virtual_display_intent(record)
-                        } {
-                            Ok(intent) => intent,
-                            Err(code) => {
-                                fail_record(
+                            Ok(None)
+                        }
+                    } else {
+                        virtual_display_intent(record)
+                    } {
+                        Ok(intent) => intent,
+                        Err(code) => {
+                            fail_record(
                                     record,
-                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                         code,
                                     ),
                                     now,
                                 );
-                                self.finish_or_retain(job.record, now, replies);
-                                return;
-                            }
-                        };
-                        if record.shared_capture.is_none()
-                            && let Err(code) = route_capture(
+                            self.finish_or_retain(job.record, now, replies);
+                            return;
+                        }
+                    };
+                    if record.shared_capture.is_none()
+                        && let Err(code) = route_capture(
+                            record,
+                            selected_capture_mode,
+                            record.virtual_display_intent.is_some(),
+                        )
+                    {
+                        fail_record(
                                 record,
-                                selected_capture_mode,
-                                record.virtual_display_intent.is_some(),
-                            )
-                        {
-                            fail_record(
-                                record,
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                     code,
                                 ),
                                 now,
                             );
-                            self.finish_or_retain(job.record, now, replies);
-                            return;
-                        }
-                        record.display_policy_snapshot = Some(display_policy_snapshot(record));
-                        let frozen_overrides = record
-                            .application_preflight_overrides
-                            .as_ref()
-                            .expect("validated preflight overrides")
-                            .clone();
-                        let mut profile = self
-                            .config
-                            .as_ref()
-                            .expect("enabled streaming config")
-                            .profile
-                            .clone();
-                        if let Err(code) =
-                            project_application_policy(record, &frozen_overrides, &mut profile)
-                        {
-                            fail_record(
+                        self.finish_or_retain(job.record, now, replies);
+                        return;
+                    }
+                    record.display_policy_snapshot = Some(display_policy_snapshot(record));
+                    let frozen_overrides = record
+                        .application_preflight_overrides
+                        .as_ref()
+                        .expect("validated preflight overrides")
+                        .clone();
+                    let mut profile = self
+                        .config
+                        .as_ref()
+                        .expect("enabled streaming config")
+                        .profile
+                        .clone();
+                    if let Err(code) =
+                        project_application_policy(record, &frozen_overrides, &mut profile)
+                    {
+                        fail_record(
                                 record,
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                     code,
                                 ),
                                 now,
                             );
-                            self.finish_or_retain(job.record, now, replies);
-                            return;
-                        }
-                        if record.shared_capture.is_some() {
-                            record.stage = if record.application_display_settings.is_some() {
-                                Stage::PrepareDisplayAdmission
-                            } else {
-                                Stage::LaunchApplication
-                            };
-                        } else if record
-                            .virtual_display_intent
-                            .as_ref()
-                            .is_some_and(VirtualDisplayIntent::active)
-                        {
-                            record.stage = Stage::PrepareDisplayAdmission;
+                        self.finish_or_retain(job.record, now, replies);
+                        return;
+                    }
+                    if record.shared_capture.is_some() {
+                        record.stage = if record.application_display_settings.is_some() {
+                            Stage::PrepareDisplayAdmission
                         } else {
-                            match record
+                            Stage::LaunchApplication
+                        };
+                    } else if record
+                        .virtual_display_intent
+                        .as_ref()
+                        .is_some_and(VirtualDisplayIntent::active)
+                    {
+                        record.stage = Stage::PrepareDisplayAdmission;
+                    } else {
+                        match record
                             .display_policy_snapshot
                             .as_ref()
                             .and_then(|snapshot| {
@@ -2409,7 +2426,7 @@ impl Controller {
                                 | "ensure_only_display",
                             ) => match capture_source(record) {
                                 Ok(_) => record.stage = Stage::SnapshotDisplay,
-                                Err(code) => fail_record(record, amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code), now),
+                                Err(code) => fail_record(record, amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code), now),
                             },
                             None | Some("disabled") => {
                                 record.stage = if record.application_display_settings.is_some() {
@@ -2418,24 +2435,23 @@ impl Controller {
                                     Stage::LaunchApplication
                                 }
                             }
-                            Some(_) => fail_record(record, amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("display_mutation_unavailable"), now),
-                        }
+                            Some(_) => fail_record(record, amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed("display_mutation_unavailable"), now),
                         }
                     }
-                    Ok(_) => fail_record(
-                        record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                            "application_preflight_unavailable",
-                        ),
-                        now,
-                    ),
-                    Err(code) => fail_record(
-                        record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
-                        now,
-                    ),
                 }
-            }
+                Ok(_) => fail_record(
+                    record,
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                        "application_preflight_unavailable",
+                    ),
+                    now,
+                ),
+                Err(code) => fail_record(
+                    record,
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
+                    now,
+                ),
+            },
             Phase::SnapshotDisplay => match display_snapshot(&payload) {
                 Ok((revision, configuration, ids)) if record.state == State::Starting => {
                     record.display_topology_revision = Some(revision);
@@ -2445,7 +2461,7 @@ impl Controller {
                 }
                 Ok(_) => fail_before_resume_stream(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "display_snapshot_unavailable",
                     ),
                     now,
@@ -2453,7 +2469,7 @@ impl Controller {
                 ),
                 Err(code) => fail_before_resume_stream(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                     now,
                     replies,
                 ),
@@ -2466,7 +2482,9 @@ impl Controller {
                     Ok(None) => record.stage = Stage::ConfirmDisplay,
                     Err(code) => fail_before_resume_stream(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                            code,
+                        ),
                         now,
                         replies,
                     ),
@@ -2474,7 +2492,7 @@ impl Controller {
             }
             Phase::EnumerateDisplay => fail_before_resume_stream(
                 record,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "display_enumeration_unavailable",
                 ),
                 now,
@@ -2505,7 +2523,7 @@ impl Controller {
                         }
                         Err(code) => fail_before_resume_stream(
                             record,
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                             now,
                             replies,
                         ),
@@ -2513,7 +2531,7 @@ impl Controller {
                 }
                 Ok(_) => fail_before_resume_stream(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "display_topology_changed",
                     ),
                     now,
@@ -2521,7 +2539,7 @@ impl Controller {
                 ),
                 Err(code) => fail_before_resume_stream(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                     now,
                     replies,
                 ),
@@ -2533,7 +2551,7 @@ impl Controller {
                         if let Err(code) = validate_application_launch_snapshot(record, &payload) {
                             fail_record(
                                 record,
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                     code,
                                 ),
                                 now,
@@ -2549,7 +2567,7 @@ impl Controller {
                         if let Err(code) = validate_application_launch_snapshot(record, &payload) {
                             fail_record(
                                 record,
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                     code,
                                 ),
                                 now,
@@ -2563,7 +2581,7 @@ impl Controller {
                         record.application_launch = Some(launch_id);
                         record.request_cleanup(
                             Some(
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                     "application_launch_unhealthy",
                                 ),
                             ),
@@ -2573,7 +2591,7 @@ impl Controller {
                     Ok((launch_id, _, _)) => {
                         record.application_launch = Some(launch_id);
                         record.request_failure_cleanup(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "application_ended",
                             ),
                             None,
@@ -2592,7 +2610,7 @@ impl Controller {
                             record.application_requested = false;
                         }
                         record.request_failure_cleanup(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "application_launch_unavailable",
                             ),
                             Some("launch_not_found"),
@@ -2601,7 +2619,9 @@ impl Controller {
                     }
                     Err(code) => fail_record(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                            code,
+                        ),
                         now,
                     ),
                 }
@@ -2612,7 +2632,7 @@ impl Controller {
                     if let Err(code) = validate_application_launch_snapshot(record, &payload) {
                         fail_record(
                             record,
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                             now,
                         );
                         self.finish_or_retain(job.record, now, replies);
@@ -2625,7 +2645,7 @@ impl Controller {
                     if let Err(code) = validate_application_launch_snapshot(record, &payload) {
                         fail_record(
                             record,
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                             now,
                         );
                         self.finish_or_retain(job.record, now, replies);
@@ -2637,7 +2657,7 @@ impl Controller {
                     record.application_launch = Some(launch_id);
                     record.request_cleanup(
                         Some(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "application_launch_unhealthy",
                             ),
                         ),
@@ -2646,7 +2666,7 @@ impl Controller {
                 }
                 Err(code) => fail_record(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                     now,
                 ),
             },
@@ -2657,14 +2677,14 @@ impl Controller {
                 }
                 Ok(_) => fail_record(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "display_admission_unavailable",
                     ),
                     now,
                 ),
                 Err(code) => fail_record(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                     now,
                 ),
             },
@@ -2689,7 +2709,7 @@ impl Controller {
                     record.rtsp_ticket = Some(ticket);
                     if record.state == State::Starting {
                         record.request_failure_cleanup(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "rtsp_not_ready",
                             ),
                             Some(safe_rtsp_provider_code(&payload["failure"])),
@@ -2712,7 +2732,7 @@ impl Controller {
                     }
                     fail_record(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "rtsp_launch_unavailable",
                         ),
                         now,
@@ -2720,40 +2740,29 @@ impl Controller {
                 }
                 Err(code) => fail_record(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(code),
                     now,
                 ),
             },
-            Phase::MonitorApplication => match application_response(record, &payload) {
-                Ok((_, "active", true)) => record.monitored(now),
-                Ok(_) => {
-                    log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
-                    record.request_cleanup(
-                        Some(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                                "application_ended",
-                            ),
-                        ),
-                        now,
-                    )
-                }
-                Err(code) => {
-                    log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
-                    fail_record(
-                        record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
-                        now,
-                    )
-                }
-            },
+            Phase::MonitorApplication => record.monitored(now),
             Phase::MonitorRtsp => {
-                record.rtsp_stream_ending = payload["state"] == "closing"
-                    || matches!(
-                        payload["stream_state"].as_str(),
-                        Some("stopping" | "stopped" | "failed" | "cancelled" | "cleanup_failed")
-                    );
-                match rtsp_response(record, &payload) {
-                    Ok((_, _, "ready" | "arming" | "playing", true)) => {
+                let observed = rtsp_response(record, &payload);
+                if observed.is_ok() {
+                    record.rtsp_stream_ending = matches!(
+                        payload["state"].as_str(),
+                        Some("closing" | "closed" | "failed" | "cleanup_failed")
+                    )
+                        || matches!(
+                            payload["stream_state"].as_str(),
+                            Some(
+                                "stopping" | "stopped" | "failed" | "cancelled" | "cleanup_failed"
+                            )
+                        );
+                }
+                match observed {
+                    Ok((_, _, "ready" | "arming" | "playing", true))
+                        if !record.rtsp_stream_ending =>
+                    {
                         record.rtsp_closing_deadline = None;
                         record.monitored(now);
                     }
@@ -2814,48 +2823,31 @@ impl Controller {
                             record.deadline = now + INITIAL_DEADLINE;
                         }
                     }
-                    Ok(_) => {
-                        log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
-                        if record.lifecycle_session_target.is_some() {
-                            record.request_monitored_transport_cleanup(
-                                Some(
-                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                                        "stream_ended",
-                                    ),
-                                ),
-                                now,
-                            );
-                        } else {
-                            record.request_cleanup(
-                                Some(
-                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                                        "stream_ended",
-                                    ),
-                                ),
-                                now,
+                    Ok((_, _, "closed" | "failed", true))
+                        if !record.lifecycle_required && clean_rtsp_terminal(record, &payload) =>
+                    {
+                        observe_authenticated_disconnect(record, &payload);
+                        if payload["state"] == "failed" {
+                            record.record_failure_because(
+                                "rtsp_stream_failed",
+                                safe_rtsp_provider_code(&payload["failure"]),
                             );
                         }
+                        record.rtsp_requested = false;
+                        record.rtsp_ticket = None;
+                        record.rtsp_url = None;
+                        record.request_cleanup(None, now);
                     }
-                    Err(code) => {
+                    Ok((_, _, "closed" | "failed" | "cleanup_failed", _)) => {
+                        // The exact ticket is ending. Retain ownership until
+                        // close/status confirms retirement before stopping the app.
+                        log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
+                        record.request_monitored_transport_cleanup(None, now);
+                    }
+                    _ => {
                         log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
-                        if record.lifecycle_session_target.is_some() {
-                            record.request_monitored_transport_cleanup(
-                                Some(
-                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                                        code,
-                                    ),
-                                ),
-                                now,
-                            );
-                        } else {
-                            fail_record(
-                                record,
-                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                                    code,
-                                ),
-                                now,
-                            );
-                        }
+                        self.unconfirmed_status(job.record, job.phase, now, replies);
+                        return;
                     }
                 }
             }
@@ -2982,7 +2974,7 @@ impl Controller {
             | Phase::VerifyBorrowedCapture => {
                 record.request_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "borrowed_capture_unverified",
                         ),
                     ),
@@ -3025,7 +3017,7 @@ impl Controller {
                         ApplicationRetirementState::Unreported;
                 }
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "lifecycle_retirement_unconfirmed",
                     ),
                 );
@@ -3035,7 +3027,7 @@ impl Controller {
                 // A previous admission reply may have been lost before this
                 // rejection; preserve the fence until reconciliation exists.
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "lifecycle_prepare_unconfirmed",
                     ),
                 );
@@ -3043,7 +3035,7 @@ impl Controller {
             }
             Phase::LookupLifecycle => {
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "lifecycle_prepare_unconfirmed",
                     ),
                 );
@@ -3096,14 +3088,14 @@ impl Controller {
             }
             Phase::LookupApplication => {
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "application_lookup_unavailable",
                     ),
                 );
             }
             Phase::LookupRtsp => {
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "rtsp_lookup_unavailable",
                     ),
                 );
@@ -3121,7 +3113,7 @@ impl Controller {
             Phase::MonitorRtsp if record.lifecycle_session_target.is_some() => {
                 record.request_monitored_transport_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "lifecycle_status_unavailable",
                         ),
                     ),
@@ -3130,7 +3122,7 @@ impl Controller {
             }
             Phase::MonitorApplication | Phase::MonitorRtsp => fail_record(
                 record,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "lifecycle_status_unavailable",
                 ),
                 now,
@@ -3139,7 +3131,7 @@ impl Controller {
                 record.application_requested = false;
                 fail_record(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "application_launch_rejected",
                     ),
                     now,
@@ -3152,7 +3144,7 @@ impl Controller {
             Phase::PrepareDisplayAdmission => {
                 fail_before_resume_stream(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "display_admission_unavailable",
                     ),
                     now,
@@ -3161,7 +3153,7 @@ impl Controller {
             }
             Phase::PreflightApplication => fail_record(
                 record,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "application_preflight_rejected",
                 ),
                 now,
@@ -3169,7 +3161,7 @@ impl Controller {
             Phase::SnapshotDisplay | Phase::EnumerateDisplay | Phase::ConfirmDisplay => {
                 fail_before_resume_stream(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "display_verification_unavailable",
                     ),
                     now,
@@ -3180,7 +3172,7 @@ impl Controller {
                 record.rtsp_requested = false;
                 fail_record(
                     record,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "rtsp_launch_rejected",
                     ),
                     now,
@@ -3277,7 +3269,7 @@ impl Controller {
             | Phase::VerifyBorrowedCapture => {
                 record.request_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "borrowed_capture_unverified",
                         ),
                     ),
@@ -3315,7 +3307,7 @@ impl Controller {
             | Phase::EndLifecycle
             | Phase::AwaitLifecycleEnd => {
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "lifecycle_prepare_unconfirmed",
                     ),
                 );
@@ -3375,7 +3367,7 @@ impl Controller {
             Phase::PreflightApplication => {
                 record.request_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "application_preflight_unavailable",
                         ),
                     ),
@@ -3386,7 +3378,7 @@ impl Controller {
                 if record.resumed && !record.rtsp_requested {
                     fail_before_resume_stream(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "display_preflight_unavailable",
                         ),
                         now,
@@ -3395,7 +3387,7 @@ impl Controller {
                 } else {
                     record.request_cleanup(
                         Some(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "display_preflight_unavailable",
                             ),
                         ),
@@ -3416,7 +3408,7 @@ impl Controller {
                 if record.resumed && !record.rtsp_requested {
                     fail_before_resume_stream(
                         record,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "display_admission_unavailable",
                         ),
                         now,
@@ -3425,7 +3417,7 @@ impl Controller {
                 } else {
                     record.request_cleanup(
                         Some(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "display_admission_unavailable",
                             ),
                         ),
@@ -3456,7 +3448,7 @@ impl Controller {
             Phase::MonitorRtsp if record.lifecycle_session_target.is_some() => {
                 record.request_monitored_transport_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "lifecycle_status_unavailable",
                         ),
                     ),
@@ -3466,7 +3458,7 @@ impl Controller {
             Phase::MonitorApplication | Phase::MonitorRtsp => {
                 record.request_cleanup(
                     Some(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "lifecycle_status_unavailable",
                         ),
                     ),
@@ -3480,7 +3472,7 @@ impl Controller {
         {
             record.request_cleanup(
                 Some(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "launch_deadline_exceeded",
                     ),
                 ),
@@ -3504,21 +3496,21 @@ impl Controller {
             {
                 if record.rtsp_requested && record.rtsp_cleanup_blocked {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "rtsp_cleanup_unconfirmed",
                         ),
                     );
                     reply_failure(record, replies);
                 } else if record.application_requested && record.application_cleanup_blocked {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "application_cleanup_unconfirmed",
                         ),
                     );
                     reply_failure(record, replies);
                 } else if now >= record.deadline {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "lifecycle_retirement_unconfirmed",
                         ),
                     );
@@ -3531,7 +3523,7 @@ impl Controller {
                     || (record.application_requested && record.owns_application_cleanup()))
             {
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "cleanup_deadline_exceeded",
                     ),
                 );
@@ -3588,7 +3580,9 @@ impl Controller {
             {
                 let error = record.cleanup_error.unwrap_or("cleanup_unconfirmed");
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(error),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                        error,
+                    ),
                 );
                 reply_failure(record, replies);
             }
@@ -3634,7 +3628,7 @@ fn observe_application_retirement(
         _ => {}
     }
     record.fail_cleanup(
-        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
             "lifecycle_application_retirement_unconfirmed",
         ),
     );
@@ -4755,7 +4749,9 @@ fn fail_before_resume_stream(
 #[track_caller]
 pub(super) fn reject_resume(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
     record.process_failure(
-        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("resume_rejected"),
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+            "resume_rejected",
+        ),
         |record| apply_resume_rejection(record, replies),
     );
 }
@@ -4817,7 +4813,7 @@ fn advance_resume_display(record: &mut Record, now: Instant) {
             }
             Some(_) => fail_record(
                 record,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "display_mutation_unavailable",
                 ),
                 now,
@@ -4835,7 +4831,7 @@ fn complete_launch(record: &mut Record, now: Instant, replies: &mut Vec<(u64, Re
     } else {
         record.request_cleanup(
             Some(
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "launch_response_unavailable",
                 ),
             ),

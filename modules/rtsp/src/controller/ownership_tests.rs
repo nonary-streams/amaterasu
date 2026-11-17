@@ -435,7 +435,7 @@ fn orderly_module_shutdown_requests_replay_safe_stop_for_owned_sessions() {
             .iter()
             .all(|(payload, _, parent)| { payload["session"] == SESSION && parent.is_none() })
     );
-    assert_eq!(controller.records[&ticket].state, State::Failed);
+    assert_eq!(controller.records[&ticket].state, State::Closed);
     assert!(controller.records[&ticket].cleanup_confirmed);
 }
 
@@ -497,7 +497,7 @@ fn orderly_module_shutdown_recovers_and_stops_an_uncertain_prepare() {
     controller.shutdown(&runtime);
 
     assert!(controller.records[&ticket].cleanup_confirmed);
-    assert_eq!(controller.records[&ticket].state, State::Failed);
+    assert_eq!(controller.records[&ticket].state, State::Closed);
     assert_eq!(
         endpoint
             .downstream_requests()
@@ -627,10 +627,11 @@ fn negotiate_announce(record: &mut Record, body: &str) -> bool {
     let accepted = record.accept_announce(&parsed);
     let permit = (!accepted).then(|| {
         match Controller::network_failure_decision(
+            &amaterasu_module_sdk::stream_lifecycle::StandardStreamFailurePolicy,
             record,
             action_ticket,
             "announce",
-            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                 "configuration_mismatch",
             ),
             None,
@@ -642,8 +643,10 @@ fn negotiate_announce(record: &mut Record, body: &str) -> bool {
         }
     });
     let negotiation = record.negotiation.as_mut().unwrap();
-    match permit.as_ref() {
-        Some(permit) => negotiation.reject(ticket, action_ticket, permit),
+    match permit {
+        Some(permit) => negotiation
+            .reject(ticket, action_ticket, permit)
+            .map(|(reply, _)| reply),
         None => negotiation.complete(ticket, action_ticket),
     }
     .expect("ANNOUNCE completion");

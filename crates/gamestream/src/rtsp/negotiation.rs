@@ -77,25 +77,12 @@ pub enum Error {
 }
 
 impl Error {
-    /// Whether this error prevents a correct, authorized stream from continuing.
-    /// Sequence, state and in-flight request refusals leave the negotiation and
-    /// prepared resources intact. Refuse the request, then allow a valid retry;
-    /// the RTSP status alone must not decide whether to retire the stream.
-    pub fn is_critical(self) -> bool {
-        match self {
-            Self::InvalidSequence | Self::WrongState | Self::Pending => false,
-            Self::InvalidLaunch
-            | Self::WrongEpoch
-            | Self::WrongSession
-            | Self::InvalidTarget
-            | Self::InvalidHeaders
-            | Self::InvalidBody
-            | Self::UnsupportedTransport
-            | Self::UnsupportedMedia
-            | Self::WrongTicket
-            | Self::InvalidFailureReport
-            | Self::Serialization => true,
-        }
+    /// These refusals leave the negotiation and its preparation intact.
+    pub fn leaves_request_unchanged(self) -> bool {
+        matches!(
+            self,
+            Self::InvalidSequence | Self::WrongState | Self::Pending
+        )
     }
 
     /// Stable, bounded lifecycle reason; never includes peer input or secrets.
@@ -157,8 +144,15 @@ struct Pending {
     retry: Option<Request>,
 }
 
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.failure_scope.invalidate_action();
+    }
+}
+
 pub struct Negotiation {
     launch: TrustedLaunch,
+    failure_owner: StreamFailureScope,
     capabilities: Capabilities,
     state: State,
     last_cseq: Option<u32>,
@@ -170,8 +164,10 @@ pub struct Negotiation {
 impl Negotiation {
     pub fn new(launch: TrustedLaunch, capabilities: Capabilities) -> Result<Self, Error> {
         validation::launch(&launch, &capabilities)?;
+        let failure_owner = StreamFailureScope::new(launch.operation.as_str());
         Ok(Self {
             launch,
+            failure_owner,
             capabilities,
             state: State::Options,
             last_cseq: None,
@@ -195,6 +191,19 @@ impl Negotiation {
         let mut negotiation = Self::new(launch, capabilities)?;
         negotiation.profile_offer = Some(offered);
         Ok(negotiation)
+    }
+
+    /// Attach the enclosing ticket's owner before admitting any request.
+    pub fn with_failure_owner(mut self, owner: &StreamFailureScope) -> Result<Self, Error> {
+        if self.state != State::Options
+            || self.pending.is_some()
+            || !owner.is_owner()
+            || owner.operation() != self.launch.operation
+        {
+            return Err(Error::InvalidLaunch);
+        }
+        self.failure_owner = owner.clone();
+        Ok(self)
     }
 
     pub fn state(&self) -> State {
@@ -235,7 +244,7 @@ impl Negotiation {
                     ticket: *ticket,
                     cseq: request.cseq,
                     success: next,
-                    failure_scope: StreamFailureScope::new(self.launch.operation.clone()),
+                    failure_scope: self.failure_owner.action(),
                     retry: matches!(action, Action::Announce(_) | Action::ExtensionAnnounce(_))
                         .then(|| request.clone()),
                 });
@@ -264,7 +273,7 @@ impl Negotiation {
         self.last_reply = self
             .pending
             .take()
-            .and_then(|pending| pending.retry)
+            .and_then(|mut pending| pending.retry.take())
             .map(|request| (request, response.clone()));
         Ok(response)
     }
@@ -281,22 +290,26 @@ impl Negotiation {
     /// # use amaterasu_module_sdk::stream_lifecycle::{StreamIssue, LifecycleLayer};
     /// fn warning_cannot_reject(machine: &mut Negotiation) {
     ///     let warning = StreamIssue::advisory("stream", LifecycleLayer::Rtsp, "announce", "hint");
-    ///     machine.reject(7, 1, &warning);
+    ///     machine.reject(7, 1, warning);
     /// }
     /// ```
     pub fn reject(
         &mut self,
         epoch: u64,
         ticket: u64,
-        permit: &StreamTermination,
-    ) -> Result<Vec<u8>, Error> {
-        if !permit.matches_scope(self.failure_scope(epoch, ticket)?) {
+        permit: StreamTermination,
+    ) -> Result<(Vec<u8>, StreamTermination), Error> {
+        let action = self.failure_scope(epoch, ticket)?;
+        if !permit.matches_scope(action) {
             return Err(Error::InvalidFailureReport);
         }
         let (response, _) = self.completion(epoch, ticket, 503)?;
+        let permit = permit
+            .settle_action(action, &self.failure_owner)
+            .ok_or(Error::InvalidFailureReport)?;
         self.state = State::Failed;
         self.pending = None;
-        Ok(response)
+        Ok((response, permit))
     }
 
     /// Refuse only a read-only/recovered operation after the common handler

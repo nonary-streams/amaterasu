@@ -148,7 +148,7 @@ pub(super) fn consume(record: &mut Record, job: &mut Job, payload: &Value, now: 
             {
                 job.fail(
                     record,
-                    StreamFailure::critical("display_scope_unavailable"),
+                    StreamFailure::requirement_failed("display_scope_unavailable"),
                     now,
                 );
                 return true;
@@ -183,7 +183,7 @@ pub(super) fn consume(record: &mut Record, job: &mut Job, payload: &Value, now: 
             {
                 job.fail(
                     record,
-                    StreamFailure::critical("source_plugin_settings_unavailable"),
+                    StreamFailure::requirement_failed("source_plugin_settings_unavailable"),
                     now,
                 );
                 return true;
@@ -198,7 +198,7 @@ pub(super) fn consume(record: &mut Record, job: &mut Job, payload: &Value, now: 
             if payload["ok"] != true || payload["scope"] != json!(scope(record).scope) {
                 job.fail(
                     record,
-                    StreamFailure::critical("source_plugin_preparation_failed"),
+                    StreamFailure::requirement_failed("source_plugin_preparation_failed"),
                     now,
                 );
                 return true;

@@ -311,14 +311,9 @@ impl Controller {
                 record.application_session == Some(application) && !record.state.terminal()
             }) {
                 if !matches!(record.state, State::Stopping | State::CleanupFailed) {
-                    record.request_transport_cleanup(
-                        Some(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                                "application_ended",
-                            ),
-                        ),
-                        now,
-                    );
+                    // The application owner already selected group teardown.
+                    // Each child still verifies its own transport retirement.
+                    record.request_transport_cleanup(None, now);
                 }
             }
             let waiting = self.records.values().any(|record| {
@@ -335,7 +330,7 @@ impl Controller {
                     .get_mut(&application)
                     .expect("retained application");
                 root.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "shared_stream_cleanup_unconfirmed",
                     ),
                 );

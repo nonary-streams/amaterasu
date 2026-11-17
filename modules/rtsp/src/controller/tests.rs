@@ -224,6 +224,9 @@ fn retirement_observations_distinguish_runtime_fences_from_missing_tickets() {
     assert_eq!(endpoint.completions[2].1["runtime_epoch"], epoch);
     let mut current = record(State::Ready);
     current.config.operation_id = "persisted-op".into();
+    current.failure_scope = amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+        current.config.operation_id.as_str(),
+    );
     controller.records.insert(current.id, current);
     controller.retirement_status(
         4,
@@ -262,11 +265,17 @@ fn retirement_observers_are_pinned_to_one_owner_and_epoch_reads_ignore_current_o
     let epoch = controller.runtime_epoch.clone();
     let mut owned = record(State::Closed);
     owned.config.operation_id = "colliding-operation".into();
+    owned.failure_scope = amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+        owned.config.operation_id.as_str(),
+    );
     owned.cleanup_confirmed = true;
     let mut foreign = record(State::Playing);
     foreign.id = 6;
     foreign.owner = "foreign-owner".into();
     foreign.config.operation_id = "colliding-operation".into();
+    foreign.failure_scope = amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+        foreign.config.operation_id.as_str(),
+    );
     controller.records.insert(owned.id, owned);
     controller.records.insert(foreign.id, foreign);
     controller.display_cleanup.push(DisplayCleanup {
@@ -1072,10 +1081,14 @@ fn startup_reconciliation_that_times_out_stays_reported_and_stops_refusing_ticke
 }
 
 pub(super) fn record(state: State) -> Record {
+    let config = open();
     Record {
+        failure_scope: amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+            config.operation_id.as_str(),
+        ),
         id: 5,
         owner: "caller".into(),
-        config: open(),
+        config,
         state,
         session: Some(23),
         negotiation: None,
@@ -1329,6 +1342,9 @@ fn frozen_display_prepare_requires_owned_applied_readback_before_ticket_ready() 
         let mut controller = Controller::new(settings).unwrap();
         let mut record = record(State::Preparing);
         record.config = attested_open();
+        record.failure_scope = amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+            record.config.operation_id.as_str(),
+        );
         record.display_preflight_deadline = Some(100);
         record.display_lease_ready_until = Some(50);
         record.display_prepare_timeout_ms = Some(40);
@@ -1803,6 +1819,9 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
     let mut controller = Controller::new(Settings::default()).expect("disabled controller");
     let config = open();
     let record = Record {
+        failure_scope: amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+            config.operation_id.as_str(),
+        ),
         id: 5,
         owner: "caller".into(),
         config,
@@ -2575,6 +2594,7 @@ fn fresh_negotiation(record: &Record) -> Negotiation {
         },
         record.capabilities(),
     )
+    .and_then(|negotiation| negotiation.with_failure_owner(&record.failure_scope))
     .expect("valid negotiation")
 }
 
@@ -3659,7 +3679,7 @@ fn lifecycle_prepare_deadline_and_late_success_preserve_cleanup_only_admission()
             // already committed to closing. It remains cleanup evidence.
             let mut record = controller.records.remove(&5).unwrap();
             record.close(Some(
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "network_disconnected",
                 ),
             ));
@@ -4265,7 +4285,10 @@ fn failed_lifecycle_prepare_requires_matching_completed_rollback_before_local_re
         });
         let result = super::preparation::apply_response(&mut record, &payload);
         assert_eq!(
-            matches!(result, super::preparation::PreparationResolution::Rejected),
+            matches!(
+                result,
+                super::preparation::PreparationResolution::Rejected(_)
+            ),
             settled
         );
         assert_eq!(record.lifecycle_prepare_outstanding, !settled);

@@ -71,7 +71,7 @@ impl Connection {
     pub(super) fn step(&mut self, tickets: &mut Tickets, now: u64) -> Step {
         if now >= self.deadline {
             return Step::Failure(
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "connection_deadline",
                 ),
             );
@@ -93,7 +93,7 @@ impl Connection {
                     }
                     Err(error) if retryable(&error) => Step::Pending,
                     Err(_) => Step::Failure(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "tcp_write_failed",
                         ),
                     ),
@@ -110,7 +110,7 @@ impl Connection {
             Err(error) if retryable(&error) => return Step::Pending,
             Err(_) => {
                 return Step::Failure(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "tcp_read_failed",
                     ),
                 );
@@ -121,7 +121,7 @@ impl Connection {
         };
         if decoder.push(&buffer[..length]).is_err() {
             return Step::Failure(
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "invalid_encrypted_frame",
                 ),
             );
@@ -131,7 +131,7 @@ impl Connection {
             Ok(None) => return Step::Pending,
             Err(_) => {
                 return Step::Failure(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "invalid_encrypted_frame",
                     ),
                 );
@@ -139,7 +139,7 @@ impl Connection {
         };
         if decoder.finish().is_err() {
             return Step::Failure(
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "multiple_encrypted_frames",
                 ),
             );
@@ -148,7 +148,9 @@ impl Connection {
             Ok(authenticated) => authenticated,
             Err(error) => {
                 return Step::Failure(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(error),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                        error,
+                    ),
                 );
             }
         };
@@ -157,7 +159,9 @@ impl Connection {
             Ok(request) => request,
             Err(error) => {
                 return Step::Failure(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(error),
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                        error,
+                    ),
                 );
             }
         };
@@ -171,13 +175,15 @@ impl Connection {
         match self.socket.read(&mut extra) {
             Ok(0) => Step::End("peer_closed"),
             Ok(_) => Step::Failure(
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "unexpected_pipelined_data",
                 ),
             ),
             Err(error) if retryable(&error) => Step::Pending,
             Err(_) => Step::Failure(
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("tcp_read_failed"),
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                    "tcp_read_failed",
+                ),
             ),
         }
     }

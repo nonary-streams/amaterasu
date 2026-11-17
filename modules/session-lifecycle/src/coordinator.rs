@@ -437,6 +437,10 @@ enum StreamPhase {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StreamRecord {
+    /// The invalidation fenced this exact generation. Only a separate owner
+    /// pause can create provider release work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    invalidation_fence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     borrowed_capture: Option<amaterasu_extension_api::BorrowedCaptureContext>,
     #[serde(default)]

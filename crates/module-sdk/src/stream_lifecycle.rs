@@ -33,7 +33,7 @@ mod termination;
 pub use termination::{
     StandardStreamFailurePolicy, StreamContinuation, StreamFailure, StreamFailureAction,
     StreamFailureDecision, StreamFailureEffect, StreamFailureFact, StreamFailureHandler,
-    StreamFailurePolicy, StreamFailureScope, StreamTermination,
+    StreamFailurePolicy, StreamFailureReport, StreamFailureScope, StreamTermination,
 };
 
 pub use feed::StreamIssueFeed;

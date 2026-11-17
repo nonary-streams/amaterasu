@@ -157,7 +157,9 @@ fn input_refusal_requiring_recovery_is_not_demoted() {
     );
     super::super::input::stop_for_input_failure(
         &mut record,
-        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("input_batch_failed"),
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+            "input_batch_failed",
+        ),
     );
     let reports: Vec<_> = record.issues.drain().collect();
     assert!(reports.iter().any(|report| matches!(report, StreamReport::Issue(issue)
@@ -335,6 +337,8 @@ fn deferred_read_settlement_limit_refuses_new_probe_without_stopping_session() {
         .unwrap();
     let record = host.pipeline.records.get_mut(&first).unwrap();
     record.config.rtsp_operation_id = Some("launch-audio".into());
+    record.failure_scope =
+        amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new("launch-audio");
     for index in 0..MAX_DEFERRED_READ_SETTLEMENTS {
         record.shutdown_observations.push(rpc::Pending::new(
             "fixture/1",
@@ -517,6 +521,8 @@ fn expired_preparation_reports_critical_issue_before_cleanup() {
     let id = host.response(1, prepare())["session"].as_u64().unwrap();
     let record = host.pipeline.records.get_mut(&id).unwrap();
     record.config.rtsp_operation_id = Some("launch-7".into());
+    record.failure_scope =
+        amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new("launch-7");
     let deadline = record.prepared_until;
     host.pipeline.pump(deadline);
     let record = host.pipeline.records.get_mut(&id).unwrap();
@@ -632,7 +638,9 @@ fn cleanup_recovery_cannot_erase_an_earlier_start_failure_with_the_same_provider
     job.cleanup = true;
     job.fail(
         &mut record,
-        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("dependency_rejected"),
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+            "dependency_rejected",
+        ),
         0,
     );
     record.report_confirmed_cleanup();
@@ -655,6 +663,8 @@ fn rumble_delivery_failure_reports_before_stopping() {
     assert_eq!(host.response(2, start(id))["state"], "active");
     let record = host.pipeline.records.get_mut(&id).unwrap();
     record.config.rtsp_operation_id = Some("launch-7".into());
+    record.failure_scope =
+        amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new("launch-7");
     record.rumble_pending.insert(
         0,
         (
@@ -689,7 +699,7 @@ fn a_session_failure_is_published_under_the_launch_owners_stream_key() {
     let mut job = Job::new(42, None, Step::Open(Resource::Video), 0);
     job.fail(
         &mut record,
-        StreamFailure::critical("dependency_rejected"),
+        StreamFailure::requirement_failed("dependency_rejected"),
         0,
     );
     pipeline.records.insert(42, record);
@@ -721,7 +731,7 @@ fn reports_are_off_until_enabled_and_need_a_stream_key() {
     let mut keyed = record_for(Some("launch-8"));
     Job::new(42, None, Step::WaitDrain, 0).fail(
         &mut keyed,
-        StreamFailure::critical("operation_deadline"),
+        StreamFailure::requirement_failed("operation_deadline"),
         0,
     );
     pipeline.records.insert(42, keyed);
@@ -742,8 +752,30 @@ fn reports_are_off_until_enabled_and_need_a_stream_key() {
     let mut unkeyed = record_for(None);
     Job::new(43, None, Step::WaitDrain, 0).fail(
         &mut unkeyed,
-        StreamFailure::critical("operation_deadline"),
+        StreamFailure::requirement_failed("operation_deadline"),
         0,
     );
     assert!(unkeyed.issues.is_empty());
+}
+
+#[test]
+fn cleanup_retry_preserves_an_authorized_stream_failure() {
+    use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    assert!(record.raise_failure(
+        StreamFailure::requirement_failed("media_failed"),
+        LifecycleLayer::EncodeVideo,
+        "active",
+        crate::pipeline::record::FailureEffect::Stop,
+    ));
+    host.broker.fail_close = Some(Resource::Video.service());
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::CleanupFailed);
+    host.broker.fail_close = None;
+    let status = host.response(3, json!({"action":"stop","session":id}));
+    assert_eq!(status["state"], "failed");
+    assert_eq!(status["error"], "media_failed");
 }

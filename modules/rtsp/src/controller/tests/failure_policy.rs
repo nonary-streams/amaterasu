@@ -9,6 +9,9 @@ fn prepared_controller() -> (Controller, u64) {
     let (mut record, _) = announced_profile_record();
     record.owner = "amaterasu.nvhttp".into();
     record.config.operation_id = "policy-launch".into();
+    record.failure_scope = amaterasu_module_sdk::stream_lifecycle::StreamFailureScope::new(
+        record.config.operation_id.as_str(),
+    );
     record.config.profile.encrypt_video = false;
     record.config.profile.encrypt_audio = false;
     let (negotiation, action) = pending_play(&record);
@@ -244,13 +247,18 @@ fn noncritical_reports_cannot_close_or_fence_a_playing_rtsp_ticket() {
         .complete(5, action)
         .unwrap();
     record.state = State::Playing;
-    record.close(Some(StreamFailure::advisory("bitrate_hint")));
-    record.fail_cleanup(StreamFailure::demoted("optional_unavailable", "continue"));
+    record.close(Some(StreamFailure::request_unchanged("bitrate_hint")));
+    record.fail_cleanup(StreamFailure::fallback_applied(
+        "optional_unavailable",
+        "continue",
+    ));
     assert_eq!(record.state, State::Playing);
     assert_eq!(record.failure, None);
     assert_eq!(record.cleanup_error, None);
     assert_eq!(record.session, Some(23));
-    record.close(Some(StreamFailure::critical("authorization_lost")));
+    record.close(Some(StreamFailure::requirement_failed(
+        "authorization_lost",
+    )));
     assert_eq!(record.state, State::Closing);
     assert_eq!(record.failure, Some("authorization_lost"));
 }

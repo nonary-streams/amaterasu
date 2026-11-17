@@ -74,10 +74,10 @@ opt-in fallback policy is configured.
 
 ## RTSP request refusals
 
-`amaterasu_gamestream::rtsp::negotiation::Error::is_critical` owns the
-classification of negotiation errors. `InvalidSequence`, `WrongState` and
-`Pending` reject only the current request: negotiation has made no state change,
-and the prepared or playing ticket retains its resources and deadlines. RTSP
+The negotiation parser reports whether a refusal left the pending request
+unchanged. RTSP adjudicates `InvalidSequence`, `WrongState` and `Pending` as
+request-only refusals. The prepared or playing ticket retains its resources
+and deadlines. RTSP
 records `negotiation_request_rejected` through the SDK lifecycle outbox with a
 stable reason. A compatible retry may continue. A refusal response is never
 reported as successful negotiation.
@@ -90,29 +90,28 @@ The PyroWave bitrate negotiation repair is a separate change.
 
 ## Common failure handler and terminal effects
 
-`StreamFailureHandler::decide` is the synchronous SDK decision point. Lower
-layers submit typed `StreamFailure` reports, with explicit disposition, reason
-and fallback. Only a valid critical report creates the private
-`StreamTermination` capability. Warning, demotion and invalid reports cannot
-execute terminal effects. Publishing diagnostics to the lifecycle store grants
-no authority.
+`StreamFailureHandler` adjudicates bounded failure evidence at the owner of an
+operation instance. Local reporters describe a failed requirement, a refused
+request that left state unchanged, or an applied fallback. Authenticated
+provider replies carry `StreamFailureFact` without a disposition. The decision
+uses the original provider fact and the effect verified by the owner.
+`StreamIssue` is the reporting and telemetry type and carries no authority.
 
-The RTSP action completion boundary preserves classification across provider
-RPC replies, checks exact operation scope, and invokes the handler before
-changing negotiation or rejecting the stream. Recoverable prepared-session
-refusals clear only the pending transaction and allow a corrected request.
-Required failures from older providers without a valid typed report remain
-critical. The public boolean completion API is removed: `complete(epoch,
-ticket)` means success, and `reject(epoch, ticket, &StreamTermination)` requires
-a critical decision. This is an intentional Rust source API change; the native
-module ABI is unchanged.
+RTSP binds wire completion to the exact pending action. A valid rejection
+consumes that action and transfers one termination permit to its ticket.
+Successful completion or request refusal invalidates the action. Reusing an
+operation name creates a different owner instance. The same owner rule applies
+to stream-session and NVHTTP record failures. Confirmed terminal observations
+project an existing decision. Unconfirmed observations use a bounded deadline.
 
-The stream-session job, native media/input/journal and cleanup failure effects,
-RTSP record closure/cleanup and transport protocol/security failures, and
-NVHTTP record failure/cleanup and failed-launch response effects use the same
-handler. Bare error strings no longer silently become terminal decisions in
-these adapters. Normal authenticated stop, cancellation, quiescence and physical
-peer/transaction completion retain explicit control paths.
+Providers can fence an unsafe local resource immediately. Video closes its
+failed resource and reports the result. Stream-session fences media and input
+when the binding is lost, then requests an authenticated coordinator pause if
+the owner selects retirement. Coordinator invalidation alone only fences the
+exact generation and plan. A separate owner pause authorizes release work.
+Explicit stop, cancellation, shutdown and completed retirement use control
+transitions. The native module ABI and provider failure JSON remain compatible.
+The Rust source API for adjudication and RTSP rejection has changed.
 
 Pending RTSP request pressure uses bounded backpressure instead of an overflow
 503. Noncritical refusal connection bookkeeping is bounded by the live transport
@@ -161,6 +160,6 @@ attempt and begins locally owned rollback. NVHTTP checks the exact operation
 and confirmed cleanup before adjudicating a required launch failure. A
 retirement receipt lets RTSP project an already completed owner outcome.
 
-These paths use the SDK's standard policy in the shipped worker. The Rust
-controller accepts an injected policy for authenticated PLAY refusals.
-Other lifecycle callers still use the original disposition API.
+The shipped workers use the SDK's standard policy. The RTSP controller accepts
+an injected policy at authenticated request boundaries. The policy must preserve
+required native and security fences.

@@ -375,7 +375,7 @@ fn failed_remote_zero_does_not_retain_local_input_lease() {
     host.idle();
     host.plane.borrow_mut().rumble_error = true;
     let result = host.response(3, json!({"action":"stop","session":id}));
-    assert_eq!(result["state"], "failed", "{result}");
+    assert_eq!(result["state"], "stopped", "{result}");
     assert!(
         host.broker.input_lease.is_none(),
         "local input is always released"

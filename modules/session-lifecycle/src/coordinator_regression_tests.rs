@@ -3114,3 +3114,52 @@ fn prepare_hdr_shared_source(mut harness: Harness) -> (Harness, Value, Value) {
     assert_eq!(source["status"], "succeeded", "{source}");
     (harness, session, source)
 }
+
+#[test]
+fn invalidation_fences_an_exact_generation_before_an_owner_authorizes_release() {
+    let (mut harness, _, source) = shared_source_harness();
+    harness
+        .settings
+        .operation_grants
+        .get_mut("transport")
+        .unwrap()
+        .insert("capture_invalidated".into());
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    let target = &source["target"];
+    let revision = &source["candidate"]["plan_revision"];
+    let stale = harness.call(
+        "transport",
+        json!({
+            "operation":"capture_invalidated","operation_id":"invalidate.stale",
+            "target":target,"plan_revision":revision.as_u64().unwrap() + 1,
+        }),
+    );
+    assert_eq!(stale["reason"], "plan_revision_mismatch", "{stale}");
+    let callbacks = harness.provider_calls.len();
+    let fenced = harness.call(
+        "transport",
+        json!({
+            "operation":"capture_invalidated","operation_id":"invalidate.current",
+            "target":target,"plan_revision":revision,
+        }),
+    );
+    assert_eq!(fenced["status"], "succeeded", "{fenced}");
+    assert_eq!(fenced["fenced"], true, "{fenced}");
+    assert_eq!(harness.provider_calls.len(), callbacks);
+    let retirement = harness.call("capture", json!({
+        "operation":"retire_stream","operation_id":"invalidate.premature_retirement",
+        "target":target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}},
+    }));
+    assert_eq!(
+        retirement["reason"], "stream_release_not_requested",
+        "{retirement}"
+    );
+    assert!(harness.native_live);
+    let retired = retire_shared_client(&mut harness, target, "invalidate.owned_pause");
+    assert_eq!(retired["status"], "succeeded", "{retired}");
+    assert!(!harness.native_live);
+}

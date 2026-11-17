@@ -550,16 +550,26 @@ impl Record {
         reason: Option<&str>,
         effect: impl FnOnce(&mut Self) -> T,
     ) -> Option<T> {
-        use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamFailureHandler};
-        let mut issue = self.attributed(failure.at(
-            self.rtsp_operation.clone(),
+        use amaterasu_module_sdk::stream_lifecycle::{
+            LifecycleLayer, StandardStreamFailurePolicy, StreamFailureHandler,
+        };
+        let (phase, dependency, provider_reason) = self.failure_attribution(failure.code());
+        let mut report = failure.at(
+            self.failure_scope.operation(),
             LifecycleLayer::Nvhttp,
-            "failure",
-        ));
-        if let Some(reason) = reason {
-            issue = issue.because(reason);
+            phase,
+        );
+        if dependency != LifecycleLayer::Nvhttp {
+            report = report.caused_by(dependency);
         }
-        let decision = StreamFailureHandler::decide_scoped(issue, &self.failure_scope);
+        if let Some(reason) = reason.or(provider_reason) {
+            report = report.because(reason);
+        }
+        let decision = StreamFailureHandler::adjudicate_report(
+            &StandardStreamFailurePolicy,
+            report,
+            &self.failure_scope,
+        );
         self.apply_failure_decision(decision, effect)
     }
 
@@ -596,19 +606,23 @@ impl Record {
     ) -> Option<T> {
         use amaterasu_module_sdk::stream_lifecycle::StreamFailureDecision;
         match decision {
-            StreamFailureDecision::Terminate(permit) => {
+            StreamFailureDecision::Terminate(permit)
+                if permit.matches_scope(&self.failure_scope) =>
+            {
                 self.issues.push(permit.issue().clone());
                 if self.failure_authority.is_none() {
                     self.failure_authority = Some(permit);
                 }
                 Some(effect(self))
             }
-            StreamFailureDecision::Continue(continuation) => {
+            StreamFailureDecision::Continue(continuation)
+                if continuation.matches_scope(&self.failure_scope) =>
+            {
                 let issue = continuation.into_issue();
                 self.issues.push(issue);
                 None
             }
-            StreamFailureDecision::Invalid(_) => None,
+            _ => None,
         }
     }
 
@@ -671,7 +685,7 @@ impl Record {
     fn begin_cleanup(&mut self, now: Instant) {
         if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
             self.fail_cleanup(
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "lifecycle_retirement_unavailable",
                 ),
             );
@@ -783,7 +797,7 @@ impl Record {
         if self.lifecycle_application_retirement == ApplicationRetirementState::Failed {
             let Some(attempt) = self.lifecycle_application_retirement_attempt.checked_add(1) else {
                 self.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "application_retirement_attempts_exhausted",
                     ),
                 );
@@ -904,7 +918,7 @@ impl Record {
     ) -> Result<Option<(Phase, Call)>, &'static str> {
         if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
             self.fail_cleanup(
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "lifecycle_retirement_unavailable",
                 ),
             );

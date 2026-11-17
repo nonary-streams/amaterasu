@@ -128,35 +128,33 @@ impl Record {
         &mut self,
         failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
     ) {
-        use amaterasu_module_sdk::stream_lifecycle::{StreamFailureDecision, StreamFailureHandler};
         let code = failure.code();
-        let issue = with_cause(
+        let report = with_cause(
             failure.at(
-                self.config.operation_id.clone(),
+                self.config.operation_id.as_str(),
                 LifecycleLayer::Rtsp,
                 CLEANUP_PHASE,
             ),
             Cause::of_cleanup(code),
         );
-        match StreamFailureHandler::decide(issue) {
-            StreamFailureDecision::Terminate(permit) => permit.terminate(|issue| {
-                let repeated =
-                    self.state == State::CleanupFailed && self.cleanup_error == Some(code);
-                self.state = State::CleanupFailed;
-                self.cleanup_error = Some(code);
-                if !repeated {
-                    self.issues.push(issue);
-                }
-            }),
-            StreamFailureDecision::Continue(continuation) => {
-                self.issues.push(continuation.into_issue())
-            }
-            StreamFailureDecision::Invalid(_) => {}
+        let unconfirmed = report.requires_containment()
+            && matches!(self.state, State::Closing | State::CleanupFailed);
+        let issue = report.into_diagnostic();
+        let repeated = self.state == State::CleanupFailed && self.cleanup_error == Some(code);
+        if unconfirmed {
+            self.state = State::CleanupFailed;
+            self.cleanup_error = Some(code);
+        }
+        if !repeated {
+            self.issues.push(issue);
         }
     }
 }
 
-pub(super) fn with_cause(issue: StreamIssue, cause: Option<Cause<'_>>) -> StreamIssue {
+pub(super) fn with_cause(
+    issue: amaterasu_module_sdk::stream_lifecycle::StreamFailureReport,
+    cause: Option<Cause<'_>>,
+) -> amaterasu_module_sdk::stream_lifecycle::StreamFailureReport {
     let Some(cause) = cause else {
         return issue;
     };
@@ -196,29 +194,16 @@ impl Controller {
         operation: &str,
         failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
     ) {
-        use amaterasu_module_sdk::stream_lifecycle::{StreamFailureDecision, StreamFailureHandler};
         let code = failure.code();
-        let mut issue = failure.at(operation, LifecycleLayer::Rtsp, OPEN_PHASE);
-        // Untrusted identifiers cannot prevent a mandatory security refusal.
+        let mut issue = failure
+            .at(operation, LifecycleLayer::Rtsp, OPEN_PHASE)
+            .into_diagnostic();
         if !issue.valid() {
             issue.operation = "rtsp-open".into();
         }
-        match StreamFailureHandler::decide(issue) {
-            StreamFailureDecision::Terminate(permit) => permit.terminate(|issue| {
-                rpc::complete(runtime, request, error(code));
-                if caller == self.settings.launch_owner {
-                    self.stream_issues.push(issue);
-                }
-            }),
-            StreamFailureDecision::Continue(continuation) => {
-                let issue = continuation.into_issue();
-                // No ticket exists: this refuses only the open operation.
-                rpc::complete(runtime, request, error(code));
-                if caller == self.settings.launch_owner {
-                    self.stream_issues.push(issue);
-                }
-            }
-            StreamFailureDecision::Invalid(_) => {}
+        rpc::complete(runtime, request, error(code));
+        if caller == self.settings.launch_owner {
+            self.stream_issues.push(issue);
         }
     }
 
@@ -229,30 +214,18 @@ impl Controller {
         admission: &super::DisplayAdmission,
         failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
     ) {
-        use amaterasu_module_sdk::stream_lifecycle::{StreamFailureDecision, StreamFailureHandler};
-        let code = failure.code();
         let issue = failure
+            .clone()
             .at(
                 admission.config.operation_id.as_str(),
                 LifecycleLayer::Rtsp,
                 "display_admission",
             )
-            .caused_by(LifecycleLayer::Application);
-        match StreamFailureHandler::decide(issue) {
-            StreamFailureDecision::Terminate(permit) => permit.terminate(|issue| {
-                rpc::complete(runtime, admission.request, error(code));
-                if admission.caller == self.settings.launch_owner {
-                    self.stream_issues.push(issue);
-                }
-            }),
-            StreamFailureDecision::Continue(continuation) => {
-                let issue = continuation.into_issue();
-                rpc::complete(runtime, admission.request, error(code));
-                if admission.caller == self.settings.launch_owner {
-                    self.stream_issues.push(issue);
-                }
-            }
-            StreamFailureDecision::Invalid(_) => {}
+            .caused_by(LifecycleLayer::Application)
+            .into_diagnostic();
+        rpc::complete(runtime, admission.request, error(failure.code()));
+        if admission.caller == self.settings.launch_owner {
+            self.stream_issues.push(issue);
         }
     }
 

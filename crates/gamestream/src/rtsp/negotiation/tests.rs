@@ -281,7 +281,7 @@ fn backend_rejection_never_emits_success_or_arms_play_but_allows_cleanup() {
         panic!()
     };
     let permit = backend_failure(&machine, ticket);
-    let response = machine.reject(7, ticket, &permit).unwrap();
+    let (response, _) = machine.reject(7, ticket, permit).unwrap();
     assert!(response.starts_with(b"RTSP/1.0 503 "));
     assert_eq!(machine.state(), State::Failed);
     assert_eq!(
@@ -503,7 +503,7 @@ fn extension_attribute_rules_bound_optional_hints_and_reject_unsupported_modes()
 #[test]
 fn negotiation_failure_criticality_is_explicit_and_reasons_are_stable() {
     for error in [Error::InvalidSequence, Error::WrongState, Error::Pending] {
-        assert!(!error.is_critical(), "{error:?}");
+        assert!(error.leaves_request_unchanged(), "{error:?}");
         assert!(!error.code().is_empty());
     }
     for error in [
@@ -518,7 +518,7 @@ fn negotiation_failure_criticality_is_explicit_and_reasons_are_stable() {
         Error::WrongTicket,
         Error::Serialization,
     ] {
-        assert!(error.is_critical(), "{error:?}");
+        assert!(!error.leaves_request_unchanged(), "{error:?}");
         assert!(
             error
                 .code()
@@ -533,17 +533,17 @@ fn backend_failure(
     ticket: u64,
 ) -> amaterasu_module_sdk::stream_lifecycle::StreamTermination {
     use amaterasu_module_sdk::stream_lifecycle::{
-        LifecycleLayer, StreamFailureDecision, StreamFailureHandler, StreamIssue,
+        LifecycleLayer, StandardStreamFailurePolicy, StreamFailure, StreamFailureDecision,
+        StreamFailureHandler,
     };
-    let failure = StreamIssue::critical(
+    let failure = StreamFailure::requirement_failed("backend_unavailable").at(
         "test-launch",
         LifecycleLayer::Rtsp,
         "arm",
-        "backend_unavailable",
     );
     let scope = machine.failure_scope(7, ticket).unwrap();
     let StreamFailureDecision::Terminate(permit) =
-        StreamFailureHandler::decide_scoped(failure, scope)
+        StreamFailureHandler::adjudicate_report(&StandardStreamFailurePolicy, failure, scope)
     else {
         panic!("expected critical failure")
     };
@@ -564,10 +564,11 @@ fn a_termination_permit_cannot_reject_another_pending_operation() {
     );
     let permit = backend_failure(&first, ticket);
     assert_eq!(
-        second.reject(7, ticket, &permit),
+        second.reject(7, ticket, permit).map(|_| ()),
         Err(Error::InvalidFailureReport)
     );
     assert_eq!(second.state(), State::Announce);
-    assert!(first.reject(7, ticket, &permit).is_ok());
+    let permit = backend_failure(&first, ticket);
+    assert!(first.reject(7, ticket, permit).is_ok());
     assert!(second.complete(7, ticket).is_ok());
 }

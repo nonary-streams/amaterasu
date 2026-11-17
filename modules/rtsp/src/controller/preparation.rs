@@ -1,9 +1,10 @@
 //! Exact coordinator admission validation shared by live teardown and shutdown.
 use super::*;
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamFailureFact};
 
 pub(super) enum PreparationResolution {
     Pending,
-    Rejected,
+    Rejected(Option<StreamFailureFact>),
     Admitted,
     Unconfirmed,
 }
@@ -15,7 +16,7 @@ pub(super) fn apply_response(record: &mut Record, payload: &Value) -> Preparatio
         // outstanding made every later cleanup of this record poll for the
         // whole cleanup budget while holding the controller's only job.
         record.lifecycle_prepare_outstanding = false;
-        return PreparationResolution::Rejected;
+        return PreparationResolution::Rejected(None);
     }
     let operation = format!("{}-lifecycle-prepare", record.operation());
     if payload["operation_id"] != operation {
@@ -26,7 +27,7 @@ pub(super) fn apply_response(record: &mut Record, payload: &Value) -> Preparatio
     }
     if payload["status"] == "rejected" {
         record.lifecycle_prepare_outstanding = false;
-        return PreparationResolution::Rejected;
+        return PreparationResolution::Rejected(None);
     }
     let target: Option<amaterasu_extension_api::LifecycleTarget> =
         serde_json::from_value(payload["target"].clone()).ok();
@@ -58,7 +59,15 @@ pub(super) fn apply_response(record: &mut Record, payload: &Value) -> Preparatio
     // settles preparation so local transport cleanup can finish.
     if payload["status"] == "failed" && payload["cleanup_completed"] == true && valid_target {
         record.lifecycle_prepare_outstanding = false;
-        return PreparationResolution::Rejected;
+        let fact = payload
+            .get("stream_failure_fact")
+            .and_then(|fact| serde_json::from_value::<StreamFailureFact>(fact.clone()).ok())
+            .filter(|fact| {
+                fact.operation == operation
+                    && fact.layer == LifecycleLayer::SessionLifecycle
+                    && fact.phase == "stream_prepare"
+            });
+        return PreparationResolution::Rejected(fact);
     }
     let returned_mode = serde_json::from_value::<amaterasu_extension_api::CaptureBindingMode>(
         payload

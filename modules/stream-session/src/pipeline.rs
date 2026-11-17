@@ -1043,7 +1043,7 @@ impl Pipeline {
             let record = self.records.get_mut(&id).expect("selected record");
             let Some(next) = record.lifecycle_validation_sequence.checked_add(1) else {
                 record.raise_failure(
-                    StreamFailure::critical("lifecycle_sequence_exhausted"),
+                    StreamFailure::requirement_failed("lifecycle_sequence_exhausted"),
                     LifecycleLayer::SessionLifecycle,
                     "observe_active_binding",
                     FailureEffect::Stop,
@@ -1122,7 +1122,7 @@ impl Pipeline {
                 && now >= record.prepared_until
             {
                 record.raise_failure(
-                    StreamFailure::critical("prepare_expired"),
+                    StreamFailure::requirement_failed("prepare_expired"),
                     LifecycleLayer::StreamSession,
                     "prepare",
                     FailureEffect::Stop,
@@ -1145,7 +1145,7 @@ impl Pipeline {
             {
                 input::stop_for_input_failure(
                     record,
-                    StreamFailure::critical("input_lease_expired"),
+                    StreamFailure::requirement_failed("input_lease_expired"),
                 );
             }
             if record.state == State::Active
@@ -1159,7 +1159,7 @@ impl Pipeline {
             {
                 record.rumble_stop_unconfirmed = true;
                 record.raise_failure(
-                    StreamFailure::critical("rumble_zero_delivery_timeout"),
+                    StreamFailure::requirement_failed("rumble_zero_delivery_timeout"),
                     LifecycleLayer::Input,
                     "rumble",
                     FailureEffect::Stop,
@@ -1215,7 +1215,7 @@ impl Pipeline {
             }
             if rumble_failed {
                 record.raise_failure(
-                    StreamFailure::critical("rumble_delivery_failed"),
+                    StreamFailure::requirement_failed("rumble_delivery_failed"),
                     LifecycleLayer::Input,
                     "rumble",
                     FailureEffect::Stop,
@@ -1237,7 +1237,7 @@ impl Pipeline {
                             input::configure_translator(record, record.input_absolute_pointer)
                         {
                             record.raise_failure(
-                                StreamFailure::critical(code),
+                                StreamFailure::requirement_failed(code),
                                 LifecycleLayer::Input,
                                 "configure_input",
                                 FailureEffect::Stop,
@@ -1288,7 +1288,7 @@ impl Pipeline {
                                 ) {
                                     input::stop_for_input_failure(
                                         record,
-                                        StreamFailure::critical(code),
+                                        StreamFailure::requirement_failed(code),
                                     );
                                 }
                                 if record.contribution_barrier.generation() != generation
@@ -1306,7 +1306,10 @@ impl Pipeline {
                         record.input_timing.end_message();
                     }
                     if let Err(code) = input::release_after_client_silence(record, now) {
-                        input::stop_for_input_failure(record, StreamFailure::critical(code));
+                        input::stop_for_input_failure(
+                            record,
+                            StreamFailure::requirement_failed(code),
+                        );
                     }
                     let allowed = record.state == State::Active
                         && record.input_lease.is_some()
@@ -1314,7 +1317,10 @@ impl Pipeline {
                     if let Some(plane) = record.plane.as_mut()
                         && let Err(code) = plane.pump_contributions(allowed)
                     {
-                        input::stop_for_input_failure(record, StreamFailure::critical(code));
+                        input::stop_for_input_failure(
+                            record,
+                            StreamFailure::requirement_failed(code),
+                        );
                     }
                 }
                 Err(failure) => {
@@ -1332,7 +1338,7 @@ impl Pipeline {
                         continue;
                     }
                     record.raise_failure(
-                        StreamFailure::critical(failure.code),
+                        StreamFailure::requirement_failed(failure.code),
                         lifecycle_issues::media_layer(failure.code),
                         "media",
                         FailureEffect::ReleaseBindings,

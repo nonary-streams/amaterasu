@@ -212,7 +212,11 @@ fn explicit_recovery_and_required_lease_failures_remain_critical() {
     let (mut host, id) = active();
     let record = host.pipeline.records.get_mut(&id).unwrap();
     let mut job = Job::new(id, None, Step::RenewInput, 30);
-    job.fail(record, StreamFailure::critical("input_lease_expired"), 1);
+    job.fail(
+        record,
+        StreamFailure::requirement_failed("input_lease_expired"),
+        1,
+    );
     assert_eq!(record.state, State::Stopping);
     assert!(job.cleanup);
 }
@@ -239,8 +243,8 @@ fn noncritical_reports_cannot_drive_workflow_or_direct_record_failure_effects() 
     use super::super::record::FailureEffect;
     use amaterasu_module_sdk::stream_lifecycle::LifecycleLayer;
     for failure in [
-        StreamFailure::advisory("advisory_hint"),
-        StreamFailure::demoted("optional_provider_unavailable", "continue_video"),
+        StreamFailure::request_unchanged("advisory_hint"),
+        StreamFailure::fallback_applied("optional_provider_unavailable", "continue_video"),
     ] {
         let (mut host, id) = active();
         let mut record = host.pipeline.records.remove(&id).unwrap();

@@ -315,20 +315,9 @@ impl Transport {
                 }
                 Step::End(reason) => events.push(self.close(id, reason)),
                 Step::Failure(failure) => {
-                    use amaterasu_module_sdk::stream_lifecycle::{
-                        LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
-                    };
-                    let code = failure.code();
-                    let issue = failure.at(
-                        format!("rtsp-connection-{id}"),
-                        LifecycleLayer::Rtsp,
-                        "transport",
-                    );
-                    if let StreamFailureDecision::Terminate(permit) =
-                        StreamFailureHandler::decide(issue)
-                    {
-                        events.push(permit.terminate(|_| self.close(id, code)));
-                    }
+                    // Close the unusable socket here. The ticket owner
+                    // decides the consequences for an authenticated stream.
+                    events.push(self.close(id, failure.code()));
                 }
             }
         }

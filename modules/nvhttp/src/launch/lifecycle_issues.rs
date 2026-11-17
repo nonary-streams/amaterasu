@@ -204,25 +204,29 @@ impl Record {
     /// its own failure itself.
     pub(super) fn attributed(&self, mut issue: StreamIssue) -> StreamIssue {
         issue.layer = LifecycleLayer::Nvhttp;
-        let dependency = match &self.failure_context {
-            Some(context) => {
-                issue.phase = label(context.phase);
-                if let Some(code) = &context.provider_code
-                    && *code != issue.code
-                {
-                    issue.reason.clone_from(code);
-                }
-                phase_layer(context.phase)
-            }
-            None => {
-                issue.phase = label(self.stage);
-                stage_layer(self.stage)
-            }
-        };
+        let (phase, dependency, reason) = self.failure_attribution(&issue.code);
+        issue.phase = phase;
+        if let Some(reason) = reason {
+            issue.reason = reason.into();
+        }
         if dependency != LifecycleLayer::Nvhttp {
             issue = issue.caused_by(dependency);
         }
         issue
+    }
+
+    pub(super) fn failure_attribution(&self, code: &str) -> (String, LifecycleLayer, Option<&str>) {
+        match &self.failure_context {
+            Some(context) => (
+                label(context.phase),
+                phase_layer(context.phase),
+                context
+                    .provider_code
+                    .as_deref()
+                    .filter(|reason| *reason != code),
+            ),
+            None => (label(self.stage), stage_layer(self.stage), None),
+        }
     }
 }
 

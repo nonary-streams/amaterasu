@@ -330,14 +330,12 @@ impl Entry {
             .map(VirtualDisplayRecovery::recovery_intent);
         record.display_operation_id = self.display_operation_id.clone();
         record.display_attempted = self.display_attempted;
-        record.raise_failure(
-            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                "host_restart_recovery",
-            ),
-            amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
-            "restart",
-            super::record::FailureEffect::Stop,
-        );
+        // A recovered record describes an interrupted process. Reconcile the
+        // journaled resources without issuing a decision for a live stream.
+        record.state = super::record::State::Stopping;
+        record.outcome = Some(super::record::State::Stopped);
+        record.error = Some("host_restart_recovery");
+        record.history.stopping("host_restart_recovery");
         Ok(record)
     }
 }

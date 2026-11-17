@@ -211,11 +211,7 @@ impl Controller {
                 continue;
             }
             if record.state != State::Closing {
-                record.close(Some(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                        "module_stopping",
-                    ),
-                ));
+                record.close(None);
             }
             if record.cleanup_confirmed
                 && record.uncertain.is_none()
@@ -281,7 +277,7 @@ impl Controller {
                 finish_record(record);
             } else {
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "quiescence_deadline",
                     ),
                 );

@@ -67,3 +67,54 @@ fn unavailable_observation_is_bounded_and_cannot_keep_a_stream_alive_forever() {
     );
     assert_eq!(controller.late_observations.len(), 1);
 }
+
+#[test]
+fn mismatched_or_unconfirmed_observation_does_not_extend_the_live_deadline() {
+    for reply in [
+        json!({"ok":true,"session":99,"state":"failed","cleanup_error":null}),
+        json!({"ok":true,"session":23,"state":"cleanup_failed","cleanup_error":"native_close_unconfirmed"}),
+    ] {
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let mut endpoint = Endpoint {
+            verifier_reply: Some(reply),
+            ..Default::default()
+        };
+        let runtime = client(&mut endpoint);
+        let mut stream = record(State::Playing);
+        stream.stream_state = Some("active".into());
+        stream.observation_stale_at = OBSERVATION_STALE_MS;
+        let ticket = stream.id;
+        controller.schedule_status(&stream, None, None, 0);
+        controller.records.insert(ticket, stream);
+        for now in 0..8 {
+            controller.advance_job(&runtime, now);
+        }
+        let stream = &controller.records[&ticket];
+        assert_eq!(stream.state, State::Playing);
+        assert_eq!(stream.stream_state.as_deref(), Some("active"));
+        assert_eq!(stream.observation_stale_at, OBSERVATION_STALE_MS);
+        assert!(!endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { payload, .. } if payload["action"] == "stop")));
+        controller.schedule_background(OBSERVATION_STALE_MS);
+        let stream = &controller.records[&ticket];
+        assert_eq!(stream.state, State::Closing);
+        assert_eq!(stream.failure, Some("stream_observation_lost"));
+    }
+}
+
+#[test]
+fn stale_disconnect_cannot_reopen_a_retired_ticket() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let mut stream = record(State::Closing);
+    stream.revoke_after = Some(10);
+    stream.cleanup_confirmed = true;
+    let ticket = stream.id;
+    controller.records.insert(ticket, stream);
+    controller.disconnected(10, Some(ticket), "tcp_write_failed");
+    assert_eq!(controller.records[&ticket].state, State::Closed);
+    controller.disconnected(11, Some(ticket), "peer_closed");
+    let stream = &controller.records[&ticket];
+    assert_eq!(stream.state, State::Closed);
+    assert!(stream.failure.is_none());
+    assert!(stream.revoke_after.is_none());
+}

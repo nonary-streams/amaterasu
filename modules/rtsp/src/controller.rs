@@ -466,11 +466,7 @@ impl Controller {
                 continue;
             };
             if !record.state.terminal() && record.state != State::Closing {
-                record.close(Some(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                        "module_stopping",
-                    ),
-                ));
+                record.close(None);
             }
             self.revoke_ticket(ticket);
             if !record.cleanup_confirmed {
@@ -501,7 +497,7 @@ impl Controller {
                 record.uncertain_phase = None;
             } else {
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "shutdown_settlement_unconfirmed",
                     ),
                 );
@@ -521,7 +517,7 @@ impl Controller {
                     record.session = response_session(&payload);
                     if record.session.is_none() {
                         record.fail_cleanup(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "shutdown_lookup_invalid",
                             ),
                         );
@@ -530,7 +526,7 @@ impl Controller {
                 }
                 Ok(payload) if payload["code"] == "session_not_found" => {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "shutdown_lookup_not_found",
                         ),
                     );
@@ -542,7 +538,7 @@ impl Controller {
                 }
                 Ok(_) => {
                     record.fail_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "shutdown_lookup_unconfirmed",
                         ),
                     );
@@ -578,7 +574,7 @@ impl Controller {
             }
             Ok(_) => {
                 record.fail_cleanup(
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "shutdown_stop_rejected",
                     ),
                 );
@@ -605,7 +601,7 @@ impl Controller {
             match response {
                 Ok(payload) => match preparation::apply_response(record, &payload) {
                     preparation::PreparationResolution::Admitted
-                    | preparation::PreparationResolution::Rejected => return true,
+                    | preparation::PreparationResolution::Rejected(_) => return true,
                     preparation::PreparationResolution::Pending => {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if !remaining.is_zero() {
@@ -614,7 +610,7 @@ impl Controller {
                     }
                     preparation::PreparationResolution::Unconfirmed => {
                         record.fail_cleanup(
-                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                                 "shutdown_lifecycle_unconfirmed",
                             ),
                         );
@@ -628,7 +624,7 @@ impl Controller {
             }
         }
         record.fail_cleanup(
-            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                 "shutdown_lifecycle_deadline",
             ),
         );
@@ -806,8 +802,7 @@ impl Controller {
         }
     }
 
-    /// The sole status-refusal writer. The supplied report always reaches the
-    /// common decision point before any negative response can reach transport.
+    /// Reject a request before it can affect an authenticated stream.
     fn reply_status(
         &mut self,
         connection: u64,
@@ -815,25 +810,17 @@ impl Controller {
         status: u16,
         failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
     ) -> bool {
-        use amaterasu_module_sdk::stream_lifecycle::{
-            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
-        };
-        let issue = failure.at(
-            format!("rtsp-connection-{connection}"),
-            LifecycleLayer::Rtsp,
-            "request",
-        );
-        let allowed = match StreamFailureHandler::decide(issue) {
-            StreamFailureDecision::Terminate(permit) => permit.authorize(|_| true),
-            StreamFailureDecision::Continue(continuation) => {
-                let issue = continuation.into_issue();
-                self.stream_issues.push(issue);
-                self.mark_noncritical_connection(connection);
-                true // Refuse only the affected request; retain the stream.
-            }
-            StreamFailureDecision::Invalid(_) => false,
-        };
-        allowed && self.write_status(connection, cseq, status)
+        use amaterasu_module_sdk::stream_lifecycle::LifecycleLayer;
+        let issue = failure
+            .at(
+                format!("rtsp-connection-{connection}"),
+                LifecycleLayer::Rtsp,
+                "request",
+            )
+            .into_diagnostic();
+        self.stream_issues.push(issue);
+        self.mark_noncritical_connection(connection);
+        self.write_status(connection, cseq, status)
     }
 
     fn write_status(&mut self, connection: u64, cseq: u32, status: u16) -> bool {
@@ -1345,7 +1332,7 @@ fn apply_undispatched_shutdown_proof(record: &mut Record, phase: Phase, call: &C
 
 fn retain_shutdown_failure(record: &mut Record, phase: Phase, failure: ShutdownFailure) {
     record.fail_cleanup(
-        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(failure.code),
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(failure.code),
     );
     record.uncertain_phase = Some(phase);
     record.uncertain = Some(*failure.call);
@@ -1414,7 +1401,7 @@ fn finish_record(record: &mut Record) {
     {
         record.cleanup_confirmed = false;
         record.fail_cleanup(
-            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+            amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                 "lifecycle_retirement_unconfirmed",
             ),
         );

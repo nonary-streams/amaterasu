@@ -54,6 +54,7 @@ impl Controller {
             .values()
             .filter(|record| {
                 matches!(record.state, State::Closing | State::CleanupFailed)
+                    && !(record.cleanup_confirmed && record.revoke_after.is_some())
                     && !self.has_job(record.id)
             })
             .map(|record| record.id)

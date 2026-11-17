@@ -49,7 +49,6 @@ pub(super) fn step_layer(step: Step) -> LifecycleLayer {
         | ResolveLifecyclePreparation
         | ObserveActiveBinding
         | ValidateActiveBinding
-        | NotifyCaptureInvalidated
         | IssueLifecycleInputBinding
         | AckLifecycleInput => LifecycleLayer::SessionLifecycle,
         ProbeExtensionSource | WaitVideoReady => LifecycleLayer::EncodeVideo,

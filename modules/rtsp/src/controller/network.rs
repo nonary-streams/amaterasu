@@ -1,7 +1,7 @@
 use super::*;
 use amaterasu_module_sdk::stream_lifecycle::{
     LifecycleLayer, StreamFailure, StreamFailureDecision, StreamFailureEffect, StreamFailureFact,
-    StreamFailureHandler, StreamIssue,
+    StreamFailureHandler,
 };
 
 #[derive(Debug)]
@@ -84,7 +84,7 @@ impl Controller {
                 connection,
                 request.cseq,
                 454,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                     "session_unavailable",
                 ),
             );
@@ -95,7 +95,7 @@ impl Controller {
                 connection,
                 request.cseq,
                 455,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::advisory(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::request_unchanged(
                     "request_wrong_state",
                 ),
             );
@@ -113,18 +113,26 @@ impl Controller {
                 connection,
                 request.cseq,
                 503,
-                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("module_stopping"),
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
+                    "module_stopping",
+                ),
             );
             self.records.insert(ticket, record);
             return;
         }
         if record.state == State::Ready && now >= record.expires {
-            let issue = StreamFailure::critical("prepare_expired").at(
+            let issue = StreamFailure::requirement_failed("prepare_expired").at(
                 record.config.operation_id.clone(),
                 LifecycleLayer::Rtsp,
                 record.state.phase(),
             );
-            if let StreamFailureDecision::Terminate(permit) = StreamFailureHandler::decide(issue) {
+            if let StreamFailureDecision::Terminate(permit) =
+                StreamFailureHandler::adjudicate_report(
+                    self.failure_policy.as_ref(),
+                    issue,
+                    &record.failure_scope,
+                )
+            {
                 self.reject_status(
                     &mut record,
                     connection,
@@ -158,7 +166,7 @@ impl Controller {
                     if success {
                         Ok(NetworkCompletion::NegotiationOnly)
                     } else {
-                        Err(StreamFailure::critical("configuration_mismatch"))
+                        Err(StreamFailure::requirement_failed("configuration_mismatch"))
                     },
                     None,
                 );
@@ -197,7 +205,9 @@ impl Controller {
                     if success {
                         Ok(NetworkCompletion::NegotiationOnly)
                     } else {
-                        Err(StreamFailure::critical("unsupported_video_format"))
+                        Err(StreamFailure::requirement_failed(
+                            "unsupported_video_format",
+                        ))
                     },
                     None,
                 );
@@ -214,7 +224,7 @@ impl Controller {
                         &mut record,
                         connection,
                         action_ticket,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "session_unavailable",
                         ),
                     );
@@ -226,7 +236,7 @@ impl Controller {
                         &mut record,
                         connection,
                         action_ticket,
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                             "negotiation_failed",
                         ),
                     );
@@ -256,24 +266,22 @@ impl Controller {
                     request.method,
                     error.status()
                 );
-                let issue = if error.is_critical() {
-                    StreamIssue::critical(
-                        record.config.operation_id.clone(),
-                        LifecycleLayer::Rtsp,
-                        "negotiate",
-                        error.code(),
-                    )
-                    .because(error.code())
+                let failure = if error.leaves_request_unchanged() {
+                    StreamFailure::request_unchanged("negotiation_request_rejected")
+                        .because(error.code())
                 } else {
-                    StreamIssue::advisory(
-                        record.config.operation_id.clone(),
-                        LifecycleLayer::Rtsp,
-                        "negotiate",
-                        "negotiation_request_rejected",
-                    )
-                    .because(error.code())
+                    StreamFailure::requirement_failed(error.code())
                 };
-                match StreamFailureHandler::decide(issue) {
+                let report = failure.at(
+                    record.failure_scope.operation(),
+                    LifecycleLayer::Rtsp,
+                    "negotiate",
+                );
+                match StreamFailureHandler::adjudicate_report(
+                    self.failure_policy.as_ref(),
+                    report,
+                    &record.failure_scope,
+                ) {
                     StreamFailureDecision::Terminate(permit) => {
                         self.reject_status(
                             &mut record,
@@ -295,10 +303,11 @@ impl Controller {
                     StreamFailureDecision::Invalid(_) => {
                         // An invalid diagnostic cannot preserve authorization
                         // after a required or security-critical failure.
-                        record.close(Some(StreamFailure::critical(
+                        if record.close(Some(StreamFailure::requirement_failed(
                             "invalid_failure_classification",
-                        )));
-                        self.revoke_ticket(record.id);
+                        ))) {
+                            self.revoke_ticket(record.id);
+                        }
                     }
                 }
             }
@@ -321,7 +330,7 @@ impl Controller {
                     record,
                     connection,
                     action_ticket,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "lifecycle_input_policy_unverified",
                     ),
                 );
@@ -332,7 +341,7 @@ impl Controller {
                     record,
                     connection,
                     action_ticket,
-                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::requirement_failed(
                         "negotiation_failed",
                     ),
                 );
@@ -399,7 +408,11 @@ impl Controller {
         permit: amaterasu_module_sdk::stream_lifecycle::StreamTermination,
         code: &'static str,
     ) {
-        let replied = permit.authorize(|_| self.write_status(connection, cseq, status));
+        let Some(replied) = permit.authorize(&record.failure_scope, |_| {
+            self.write_status(connection, cseq, status)
+        }) else {
+            return;
+        };
         self.retire_after_reply(record, connection, replied, permit, code);
     }
 
@@ -411,7 +424,9 @@ impl Controller {
         permit: amaterasu_module_sdk::stream_lifecycle::StreamTermination,
         code: &'static str,
     ) {
-        record.close_reported(permit, code);
+        if !record.close_reported(permit, code) {
+            return;
+        }
         if replied {
             record.revoke_after = Some(connection);
         } else {
@@ -429,7 +444,7 @@ impl Controller {
             return true;
         }
         if record.failure.is_none() {
-            record.close(Some(StreamFailure::demoted(
+            record.close(Some(StreamFailure::fallback_applied(
                 "negotiation_reply_unavailable",
                 "retry_request",
             )));
@@ -445,8 +460,9 @@ impl Controller {
             Err(code) => {
                 // With an unusable authenticated response channel (including
                 // nonce exhaustion), another socket cannot recover this ticket.
-                record.close(Some(StreamFailure::critical(code)));
-                self.revoke_ticket(record.id);
+                if record.close(Some(StreamFailure::requirement_failed(code))) {
+                    self.revoke_ticket(record.id);
+                }
                 false
             }
         }
@@ -454,6 +470,7 @@ impl Controller {
 
     #[track_caller]
     pub(super) fn network_failure_decision(
+        policy: &dyn amaterasu_module_sdk::stream_lifecycle::StreamFailurePolicy,
         record: &Record,
         action_ticket: u64,
         phase: &str,
@@ -473,8 +490,8 @@ impl Controller {
             .as_ref()
             .and_then(|negotiation| negotiation.failure_scope(record.id, action_ticket).ok())
         {
-            Some(scope) => StreamFailureHandler::decide_scoped(issue, scope),
-            None => StreamFailureDecision::Invalid(issue),
+            Some(scope) => StreamFailureHandler::adjudicate_report(policy, issue, scope),
+            None => StreamFailureDecision::Invalid(issue.into_diagnostic()),
         }
     }
 
@@ -491,11 +508,10 @@ impl Controller {
         cause: Option<super::lifecycle_issues::Cause<'_>>,
     ) -> bool {
         let Some(_) = record.negotiation.as_ref() else {
-            match outcome {
-                Ok(_) => record.close(Some(StreamFailure::critical("negotiation_failed"))),
-                Err(failure) => record.close(Some(failure)),
-            }
-            if record.failure.is_some() {
+            let failure = outcome
+                .err()
+                .unwrap_or_else(|| StreamFailure::requirement_failed("negotiation_failed"));
+            if record.close(Some(failure)) {
                 self.revoke_ticket(record.id);
             }
             return false;
@@ -518,8 +534,11 @@ impl Controller {
             let reply = match reply {
                 Ok(reply) => reply,
                 Err(_) => {
-                    record.close(Some(StreamFailure::critical("negotiation_failed")));
-                    self.revoke_ticket(record.id);
+                    if record.close(Some(StreamFailure::requirement_failed(
+                        "negotiation_failed",
+                    ))) {
+                        self.revoke_ticket(record.id);
+                    }
                     return false;
                 }
             };
@@ -529,13 +548,17 @@ impl Controller {
             if self.reply_bytes(connection, &reply) {
                 return true;
             }
-            record.close(Some(StreamFailure::critical("response_unavailable")));
-            self.revoke_ticket(record.id);
+            if record.close(Some(StreamFailure::requirement_failed(
+                "response_unavailable",
+            ))) {
+                self.revoke_ticket(record.id);
+            }
             return false;
         }
         let failure = outcome.expect_err("success returned above");
         let code = failure.code();
         let decision = Self::network_failure_decision(
+            self.failure_policy.as_ref(),
             record,
             action_ticket,
             record.state.phase(),
@@ -546,13 +569,13 @@ impl Controller {
         false
     }
 
-    pub(super) fn finish_provider_start_failure(
+    pub(super) fn finish_provider_failure(
         &mut self,
         record: &mut Record,
         connection: u64,
         action_ticket: u64,
-        mut fact: StreamFailureFact,
-        effect: StreamFailureEffect,
+        (mut fact, effect): (StreamFailureFact, StreamFailureEffect),
+        code: &'static str,
     ) -> bool {
         let Some(scope) = record
             .negotiation
@@ -561,8 +584,8 @@ impl Controller {
         else {
             return false;
         };
-        // The authenticated record proves the legacy local session alias is
-        // the same operation. Bind any resulting permit to the pending action.
+        // The caller verified the provider operation. Bind this fact to
+        // the exact pending RTSP action before applying its effects.
         fact.operation.clone_from(&record.config.operation_id);
         let decision = StreamFailureHandler::adjudicate(
             self.failure_policy.as_ref(),
@@ -570,15 +593,9 @@ impl Controller {
             effect,
             scope,
             LifecycleLayer::Rtsp,
-            "start_rejected",
+            code,
         );
-        self.apply_network_failure(
-            record,
-            connection,
-            action_ticket,
-            decision,
-            "start_rejected",
-        )
+        self.apply_network_failure(record, connection, action_ticket, decision, code)
     }
 
     fn apply_network_failure(
@@ -593,13 +610,20 @@ impl Controller {
         let continued = matches!(decision, StreamFailureDecision::Continue(_));
         match decision {
             StreamFailureDecision::Terminate(permit) => {
-                let reply = negotiation.reject(record.id, action_ticket, &permit).ok();
-                let replied = reply
-                    .as_deref()
-                    .is_some_and(|reply| self.reply_bytes(connection, reply));
+                let Ok((reply, permit)) = negotiation.reject(record.id, action_ticket, permit)
+                else {
+                    return false;
+                };
+                let replied = self.reply_bytes(connection, &reply);
                 self.retire_after_reply(record, connection, replied, permit, code);
             }
             StreamFailureDecision::Continue(continuation) => {
+                if negotiation
+                    .failure_scope(record.id, action_ticket)
+                    .map_or(true, |scope| !continuation.matches_scope(scope))
+                {
+                    return false;
+                }
                 let reply = negotiation.refuse(record.id, action_ticket, &continuation);
                 record.issues.push(continuation.into_issue());
                 match reply {
@@ -607,16 +631,20 @@ impl Controller {
                         self.deliver_scoped_reply(record, connection, &reply);
                     }
                     Err(_) => {
-                        record.close(Some(StreamFailure::critical("negotiation_failed")));
-                        self.revoke_ticket(record.id);
+                        if record.close(Some(StreamFailure::requirement_failed(
+                            "negotiation_failed",
+                        ))) {
+                            self.revoke_ticket(record.id);
+                        }
                     }
                 }
             }
             StreamFailureDecision::Invalid(_) => {
-                record.close(Some(StreamFailure::critical(
+                if record.close(Some(StreamFailure::requirement_failed(
                     "invalid_failure_classification",
-                )));
-                self.revoke_ticket(record.id);
+                ))) {
+                    self.revoke_ticket(record.id);
+                }
             }
         }
         continued && record.failure.is_none()
@@ -652,14 +680,21 @@ impl Controller {
         let Some(mut record) = self.records.remove(&ticket) else {
             return;
         };
-        if reason == "response_complete" {
-            if record.revoke_after == Some(connection) {
-                record.revoke_after = None;
-                self.revoke_ticket(ticket);
-                if record.cleanup_confirmed {
-                    finish_record(&mut record);
-                }
+        if record.revoke_after == Some(connection) {
+            record.revoke_after = None;
+            self.revoke_ticket(ticket);
+            if record.cleanup_confirmed {
+                finish_record(&mut record);
             }
+            self.records.insert(ticket, record);
+            return;
+        }
+        if reason == "response_complete"
+            || matches!(
+                record.state,
+                State::Closing | State::CleanupFailed | State::Closed | State::Failed
+            )
+        {
             self.records.insert(ticket, record);
             return;
         }
@@ -681,30 +716,27 @@ impl Controller {
         );
         if (noncritical || queued_request) && io_loss && pending_mutation.is_none() {
             if queued_request {
-                let issue = StreamFailure::advisory("request_connection_lost")
+                let issue = StreamFailure::request_unchanged("request_connection_lost")
                     .because(reason)
                     .at(
                         record.config.operation_id.clone(),
                         LifecycleLayer::Rtsp,
                         "queued_request",
                     );
-                if let StreamFailureDecision::Continue(continuation) =
-                    StreamFailureHandler::decide(issue)
-                {
-                    record.issues.push(continuation.into_issue());
-                }
+                record.issues.push(issue.into_diagnostic());
             }
             self.records.insert(ticket, record);
             return;
         }
-        if let Some(job) = pending_mutation {
-            job.call.cancel();
-            job.network = None;
+        if record.close(Some(
+            StreamFailure::requirement_failed("network_disconnected").because(reason),
+        )) {
+            if let Some(job) = pending_mutation {
+                job.call.cancel();
+                job.network = None;
+            }
+            self.revoke_ticket(ticket);
         }
-        record.close(Some(
-            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("network_disconnected"),
-        ));
-        self.revoke_ticket(ticket);
         self.records.insert(ticket, record);
     }
 }

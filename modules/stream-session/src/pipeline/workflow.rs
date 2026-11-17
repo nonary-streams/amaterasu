@@ -48,7 +48,6 @@ pub(super) enum Step {
     ResolveLifecyclePreparation,
     ObserveActiveBinding,
     ValidateActiveBinding,
-    NotifyCaptureInvalidated,
     IssueLifecycleInputBinding,
     AckLifecycleInput,
     AcquireAudio,
@@ -141,16 +140,13 @@ impl Job {
         now: u64,
     ) {
         use amaterasu_module_sdk::stream_lifecycle::{
-            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
+            LifecycleLayer, StandardStreamFailurePolicy, StreamFailureDecision,
+            StreamFailureHandler,
         };
         let code = failure.code();
-        let operation = record
-            .config
-            .rtsp_operation_id
-            .as_deref()
-            .unwrap_or("local-stream-session");
+        let scope = record.failure_scope.clone();
         let mut issue = failure.at(
-            operation,
+            scope.operation(),
             LifecycleLayer::StreamSession,
             super::lifecycle_issues::step_label(self.step),
         );
@@ -158,20 +154,32 @@ impl Job {
         if dependency != LifecycleLayer::StreamSession {
             issue = issue.caused_by(dependency);
         }
-        let cleanup_failure =
-            self.cleanup || (record.state == State::Stopping && record.outcome == State::Stopped);
-        if issue.is_critical() && cleanup_failure {
-            issue.code = "cleanup_step_failed".into();
+        let cleanup_failure = self.cleanup || record.outcome.is_some();
+        if issue.requires_containment() && cleanup_failure {
+            issue = issue.with_code("cleanup_step_failed");
         }
         if self.step == Step::RecoverAudio {
-            issue.reason = "audio_encoder_failed".into();
+            issue = issue.because("audio_encoder_failed");
         }
-        match StreamFailureHandler::decide(issue) {
+        if cleanup_failure {
+            let containment = issue.requires_containment();
+            let diagnostic = issue.into_diagnostic();
+            if diagnostic.valid() {
+                if record.config.rtsp_operation_id.is_some() {
+                    record.issues.push(diagnostic);
+                }
+                if containment {
+                    record.remember_cleanup_failure("cleanup_step_failed");
+                    self.adopt_ending(record, now);
+                    return;
+                }
+            }
+            self.failure_continued = true;
+            return;
+        }
+        match StreamFailureHandler::adjudicate_report(&StandardStreamFailurePolicy, issue, &scope) {
             StreamFailureDecision::Terminate(permit) => {
-                permit.terminate(|issue| {
-                    if cleanup_failure {
-                        record.remember_cleanup_failure("cleanup_step_failed");
-                    }
+                permit.terminate(&scope, |issue| {
                     if record.config.rtsp_operation_id.is_some() {
                         record.issues.push(issue);
                     }
@@ -191,6 +199,15 @@ impl Job {
         }
     }
 
+    pub fn adopt_ending(&mut self, record: &mut Record, now: u64) {
+        self.stop_with_outcome(
+            record,
+            record.error.unwrap_or("media_failed"),
+            record.outcome.unwrap_or(State::Failed),
+            now,
+        );
+    }
+
     pub fn cancel(&mut self, record: &mut Record, now: u64) {
         self.stop_with_outcome(record, "request_cancelled", State::Cancelled, now);
     }
@@ -203,7 +220,7 @@ impl Job {
         now: u64,
     ) {
         record.error.get_or_insert(code);
-        record.outcome = outcome;
+        record.outcome = Some(outcome);
         record.history.stopping(code);
         record.state = State::Stopping;
         super::input::queue_rumble_zeros(record, now);
@@ -507,7 +524,6 @@ impl Job {
             | Step::PauseLifecycle
             | Step::RetireLifecycle
             | Step::ValidateActiveBinding
-            | Step::NotifyCaptureInvalidated
             | Step::IssueLifecycleInputBinding
             | Step::AckLifecycleInput => {
                 let start = record.start.as_ref().expect("lifecycle requires start");
@@ -521,15 +537,11 @@ impl Job {
                     Step::PauseLifecycle => "pause_stream",
                     Step::RetireLifecycle => "retire_stream",
                     Step::ValidateActiveBinding => "binding_validate",
-                    Step::NotifyCaptureInvalidated => "capture_invalidated",
                     Step::IssueLifecycleInputBinding => "issue_input_binding",
                     Step::AckLifecycleInput => "ack_binding",
                     _ => unreachable!(),
                 };
-                let operation_id = if matches!(
-                    self.step,
-                    Step::ValidateActiveBinding | Step::NotifyCaptureInvalidated
-                ) {
+                let operation_id = if self.step == Step::ValidateActiveBinding {
                     format!(
                         "ss-{:016x}-{operation}-{}",
                         record.id, record.lifecycle_validation_sequence
@@ -558,9 +570,6 @@ impl Job {
                         Step::ValidateActiveBinding => {
                             payload["binding"] = json!(candidate);
                             payload["observation"] = json!(record.lifecycle_observation);
-                        }
-                        Step::NotifyCaptureInvalidated => {
-                            payload["reason"] = json!(record.lifecycle_invalid_reason);
                         }
                         Step::IssueLifecycleInputBinding => {
                             payload["consumer"] = json!("amaterasu.input/1");
