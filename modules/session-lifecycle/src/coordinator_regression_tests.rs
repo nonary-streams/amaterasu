@@ -3117,7 +3117,7 @@ fn prepare_hdr_shared_source(mut harness: Harness) -> (Harness, Value, Value) {
 
 #[test]
 fn invalidation_fences_an_exact_generation_before_an_owner_authorizes_release() {
-    let (mut harness, _, source) = shared_source_harness();
+    let (mut harness, session, source) = shared_source_harness();
     harness
         .settings
         .operation_grants
@@ -3161,5 +3161,17 @@ fn invalidation_fences_an_exact_generation_before_an_owner_authorizes_release() 
     assert!(harness.native_live);
     let retired = retire_shared_client(&mut harness, target, "invalidate.owned_pause");
     assert_eq!(retired["status"], "succeeded", "{retired}");
-    assert!(!harness.native_live);
+    let status = harness.call(
+        "transport",
+        json!({"operation":"snapshot","target":session}),
+    );
+    assert_eq!(
+        status["sessions"][0]["streams"][0]["stream_id"],
+        target["stream_id"]
+    );
+    assert_eq!(status["sessions"][0]["streams"][0]["phase"], "retired");
+    assert!(
+        harness.native_live,
+        "the application owns the retained producer"
+    );
 }
