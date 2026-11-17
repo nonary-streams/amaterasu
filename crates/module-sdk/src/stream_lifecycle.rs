@@ -29,6 +29,8 @@
 //! an incomplete record as complete.
 mod feed;
 mod store;
+mod termination;
+pub use termination::{StreamFailureDecision, StreamFailureHandler, StreamTermination};
 
 pub use feed::StreamIssueFeed;
 pub use store::{

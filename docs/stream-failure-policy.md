@@ -87,3 +87,46 @@ ownership retirement fences still apply. Backend acceptance remains a separate
 obligation: recoverable media hints must be negotiated before completing an
 ANNOUNCE, rather than passing `false` to `Negotiation::complete`, whose failure
 is terminal. The PyroWave bitrate negotiation repair is a separate change.
+
+## Common failure handler and terminal effects
+
+Lower layers produce bounded `StreamIssue` reports; participating owners pass
+these through `StreamFailureHandler::decide` before issuing the failure response
+or performing a terminal effect. `Continue` scopes the failure to the affected
+operation, retaining the stream and applying its recorded fallback. `Terminate`
+contains a private `StreamTermination` capability, available only for a valid,
+explicitly critical report with a nonempty reason. `Invalid` does not authorize
+termination. A trusted owner handling a known required/security failure may
+submit a separate bounded critical report when the original diagnostic is invalid.
+
+The handler is a synchronous shared SDK decision point. Publishing an event to
+`STREAM_REPORTS`, or inspecting the diagnostic lifecycle store, does not grant
+termination authority and is not a substitute for this call. Native modules
+remain trusted code and can still bypass the SDK; this is not isolation.
+
+The migrated boundaries are RTSP negotiation-error replies/closure and backend
+ANNOUNCE/PLAY failure completions, and the
+stream-session workflow's failure-driven terminal effect. Explicit caller
+cancellation has its separate authorized stop path. Four active-session
+maintenance operations (`ForceIdr`, `FeedbackPeek`, `FeedbackAck`, and
+`PollGamepadFeedback`) report failures without entering allocation cleanup:
+timeout, unavailable service, refusal, malformed optional reply, and unconfirmed
+broker bookkeeping retain video/input, back off or await the next keyframe,
+and report a demoted issue with a bounded reason and fallback. Their independent
+settlement queue is capped at eight; saturation skips another optional call.
+Uncertain admissions retain the exact operation identity and are never replayed
+after the broker recovery horizon. Admitted operations keep their bookkeeping
+until settlement. This queue is not evidence of native resource retirement.
+
+Explicit recovery/cleanup-required responses, existing feedback/keyframe
+permission failures, required input renewal, native media failure, capture and
+lifecycle authorization, ownership persistence and actual native retirement
+remain critical. Existing rumble-zero delivery fences remain in force.
+
+Coverage is partial: direct record-state assignments, legacy string-to-critical
+adapters, NVHTTP cleanup decisions, session-lifecycle provider rollback, and
+the public `Negotiation::complete(bool)` API remain bypass seams (the production
+controller's negative completions are now gated). The handler cannot infer
+whether a module incorrectly called an arbitrary limit critical. Future
+migration must carry the original failure report to the owning decision boundary
+and replace these bypasses, rather than adding independent rejection policy.

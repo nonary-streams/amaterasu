@@ -498,6 +498,8 @@ impl Controller {
             self.schedule_stop(record, job.caller, now);
             return;
         };
+        let termination =
+            (!valid).then(|| Self::critical_network_failure(record, "arm", "start_rejected"));
         let reply = record
             .negotiation
             .as_mut()
@@ -517,7 +519,10 @@ impl Controller {
             // A refused start is stream-session's verdict; a reply RTSP could
             // not deliver is RTSP's own failure.
             let cause = (!valid).then(|| Cause::stream_session(provider_code(payload)));
-            record.close_with_cause(Some("start_rejected"), cause);
+            let permit = termination.unwrap_or_else(|| {
+                Self::critical_network_failure(record, "reply", "response_unavailable")
+            });
+            permit.terminate(|_| record.close_with_cause(Some("start_rejected"), cause));
             record.revoke_after = replied.then_some(connection);
         }
     }

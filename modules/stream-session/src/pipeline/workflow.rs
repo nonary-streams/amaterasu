@@ -141,6 +141,48 @@ impl Job {
                 code,
             );
         }
+        if code == "request_cancelled" {
+            self.stop_failed_or_cancelled(record, code, now);
+            return;
+        }
+        use amaterasu_module_sdk::stream_lifecycle::{
+            LifecycleLayer, StreamIssue, StreamTermination,
+        };
+        let issue = StreamIssue::critical(
+            "stream-session",
+            LifecycleLayer::StreamSession,
+            "workflow",
+            code,
+        )
+        .because(code);
+        // A malformed diagnostic cannot suppress a genuinely required failure.
+        // Preserve fail-closed behavior with a bounded, explicit fallback reason.
+        let permit = StreamTermination::try_from(issue).unwrap_or_else(|_| {
+            StreamTermination::try_from(
+                StreamIssue::critical(
+                    "stream-session",
+                    LifecycleLayer::StreamSession,
+                    "workflow",
+                    "invalid_failure_classification",
+                )
+                .because("required_operation_failed"),
+            )
+            .expect("static critical classification")
+        });
+        self.terminate(record, permit, code, now);
+    }
+
+    fn terminate(
+        &mut self,
+        record: &mut Record,
+        permit: amaterasu_module_sdk::stream_lifecycle::StreamTermination,
+        code: &'static str,
+        now: u64,
+    ) {
+        permit.terminate(|_| self.stop_failed_or_cancelled(record, code, now));
+    }
+
+    fn stop_failed_or_cancelled(&mut self, record: &mut Record, code: &'static str, now: u64) {
         record.error.get_or_insert(code);
         record.outcome = if code == "request_cancelled" {
             State::Cancelled

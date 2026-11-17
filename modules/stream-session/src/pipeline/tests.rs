@@ -9,6 +9,7 @@ mod history;
 mod host_audio;
 mod input;
 mod lifecycle_issues;
+mod maintenance;
 mod providers;
 mod quiescence;
 mod restart;

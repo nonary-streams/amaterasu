@@ -13,6 +13,7 @@ mod input_timing;
 mod journal;
 mod lifecycle;
 mod lifecycle_issues;
+mod maintenance;
 mod quiescence;
 mod record;
 mod responses;
@@ -144,6 +145,7 @@ pub struct Pipeline {
     service: String,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
+    maintenance_retirements: Vec<maintenance::Retirement>,
     sequence: u64,
     started: Instant,
     live_status_epoch: Option<String>,
@@ -185,6 +187,7 @@ impl Pipeline {
             service,
             records: BTreeMap::new(),
             job: None,
+            maintenance_retirements: Vec::new(),
             sequence: 0,
             started: Instant::now(),
             live_status_epoch: None,
@@ -538,6 +541,7 @@ impl Pipeline {
                 }
             }
         }
+        self.progress_maintenance_retirements(now, send);
         self.progress_shutdown_observations(now, send);
         self.publish_stream_issues(send);
         self.history_activities.progress(now, &self.records, send);

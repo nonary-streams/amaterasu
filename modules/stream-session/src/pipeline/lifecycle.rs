@@ -19,6 +19,9 @@ impl Pipeline {
         if let Some(deadline) = shutdown_deadline {
             job.deadline = job.deadline.min(deadline);
         }
+        if !job.cleanup && record.state == State::Active && maintenance::optional(job.step) {
+            return self.advance_maintenance(record, job, now, send);
+        }
         if now >= job.deadline && job.step == Step::PersistJournal {
             if job.pending.is_none() {
                 // No broker request was issued, so there is no late write to
