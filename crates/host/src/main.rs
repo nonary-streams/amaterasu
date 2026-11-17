@@ -67,6 +67,10 @@ fn run() -> PackageResult<()> {
             service::probe_operational_readiness(Path::new(root))?;
             println!("operationally ready");
         }
+        [command, root] if command == "first-run-ready" => {
+            service::probe_first_run_readiness(Path::new(root))?;
+            println!("first-run service ready");
+        }
         [command, root] if command == "web-recovery-status" => {
             web_recovery::status(Path::new(root))?;
         }

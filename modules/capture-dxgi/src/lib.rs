@@ -32,6 +32,16 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
+/// Enumerate the same physical output identities used by this capture provider.
+/// This read-only setup operation opens no capture stream or listener.
+pub fn enumerate_local_outputs() -> Result<Value, String> {
+    use backend::Backend;
+    let outputs = NativeBackend
+        .enumerate()
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    serde_json::to_value(outputs).map_err(|error| error.to_string())
+}
+
 const SERVICE: &str = "amaterasu.capture-dxgi/1";
 const MAX_PENDING_CLOSES: usize = 32;
 const MAX_PENDING_OPERATIONS: usize = 32;

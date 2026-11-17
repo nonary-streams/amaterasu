@@ -11,6 +11,7 @@ mod operation_apis;
 mod platform_extensions;
 mod processing;
 mod remote_sessions;
+pub(crate) mod windows_side_by_side;
 
 pub const RUNTIME_ID: &str = "amaterasu.runtime";
 
