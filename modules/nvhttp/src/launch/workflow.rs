@@ -2828,6 +2828,7 @@ impl Controller {
                     {
                         observe_authenticated_disconnect(record, &payload);
                         if payload["state"] == "failed" {
+                            log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
                             record.record_failure_because(
                                 "rtsp_stream_failed",
                                 safe_rtsp_provider_code(&payload["failure"]),

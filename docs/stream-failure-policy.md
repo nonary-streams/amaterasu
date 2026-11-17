@@ -113,6 +113,10 @@ Explicit stop, cancellation, shutdown and completed retirement use control
 transitions. The native module ABI and provider failure JSON remain compatible.
 The Rust source API for adjudication and RTSP rejection has changed.
 
+The coordinator reads existing journal records. A binary predating this
+change cannot reopen a journal containing an active fence-only record.
+Complete the pending owner release before downgrading.
+
 Pending RTSP request pressure uses bounded backpressure instead of an overflow
 503. Noncritical refusal connection bookkeeping is bounded by the live transport
 connection table. Existing deadlines, native retirement and ownership fences

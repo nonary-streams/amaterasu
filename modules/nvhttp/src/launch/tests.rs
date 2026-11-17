@@ -6035,7 +6035,7 @@ fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
     payload["failure"] = json!("stream_failed");
     controller.consume(&job, payload, now, &mut Vec::new());
     queue.flush(&runtime);
-    assert!(matches!(&commands[..], [Command::Log { level: 3, target, message }] if target == "launch" && message.contains("MonitorRtsp") && (message.contains("unhealthy") || message.contains("stream_failed"))));
+    assert!(matches!(&commands[..], [Command::Log { level: 3, target, message }] if target == "launch" && message.contains("MonitorRtsp") && message.contains("unhealthy")));
 }
 
 #[test]
