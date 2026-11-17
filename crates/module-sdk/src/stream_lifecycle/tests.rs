@@ -211,6 +211,26 @@ fn the_store_forgets_the_oldest_stream_and_its_aliases() {
 }
 
 #[test]
+fn transient_refusals_never_evict_an_open_stream() {
+    let mut store = StreamLifecycleStore::new();
+    for index in 0..MAX_TRACKED_STREAMS {
+        store.open(&format!("stream-{index}"));
+    }
+    assert!(!store.open_transient("refused.1"));
+    store.commit(
+        "host",
+        StreamIssue::critical("refused.1", LifecycleLayer::Nvhttp, "admission", "refused"),
+    );
+    assert_eq!(store.unattributed().count(), 1);
+    assert!(store.stream("stream-0").is_some());
+    store.end("stream-1");
+    assert!(store.open_transient("refused.2"));
+    assert!(store.stream("stream-0").is_some());
+    assert!(store.stream("stream-1").is_none());
+    assert!(store.stream("refused.2").is_some());
+}
+
+#[test]
 fn a_feed_commits_events_with_the_runtime_publisher_and_marks_gaps() {
     let issue = StreamIssue::critical("launch-1-rtsp", LifecycleLayer::Rtsp, "arm", "rejected");
     let forged_invalid = json!({"kind":"issue","operation":"launch-1","layer":"rtsp","phase":"arm",

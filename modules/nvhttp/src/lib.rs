@@ -266,7 +266,10 @@ impl ManagedModule for NvhttpModule {
                     .ok_or("enabled nvhttp requires a network provider")?
                     .clone(),
                 &settings,
-            )?;
+            )
+            .inspect_err(|error| {
+                let _ = runtime.log(LogLevel::Error, "nvhttp.listener", error);
+            })?;
             let mut launches = launch::Controller::new(settings.streaming.clone())?;
             launches.set_logger(log_emitter.clone());
             // Other layers report stream failures and fallbacks on the SDK's
@@ -542,6 +545,11 @@ impl ManagedModule for NvhttpModule {
                     self.next_listener_rebind = Instant::now() + self.listener_rebind_delay;
                 }
                 Err(error) => {
+                    if self.product_settings.listener_error() != Some(error.as_str()) {
+                        let _ = self
+                            .runtime
+                            .log(LogLevel::Warning, "nvhttp.listener", &error);
+                    }
                     self.product_settings
                         .record_listener_apply_failure(&target, error);
                     self.next_listener_rebind = Instant::now() + self.listener_rebind_delay;

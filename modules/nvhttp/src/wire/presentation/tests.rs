@@ -380,6 +380,59 @@ fn peer() -> RequestContext {
     }
 }
 
+#[test]
+fn launch_and_resume_refusals_identify_the_rejected_input() {
+    for presentation in [false, true] {
+        for route in ["launch", "resume"] {
+            for (fields, field, value) in [
+                ("appid=1&mode=1920x1079x60", "mode.height", Some(1079)),
+                ("appid=1&hdrMode=2", "hdrMode", Some(2)),
+                (
+                    "appid=1&localAudioPlayMode=9",
+                    "localAudioPlayMode",
+                    Some(9),
+                ),
+                (
+                    "appid=1&continuousAudio=arbitrary_text",
+                    "continuousAudio",
+                    None,
+                ),
+                ("appid=1&mode=16x16x1&rikey=123456789", "rikey", None),
+                ("appid=1", "mode", None),
+            ] {
+                let mut router = router();
+                if !presentation {
+                    router.presentation = None;
+                }
+                let reply = dispatch(
+                    &mut router,
+                    &format!("/{route}?{fields}"),
+                    peer(),
+                    Instant::now(),
+                )
+                .unwrap();
+                assert_eq!(reply.status, 400);
+                let issue = router
+                    .launches
+                    .refusal_snapshot("refused.1")
+                    .unwrap()
+                    .root_cause
+                    .unwrap()
+                    .issue;
+                assert_eq!(issue.reason, format!("http_400.{field}"));
+                assert_eq!(
+                    issue.requested,
+                    value.map(amaterasu_module_sdk::stream_warnings::WarningValue::Integer)
+                );
+                assert!(issue.site.contains("wire/streaming.rs"), "{}", issue.site);
+                let record = serde_json::to_string(&issue).unwrap();
+                assert!(!record.contains("123456789"));
+                assert!(!record.contains("arbitrary_text"));
+            }
+        }
+    }
+}
+
 fn dispatch(
     router: &mut Router,
     target: &str,

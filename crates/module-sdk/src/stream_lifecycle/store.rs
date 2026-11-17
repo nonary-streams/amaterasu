@@ -244,6 +244,31 @@ impl StreamLifecycleStore {
             .insert(key.to_owned(), StreamLifecycle::new(key.to_owned()));
     }
 
+    /// Track a short-lived refusal without evicting a still-open stream.
+    /// If every slot is open, its issue can still be committed as unattributed.
+    pub fn open_transient(&mut self, key: &str) -> bool {
+        if key.is_empty() {
+            return false;
+        }
+        if self.streams.contains_key(key) {
+            return true;
+        }
+        if self.order.len() >= MAX_TRACKED_STREAMS {
+            let Some(index) = self.order.iter().position(|candidate| {
+                self.streams
+                    .get(candidate)
+                    .is_some_and(|stream| stream.ended)
+            }) else {
+                return false;
+            };
+            let oldest = self.order.remove(index).expect("known stream index");
+            self.streams.remove(&oldest);
+            self.aliases.retain(|_, stream| *stream != oldest);
+        }
+        self.open(key);
+        true
+    }
+
     /// Let issues naming `alias`, or an ID derived from it, reach `key`.
     pub fn alias(&mut self, key: &str, alias: &str) {
         if alias.is_empty() || alias == key || !self.streams.contains_key(key) {

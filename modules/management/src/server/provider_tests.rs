@@ -271,3 +271,21 @@ fn management_listener_uses_replacement_provider_and_retires_its_handle() {
     assert_eq!(calls.close.load(Ordering::SeqCst), 1);
     assert_eq!(calls.release.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn occupied_management_listener_identifies_protocol_endpoint_and_provider_cause() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = occupied.local_addr().unwrap();
+    let ephemeral = "127.0.0.1:0".parse().unwrap();
+    for (plain, tls, role) in [(address, None, "HTTP"), (ephemeral, Some(address), "HTTPS")] {
+        let error = Server::bind(plain, Vec::new(), None, tls, None)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains(&format!(
+                "management {role} listener bind {address} failed (AddrInUse)"
+            )),
+            "{error}"
+        );
+    }
+}

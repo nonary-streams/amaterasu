@@ -115,27 +115,26 @@ impl Server {
         tls_bind: Option<SocketAddr>,
         tls_configuration: Option<Arc<ServerConfig>>,
     ) -> ModuleResult<Self> {
-        let listener = network
-            .bind_tcp(address)
-            .map_err(|_| "management bind failed")?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| "management nonblocking listener unavailable")?;
-        let address = listener
-            .local_addr()
-            .map_err(|_| "management local address unavailable")?
-            .to_string();
-        let tls_listener = if let Some(bind) = tls_bind {
-            let listener = network
-                .bind_tcp(bind)
-                .map_err(|_| "management TLS bind failed")?;
-            listener
-                .set_nonblocking(true)
-                .map_err(|_| "management TLS listener unavailable")?;
-            Some(listener)
-        } else {
-            None
+        let listen = |bind, protocol| -> ModuleResult<TcpListener> {
+            let listener = network.bind_tcp(bind).map_err(|error| {
+                format!(
+                    "management {protocol} listener bind {bind} failed ({:?}): {error}",
+                    error.kind()
+                )
+            })?;
+            listener.set_nonblocking(true).map_err(|error| {
+                format!(
+                    "management {protocol} listener set_nonblocking {bind} failed ({:?}): {error}",
+                    error.kind()
+                )
+            })?;
+            Ok(listener)
         };
+        let listener = listen(address, "HTTP")?;
+        let address = listener.local_addr().map_err(|error| {
+            format!("management HTTP listener local address lookup for {address} failed ({:?}): {error}", error.kind())
+        })?.to_string();
+        let tls_listener = tls_bind.map(|bind| listen(bind, "HTTPS")).transpose()?;
         Ok(Self {
             audio_providers: AudioProviders::default(),
             listener,

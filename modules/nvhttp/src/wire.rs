@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
+pub(crate) use streaming::StreamQueryError;
 
 pub struct Request {
     pub method: String,
@@ -507,7 +508,9 @@ impl Router {
                 } else {
                     let request = match streaming::launch_request(&query) {
                         Ok(request) => request,
-                        Err(error) => return Some(xml::error(400, error)),
+                        Err(error) => {
+                            return Some(self.launches.refuse_stream_query(error));
+                        }
                     };
                     let identity = match peer.identity() {
                         Ok(identity) => identity,
@@ -563,7 +566,9 @@ impl Router {
                 }
                 let request = match streaming::resume_request(&query) {
                     Ok(request) => request,
-                    Err(error) => return Some(xml::error(400, error)),
+                    Err(error) => {
+                        return Some(self.launches.refuse_stream_query(error));
+                    }
                 };
                 let identity = match peer.identity() {
                     Ok(identity) => identity,

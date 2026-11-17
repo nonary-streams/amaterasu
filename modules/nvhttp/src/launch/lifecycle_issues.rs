@@ -9,7 +9,7 @@ use super::{
     record::{Record, Stage},
     workflow::Phase,
 };
-use crate::wire::Reply;
+use crate::wire::{Reply, StreamQueryError};
 use amaterasu_module_sdk::stream_lifecycle::{
     LifecycleLayer, StreamIssue, StreamIssueFeed, StreamLifecycleSnapshot, StreamReport,
 };
@@ -225,6 +225,11 @@ impl Record {
 }
 
 impl Controller {
+    #[cfg(test)]
+    pub(crate) fn refusal_snapshot(&self, key: &str) -> Option<StreamLifecycleSnapshot> {
+        self.stream_lifecycle.snapshot(key)
+    }
+
     /// Read issues other layers publish. Off by default so a controller in a
     /// test speaks only the commands that test scripts.
     pub fn enable_stream_issue_feed(&mut self) {
@@ -275,17 +280,43 @@ impl Controller {
 
     /// A refusal sent before any launch record existed is a stream of its
     /// own in the store: one entry naming the line that refused.
-    pub(super) fn record_refusal(&mut self, reply: &mut Reply, phase: &str) {
+    pub(crate) fn record_refusal(&mut self, reply: &mut Reply, phase: &str) {
+        self.record_refusal_with_input(reply, phase, None);
+    }
+
+    pub(crate) fn refuse_stream_query(&mut self, error: StreamQueryError) -> Reply {
+        let mut reply = super::private_error_with_input(400, error.message, Some(&error));
+        self.record_refusal_with_input(&mut reply, "request_parsing", Some(&error));
+        reply
+    }
+
+    fn record_refusal_with_input(
+        &mut self,
+        reply: &mut Reply,
+        phase: &str,
+        input: Option<&StreamQueryError>,
+    ) {
         let Some(rejection) = reply.rejection.take() else {
             return;
         };
         self.sequence = self.sequence.saturating_add(1);
         let key = format!("refused.{}", self.sequence);
-        self.stream_lifecycle.open(&key);
+        self.stream_lifecycle.open_transient(&key);
         let mut issue =
             StreamIssue::critical(key.clone(), LifecycleLayer::Nvhttp, phase, rejection.code)
                 .because(format!("http_{}", rejection.status));
-        issue.site = format!("{}:{}", rejection.site.file(), rejection.site.line());
+        let site = if let Some(input) = input {
+            if let Some(field) = input.field {
+                issue.reason = format!("{}.{field}", issue.reason);
+            }
+            issue.requested = input
+                .requested
+                .map(amaterasu_module_sdk::stream_warnings::WarningValue::Integer);
+            input.site
+        } else {
+            rejection.site
+        };
+        issue.site = format!("{}:{}", site.file(), site.line());
         self.stream_lifecycle
             .commit_logged(self.logger.as_ref(), NVHTTP_PUBLISHER, issue);
         self.stream_lifecycle.end(&key);

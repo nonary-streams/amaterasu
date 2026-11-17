@@ -6,6 +6,7 @@ use std::{ffi::c_void, sync::Mutex};
 #[derive(Default)]
 struct Script {
     reject_listen: bool,
+    reject_address_lookup: bool,
     listeners: Vec<Address>,
     listen_attempts: usize,
     accepted: bool,
@@ -81,6 +82,9 @@ unsafe extern "C" fn accept(
 unsafe extern "C" fn local_addr(context: *mut c_void, handle: u64, output: *mut Address) -> Status {
     // SAFETY: fixture context/output live during this synchronous callback.
     let script = unsafe { script(context) }.lock().unwrap();
+    if script.reject_address_lookup {
+        return NOT_FOUND;
+    }
     let index = if handle == 3 {
         0
     } else {
@@ -258,9 +262,31 @@ fn settings() -> Settings {
 #[test]
 fn configured_provider_rejection_does_not_fall_back_to_os_listeners() {
     let (network, script) = replacement(true);
-    assert!(Server::bind_with_network(network, &settings()).is_err());
+    let error = Server::bind_with_network(network, &settings())
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("HTTP listener bind 127.0.0.1:0 failed (AddrInUse)"),
+        "{error}"
+    );
+    assert!(error.contains(&format!("network provider status {ADDRESS_IN_USE}")));
     let script = script.lock().unwrap();
     assert_eq!(script.listen_attempts, 1);
+    assert!(script.released);
+}
+#[test]
+fn failed_bound_address_lookup_names_endpoint_and_releases_handle() {
+    let (network, script) = replacement(false);
+    script.lock().unwrap().reject_address_lookup = true;
+    let error = Server::bind_with_network(network, &settings())
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("HTTP listener local address lookup for 127.0.0.1:0 failed (NotFound)"),
+        "{error}"
+    );
+    let script = script.lock().unwrap();
+    assert_eq!(script.closed, [1]);
     assert!(script.released);
 }
 #[test]

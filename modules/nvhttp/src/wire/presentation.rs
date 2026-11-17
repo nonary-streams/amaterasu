@@ -1678,7 +1678,9 @@ impl Router {
                     };
                     match parsed {
                         Ok(request) => Some(request),
-                        Err(error) => return Some(xml::error(400, error)),
+                        Err(error) => {
+                            return Some(self.launches.refuse_stream_query(error));
+                        }
                     }
                 };
                 let identity = match peer.identity() {
