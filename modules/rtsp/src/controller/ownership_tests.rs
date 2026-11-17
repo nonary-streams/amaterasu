@@ -625,12 +625,27 @@ fn negotiate_announce(record: &mut Record, body: &str) -> bool {
         panic!("expected ANNOUNCE action");
     };
     let accepted = record.accept_announce(&parsed);
-    record
-        .negotiation
-        .as_mut()
-        .unwrap()
-        .complete(ticket, action_ticket, accepted)
-        .expect("ANNOUNCE completion");
+    let permit = (!accepted).then(|| {
+        match Controller::network_failure_decision(
+            record,
+            "announce",
+            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                "configuration_mismatch",
+            ),
+            None,
+        ) {
+            amaterasu_module_sdk::stream_lifecycle::StreamFailureDecision::Terminate(permit) => {
+                permit
+            }
+            _ => panic!("required configuration failure was not critical"),
+        }
+    });
+    let negotiation = record.negotiation.as_mut().unwrap();
+    match permit.as_ref() {
+        Some(permit) => negotiation.reject(ticket, action_ticket, permit),
+        None => negotiation.complete(ticket, action_ticket),
+    }
+    .expect("ANNOUNCE completion");
     accepted
 }
 

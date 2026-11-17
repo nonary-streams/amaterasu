@@ -59,6 +59,10 @@ pub struct Transport {
 }
 
 impl Transport {
+    pub(super) fn has_connection(&self, connection: u64) -> bool {
+        self.connections.contains_key(&connection)
+    }
+
     #[cfg(test)]
     pub fn bind(address: SocketAddr, allow_remote: bool) -> TransportResult<Self> {
         Self::bind_all(vec![address], allow_remote)
@@ -274,12 +278,26 @@ impl Transport {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn poll(&mut self, now_ms: u64) -> Vec<Event> {
+        self.poll_with_request_budget(now_ms, usize::MAX)
+    }
+
+    /// Leave unread transactions in the bounded connection table when the
+    /// owner cannot admit another request. Still progress writes/disconnects.
+    pub fn poll_with_request_budget(
+        &mut self,
+        now_ms: u64,
+        mut request_budget: usize,
+    ) -> Vec<Event> {
         self.now = self.now.max(now_ms);
         self.accept();
         let ids: Vec<_> = self.connections.keys().copied().collect();
         let mut events = Vec::new();
         for id in ids {
+            if request_budget == 0 && self.connections[&id].awaiting_request() {
+                continue;
+            }
             let step = self
                 .connections
                 .get_mut(&id)
@@ -287,12 +305,31 @@ impl Transport {
                 .step(&mut self.tickets, self.now);
             match step {
                 Step::Pending => {}
-                Step::Request { ticket, request } => events.push(Event::Request {
-                    connection: id,
-                    ticket,
-                    request,
-                }),
-                Step::Close(reason) => events.push(self.close(id, reason)),
+                Step::Request { ticket, request } => {
+                    request_budget = request_budget.saturating_sub(1);
+                    events.push(Event::Request {
+                        connection: id,
+                        ticket,
+                        request,
+                    });
+                }
+                Step::End(reason) => events.push(self.close(id, reason)),
+                Step::Failure(failure) => {
+                    use amaterasu_module_sdk::stream_lifecycle::{
+                        LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
+                    };
+                    let code = failure.code();
+                    let issue = failure.at(
+                        format!("rtsp-connection-{id}"),
+                        LifecycleLayer::Rtsp,
+                        "transport",
+                    );
+                    if let StreamFailureDecision::Terminate(permit) =
+                        StreamFailureHandler::decide(issue)
+                    {
+                        events.push(permit.terminate(|_| self.close(id, code)));
+                    }
+                }
             }
         }
         events

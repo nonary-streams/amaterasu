@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 amaterasu-timing-metrics.workspace = true
 amaterasu-contracts.workspace = true
+amaterasu-module-sdk.workspace = true
 amaterasu-media.workspace = true
 ring = "0.17.14"
 aes = { version = "0.8.4", features = ["zeroize"] }

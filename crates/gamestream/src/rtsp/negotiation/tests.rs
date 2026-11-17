@@ -239,7 +239,7 @@ fn primary_modern_order_requires_backend_acceptance_before_play_success() {
         machine.handle(7, &request(Method::Play, "/", 7, true)),
         Err(Error::Pending)
     );
-    machine.complete(7, ticket, true).unwrap();
+    machine.complete(7, ticket).unwrap();
     let Step::Action {
         ticket,
         action: Action::Play,
@@ -250,7 +250,7 @@ fn primary_modern_order_requires_backend_acceptance_before_play_success() {
         panic!()
     };
     assert_eq!(machine.state(), State::Play);
-    machine.complete(7, ticket, true).unwrap();
+    machine.complete(7, ticket).unwrap();
     assert_eq!(machine.state(), State::Playing);
 }
 
@@ -265,13 +265,10 @@ fn epoch_session_and_completion_tickets_cannot_adopt_another_launch() {
     let Step::Action { ticket, .. } = machine.handle(7, &announce()).unwrap() else {
         panic!()
     };
-    assert_eq!(machine.complete(8, ticket, true), Err(Error::WrongEpoch));
-    assert_eq!(
-        machine.complete(7, ticket + 1, true),
-        Err(Error::WrongTicket)
-    );
-    machine.complete(7, ticket, true).unwrap();
-    assert_eq!(machine.complete(7, ticket, true), Err(Error::WrongTicket));
+    assert_eq!(machine.complete(8, ticket), Err(Error::WrongEpoch));
+    assert_eq!(machine.complete(7, ticket + 1), Err(Error::WrongTicket));
+    machine.complete(7, ticket).unwrap();
+    assert_eq!(machine.complete(7, ticket), Err(Error::WrongTicket));
     assert_eq!(machine.handle(7, &announce()), Err(Error::InvalidSequence));
 }
 
@@ -282,7 +279,22 @@ fn backend_rejection_never_emits_success_or_arms_play_but_allows_cleanup() {
     let Step::Action { ticket, .. } = machine.handle(7, &announce()).unwrap() else {
         panic!()
     };
-    let response = machine.complete(7, ticket, false).unwrap();
+    let response = machine
+        .reject(
+            7,
+            ticket,
+            &amaterasu_module_sdk::stream_lifecycle::StreamTermination::try_from(
+                amaterasu_module_sdk::stream_lifecycle::StreamIssue::critical(
+                    "stream",
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Rtsp,
+                    "arm",
+                    "backend_unavailable",
+                )
+                .because("backend_unavailable"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
     assert!(response.starts_with(b"RTSP/1.0 503 "));
     assert_eq!(machine.state(), State::Failed);
     assert_eq!(
@@ -298,7 +310,7 @@ fn backend_rejection_never_emits_success_or_arms_play_but_allows_cleanup() {
     else {
         panic!()
     };
-    machine.complete(7, ticket, true).unwrap();
+    machine.complete(7, ticket).unwrap();
     assert_eq!(machine.state(), State::Closed);
     assert_eq!(
         machine.handle(7, &request(Method::Teardown, "/", 9, true)),
@@ -451,7 +463,7 @@ fn moonlight_generated_extension_announcement_completes_negotiation() {
     else {
         panic!("extension ANNOUNCE action")
     };
-    machine.complete(7, ticket, true).unwrap();
+    machine.complete(7, ticket).unwrap();
     let play = request(Method::Play, "/", 7, true);
     let Step::Action {
         ticket,
@@ -460,7 +472,7 @@ fn moonlight_generated_extension_announcement_completes_negotiation() {
     else {
         panic!("PLAY action")
     };
-    machine.complete(7, ticket, true).unwrap();
+    machine.complete(7, ticket).unwrap();
     assert_eq!(machine.state(), State::Playing);
 }
 

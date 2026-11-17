@@ -165,10 +165,30 @@ impl Record {
         );
     }
 
+    /// A request refusal carries the same report in its response. Logging
+    /// alone cannot preserve classification across a module/RPC boundary.
+    #[track_caller]
+    pub(super) fn request_error(&mut self, phase: &str, code: &str) -> serde_json::Value {
+        let operation = self
+            .config
+            .rtsp_operation_id
+            .clone()
+            .unwrap_or_else(|| format!("ss-{:x}", self.id));
+        let report = StreamIssue::advisory(operation, LifecycleLayer::StreamSession, phase, code)
+            .because(code);
+        let response = serde_json::json!({"ok":false, "code":code, "session":self.id,
+            "state":self.state, "cleanup_error":self.cleanup_error, "stream_failure":report});
+        if self.config.rtsp_operation_id.is_some() {
+            self.issues.push(report);
+        }
+        response
+    }
+
     /// Record a failure that stops this session, under this module's own
     /// layer. `dependency` names the layer it was reacting to; that layer
     /// reports its own failure. Sessions no launch owner named have nowhere
     /// to report and record nothing.
+    #[allow(dead_code)]
     #[track_caller]
     pub(super) fn report_failure(&mut self, dependency: LifecycleLayer, phase: &str, code: &str) {
         self.report_failure_because(dependency, phase, code, code);
@@ -199,14 +219,14 @@ impl Record {
         &mut self,
         dependency: LifecycleLayer,
         phase: &str,
-        code: &'static str,
+        failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
     ) {
-        if self.state != super::State::CleanupFailed || self.cleanup_error != Some(code) {
-            self.report_failure_because(dependency, phase, "cleanup_failed", code);
-            self.remember_cleanup_failure("cleanup_failed");
-        }
-        self.cleanup_error = Some(code);
-        self.state = super::State::CleanupFailed;
+        self.raise_failure(
+            failure,
+            dependency,
+            phase,
+            super::record::FailureEffect::CleanupUnconfirmed,
+        );
     }
 
     pub(super) fn remember_cleanup_failure(&mut self, code: &'static str) {

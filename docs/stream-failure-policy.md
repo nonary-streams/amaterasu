@@ -83,52 +83,55 @@ stable reason. A compatible retry may continue. A refusal response is never
 reported as successful negotiation.
 
 Epoch/session authentication, required wire/media validation, internal ticket
-corruption and serialization failures remain critical. Failure to deliver a
-refusal still closes the ticket as `response_unavailable`; disconnect and
-ownership retirement fences still apply. Backend acceptance remains a separate
-obligation: recoverable media hints must be negotiated before completing an
-ANNOUNCE, rather than passing `false` to `Negotiation::complete`, whose failure
-is terminal. The PyroWave bitrate negotiation repair is a separate change.
+corruption and serialization failures remain critical. A lost response to a
+noncritical refusal affects only that request connection; it cannot retire the
+stream. An unacknowledged native start remains a critical ownership failure.
+The PyroWave bitrate negotiation repair is a separate change.
 
 ## Common failure handler and terminal effects
 
-Lower layers produce bounded `StreamIssue` reports; participating owners pass
-these through `StreamFailureHandler::decide` before issuing the failure response
-or performing a terminal effect. `Continue` scopes the failure to the affected
-operation, retaining the stream and applying its recorded fallback. `Terminate`
-contains a private `StreamTermination` capability, available only for a valid,
-explicitly critical report with a nonempty reason. `Invalid` does not authorize
-termination. A trusted owner handling a known required/security failure may
-submit a separate bounded critical report when the original diagnostic is invalid.
+`StreamFailureHandler::decide` is the synchronous SDK decision point. Lower
+layers submit typed `StreamFailure` reports, with explicit disposition, reason
+and fallback. Only a valid critical report creates the private
+`StreamTermination` capability. Warning, demotion and invalid reports cannot
+execute terminal effects. Publishing diagnostics to the lifecycle store grants
+no authority.
 
-The handler is a synchronous shared SDK decision point. Publishing an event to
-`STREAM_REPORTS`, or inspecting the diagnostic lifecycle store, does not grant
-termination authority and is not a substitute for this call. Native modules
-remain trusted code and can still bypass the SDK; this is not isolation.
+The RTSP action completion boundary preserves classification across provider
+RPC replies, checks exact operation scope, and invokes the handler before
+changing negotiation or rejecting the stream. Recoverable prepared-session
+refusals clear only the pending transaction and allow a corrected request.
+Required failures from older providers without a valid typed report remain
+critical. The public boolean completion API is removed: `complete(epoch,
+ticket)` means success, and `reject(epoch, ticket, &StreamTermination)` requires
+a critical decision. This is an intentional Rust source API change; the native
+module ABI is unchanged.
 
-The migrated boundaries are RTSP negotiation-error replies/closure and backend
-ANNOUNCE/PLAY failure completions, and the
-stream-session workflow's failure-driven terminal effect. Explicit caller
-cancellation has its separate authorized stop path. Four active-session
-maintenance operations (`ForceIdr`, `FeedbackPeek`, `FeedbackAck`, and
-`PollGamepadFeedback`) report failures without entering allocation cleanup:
-timeout, unavailable service, refusal, malformed optional reply, and unconfirmed
-broker bookkeeping retain video/input, back off or await the next keyframe,
-and report a demoted issue with a bounded reason and fallback. Their independent
-settlement queue is capped at eight; saturation skips another optional call.
-Uncertain admissions retain the exact operation identity and are never replayed
-after the broker recovery horizon. Admitted operations keep their bookkeeping
-until settlement. This queue is not evidence of native resource retirement.
+The stream-session job, native media/input/journal and cleanup failure effects,
+RTSP record closure/cleanup and transport protocol/security failures, and
+NVHTTP record failure/cleanup and failed-launch response effects use the same
+handler. Bare error strings no longer silently become terminal decisions in
+these adapters. Normal authenticated stop, cancellation, quiescence and physical
+peer/transaction completion retain explicit control paths.
 
-Explicit recovery/cleanup-required responses, existing feedback/keyframe
-permission failures, required input renewal, native media failure, capture and
-lifecycle authorization, ownership persistence and actual native retirement
-remain critical. Existing rumble-zero delivery fences remain in force.
+Pending RTSP request pressure uses bounded backpressure instead of an overflow
+503. Noncritical refusal connection bookkeeping is bounded by the live transport
+connection table. Existing deadlines, native retirement and ownership fences
+remain intact. NVHTTP request/admission refusals before a ticket exists and
+management errors are scoped to those operations and do not stop an existing
+stream; local resource retirement in session-lifecycle is not a network decision.
 
-Coverage is partial: direct record-state assignments, legacy string-to-critical
-adapters, NVHTTP cleanup decisions, session-lifecycle provider rollback, and
-the public `Negotiation::complete(bool)` API remain bypass seams (the production
-controller's negative completions are now gated). The handler cannot infer
-whether a module incorrectly called an arbitrary limit critical. Future
-migration must carry the original failure report to the owning decision boundary
-and replace these bypasses, rather than adding independent rejection policy.
+Four active maintenance operations (`ForceIdr`, `FeedbackPeek`, `FeedbackAck`,
+`PollGamepadFeedback`) use independent bounded continuation for timeout,
+unavailable service, refusal, malformed optional reply and uncertain broker
+bookkeeping. Their settlement queue is capped at eight, retains exact operation
+identities and does not assert native retirement. Explicit recovery/cleanup
+required, permissions, required input renewal, native media failure, selected
+format/encryption, authorization and ownership persistence remain critical.
+
+This enforces the migrated core boundaries, not native-code isolation. Trusted
+native providers can still stop their own resources, fail or misclassify a
+condition; the SDK cannot infer a safe fallback from arbitrary provider code.
+The static inventory is a review aid, not a dominance proof, and skips symlinked
+provider source. Provider/platform paths need separate source and runtime review
+before claiming universal coverage.

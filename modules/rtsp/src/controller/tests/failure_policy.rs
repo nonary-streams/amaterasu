@@ -90,7 +90,7 @@ fn request_state_and_sequence_refusals_preserve_the_stream_and_allow_cleanup() {
             .negotiation
             .as_mut()
             .unwrap()
-            .complete(5, action, true)
+            .complete(5, action)
             .unwrap();
         record.state = State::Playing;
     }
@@ -160,7 +160,7 @@ fn session_authentication_failure_still_rejects_and_retires_the_ticket() {
         .negotiation
         .as_mut()
         .unwrap()
-        .complete(5, action, true)
+        .complete(5, action)
         .unwrap();
     record.state = State::Playing;
     let mut sealer = RtspSealer::new(&KEY, Direction::ClientToHost).unwrap();
@@ -181,17 +181,25 @@ fn session_authentication_failure_still_rejects_and_retires_the_ticket() {
 }
 
 #[test]
-fn undeliverable_recoverable_refusal_remains_a_critical_transport_failure() {
+fn undeliverable_recoverable_refusal_preserves_the_stream() {
     let (mut controller, _) = prepared_controller();
     controller.handle_network(999, 5, request(Method::Play, "/", 8, true), 10);
-    let record = controller.records.get_mut(&5).unwrap();
+    assert_retained(&controller, State::Ready);
+}
+
+#[test]
+fn undeliverable_native_completion_retains_critical_rollback() {
+    let (mut controller, action) = prepared_controller();
+    let mut record = controller.records.remove(&5).unwrap();
+    assert!(!controller.finish_network_result(
+        &mut record,
+        999,
+        action,
+        Ok(super::super::network::NetworkCompletion::NativeStart),
+        None
+    ));
     assert_eq!(record.state, State::Closing);
     assert_eq!(record.failure, Some("response_unavailable"));
-    let reports: Vec<_> = record.issues.drain().collect();
-    assert!(
-        reports.iter().any(|report| matches!(report,
-        StreamReport::Issue(issue) if issue.is_critical() && issue.code == "response_unavailable"))
-    );
 }
 
 #[test]
@@ -238,4 +246,171 @@ fn wrong_state_before_options_allows_a_corrected_request_on_the_same_ticket() {
         controller.records[&5].negotiation.as_ref().unwrap().state(),
         amaterasu_gamestream::rtsp::negotiation::State::Describe
     );
+}
+
+#[test]
+fn noncritical_reports_cannot_close_or_fence_a_playing_rtsp_ticket() {
+    use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
+    let (mut controller, action) = prepared_controller();
+    let record = controller.records.get_mut(&5).unwrap();
+    record
+        .negotiation
+        .as_mut()
+        .unwrap()
+        .complete(5, action)
+        .unwrap();
+    record.state = State::Playing;
+    record.close(Some(StreamFailure::advisory("bitrate_hint")));
+    record.fail_cleanup(StreamFailure::demoted("optional_unavailable", "continue"));
+    assert_eq!(record.state, State::Playing);
+    assert_eq!(record.failure, None);
+    assert_eq!(record.cleanup_error, None);
+    assert_eq!(record.session, Some(23));
+    record.close(Some(StreamFailure::critical("authorization_lost")));
+    assert_eq!(record.state, State::Closing);
+    assert_eq!(record.failure, Some("authorization_lost"));
+}
+
+#[test]
+fn provider_report_classification_survives_rpc_to_the_final_wire_boundary() {
+    use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+    for scenario in ["warning", "critical", "wrong_scope"] {
+        let (mut controller, action) = prepared_controller();
+        let mut record = controller.records.remove(&5).unwrap();
+        record.state = State::Arming;
+        let operation = if scenario == "wrong_scope" {
+            "other-stream".into()
+        } else {
+            record.config.operation_id.clone()
+        };
+        let report = if scenario == "critical" {
+            StreamIssue::critical(
+                operation,
+                LifecycleLayer::StreamSession,
+                "start",
+                "required_resource_failed",
+            )
+            .because("native_failure")
+        } else {
+            StreamIssue::advisory(
+                operation,
+                LifecycleLayer::StreamSession,
+                "start",
+                "request_adjustment",
+            )
+            .because("retry_prepared_request")
+        };
+        let mut sealer = RtspSealer::new(&KEY, Direction::ClientToHost).unwrap();
+        let mut client =
+            TcpStream::connect(controller.transport.as_ref().unwrap().local_addr().unwrap())
+                .unwrap();
+        client
+            .write_all(
+                &sealer
+                    .seal(request_text("PLAY", 7, &record.session_token).as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let connection = loop {
+            let events = controller.transport.as_mut().unwrap().poll(10);
+            if let Some(Event::Request { connection, .. }) = events.into_iter().next() {
+                break connection;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        };
+        controller.armed(
+            &mut record,
+            Job {
+                ticket: 5,
+                phase: Phase::Arm,
+                call: Call::for_service(
+                    "amaterasu.stream-session/1",
+                    json!({}),
+                    "test-arm".into(),
+                    None,
+                ),
+                caller: None,
+                network: Some((connection, action)),
+                deadline: 1000,
+            },
+            &json!({"ok":false,"session":23,"state":"prepared","cleanup_error":null,
+                "code":report.code,"stream_failure":report}),
+            10,
+        );
+        if scenario == "warning" {
+            assert_eq!(record.state, State::Ready);
+            assert_eq!(record.failure, None);
+            assert_eq!(record.session, Some(23));
+        } else {
+            assert_eq!(record.state, State::Closing);
+        }
+        controller.records.insert(5, record);
+        client.set_nonblocking(true).unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            controller.poll_transport(11);
+            let mut buffer = [0; 4096];
+            match client.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("{e}"),
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let reply = RtspOpener::new(&KEY, Direction::HostToClient)
+            .unwrap()
+            .open(&bytes)
+            .unwrap()
+            .plaintext;
+        let expected = if scenario == "warning" {
+            b"RTSP/1.0 455 ".as_slice()
+        } else {
+            b"RTSP/1.0 503 ".as_slice()
+        };
+        assert!(
+            reply.starts_with(expected),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        if scenario == "warning" {
+            assert_retained(&controller, State::Ready);
+        }
+    }
+}
+
+#[test]
+fn failed_connection_of_a_scoped_refusal_does_not_retire_the_ticket() {
+    let (mut controller, _) = prepared_controller();
+    controller.noncritical_connections.insert(42);
+    controller.disconnected(42, Some(5), "peer_disconnected");
+    assert_retained(&controller, State::Ready);
+    assert!(controller.noncritical_connections.is_empty());
+    controller.mark_noncritical_connection(999);
+    assert!(
+        controller.noncritical_connections.is_empty(),
+        "nonexistent connections cannot grow the set"
+    );
+    controller.disconnected(43, Some(5), "peer_disconnected");
+    assert_eq!(controller.records[&5].state, State::Closing);
+    assert_eq!(controller.records[&5].failure, Some("network_disconnected"));
+}
+
+#[test]
+fn undeliverable_negotiation_only_completion_preserves_ownership() {
+    let (mut controller, action) = prepared_controller();
+    let mut record = controller.records.remove(&5).unwrap();
+    assert!(!controller.finish_network_result(
+        &mut record,
+        999,
+        action,
+        Ok(super::super::network::NetworkCompletion::NegotiationOnly),
+        None
+    ));
+    assert_eq!(record.state, State::Ready);
+    assert_eq!(record.failure, None);
+    assert_eq!(record.session, Some(23));
 }

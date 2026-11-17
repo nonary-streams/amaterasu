@@ -269,7 +269,8 @@ fn four_k_pyrowave_bandwidth_announcement_returns_200_and_reaches_play() {
             panic!("expected extension ANNOUNCE");
         };
         let accepted = record.accept_extension_announce(&announce);
-        let reply = negotiation.complete(record.id, ticket, accepted).unwrap();
+        assert!(accepted, "lower extension rate must be accepted");
+        let reply = negotiation.complete(record.id, ticket).unwrap();
         assert!(
             reply.starts_with(b"RTSP/1.0 200 "),
             "{}",

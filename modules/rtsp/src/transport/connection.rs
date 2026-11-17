@@ -16,7 +16,8 @@ const ROUTER_DEADLINE_MS: u64 = 15_000;
 pub(super) enum Step {
     Pending,
     Request { ticket: u64, request: Request },
-    Close(&'static str),
+    End(&'static str),
+    Failure(amaterasu_module_sdk::stream_lifecycle::StreamFailure),
 }
 
 enum State {
@@ -55,6 +56,9 @@ impl Connection {
     pub(super) fn ticket(&self) -> Option<u64> {
         self.ticket
     }
+    pub(super) fn awaiting_request(&self) -> bool {
+        matches!(self.state, State::Reading(_))
+    }
     pub(super) fn awaiting_reply(&self) -> bool {
         matches!(self.state, State::Waiting)
     }
@@ -66,7 +70,11 @@ impl Connection {
 
     pub(super) fn step(&mut self, tickets: &mut Tickets, now: u64) -> Step {
         if now >= self.deadline {
-            return Step::Close("connection_deadline");
+            return Step::Failure(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "connection_deadline",
+                ),
+            );
         }
         match &mut self.state {
             State::Reading(_) => self.read(tickets, now),
@@ -74,17 +82,21 @@ impl Connection {
             State::Writing { bytes, offset } => {
                 let end = (*offset + IO_BUDGET).min(bytes.len());
                 match self.socket.write(&bytes[*offset..end]) {
-                    Ok(0) => Step::Close("peer_closed"),
+                    Ok(0) => Step::End("peer_closed"),
                     Ok(length) => {
                         *offset += length;
                         if *offset == bytes.len() {
-                            Step::Close("response_complete")
+                            Step::End("response_complete")
                         } else {
                             Step::Pending
                         }
                     }
                     Err(error) if retryable(&error) => Step::Pending,
-                    Err(_) => Step::Close("tcp_write_failed"),
+                    Err(_) => Step::Failure(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "tcp_write_failed",
+                        ),
+                    ),
                 }
             }
         }
@@ -93,33 +105,61 @@ impl Connection {
     fn read(&mut self, tickets: &mut Tickets, now: u64) -> Step {
         let mut buffer = [0; IO_BUDGET];
         let length = match self.socket.read(&mut buffer) {
-            Ok(0) => return Step::Close("peer_closed"),
+            Ok(0) => return Step::End("peer_closed"),
             Ok(length) => length,
             Err(error) if retryable(&error) => return Step::Pending,
-            Err(_) => return Step::Close("tcp_read_failed"),
+            Err(_) => {
+                return Step::Failure(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "tcp_read_failed",
+                    ),
+                );
+            }
         };
         let State::Reading(decoder) = &mut self.state else {
             unreachable!("read state");
         };
         if decoder.push(&buffer[..length]).is_err() {
-            return Step::Close("invalid_encrypted_frame");
+            return Step::Failure(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "invalid_encrypted_frame",
+                ),
+            );
         }
         let envelope = match decoder.next_frame() {
             Ok(Some(envelope)) => envelope,
             Ok(None) => return Step::Pending,
-            Err(_) => return Step::Close("invalid_encrypted_frame"),
+            Err(_) => {
+                return Step::Failure(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "invalid_encrypted_frame",
+                    ),
+                );
+            }
         };
         if decoder.finish().is_err() {
-            return Step::Close("multiple_encrypted_frames");
+            return Step::Failure(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "multiple_encrypted_frames",
+                ),
+            );
         }
         let (ticket, plaintext) = match tickets.authenticate(self.peer, &envelope) {
             Ok(authenticated) => authenticated,
-            Err(error) => return Step::Close(error),
+            Err(error) => {
+                return Step::Failure(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(error),
+                );
+            }
         };
         self.ticket = Some(ticket);
         let request = match decode_request(&plaintext) {
             Ok(request) => request,
-            Err(error) => return Step::Close(error),
+            Err(error) => {
+                return Step::Failure(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(error),
+                );
+            }
         };
         self.state = State::Waiting;
         self.deadline = now.saturating_add(ROUTER_DEADLINE_MS);
@@ -129,10 +169,16 @@ impl Connection {
     fn check_disconnect(&mut self) -> Step {
         let mut extra = [0];
         match self.socket.read(&mut extra) {
-            Ok(0) => Step::Close("peer_closed"),
-            Ok(_) => Step::Close("unexpected_pipelined_data"),
+            Ok(0) => Step::End("peer_closed"),
+            Ok(_) => Step::Failure(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "unexpected_pipelined_data",
+                ),
+            ),
             Err(error) if retryable(&error) => Step::Pending,
-            Err(_) => Step::Close("tcp_read_failed"),
+            Err(_) => Step::Failure(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("tcp_read_failed"),
+            ),
         }
     }
 }

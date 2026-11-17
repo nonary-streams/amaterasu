@@ -77,6 +77,7 @@ pub(super) enum Step {
 }
 
 pub(super) struct Job {
+    pub failure_continued: bool,
     pub session: u64,
     pub request: Option<u64>,
     pub step: Step,
@@ -105,6 +106,7 @@ pub(super) struct Job {
 impl Job {
     pub fn new(session: u64, request: Option<u64>, step: Step, deadline: u64) -> Self {
         Self {
+            failure_continued: false,
             session,
             request,
             step,
@@ -132,77 +134,75 @@ impl Job {
     }
 
     #[track_caller]
-    pub fn fail(&mut self, record: &mut Record, code: &'static str, now: u64) {
-        eprintln!("amaterasu session failed step={:?} code={code}", self.step);
-        if code != "request_cancelled" {
-            let cleanup_failure = self.cleanup
-                || (record.state == State::Stopping && record.outcome == State::Stopped);
-            record.report_failure_because(
-                super::lifecycle_issues::step_layer(self.step),
-                &super::lifecycle_issues::step_label(self.step),
-                if cleanup_failure {
-                    "cleanup_step_failed"
-                } else {
-                    code
-                },
-                if self.step == Step::RecoverAudio {
-                    "audio_encoder_failed"
-                } else {
-                    code
-                },
-            );
-            if cleanup_failure {
-                record.remember_cleanup_failure("cleanup_step_failed");
-            }
-        }
-        if code == "request_cancelled" {
-            self.stop_failed_or_cancelled(record, code, now);
-            return;
-        }
-        use amaterasu_module_sdk::stream_lifecycle::{
-            LifecycleLayer, StreamIssue, StreamTermination,
-        };
-        let issue = StreamIssue::critical(
-            "stream-session",
-            LifecycleLayer::StreamSession,
-            "workflow",
-            code,
-        )
-        .because(code);
-        // A malformed diagnostic cannot suppress a genuinely required failure.
-        // Preserve fail-closed behavior with a bounded, explicit fallback reason.
-        let permit = StreamTermination::try_from(issue).unwrap_or_else(|_| {
-            StreamTermination::try_from(
-                StreamIssue::critical(
-                    "stream-session",
-                    LifecycleLayer::StreamSession,
-                    "workflow",
-                    "invalid_failure_classification",
-                )
-                .because("required_operation_failed"),
-            )
-            .expect("static critical classification")
-        });
-        self.terminate(record, permit, code, now);
-    }
-
-    fn terminate(
+    pub fn fail(
         &mut self,
         record: &mut Record,
-        permit: amaterasu_module_sdk::stream_lifecycle::StreamTermination,
-        code: &'static str,
+        failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
         now: u64,
     ) {
-        permit.terminate(|_| self.stop_failed_or_cancelled(record, code, now));
+        use amaterasu_module_sdk::stream_lifecycle::{
+            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
+        };
+        let code = failure.code();
+        let operation = record
+            .config
+            .rtsp_operation_id
+            .as_deref()
+            .unwrap_or("local-stream-session");
+        let mut issue = failure.at(
+            operation,
+            LifecycleLayer::StreamSession,
+            super::lifecycle_issues::step_label(self.step),
+        );
+        let dependency = super::lifecycle_issues::step_layer(self.step);
+        if dependency != LifecycleLayer::StreamSession {
+            issue = issue.caused_by(dependency);
+        }
+        let cleanup_failure =
+            self.cleanup || (record.state == State::Stopping && record.outcome == State::Stopped);
+        if issue.is_critical() && cleanup_failure {
+            issue.code = "cleanup_step_failed".into();
+        }
+        if self.step == Step::RecoverAudio {
+            issue.reason = "audio_encoder_failed".into();
+        }
+        match StreamFailureHandler::decide(issue) {
+            StreamFailureDecision::Terminate(permit) => {
+                permit.terminate(|issue| {
+                    if cleanup_failure {
+                        record.remember_cleanup_failure("cleanup_step_failed");
+                    }
+                    if record.config.rtsp_operation_id.is_some() {
+                        record.issues.push(issue);
+                    }
+                    self.stop_with_outcome(record, code, State::Failed, now);
+                });
+            }
+            StreamFailureDecision::Continue(issue) => {
+                self.failure_continued = true;
+                if record.config.rtsp_operation_id.is_some() {
+                    record.issues.push(issue);
+                }
+            }
+            StreamFailureDecision::Invalid(_) => {
+                self.failure_continued = true;
+            }
+        }
     }
 
-    fn stop_failed_or_cancelled(&mut self, record: &mut Record, code: &'static str, now: u64) {
+    pub fn cancel(&mut self, record: &mut Record, now: u64) {
+        self.stop_with_outcome(record, "request_cancelled", State::Cancelled, now);
+    }
+
+    fn stop_with_outcome(
+        &mut self,
+        record: &mut Record,
+        code: &'static str,
+        outcome: State,
+        now: u64,
+    ) {
         record.error.get_or_insert(code);
-        record.outcome = if code == "request_cancelled" {
-            State::Cancelled
-        } else {
-            State::Failed
-        };
+        record.outcome = outcome;
         record.history.stopping(code);
         record.state = State::Stopping;
         super::input::queue_rumble_zeros(record, now);

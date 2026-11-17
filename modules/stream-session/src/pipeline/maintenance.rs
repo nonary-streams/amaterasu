@@ -1,7 +1,7 @@
 //! Optional, nonallocating commands never use the fatal allocation workflow.
 //! Their broker bookkeeping retires independently; native ownership fences do not.
 use super::{
-    Job, Pipeline, Send, Step, input, lifecycle_issues,
+    Job, Pipeline, Send, Step, StreamFailure, input, lifecycle_issues,
     record::{Record, State},
     rpc,
 };
@@ -76,7 +76,11 @@ impl Pipeline {
                 if matches!(job.step, Step::ForceIdr | Step::PollGamepadFeedback)
                     && pending.admission_error_code() == Some("permission_denied")
                 {
-                    job.fail(record, "dependency_unavailable", now);
+                    job.fail(
+                        record,
+                        StreamFailure::critical("dependency_unavailable"),
+                        now,
+                    );
                     return true;
                 }
                 if !pending.admission_rejected() && pending.request_id().is_none() {
@@ -95,7 +99,11 @@ impl Pipeline {
                 // An explicit ownership/recovery fence is never demoted merely
                 // because the operation normally provides optional feedback.
                 if payload["recovery_required"] == true || payload["cleanup_required"] == true {
-                    job.fail(record, "maintenance_recovery_required", now);
+                    job.fail(
+                        record,
+                        StreamFailure::critical("maintenance_recovery_required"),
+                        now,
+                    );
                     return true;
                 }
                 if payload["ok"] != true
@@ -103,7 +111,7 @@ impl Pipeline {
                     && (payload["error"]["code"] == "permission_denied"
                         || payload["code"] == "permission_denied")
                 {
-                    job.fail(record, "dependency_rejected", now);
+                    job.fail(record, StreamFailure::critical("dependency_rejected"), now);
                     return true;
                 }
                 if payload["ok"] != true {
@@ -219,7 +227,9 @@ impl Pipeline {
                 StreamFailureDecision::Continue(issue) => record.issues.push(issue),
                 StreamFailureDecision::Terminate(permit) => {
                     // Only the common handler can authorize a terminal effect.
-                    permit.terminate(|_| job.fail(record, "maintenance_failed", now));
+                    permit.terminate(|_| {
+                        job.fail(record, StreamFailure::critical("maintenance_failed"), now)
+                    });
                     return true;
                 }
                 StreamFailureDecision::Invalid(_) => {

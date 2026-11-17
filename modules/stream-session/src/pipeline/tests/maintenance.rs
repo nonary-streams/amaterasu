@@ -212,7 +212,7 @@ fn explicit_recovery_and_required_lease_failures_remain_critical() {
     let (mut host, id) = active();
     let record = host.pipeline.records.get_mut(&id).unwrap();
     let mut job = Job::new(id, None, Step::RenewInput, 30);
-    job.fail(record, "input_lease_expired", 1);
+    job.fail(record, StreamFailure::critical("input_lease_expired"), 1);
     assert_eq!(record.state, State::Stopping);
     assert!(job.cleanup);
 }
@@ -232,4 +232,47 @@ fn maintenance_deadline_retains_active_video() {
     assert_eq!(record.state, State::Active);
     assert!(record.plane.is_some());
     assert!(!job.cleanup);
+}
+
+#[test]
+fn noncritical_reports_cannot_drive_workflow_or_direct_record_failure_effects() {
+    use super::super::record::FailureEffect;
+    use amaterasu_module_sdk::stream_lifecycle::LifecycleLayer;
+    for failure in [
+        StreamFailure::advisory("advisory_hint"),
+        StreamFailure::demoted("optional_provider_unavailable", "continue_video"),
+    ] {
+        let (mut host, id) = active();
+        let mut record = host.pipeline.records.remove(&id).unwrap();
+        let resources = record.resources.clone();
+        let mut job = Job::new(id, None, Step::Open(Resource::Video), 30);
+        job.fail(&mut record, failure.clone(), 1);
+        assert!(!advance(
+            &mut host.pipeline,
+            &mut record,
+            &mut job,
+            2,
+            &mut |_| panic!("warning submitted a provider effect")
+        ));
+        assert!(!job.cleanup);
+        for effect in [
+            FailureEffect::Stop,
+            FailureEffect::CancelUnconfirmed,
+            FailureEffect::ReleaseBindings,
+            FailureEffect::CleanupUnconfirmed,
+        ] {
+            assert!(!record.raise_failure(
+                failure.clone(),
+                LifecycleLayer::Capture,
+                "open",
+                effect
+            ));
+            assert_eq!(record.state, State::Active);
+            assert_eq!(record.resources, resources);
+            assert!(record.plane.is_some());
+            assert_eq!(record.error, None);
+            assert_eq!(record.cleanup_error, None);
+        }
+        assert_eq!(host.plane.borrow().media_ticks_when_stopped, None);
+    }
 }

@@ -36,8 +36,9 @@ use crate::{
     },
 };
 use amaterasu_gamestream::control::HostFeedback;
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamFailure};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
-use record::{Record, Resource, State, error};
+use record::{FailureEffect, Record, Resource, State, error};
 use rpc::Send;
 use serde_json::{Value, json};
 use std::{
@@ -1038,14 +1039,12 @@ impl Pipeline {
         if step == Step::ObserveActiveBinding {
             let record = self.records.get_mut(&id).expect("selected record");
             let Some(next) = record.lifecycle_validation_sequence.checked_add(1) else {
-                record.report_failure(
-                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                record.raise_failure(
+                    StreamFailure::critical("lifecycle_sequence_exhausted"),
+                    LifecycleLayer::SessionLifecycle,
                     "observe_active_binding",
-                    "lifecycle_sequence_exhausted",
+                    FailureEffect::Stop,
                 );
-                record.state = State::Stopping;
-                record.outcome = State::Failed;
-                record.error = Some("lifecycle_sequence_exhausted");
                 return true;
             };
             record.lifecycle_validation_sequence = next;
@@ -1119,14 +1118,12 @@ impl Pipeline {
             if matches!(record.state, State::Prepared | State::Armed)
                 && now >= record.prepared_until
             {
-                record.report_failure(
-                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                record.raise_failure(
+                    StreamFailure::critical("prepare_expired"),
+                    LifecycleLayer::StreamSession,
                     "prepare",
-                    "prepare_expired",
+                    FailureEffect::Stop,
                 );
-                record.state = State::Stopping;
-                record.outcome = State::Failed;
-                record.error = Some("prepare_expired");
             }
             if record.state == State::Stopping
                 && record
@@ -1143,7 +1140,10 @@ impl Pipeline {
                 && record.input_lease.is_some()
                 && now >= record.input_expires_at
             {
-                input::stop_for_input_failure(record, "input_lease_expired");
+                input::stop_for_input_failure(
+                    record,
+                    StreamFailure::critical("input_lease_expired"),
+                );
             }
             if record.state == State::Active
                 && record
@@ -1154,15 +1154,13 @@ impl Pipeline {
                     .values()
                     .any(|(command, _)| command.low_frequency == 0 && command.high_frequency == 0)
             {
-                record.report_failure(
-                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
-                    "rumble",
-                    "rumble_zero_delivery_timeout",
-                );
                 record.rumble_stop_unconfirmed = true;
-                record.error.get_or_insert("rumble_zero_delivery_timeout");
-                record.outcome = State::Failed;
-                record.state = State::Stopping;
+                record.raise_failure(
+                    StreamFailure::critical("rumble_zero_delivery_timeout"),
+                    LifecycleLayer::Input,
+                    "rumble",
+                    FailureEffect::Stop,
+                );
                 record.rumble_pending.clear();
                 record.rumble_active_until.clear();
             }
@@ -1181,10 +1179,7 @@ impl Pipeline {
             let Some(plane) = record.plane.as_mut() else {
                 continue;
             };
-            if record.error == Some("rumble_zero_delivery_timeout") {
-                plane.stop();
-            }
-            let mut rumble_delivery_failed = false;
+            let mut rumble_failed = false;
             if let Some((slot, (command, expires_at))) = record
                 .rumble_pending
                 .first_key_value()
@@ -1207,27 +1202,27 @@ impl Pipeline {
                     }
                     Ok(false) => {}
                     Err(_) => {
-                        rumble_delivery_failed = true;
                         record.rumble_stop_unconfirmed = true;
                         record.rumble_pending.clear();
                         record.rumble_active_until.clear();
-                        record.error.get_or_insert("rumble_delivery_failed");
-                        record.outcome = State::Failed;
-                        record.state = State::Stopping;
+                        rumble_failed = true;
                         record.rumble_shutdown_deadline = Some(now);
-                        plane.stop();
                     }
                 }
             }
-            let media_active = matches!(record.state, State::Active | State::Stopping);
-            let result = plane.tick(media_active, control_budget);
-            if rumble_delivery_failed {
-                record.report_failure(
-                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
+            if rumble_failed {
+                record.raise_failure(
+                    StreamFailure::critical("rumble_delivery_failed"),
+                    LifecycleLayer::Input,
                     "rumble",
-                    "rumble_delivery_failed",
+                    FailureEffect::Stop,
                 );
             }
+            let media_active = matches!(record.state, State::Active | State::Stopping);
+            let Some(plane) = record.plane.as_mut() else {
+                continue;
+            };
+            let result = plane.tick(media_active, control_budget);
             match result {
                 Ok(progress) => {
                     record.history.observe_encode_timing(progress.encode_timing);
@@ -1238,14 +1233,12 @@ impl Pipeline {
                         if let Err(code) =
                             input::configure_translator(record, record.input_absolute_pointer)
                         {
-                            record.report_failure(
-                                amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
-                                "configure_translator",
-                                code,
+                            record.raise_failure(
+                                StreamFailure::critical(code),
+                                LifecycleLayer::Input,
+                                "configure_input",
+                                FailureEffect::Stop,
                             );
-                            record.error = Some(code);
-                            record.state = State::Stopping;
-                            record.outcome = State::Failed;
                         }
                     }
                     record.history.observe_media(
@@ -1290,7 +1283,10 @@ impl Pipeline {
                                     self.settings.enable_input,
                                     now,
                                 ) {
-                                    input::stop_for_input_failure(record, code);
+                                    input::stop_for_input_failure(
+                                        record,
+                                        StreamFailure::critical(code),
+                                    );
                                 }
                                 if record.contribution_barrier.generation() != generation
                                     && let Some(plane) = record.plane.as_mut()
@@ -1307,7 +1303,7 @@ impl Pipeline {
                         record.input_timing.end_message();
                     }
                     if let Err(code) = input::release_after_client_silence(record, now) {
-                        input::stop_for_input_failure(record, code);
+                        input::stop_for_input_failure(record, StreamFailure::critical(code));
                     }
                     let allowed = record.state == State::Active
                         && record.input_lease.is_some()
@@ -1315,7 +1311,7 @@ impl Pipeline {
                     if let Some(plane) = record.plane.as_mut()
                         && let Err(code) = plane.pump_contributions(allowed)
                     {
-                        input::stop_for_input_failure(record, code);
+                        input::stop_for_input_failure(record, StreamFailure::critical(code));
                     }
                 }
                 Err(failure) => {
@@ -1332,16 +1328,12 @@ impl Pipeline {
                         record.audio_recovery_needed = true;
                         continue;
                     }
-                    record.report_failure(
+                    record.raise_failure(
+                        StreamFailure::critical(failure.code),
                         lifecycle_issues::media_layer(failure.code),
                         "media",
-                        failure.code,
+                        FailureEffect::ReleaseBindings,
                     );
-                    record.error = Some(failure.code);
-                    record.outcome = State::Failed;
-                    record.history.stopping(failure.code);
-                    record.state = State::Stopping;
-                    record.plane = None;
                 }
             }
         }

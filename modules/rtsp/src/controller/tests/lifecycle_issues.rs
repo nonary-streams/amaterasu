@@ -160,7 +160,9 @@ fn a_stream_session_failure_is_reported_as_rtsps_reaction_once() {
         &runtime,
     );
     // A later reason does not replace the failure, and is not reported.
-    record.close(Some("operation_deadline"));
+    record.close(Some(
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("operation_deadline"),
+    ));
     controller.records.insert(record.id, record);
 
     let reports = publish(&mut controller);
@@ -185,9 +187,15 @@ fn an_unconfirmed_cleanup_is_reported_once_per_code() {
     controller.enable_stream_issue_reports();
     let mut record = launch_owned_record("launch-10");
     record.state = State::Closing;
-    record.fail_cleanup("invalid_stop_response");
-    record.fail_cleanup("invalid_stop_response");
-    record.fail_cleanup("cleanup_deadline");
+    record.fail_cleanup(
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("invalid_stop_response"),
+    );
+    record.fail_cleanup(
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("invalid_stop_response"),
+    );
+    record.fail_cleanup(
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("cleanup_deadline"),
+    );
     controller.records.insert(record.id, record);
 
     let reports = publish(&mut controller);
@@ -213,7 +221,9 @@ fn an_unconfirmed_cleanup_is_reported_once_per_code() {
 fn reports_are_off_until_enabled_and_only_cover_launch_owned_tickets() {
     let mut controller = Controller::new(Settings::default()).unwrap();
     let mut owned = launch_owned_record("launch-11");
-    owned.close(Some("network_disconnected"));
+    owned.close(Some(
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("network_disconnected"),
+    ));
     controller.records.insert(owned.id, owned);
     assert!(publish(&mut controller).is_empty(), "nothing is sent");
     assert!(
@@ -223,7 +233,9 @@ fn reports_are_off_until_enabled_and_only_cover_launch_owned_tickets() {
 
     controller.enable_stream_issue_reports();
     let mut foreign = record(State::Playing);
-    foreign.close(Some("network_disconnected"));
+    foreign.close(Some(
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("network_disconnected"),
+    ));
     controller.records.insert(foreign.id, foreign);
     assert!(publish(&mut controller).is_empty());
     assert!(controller.records[&5].issues.is_empty());
@@ -235,7 +247,7 @@ fn a_cancelled_request_is_the_callers_decision_and_not_reported() {
     controller.enable_stream_issue_reports();
     let mut record = launch_owned_record("launch-12");
     record.state = State::Preparing;
-    record.close(Some("request_cancelled"));
+    record.cancel();
     controller.records.insert(record.id, record);
     assert!(publish(&mut controller).is_empty());
 }

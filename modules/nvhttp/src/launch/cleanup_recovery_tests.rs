@@ -259,7 +259,7 @@ fn a_retained_application_settling_its_transport_still_holds_the_slot() {
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let record = controller.records.get_mut(&1).unwrap();
-    record.request_transport_cleanup(Some("stream_failed"), now);
+    record.request_transport_cleanup(Some(amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("stream_failed")), now);
     assert!(record.retains_application());
     assert_eq!(
         controller.application_admission(),
@@ -515,8 +515,8 @@ fn a_failed_transport_cleanup_keeps_the_retained_application_resumable() {
     launch_ready(&mut controller, &mut broker, now);
     let record = controller.records.get_mut(&1).unwrap();
     // Only this root's own transport failed to retire.
-    record.request_transport_cleanup(Some("stream_failed"), now);
-    record.fail_cleanup("rtsp_cleanup_unconfirmed");
+    record.request_transport_cleanup(Some(amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("stream_failed")), now);
+    record.fail_cleanup(amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("rtsp_cleanup_unconfirmed"));
     record.rtsp_cleanup_blocked = true;
     assert!(record.retains_application());
     broker.fail_rtsp_cleanup = true;

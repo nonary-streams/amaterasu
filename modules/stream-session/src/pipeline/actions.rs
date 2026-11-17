@@ -517,8 +517,8 @@ impl Pipeline {
                     && record.extension_limits.is_some()
                     && route.profile == profile
             }) else {
-                record.report_request_warning("start", "extension_profile_not_offered");
-                rpc::complete(send, request, error("extension_profile_not_offered"));
+                let refusal = record.request_error("start", "extension_profile_not_offered");
+                rpc::complete(send, request, refusal);
                 return;
             };
             let mut expected = record
@@ -538,8 +538,8 @@ impl Pipeline {
                 || configuration.encoder_provider.is_some()
                 || configuration.encoder_options.is_some()
             {
-                record.report_request_warning("start", "extension_configuration_mismatch");
-                rpc::complete(send, request, error("extension_configuration_mismatch"));
+                let refusal = record.request_error("start", "extension_configuration_mismatch");
+                rpc::complete(send, request, refusal);
                 return;
             }
             configuration.source_id = Some(route.source_id);
@@ -549,16 +549,16 @@ impl Pipeline {
         if let Err(code) =
             validate_start_configuration(lifecycle_admitter, record, &mut configuration)
         {
-            record.report_request_warning("start", code);
-            rpc::complete(send, request, error(code));
+            let refusal = record.request_error("start", code);
+            rpc::complete(send, request, refusal);
             return;
         }
         if mode != StartMode::Immediate
             && record.start.is_some()
             && record.video_warmup_requested != (mode == StartMode::BeforePlay)
         {
-            record.report_request_warning("start", "start_configuration_conflict");
-            rpc::complete(send, request, error("start_configuration_conflict"));
+            let refusal = record.request_error("start", "start_configuration_conflict");
+            rpc::complete(send, request, refusal);
             return;
         }
         if record.state == State::Active || (mode != StartMode::Immediate && record.armed_accepted)
@@ -567,8 +567,8 @@ impl Pipeline {
             return;
         }
         if record.state != State::Prepared {
-            record.report_request_warning("start", "invalid_state");
-            rpc::complete(send, request, error("invalid_state"));
+            let refusal = record.request_error("start", "invalid_state");
+            rpc::complete(send, request, refusal);
             return;
         }
         record.start = Some(configuration);
@@ -625,14 +625,12 @@ impl Pipeline {
             record.armed_accepted = true;
             record.next_auth_poll = now;
         } else {
-            record.report_failure(
+            record.raise_failure(
+                StreamFailure::critical("completion_unavailable"),
                 amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                 "arm",
-                "completion_unavailable",
+                super::record::FailureEffect::CancelUnconfirmed,
             );
-            record.state = State::Stopping;
-            record.outcome = State::Cancelled;
-            record.error = Some("completion_unavailable");
         }
     }
 
@@ -700,7 +698,7 @@ impl Pipeline {
             record.fail_cleanup(
                 amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                 "persist_journal",
-                code,
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
             );
             self.journal_waiting_stops.insert(record.id);
             rpc::complete(send, request, record.response());
@@ -723,7 +721,9 @@ impl Pipeline {
                 record.fail_cleanup(
                     amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                     "persist_journal",
-                    "lifecycle_journal_write_failed",
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "lifecycle_journal_write_failed",
+                    ),
                 );
                 rpc::complete(send, request, record.response());
                 return;

@@ -525,19 +525,16 @@ fn coalesce_controller_sample(
 }
 
 #[track_caller]
-pub(super) fn stop_for_input_failure(record: &mut Record, code: &'static str) {
-    record.report_failure(
+pub(super) fn stop_for_input_failure(
+    record: &mut Record,
+    failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
+) {
+    record.raise_failure(
+        failure,
         amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
         "input",
-        code,
+        super::record::FailureEffect::Stop,
     );
-    record.error.get_or_insert(code);
-    record.outcome = State::Failed;
-    record.history.stopping(code);
-    record.state = State::Stopping;
-    if let Some(plane) = record.plane.as_mut() {
-        plane.stop();
-    }
 }
 
 pub(super) fn accept_input_lease(

@@ -412,24 +412,64 @@ impl Record {
     /// Close this ticket. The first reason given is its failure, reported
     /// with the dependency the reason itself names, if any.
     #[track_caller]
-    pub fn close(&mut self, reason: Option<&'static str>) {
-        let cause = reason.and_then(Cause::of_close);
-        self.close_with_cause(reason, cause);
+    pub fn close(
+        &mut self,
+        failure: Option<amaterasu_module_sdk::stream_lifecycle::StreamFailure>,
+    ) {
+        let cause = failure
+            .as_ref()
+            .and_then(|failure| Cause::of_close(failure.code()));
+        self.close_with_cause(failure, cause);
     }
 
-    /// Close this ticket; `cause` is the dependency whose failure ended it.
-    #[track_caller]
-    pub fn close_with_cause(&mut self, reason: Option<&'static str>, cause: Option<Cause<'_>>) {
-        if let Some(reason) = reason {
-            if self.state == State::Playing {
-                eprintln!("amaterasu rtsp closing playing stream reason={reason}");
-            }
-            if self.failure.is_none() {
-                self.failure = Some(reason);
-                self.report_failure(reason, cause);
-            }
-        }
+    /// Explicit verified caller cancellation is a control action, not a failure.
+    pub fn cancel(&mut self) {
+        self.failure.get_or_insert("request_cancelled");
         self.state = State::Closing;
+    }
+
+    #[track_caller]
+    pub fn close_with_cause(
+        &mut self,
+        failure: Option<amaterasu_module_sdk::stream_lifecycle::StreamFailure>,
+        cause: Option<Cause<'_>>,
+    ) {
+        use amaterasu_module_sdk::stream_lifecycle::{
+            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
+        };
+        let Some(failure) = failure else {
+            // This entry point is used by authorized close/TEARDOWN operations.
+            self.state = State::Closing;
+            return;
+        };
+        let code = failure.code();
+        let issue = super::lifecycle_issues::with_cause(
+            failure.at(
+                self.config.operation_id.clone(),
+                LifecycleLayer::Rtsp,
+                self.state.phase(),
+            ),
+            cause,
+        );
+        match StreamFailureHandler::decide(issue) {
+            StreamFailureDecision::Terminate(permit) => self.close_reported(permit, code),
+            StreamFailureDecision::Continue(issue) => self.issues.push(issue),
+            StreamFailureDecision::Invalid(_) => {}
+        }
+    }
+
+    pub(super) fn close_reported(
+        &mut self,
+        permit: amaterasu_module_sdk::stream_lifecycle::StreamTermination,
+        code: &'static str,
+    ) {
+        permit.terminate(|issue| {
+            if self.failure.is_none() {
+                self.failure = Some(code);
+                self.issues.push(issue);
+            }
+            self.state = State::Closing;
+        });
     }
 
     pub fn capabilities(&self) -> Capabilities {

@@ -90,6 +90,7 @@ pub enum ApplicationRetirementState {
 }
 
 pub struct Record {
+    failure_authority: Option<amaterasu_module_sdk::stream_lifecycle::StreamTermination>,
     pub id: u64,
     /// Joining transports borrow the application/session retained by this root.
     /// Only the root may terminate the application or end the lifecycle session.
@@ -334,6 +335,7 @@ impl Record {
         });
         let application_owner_client_id = super::fingerprint(peer.certificate());
         Self {
+            failure_authority: None,
             id,
             application_session: None,
             application_owner_client_id,
@@ -526,14 +528,86 @@ impl Record {
         }
     }
 
+    /// Reports reach the common decision point; final effects require its
+    /// retained authority. A raw state/error field cannot authorize a 503.
     #[track_caller]
-    pub fn request_cleanup(&mut self, failure: Option<&'static str>, now: Instant) {
-        if let Some(failure) = failure {
-            self.failure.get_or_insert(failure);
-            self.record_failure(failure);
+    pub(super) fn process_failure<T>(
+        &mut self,
+        failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
+        effect: impl FnOnce(&mut Self) -> T,
+    ) -> Option<T> {
+        use amaterasu_module_sdk::stream_lifecycle::{
+            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
+        };
+        let issue = self.attributed(failure.at(
+            self.rtsp_operation.clone(),
+            LifecycleLayer::Nvhttp,
+            "failure",
+        ));
+        match StreamFailureHandler::decide(issue) {
+            StreamFailureDecision::Terminate(permit) => {
+                let value = permit.authorize(|issue| {
+                    self.issues.push(issue.clone());
+                    effect(self)
+                });
+                if self.failure_authority.is_none() {
+                    self.failure_authority = Some(permit);
+                }
+                Some(value)
+            }
+            StreamFailureDecision::Continue(issue) => {
+                self.issues.push(issue);
+                None
+            }
+            StreamFailureDecision::Invalid(_) => None,
         }
+    }
+
+    pub(super) fn with_failure_authority<T>(
+        &mut self,
+        effect: impl FnOnce(&mut Self) -> T,
+    ) -> Option<T> {
+        let permit = self.failure_authority.take()?;
+        let value = permit.authorize(|_| effect(self));
+        self.failure_authority = Some(permit);
+        Some(value)
+    }
+
+    #[track_caller]
+    pub fn request_cleanup(
+        &mut self,
+        failure: Option<amaterasu_module_sdk::stream_lifecycle::StreamFailure>,
+        now: Instant,
+    ) {
+        self.apply_cleanup_request(failure, now);
+    }
+
+    #[track_caller]
+    fn apply_cleanup_request(
+        &mut self,
+        failure: Option<amaterasu_module_sdk::stream_lifecycle::StreamFailure>,
+        now: Instant,
+    ) -> bool {
+        if let Some(failure) = failure {
+            let code = failure.code();
+            self.process_failure(failure, |record| {
+                record.failure.get_or_insert(code);
+                record.begin_cleanup(now);
+            })
+            .is_some()
+        } else {
+            self.begin_cleanup(now); // Verified caller stop, not failure policy.
+            true
+        }
+    }
+
+    fn begin_cleanup(&mut self, now: Instant) {
         if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
-            self.fail_cleanup("lifecycle_retirement_unavailable");
+            self.fail_cleanup(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "lifecycle_retirement_unavailable",
+                ),
+            );
             return;
         }
         let already_stopping = self.state == State::Stopping;
@@ -552,22 +626,27 @@ impl Record {
     }
 
     #[track_caller]
-    pub fn request_transport_cleanup(&mut self, failure: Option<&'static str>, now: Instant) {
-        self.request_cleanup(failure, now);
-        self.transport_only_cleanup = true;
+    pub fn request_transport_cleanup(
+        &mut self,
+        failure: Option<amaterasu_module_sdk::stream_lifecycle::StreamFailure>,
+        now: Instant,
+    ) {
+        if self.apply_cleanup_request(failure, now) {
+            self.transport_only_cleanup = true;
+        }
     }
 
-    /// A failed monitor does not prove that the stream has retired. Keep the
-    /// application alive until the exact RTSP cleanup receipt is available.
     #[track_caller]
     pub fn request_monitored_transport_cleanup(
         &mut self,
-        failure: Option<&'static str>,
+        failure: Option<amaterasu_module_sdk::stream_lifecycle::StreamFailure>,
         now: Instant,
     ) {
-        self.stop_application_after_stream_retirement =
-            self.application_session.is_none() && self.stop_on_stream_end;
-        self.request_transport_cleanup(failure, now);
+        if self.apply_cleanup_request(failure, now) {
+            self.transport_only_cleanup = true;
+            self.stop_application_after_stream_retirement =
+                self.application_session.is_none() && self.stop_on_stream_end;
+        }
     }
 
     pub fn cleanup_deadline(&self, now: Instant) -> Instant {
@@ -582,11 +661,13 @@ impl Record {
     }
 
     #[track_caller]
-    pub fn fail_cleanup(&mut self, error: &'static str) {
-        self.record_failure(error);
-        self.state = State::CleanupFailed;
-        self.cleanup_error = Some(error);
-        self.automatic_cleanup_retry_active = false;
+    pub fn fail_cleanup(&mut self, failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure) {
+        let code = failure.code();
+        self.process_failure(failure, |record| {
+            record.state = State::CleanupFailed;
+            record.cleanup_error = Some(code);
+            record.automatic_cleanup_retry_active = false;
+        });
     }
 
     /// History release is idempotent for the frozen activity identity. No
@@ -634,7 +715,11 @@ impl Record {
     pub fn retry_cleanup(&mut self, now: Instant) -> Result<Option<(Phase, Call)>, &'static str> {
         if self.lifecycle_application_retirement == ApplicationRetirementState::Failed {
             let Some(attempt) = self.lifecycle_application_retirement_attempt.checked_add(1) else {
-                self.fail_cleanup("application_retirement_attempts_exhausted");
+                self.fail_cleanup(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "application_retirement_attempts_exhausted",
+                    ),
+                );
                 return Err("application_retirement_attempts_exhausted");
             };
             self.lifecycle_application_retirement_attempt = attempt;
@@ -751,7 +836,11 @@ impl Record {
         deadline: Instant,
     ) -> Result<Option<(Phase, Call)>, &'static str> {
         if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
-            self.fail_cleanup("lifecycle_retirement_unavailable");
+            self.fail_cleanup(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "lifecycle_retirement_unavailable",
+                ),
+            );
             return Err("lifecycle_retirement_unavailable");
         }
         self.automatic_cleanup_retry_active = false;

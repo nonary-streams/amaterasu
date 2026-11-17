@@ -311,7 +311,14 @@ impl Controller {
                 record.application_session == Some(application) && !record.state.terminal()
             }) {
                 if !matches!(record.state, State::Stopping | State::CleanupFailed) {
-                    record.request_transport_cleanup(Some("application_ended"), now);
+                    record.request_transport_cleanup(
+                        Some(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                "application_ended",
+                            ),
+                        ),
+                        now,
+                    );
                 }
             }
             let waiting = self.records.values().any(|record| {
@@ -327,16 +334,20 @@ impl Controller {
                     .records
                     .get_mut(&application)
                     .expect("retained application");
-                root.fail_cleanup("shared_stream_cleanup_unconfirmed");
+                root.fail_cleanup(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "shared_stream_cleanup_unconfirmed",
+                    ),
+                );
                 if let Some(connection) = root
                     .cancel_connection
                     .take()
                     .or(root.launch_connection.take())
+                    && let Some(reply) = root.with_failure_authority(|_| {
+                        private_error(503, "shared stream cleanup is unconfirmed")
+                    })
                 {
-                    self.management_replies.push((
-                        connection,
-                        private_error(503, "shared stream cleanup is unconfirmed"),
-                    ));
+                    self.management_replies.push((connection, reply));
                 }
             }
         }

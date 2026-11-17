@@ -216,6 +216,7 @@ pub struct Controller {
     locals: Vec<SocketAddr>,
     records: BTreeMap<u64, Record>,
     pending_network: VecDeque<PendingNetwork>,
+    noncritical_connections: BTreeSet<u64>,
     pending_ignored_client_features: u32,
     pending_adjustment_logs: VecDeque<String>,
     /// The job of an open ticket or an incoming request. While it is busy
@@ -294,6 +295,7 @@ impl Controller {
             locals,
             records: BTreeMap::new(),
             pending_network: VecDeque::new(),
+            noncritical_connections: BTreeSet::new(),
             pending_ignored_client_features: 0,
             pending_adjustment_logs: VecDeque::new(),
             job: None,
@@ -450,7 +452,11 @@ impl Controller {
                 continue;
             };
             if !record.state.terminal() && record.state != State::Closing {
-                record.close(Some("module_stopping"));
+                record.close(Some(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "module_stopping",
+                    ),
+                ));
             }
             self.revoke_ticket(ticket);
             if !record.cleanup_confirmed {
@@ -480,7 +486,11 @@ impl Controller {
                     .push(record.uncertain.take().expect("retained call"));
                 record.uncertain_phase = None;
             } else {
-                record.fail_cleanup("shutdown_settlement_unconfirmed");
+                record.fail_cleanup(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "shutdown_settlement_unconfirmed",
+                    ),
+                );
                 return;
             }
         }
@@ -496,12 +506,20 @@ impl Controller {
                 Ok(payload) if payload["ok"] == true => {
                     record.session = response_session(&payload);
                     if record.session.is_none() {
-                        record.fail_cleanup("shutdown_lookup_invalid");
+                        record.fail_cleanup(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                "shutdown_lookup_invalid",
+                            ),
+                        );
                         return;
                     }
                 }
                 Ok(payload) if payload["code"] == "session_not_found" => {
-                    record.fail_cleanup("shutdown_lookup_not_found");
+                    record.fail_cleanup(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "shutdown_lookup_not_found",
+                        ),
+                    );
                     return;
                 }
                 Err(failure) => {
@@ -509,7 +527,11 @@ impl Controller {
                     return;
                 }
                 Ok(_) => {
-                    record.fail_cleanup("shutdown_lookup_unconfirmed");
+                    record.fail_cleanup(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "shutdown_lookup_unconfirmed",
+                        ),
+                    );
                     return;
                 }
             }
@@ -541,7 +563,11 @@ impl Controller {
                 finish_record(record);
             }
             Ok(_) => {
-                record.fail_cleanup("shutdown_stop_rejected");
+                record.fail_cleanup(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "shutdown_stop_rejected",
+                    ),
+                );
             }
             Err(failure) => retain_shutdown_failure(record, Phase::Stop, failure),
         }
@@ -573,7 +599,11 @@ impl Controller {
                         }
                     }
                     preparation::PreparationResolution::Unconfirmed => {
-                        record.fail_cleanup("shutdown_lifecycle_unconfirmed");
+                        record.fail_cleanup(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                "shutdown_lifecycle_unconfirmed",
+                            ),
+                        );
                         return false;
                     }
                 },
@@ -583,7 +613,11 @@ impl Controller {
                 }
             }
         }
-        record.fail_cleanup("shutdown_lifecycle_deadline");
+        record.fail_cleanup(
+            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                "shutdown_lifecycle_deadline",
+            ),
+        );
         false
     }
 
@@ -758,10 +792,36 @@ impl Controller {
         }
     }
 
-    fn reply_status(&mut self, connection: u64, cseq: u32, status: u16) -> bool {
-        serialize_response(status, cseq, &[], &[])
-            .ok()
-            .is_some_and(|reply| self.reply_bytes(connection, &reply))
+    /// The sole status-refusal writer. The supplied report always reaches the
+    /// common decision point before any negative response can reach transport.
+    fn reply_status(
+        &mut self,
+        connection: u64,
+        cseq: u32,
+        status: u16,
+        failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
+    ) -> bool {
+        use amaterasu_module_sdk::stream_lifecycle::{
+            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
+        };
+        let issue = failure.at(
+            format!("rtsp-connection-{connection}"),
+            LifecycleLayer::Rtsp,
+            "request",
+        );
+        let allowed = match StreamFailureHandler::decide(issue) {
+            StreamFailureDecision::Terminate(permit) => permit.authorize(|_| true),
+            StreamFailureDecision::Continue(issue) => {
+                self.stream_issues.push(issue);
+                self.mark_noncritical_connection(connection);
+                true // Refuse only the affected request; retain the stream.
+            }
+            StreamFailureDecision::Invalid(_) => false,
+        };
+        allowed
+            && serialize_response(status, cseq, &[], &[])
+                .ok()
+                .is_some_and(|reply| self.reply_bytes(connection, &reply))
     }
 
     fn reply_bytes(&mut self, connection: u64, reply: &[u8]) -> bool {
@@ -1261,7 +1321,9 @@ fn apply_undispatched_shutdown_proof(record: &mut Record, phase: Phase, call: &C
 }
 
 fn retain_shutdown_failure(record: &mut Record, phase: Phase, failure: ShutdownFailure) {
-    record.fail_cleanup(failure.code);
+    record.fail_cleanup(
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(failure.code),
+    );
     record.uncertain_phase = Some(phase);
     record.uncertain = Some(*failure.call);
 }
@@ -1328,7 +1390,11 @@ fn finish_record(record: &mut Record) {
         || (record.lifecycle_target.is_some() && !record.cleanup_confirmed)
     {
         record.cleanup_confirmed = false;
-        record.fail_cleanup("lifecycle_retirement_unconfirmed");
+        record.fail_cleanup(
+            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                "lifecycle_retirement_unconfirmed",
+            ),
+        );
         return;
     }
     record.display_applied = false;

@@ -406,9 +406,11 @@ impl Controller {
                 private_error(503, "stream cleanup is incomplete"),
             ));
         }
-        if let Some(connection) = launch_connection {
-            self.management_replies
-                .push((connection, private_error(503, "stream launch failed")));
+        if let Some(connection) = launch_connection
+            && let Some(reply) =
+                record.with_failure_authority(|_| private_error(503, "stream launch failed"))
+        {
+            self.management_replies.push((connection, reply));
         }
     }
 

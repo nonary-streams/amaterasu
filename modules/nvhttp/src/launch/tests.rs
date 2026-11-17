@@ -6343,7 +6343,7 @@ fn the_failing_provider_is_the_root_cause_through_each_callers_binding() {
         .records
         .get_mut(&id)
         .unwrap()
-        .request_cleanup(Some("monitor_unavailable"), now);
+        .request_cleanup(Some(amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("monitor_unavailable")), now);
     controller.poll(now, &mut |command| reports.send(&mut broker, command));
 
     let lifecycle = lifecycle_of(&controller, id);
@@ -6366,4 +6366,49 @@ fn the_failing_provider_is_the_root_cause_through_each_callers_binding() {
     );
     assert_eq!(controller.stream_lifecycle.unattributed().count(), 0);
     assert!(!lifecycle.audit_gap());
+}
+
+#[test]
+fn warning_reports_cannot_stop_a_launch_or_change_cleanup_ownership() {
+    use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    let record = controller.records.get_mut(&1).unwrap();
+    let before = (record.state, record.transport_only_cleanup,
+        record.stop_application_after_stream_retirement, record.application_launch,
+        record.rtsp_ticket, record.deadline);
+    record.request_cleanup(Some(StreamFailure::advisory("advisory_hint")), now);
+    record.request_transport_cleanup(Some(StreamFailure::advisory("optional_hint")), now);
+    record.request_monitored_transport_cleanup(Some(StreamFailure::demoted("optional_unavailable", "continue")), now);
+    record.fail_cleanup(StreamFailure::advisory("diagnostic_unavailable"));
+    assert_eq!((record.state, record.transport_only_cleanup,
+        record.stop_application_after_stream_retirement, record.application_launch,
+        record.rtsp_ticket, record.deadline), before);
+    assert_eq!(record.failure, None);
+    assert_eq!(record.cleanup_error, None);
+    assert!(!broker.rtsp_closed);
+    assert!(!broker.application_stopped);
+}
+
+#[test]
+fn raw_error_fields_cannot_authorize_a_launch_503_but_a_critical_report_can() {
+    use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    let record = controller.records.get_mut(&1).unwrap();
+    record.launch_connection = Some(77);
+    record.failure = Some("synthetic_error_field");
+    let mut replies = Vec::new();
+    super::workflow::reply_failure(record, &mut replies);
+    assert!(replies.is_empty());
+    assert_eq!(record.launch_connection, Some(77));
+    record.failure = None;
+    record.request_cleanup(Some(StreamFailure::critical("authorization_lost")), now);
+    super::workflow::reply_failure(record, &mut replies);
+    assert!(matches!(&replies[..], [(77, reply)] if reply.status == 503));
+    assert_eq!(record.state, State::Stopping);
 }

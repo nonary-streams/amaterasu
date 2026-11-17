@@ -509,7 +509,7 @@ fn a_joined_client_can_confirm_application_exit_after_the_source_monitor_is_fenc
         .records
         .get_mut(&1)
         .unwrap()
-        .fail_cleanup("rtsp_cleanup_unconfirmed");
+        .fail_cleanup(amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("rtsp_cleanup_unconfirmed"));
     assert_eq!(controller.records[&1].state, State::CleanupFailed);
     assert_eq!(controller.records[&2].state, State::Ready);
     broker.broker.application_state = "stopped";

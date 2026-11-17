@@ -426,3 +426,39 @@ fn response_admission_and_write_deadline_are_bounded() {
         }]
     ));
 }
+
+#[test]
+fn request_pressure_backpressures_instead_of_emitting_a_rejection() {
+    let mut server = server();
+    let key = [61; 16];
+    server
+        .add_ticket(7, "127.0.0.1".parse().unwrap(), &key)
+        .unwrap();
+    let mut sealer = RtspSealer::new(&key, Direction::ClientToHost).unwrap();
+    let mut client = connect(&server, &sealer.seal(&request(1)).unwrap());
+    for now in 1..=4 {
+        assert!(server.poll_with_request_budget(now, 0).is_empty());
+        assert_eq!(server.connection_count(), 1);
+    }
+    let mut events = server.poll_with_request_budget(5, 1);
+    let Event::Request {
+        connection,
+        ticket,
+        request,
+    } = events.remove(0)
+    else {
+        panic!("request was lost");
+    };
+    assert_eq!((ticket, request.cseq), (7, 1));
+    server
+        .reply(connection, &serialize_response(200, 1, &[], &[]).unwrap())
+        .unwrap();
+    assert_eq!(disconnected(&mut server), ("response_complete", Some(7)));
+    let mut bytes = Vec::new();
+    client.read_to_end(&mut bytes).unwrap();
+    let message = RtspOpener::new(&key, Direction::HostToClient)
+        .unwrap()
+        .open(&bytes)
+        .unwrap();
+    assert!(message.plaintext.starts_with(b"RTSP/1.0 200 "));
+}

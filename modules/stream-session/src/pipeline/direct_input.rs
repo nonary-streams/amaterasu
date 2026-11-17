@@ -13,6 +13,7 @@ use super::input::{
 use super::record::{Record, State};
 use super::{Pipeline, Step};
 use amaterasu_module_sdk::input::INPUT_SERVICE;
+use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
 use amaterasu_module_sdk::{DirectReply, ModuleResult};
 use serde_json::Value;
 
@@ -70,7 +71,7 @@ fn deliver(record: &mut Record, now: u64, direct: &mut DirectCall<'_>) -> bool {
                 record.input_direct_declines = 0;
                 if let Err(code) = accept_direct_reply(record, &reply) {
                     record.input_inflight = 0;
-                    stop_for_input_failure(record, code);
+                    stop_for_input_failure(record, StreamFailure::critical(code));
                     return false;
                 }
             }
@@ -88,7 +89,7 @@ fn deliver(record: &mut Record, now: u64, direct: &mut DirectCall<'_>) -> bool {
                 // The provider was entered and its outcome is unknown; a
                 // replay could inject the same events twice.
                 record.input_inflight = 0;
-                stop_for_input_failure(record, "input_batch_failed");
+                stop_for_input_failure(record, StreamFailure::critical("input_batch_failed"));
                 return false;
             }
         }

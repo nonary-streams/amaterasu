@@ -26,7 +26,7 @@ impl Controller {
                 .caller
                 .is_some_and(|request| !rpc::active(runtime, request))
         {
-            record.close(Some("request_cancelled"));
+            record.cancel();
             job.call.cancel();
             job.deadline = self.cleanup_deadline(now);
         }
@@ -38,7 +38,11 @@ impl Controller {
             return;
         }
         if now >= job.deadline && record.state != State::Closing {
-            record.close(Some("operation_deadline"));
+            record.close(Some(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "operation_deadline",
+                ),
+            ));
             job.call.cancel();
             job.deadline = self.cleanup_deadline(now);
         }
@@ -90,7 +94,11 @@ impl Controller {
     ) {
         match job.phase {
             Phase::Prepare => {
-                record.close(Some("dependency_unavailable"));
+                record.close(Some(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "dependency_unavailable",
+                    ),
+                ));
                 if job.call.proven_not_dispatched() {
                     record.needs_lookup = false;
                     self.schedule_cleanup(record, job.caller, now);
@@ -101,7 +109,11 @@ impl Controller {
             }
             Phase::LifecyclePrepare | Phase::LifecycleLookup => {
                 record.close_with_cause(
-                    Some("dependency_unavailable"),
+                    Some(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "dependency_unavailable",
+                        ),
+                    ),
                     Some(Cause::of_phase(job.phase)),
                 );
                 if let Some((connection, action_ticket)) = job.network {
@@ -109,7 +121,9 @@ impl Controller {
                         record,
                         connection,
                         action_ticket,
-                        "dependency_unavailable",
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "dependency_unavailable",
+                        ),
                     );
                 }
                 if job.phase == Phase::LifecyclePrepare && job.call.proven_not_dispatched() {
@@ -125,7 +139,11 @@ impl Controller {
                         self.cleanup_deadline(now),
                     );
                 } else {
-                    record.fail_cleanup("lifecycle_prepare_lookup_unavailable");
+                    record.fail_cleanup(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "lifecycle_prepare_lookup_unavailable",
+                        ),
+                    );
                     complete_caller(record, job.caller, runtime);
                 }
             }
@@ -135,10 +153,16 @@ impl Controller {
                         record,
                         connection,
                         action_ticket,
-                        "dependency_unavailable",
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "dependency_unavailable",
+                        ),
                     );
                 } else {
-                    record.close(Some("network_disconnected"));
+                    record.close(Some(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "network_disconnected",
+                        ),
+                    ));
                     self.schedule_stop(record, job.caller, now);
                 }
             }
@@ -149,7 +173,11 @@ impl Controller {
                 record.next_status = now.saturating_add(STATUS_INTERVAL_MS);
             }
             Phase::Find | Phase::Observe | Phase::Status => {
-                record.fail_cleanup("dependency_unavailable");
+                record.fail_cleanup(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "dependency_unavailable",
+                    ),
+                );
                 complete_caller(record, job.caller, runtime);
             }
         }
@@ -196,10 +224,16 @@ impl Controller {
                         record,
                         connection,
                         action_ticket,
-                        "lifecycle_prepare_rejected",
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "lifecycle_prepare_rejected",
+                        ),
                     );
                 } else {
-                    record.close(Some("lifecycle_prepare_rejected"));
+                    record.close(Some(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "lifecycle_prepare_rejected",
+                        ),
+                    ));
                 }
                 self.schedule_stop(record, job.caller, now);
             }
@@ -210,7 +244,9 @@ impl Controller {
                             record,
                             connection,
                             action_ticket,
-                            "negotiation_failed",
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                "negotiation_failed",
+                            ),
                         );
                         return;
                     };
@@ -222,7 +258,11 @@ impl Controller {
                         job.deadline,
                     );
                 } else {
-                    record.close(Some("network_disconnected"));
+                    record.close(Some(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "network_disconnected",
+                        ),
+                    ));
                     self.schedule_stop(record, job.caller, now);
                 }
             }
@@ -244,11 +284,21 @@ impl Controller {
                 record,
                 connection,
                 action_ticket,
-                "lifecycle_prepare_rejected",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "lifecycle_prepare_rejected",
+                ),
             );
         } else {
-            record.close(Some("lifecycle_prepare_rejected"));
-            record.fail_cleanup("lifecycle_prepare_unconfirmed");
+            record.close(Some(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "lifecycle_prepare_rejected",
+                ),
+            ));
+            record.fail_cleanup(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "lifecycle_prepare_unconfirmed",
+                ),
+            );
             complete_caller(record, caller, runtime);
         }
     }
@@ -428,7 +478,10 @@ impl Controller {
             } else {
                 Cause::of_close(code)
             };
-            record.close_with_cause(Some(code), cause);
+            record.close_with_cause(
+                Some(amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code)),
+                cause,
+            );
             self.revoke_ticket(record.id);
             self.schedule_cleanup(record, job.caller, now);
             return;
@@ -437,7 +490,11 @@ impl Controller {
             rpc::active(runtime, request) && rpc::complete(runtime, request, record.response())
         });
         if !accepted {
-            record.close(Some("completion_unavailable"));
+            record.close(Some(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "completion_unavailable",
+                ),
+            ));
             self.revoke_ticket(record.id);
             self.schedule_stop(record, None, now);
         }
@@ -460,7 +517,11 @@ impl Controller {
             return;
         }
         let Some(session) = response_session(payload) else {
-            record.fail_cleanup("invalid_lookup_response");
+            record.fail_cleanup(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "invalid_lookup_response",
+                ),
+            );
             complete_caller(record, job.caller, runtime);
             return;
         };
@@ -494,36 +555,57 @@ impl Controller {
             record.stream_state = Some(state.into());
         }
         let Some((connection, action_ticket)) = job.network else {
-            record.close(Some("network_disconnected"));
+            record.close(Some(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "network_disconnected",
+                ),
+            ));
             self.schedule_stop(record, job.caller, now);
             return;
         };
-        let termination =
-            (!valid).then(|| Self::critical_network_failure(record, "arm", "start_rejected"));
-        let reply = record
-            .negotiation
-            .as_mut()
-            .and_then(|negotiation| negotiation.complete(record.id, action_ticket, valid).ok());
-        let replied = if let Some(reply) = reply {
-            self.reply_bytes(connection, &reply)
+        let cause = (!valid).then(|| Cause::stream_session(provider_code(payload)));
+        let mut prepared_refusal = false;
+        let outcome = if valid {
+            Ok(super::network::NetworkCompletion::NativeStart)
         } else {
-            self.revoke_ticket(record.id);
-            false
+            let report = payload
+                .get("stream_failure")
+                .and_then(|value| {
+                    serde_json::from_value::<amaterasu_module_sdk::stream_lifecycle::StreamIssue>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .filter(|report| {
+                    report.operation == record.config.operation_id
+                        && report.valid()
+                        && !report.reason.is_empty()
+                });
+            Err(match report {
+                Some(report) => {
+                    prepared_refusal = !report.is_critical()
+                        && state == Some("prepared")
+                        && response_session(payload) == record.session
+                        && payload["cleanup_error"].is_null();
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::reported(
+                        "start_rejected",
+                        report,
+                    )
+                }
+                None => amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "start_rejected",
+                ),
+            })
         };
-        if valid && replied {
+        if self.finish_network_result(record, connection, action_ticket, outcome, cause) {
             record.state = State::Playing;
             record.expires = u64::MAX;
             record.observation_stale_at = now.saturating_add(OBSERVATION_STALE_MS);
             record.next_status = now.saturating_add(STATUS_INTERVAL_MS);
-        } else {
-            // A refused start is stream-session's verdict; a reply RTSP could
-            // not deliver is RTSP's own failure.
-            let cause = (!valid).then(|| Cause::stream_session(provider_code(payload)));
-            let permit = termination.unwrap_or_else(|| {
-                Self::critical_network_failure(record, "reply", "response_unavailable")
-            });
-            permit.terminate(|_| record.close_with_cause(Some("start_rejected"), cause));
-            record.revoke_after = replied.then_some(connection);
+        } else if prepared_refusal && record.failure.is_none() && record.state == State::Arming {
+            // Exact selected provider confirms the same session is still only
+            // prepared. No retirement or media mutation is inferred from a log.
+            record.state = State::Ready;
         }
     }
 
@@ -543,7 +625,11 @@ impl Controller {
         } else if response_session(payload) == record.session {
             self.schedule_status_until(record, job.caller, job.network, job.deadline);
         } else {
-            record.fail_cleanup("invalid_stop_response");
+            record.fail_cleanup(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "invalid_stop_response",
+                ),
+            );
             complete_caller(record, job.caller, runtime);
         }
     }
@@ -558,9 +644,17 @@ impl Controller {
     ) {
         let state = stream_state(payload);
         if response_session(payload) != record.session || payload["ok"] != true || state.is_none() {
-            record.close(Some("stream_status_unavailable"));
+            record.close(Some(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "stream_status_unavailable",
+                ),
+            ));
             if job.network.is_some() || job.caller.is_some() {
-                record.fail_cleanup("invalid_status_response");
+                record.fail_cleanup(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "invalid_status_response",
+                    ),
+                );
                 complete_caller(record, job.caller, runtime);
             } else {
                 self.schedule_stop(record, None, now);
@@ -573,17 +667,29 @@ impl Controller {
             record.authenticated_disconnect_reason =
                 authenticated_disconnect_reason(record, payload);
             if record.state != State::Closing {
-                record.close(Some("stream_failed"));
+                record.close(Some(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "stream_failed",
+                    ),
+                ));
             }
             self.finish_cleanup_reply(record, job, runtime);
         } else if matches!(state, Some("cleanup_failed" | "failed" | "cancelled"))
             || !payload["cleanup_error"].is_null()
         {
             if record.state == State::Closing {
-                record.fail_cleanup("stream_cleanup_failed");
+                record.fail_cleanup(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "stream_cleanup_failed",
+                    ),
+                );
                 complete_caller(record, job.caller, runtime);
             } else {
-                record.close(Some("stream_failed"));
+                record.close(Some(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "stream_failed",
+                    ),
+                ));
                 self.revoke_ticket(record.id);
                 self.schedule_stop(record, None, now);
             }
@@ -609,7 +715,7 @@ impl Controller {
             let reply = record
                 .negotiation
                 .as_mut()
-                .and_then(|negotiation| negotiation.complete(record.id, action_ticket, true).ok());
+                .and_then(|negotiation| negotiation.complete(record.id, action_ticket).ok());
             if let Some(reply) = reply {
                 if self.reply_bytes(connection, &reply) {
                     record.revoke_after = Some(connection);
@@ -638,10 +744,14 @@ impl Controller {
         runtime: &RuntimeClient,
     ) {
         record.close_with_cause(
-            Some("dependency_unavailable"),
+            Some(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "dependency_unavailable",
+                ),
+            ),
             Some(Cause::of_phase(job.phase)),
         );
-        record.fail_cleanup(code);
+        record.fail_cleanup(amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code));
         record.uncertain_phase = Some(job.phase);
         record.uncertain = Some(job.call);
         self.revoke_ticket(record.id);
@@ -663,7 +773,11 @@ impl Controller {
     pub(super) fn schedule_background(&mut self, now: u64) {
         for record in self.records.values_mut() {
             if record.state == State::Playing && now >= record.observation_stale_at {
-                record.close(Some("stream_observation_lost"));
+                record.close(Some(
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "stream_observation_lost",
+                    ),
+                ));
             }
         }
         if let Some(ticket) = self
@@ -675,7 +789,9 @@ impl Controller {
             .map(|record| record.id)
         {
             let record = self.records.get_mut(&ticket).expect("selected record");
-            record.close(Some("prepare_expired"));
+            record.close(Some(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("prepare_expired"),
+            ));
             self.revoke_ticket(ticket);
         }
         // Cleanup of ended tickets is scheduled by `schedule_retiring`; the

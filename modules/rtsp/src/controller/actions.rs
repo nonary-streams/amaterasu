@@ -116,7 +116,7 @@ impl Controller {
                 input.request,
                 &input.caller,
                 &input.config.operation_id,
-                "module_quiescing",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("module_quiescing"),
             );
             return;
         }
@@ -137,7 +137,9 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                "runtime_epoch_changed",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "runtime_epoch_changed",
+                ),
             );
             return;
         }
@@ -150,12 +152,20 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                "startup_reconciliation_pending",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "startup_reconciliation_pending",
+                ),
             );
             return;
         }
         if !self.settings.enabled {
-            self.refuse_open(runtime, request, &caller, &config.operation_id, "disabled");
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("disabled"),
+            );
             return;
         }
         if !self
@@ -169,7 +179,9 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                "permission_denied",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "permission_denied",
+                ),
             );
             return;
         }
@@ -182,12 +194,20 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                "operation_retired",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "operation_retired",
+                ),
             );
             return;
         }
         if let Err(code) = config.validate(self.settings.allow_remote) {
-            self.refuse_open(runtime, request, &caller, &config.operation_id, code);
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+            );
             return;
         }
         if config.lifecycle_session_target.is_some() && self.settings.lifecycle_service.is_none() {
@@ -196,7 +216,9 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                "lifecycle_provider_not_selected",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "lifecycle_provider_not_selected",
+                ),
             );
             return;
         }
@@ -216,7 +238,9 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                "history_activity_denied",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "history_activity_denied",
+                ),
             );
             return;
         }
@@ -228,14 +252,22 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                "display_admission_expired",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "display_admission_expired",
+                ),
             );
             return;
         }
         let local = match self.advertised_local_for_peer(config.peer_ip) {
             Ok(local) => local,
             Err(code) => {
-                self.refuse_open(runtime, request, &caller, &config.operation_id, code);
+                self.refuse_open(
+                    runtime,
+                    request,
+                    &caller,
+                    &config.operation_id,
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                );
                 return;
             }
         };
@@ -266,7 +298,9 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                "capacity_exceeded",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "capacity_exceeded",
+                ),
             );
             return;
         }
@@ -277,7 +311,9 @@ impl Controller {
                     request,
                     &caller,
                     &config.operation_id,
-                    "display_admission_unavailable",
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "display_admission_unavailable",
+                    ),
                 );
                 return;
             }
@@ -332,7 +368,13 @@ impl Controller {
         {
             Ok(identity) => identity,
             Err(code) => {
-                self.refuse_open(runtime, request, &caller, &config.operation_id, code);
+                self.refuse_open(
+                    runtime,
+                    request,
+                    &caller,
+                    &config.operation_id,
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
+                );
                 return;
             }
         };
@@ -350,7 +392,9 @@ impl Controller {
                 request,
                 &caller,
                 &config.operation_id,
-                "media_port_capacity_exhausted",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "media_port_capacity_exhausted",
+                ),
             );
             return;
         }
@@ -476,7 +520,13 @@ impl Controller {
                     true,
                 );
             } else {
-                self.refuse_display_admission(runtime, &admission, "display_admission_unavailable");
+                self.refuse_display_admission(
+                    runtime,
+                    &admission,
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "display_admission_unavailable",
+                    ),
+                );
             }
             return;
         }
@@ -492,7 +542,9 @@ impl Controller {
                     self.refuse_display_admission(
                         runtime,
                         &admission,
-                        "display_admission_unavailable",
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "display_admission_unavailable",
+                        ),
                     );
                     self.display_cleanup.push(DisplayCleanup {
                         owner: admission.caller,
@@ -524,15 +576,33 @@ impl Controller {
                     admission.display_preflight_deadline = preflight_deadline;
                     self.display_admission = Some(admission);
                 } else {
-                    self.refuse_display_admission(runtime, &admission, "display_admission_denied");
+                    self.refuse_display_admission(
+                        runtime,
+                        &admission,
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "display_admission_denied",
+                        ),
+                    );
                 }
             }
             Outcome::SettledFailure => {
-                self.refuse_display_admission(runtime, &admission, "display_admission_unavailable");
+                self.refuse_display_admission(
+                    runtime,
+                    &admission,
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "display_admission_unavailable",
+                    ),
+                );
             }
             Outcome::Uncertain => {
                 admission.call.cancel_read_only();
-                self.refuse_display_admission(runtime, &admission, "display_admission_unavailable");
+                self.refuse_display_admission(
+                    runtime,
+                    &admission,
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "display_admission_unavailable",
+                    ),
+                );
                 self.display_cleanup.push(DisplayCleanup {
                     owner: admission.caller,
                     operation_id: admission.config.operation_id,

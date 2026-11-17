@@ -68,6 +68,7 @@ pub enum Error {
     WrongState,
     Pending,
     WrongTicket,
+    InvalidFailureReport,
     Serialization,
 }
 
@@ -88,6 +89,7 @@ impl Error {
             | Self::UnsupportedTransport
             | Self::UnsupportedMedia
             | Self::WrongTicket
+            | Self::InvalidFailureReport
             | Self::Serialization => true,
         }
     }
@@ -107,6 +109,7 @@ impl Error {
             Self::WrongState => "wrong_state",
             Self::Pending => "pending",
             Self::WrongTicket => "wrong_ticket",
+            Self::InvalidFailureReport => "invalid_failure_report",
             Self::Serialization => "serialization",
         }
     }
@@ -119,7 +122,10 @@ impl Error {
             Self::UnsupportedTransport => 461,
             Self::UnsupportedMedia => 406,
             Self::WrongState | Self::Pending => 455,
-            Self::InvalidLaunch | Self::WrongTicket | Self::Serialization => 500,
+            Self::InvalidLaunch
+            | Self::WrongTicket
+            | Self::InvalidFailureReport
+            | Self::Serialization => 500,
             _ => 400,
         }
     }
@@ -219,9 +225,68 @@ impl Negotiation {
         Ok(step)
     }
 
-    /// Only acknowledge success after the backend has committed its operation.
-    /// Failure is terminal except that TEARDOWN remains available for cleanup.
-    pub fn complete(&mut self, epoch: u64, ticket: u64, success: bool) -> Result<Vec<u8>, Error> {
+    /// Acknowledge only an operation the backend has committed successfully.
+    /// Failure completion is a separate API requiring the shared handler's
+    /// capability; a bool cannot authorize a terminal wire response.
+    ///
+    /// ```compile_fail
+    /// # use amaterasu_gamestream::rtsp::negotiation::Negotiation;
+    /// fn unchecked_failure(machine: &mut Negotiation) {
+    ///     machine.complete(7, 1, false);
+    /// }
+    /// ```
+    pub fn complete(&mut self, epoch: u64, ticket: u64) -> Result<Vec<u8>, Error> {
+        let (response, next) = self.completion(epoch, ticket, 200)?;
+        self.state = next;
+        self.pending = None;
+        Ok(response)
+    }
+
+    /// Only the central failure decision can authorize terminal rejection.
+    ///
+    /// ```compile_fail
+    /// # use amaterasu_gamestream::rtsp::negotiation::Negotiation;
+    /// # use amaterasu_module_sdk::stream_lifecycle::{StreamIssue, LifecycleLayer};
+    /// fn warning_cannot_reject(machine: &mut Negotiation) {
+    ///     let warning = StreamIssue::advisory("stream", LifecycleLayer::Rtsp, "announce", "hint");
+    ///     machine.reject(7, 1, &warning);
+    /// }
+    /// ```
+    pub fn reject(
+        &mut self,
+        epoch: u64,
+        ticket: u64,
+        permit: &amaterasu_module_sdk::stream_lifecycle::StreamTermination,
+    ) -> Result<Vec<u8>, Error> {
+        let (response, _) = self.completion(epoch, ticket, 503)?;
+        permit.authorize(|_| {
+            self.state = State::Failed;
+            self.pending = None;
+        });
+        Ok(response)
+    }
+
+    /// Refuse only a read-only/recovered operation after the common handler
+    /// approves continuation. This does not put the negotiation in Failed.
+    pub fn refuse(
+        &mut self,
+        epoch: u64,
+        ticket: u64,
+        report: amaterasu_module_sdk::stream_lifecycle::StreamIssue,
+    ) -> Result<Vec<u8>, Error> {
+        use amaterasu_module_sdk::stream_lifecycle::{StreamFailureDecision, StreamFailureHandler};
+        if !matches!(
+            StreamFailureHandler::decide(report),
+            StreamFailureDecision::Continue(_)
+        ) {
+            return Err(Error::InvalidFailureReport);
+        }
+        let (response, _) = self.completion(epoch, ticket, 455)?;
+        self.pending = None;
+        Ok(response)
+    }
+
+    fn completion(&self, epoch: u64, ticket: u64, status: u16) -> Result<(Vec<u8>, State), Error> {
         if epoch != self.launch.epoch {
             return Err(Error::WrongEpoch);
         }
@@ -229,14 +294,10 @@ impl Negotiation {
         if pending.ticket != ticket {
             return Err(Error::WrongTicket);
         }
-        let response = self.response(if success { 200 } else { 503 }, pending.cseq, &[], &[])?;
-        self.state = if success {
-            pending.success
-        } else {
-            State::Failed
-        };
-        self.pending = None;
-        Ok(response)
+        Ok((
+            self.response(status, pending.cseq, &[], &[])?,
+            pending.success,
+        ))
     }
 
     fn validate_session(&self, request: &Request) -> Result<(), Error> {

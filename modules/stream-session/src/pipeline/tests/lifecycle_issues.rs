@@ -155,7 +155,10 @@ fn input_refusal_requiring_recovery_is_not_demoted() {
         )
         .is_err()
     );
-    super::super::input::stop_for_input_failure(&mut record, "input_batch_failed");
+    super::super::input::stop_for_input_failure(
+        &mut record,
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("input_batch_failed"),
+    );
     let reports: Vec<_> = record.issues.drain().collect();
     assert!(reports.iter().any(|report| matches!(report, StreamReport::Issue(issue)
         if issue.code == "input_batch_failed" && issue.disposition == IssueDisposition::CriticalFailure)));
@@ -627,7 +630,11 @@ fn cleanup_recovery_cannot_erase_an_earlier_start_failure_with_the_same_provider
     record.report_failure(LifecycleLayer::Audio, "prepare", "dependency_rejected");
     let mut job = Job::new(42, None, Step::Close(Resource::AudioCapture), 100);
     job.cleanup = true;
-    job.fail(&mut record, "dependency_rejected", 0);
+    job.fail(
+        &mut record,
+        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("dependency_rejected"),
+        0,
+    );
     record.report_confirmed_cleanup();
     let mut store = StreamLifecycleStore::new();
     store.open("launch-7");
@@ -680,7 +687,11 @@ fn a_session_failure_is_published_under_the_launch_owners_stream_key() {
     pipeline.enable_stream_issue_reports();
     let mut record = record_for(Some("launch-7"));
     let mut job = Job::new(42, None, Step::Open(Resource::Video), 0);
-    job.fail(&mut record, "dependency_rejected", 0);
+    job.fail(
+        &mut record,
+        StreamFailure::critical("dependency_rejected"),
+        0,
+    );
     pipeline.records.insert(42, record);
 
     let mut commands = Vec::new();
@@ -708,7 +719,11 @@ fn a_session_failure_is_published_under_the_launch_owners_stream_key() {
 fn reports_are_off_until_enabled_and_need_a_stream_key() {
     let mut pipeline = Harness::new().pipeline;
     let mut keyed = record_for(Some("launch-8"));
-    Job::new(42, None, Step::WaitDrain, 0).fail(&mut keyed, "operation_deadline", 0);
+    Job::new(42, None, Step::WaitDrain, 0).fail(
+        &mut keyed,
+        StreamFailure::critical("operation_deadline"),
+        0,
+    );
     pipeline.records.insert(42, keyed);
     let mut commands = Vec::new();
     pipeline.publish_stream_issues(&mut |command| {
@@ -725,6 +740,10 @@ fn reports_are_off_until_enabled_and_need_a_stream_key() {
     );
 
     let mut unkeyed = record_for(None);
-    Job::new(43, None, Step::WaitDrain, 0).fail(&mut unkeyed, "operation_deadline", 0);
+    Job::new(43, None, Step::WaitDrain, 0).fail(
+        &mut unkeyed,
+        StreamFailure::critical("operation_deadline"),
+        0,
+    );
     assert!(unkeyed.issues.is_empty());
 }

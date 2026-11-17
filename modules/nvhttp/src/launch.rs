@@ -2110,11 +2110,22 @@ impl Controller {
                     } else {
                         if record.resumed && record.lifecycle_session_target.is_some() {
                             record.request_transport_cleanup(
-                                Some("launch_response_unavailable"),
+                                Some(
+                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                        "launch_response_unavailable",
+                                    ),
+                                ),
                                 now,
                             );
                         } else {
-                            record.request_cleanup(Some("launch_response_unavailable"), now);
+                            record.request_cleanup(
+                                Some(
+                                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                        "launch_response_unavailable",
+                                    ),
+                                ),
+                                now,
+                            );
                         }
                     }
                     affected = Some(record.id);
@@ -2195,9 +2206,23 @@ impl Controller {
                         && (record.application_session.is_some()
                             || matches!(record.state, State::Ready | State::Paused))
                     {
-                        record.request_transport_cleanup(Some("client_revoked"), now);
+                        record.request_transport_cleanup(
+                            Some(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                    "client_revoked",
+                                ),
+                            ),
+                            now,
+                        );
                     } else {
-                        record.request_cleanup(Some("client_revoked"), now);
+                        record.request_cleanup(
+                            Some(
+                                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                    "client_revoked",
+                                ),
+                            ),
+                            now,
+                        );
                     }
                     affected.push(record.id);
                 }
@@ -2233,7 +2258,14 @@ impl Controller {
                 if record.application_session.is_none() {
                     record.transport_only_cleanup = false;
                 }
-                record.request_cleanup(Some("host_stopping"), now);
+                record.request_cleanup(
+                    Some(
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "host_stopping",
+                        ),
+                    ),
+                    now,
+                );
             }
         }
         self.no_jobs() && self.records.values().all(|record| record.state.terminal())

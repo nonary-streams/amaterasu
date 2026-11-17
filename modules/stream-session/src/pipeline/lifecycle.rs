@@ -11,6 +11,9 @@ impl Pipeline {
         send: &mut Send<'_>,
         operations: &mut NativeOperations<'_, '_>,
     ) -> bool {
+        if job.failure_continued {
+            return false;
+        }
         let shutdown_deadline = self.shutdown_deadline.or_else(|| {
             (job.cleanup || record.state == State::Stopping)
                 .then_some(self.shutdown_announced_deadline)
@@ -30,7 +33,9 @@ impl Pipeline {
                     record.fail_cleanup(
                         lifecycle_issues::step_layer(job.step),
                         &lifecycle_issues::step_label(job.step),
-                        "cleanup_deadline",
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "cleanup_deadline",
+                        ),
                     );
                     self.reply(record, job, send);
                     return false;
@@ -39,7 +44,7 @@ impl Pipeline {
                 job.journal_document = None;
                 job.journal_payload = None;
                 job.journal_operation_id = None;
-                job.fail(record, "operation_deadline", now);
+                job.fail(record, StreamFailure::critical("operation_deadline"), now);
                 return true;
             }
             // Ownership persistence may already have committed. Retain its
@@ -53,7 +58,9 @@ impl Pipeline {
             record.fail_cleanup(
                 amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                 "persist_journal",
-                "lifecycle_journal_write_unconfirmed",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "lifecycle_journal_write_unconfirmed",
+                ),
             );
             self.reply(record, job, send);
             // Keep this separately from any uncertain dependent operation,
@@ -83,7 +90,11 @@ impl Pipeline {
             job.deadline = job.deadline.min(deadline);
         }
         if !job.cleanup && record.state == State::Stopping && record.outcome == State::Failed {
-            job.fail(record, record.error.unwrap_or("media_failed"), now);
+            job.fail(
+                record,
+                StreamFailure::critical(record.error.unwrap_or("media_failed")),
+                now,
+            );
         }
         if !job.cleanup
             && record.state != State::Stopping
@@ -96,7 +107,7 @@ impl Pipeline {
                 let pending = job.pending.take();
                 return self.abandon_audio_probe(record, job, pending, None, send);
             }
-            job.fail(record, "request_cancelled", now);
+            job.cancel(record, now);
         }
         if now >= job.deadline {
             if job.cleanup {
@@ -108,7 +119,9 @@ impl Pipeline {
                 record.fail_cleanup(
                     lifecycle_issues::step_layer(job.step),
                     &lifecycle_issues::step_label(job.step),
-                    "cleanup_deadline",
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "cleanup_deadline",
+                    ),
                 );
                 self.reply(record, job, send);
                 return false;
@@ -144,7 +157,7 @@ impl Pipeline {
                 record.input_events.clear();
                 record.input_timing.clear_queue();
             }
-            job.fail(record, "operation_deadline", now);
+            job.fail(record, StreamFailure::critical("operation_deadline"), now);
         }
         if let Some(mut pending) = job.pending.take() {
             match pending.poll(send, now) {
@@ -176,7 +189,9 @@ impl Pipeline {
                         record.fail_cleanup(
                             amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                             "persist_journal",
-                            "lifecycle_journal_write_unconfirmed",
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                "lifecycle_journal_write_unconfirmed",
+                            ),
                         );
                         self.reply(record, job, send);
                         return false;
@@ -188,7 +203,11 @@ impl Pipeline {
                             record.uncertain_step = Some(job.step);
                         }
                         record.display_state = "apply_uncertain".into();
-                        job.fail(record, "display_apply_uncertain", now);
+                        job.fail(
+                            record,
+                            StreamFailure::critical("display_apply_uncertain"),
+                            now,
+                        );
                         return true;
                     }
                     if matches!(
@@ -204,7 +223,11 @@ impl Pipeline {
                             record.uncertain_step = Some(job.step);
                         }
                         record.virtual_display_state = "request_uncertain".into();
-                        job.fail(record, "virtual_display_request_uncertain", now);
+                        job.fail(
+                            record,
+                            StreamFailure::critical("virtual_display_request_uncertain"),
+                            now,
+                        );
                         return true;
                     }
                     record.uncertain = Some(pending);
@@ -214,7 +237,9 @@ impl Pipeline {
                     record.fail_cleanup(
                         lifecycle_issues::step_layer(job.step),
                         &lifecycle_issues::step_label(job.step),
-                        "request_cancellation_unconfirmed",
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "request_cancellation_unconfirmed",
+                        ),
                     );
                     self.reply(record, job, send);
                     return false;
@@ -321,18 +346,22 @@ impl Pipeline {
                             self.retain_uncertain_journal(record, job, pending, now);
                             self.journal.failed = true;
                             self.recovery_blocked = true;
-                            record.fail_cleanup(amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession, "persist_journal", "lifecycle_journal_write_unconfirmed");
+                            record.fail_cleanup(amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession, "persist_journal", amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("lifecycle_journal_write_unconfirmed"));
                             self.reply(record, job, send);
                             return false;
                         }
                         self.journal.failed = true;
                         self.recovery_blocked = true;
                         if job.cleanup {
-                            record.fail_cleanup(amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession, "persist_journal", "lifecycle_journal_write_failed");
+                            record.fail_cleanup(amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession, "persist_journal", amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("lifecycle_journal_write_failed"));
                             self.reply(record, job, send);
                             return false;
                         }
-                        job.fail(record, "lifecycle_journal_write_failed", now);
+                        job.fail(
+                            record,
+                            StreamFailure::critical("lifecycle_journal_write_failed"),
+                            now,
+                        );
                         return true;
                     }
                     if job.settling_allocation {
@@ -386,7 +415,11 @@ impl Pipeline {
                     }
                     if matches!(job.step, Step::StatusVirtualDisplay | Step::SnapshotDisplay) {
                         record.virtual_display_state = "dependency_unavailable".into();
-                        job.fail(record, "virtual_display_unavailable", now);
+                        job.fail(
+                            record,
+                            StreamFailure::critical("virtual_display_unavailable"),
+                            now,
+                        );
                         return true;
                     }
                     if matches!(job.step, Step::CheckDisplay | Step::ApplyDisplay) {
@@ -394,7 +427,7 @@ impl Pipeline {
                         if job.step == Step::ApplyDisplay && !pending.admission_rejected() {
                             job.step = Step::FindDisplay;
                         } else if record.state == State::Preparing {
-                            job.fail(record, "display_unavailable", now);
+                            job.fail(record, StreamFailure::critical("display_unavailable"), now);
                         } else {
                             record.display_attempted = false;
                             job.step = Step::AcquireOutput;
@@ -404,13 +437,21 @@ impl Pipeline {
                     if job.step == Step::FindDisplay {
                         record.display_state = "status_unavailable".into();
                         if record.state == State::Preparing {
-                            job.fail(record, "display_status_unverified", now);
+                            job.fail(
+                                record,
+                                StreamFailure::critical("display_status_unverified"),
+                                now,
+                            );
                             return true;
                         }
                         job.step = Step::AcquireOutput;
                         return true;
                     }
-                    job.fail(record, "dependency_unavailable", now);
+                    job.fail(
+                        record,
+                        StreamFailure::critical("dependency_unavailable"),
+                        now,
+                    );
                 }
             }
         }
@@ -427,7 +468,9 @@ impl Pipeline {
                     record.fail_cleanup(
                         amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                         "persist_journal",
-                        "lifecycle_journal_write_unconfirmed",
+                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                            "lifecycle_journal_write_unconfirmed",
+                        ),
                     );
                     self.reply(record, job, send);
                     return false;
@@ -507,7 +550,7 @@ impl Pipeline {
         if job.step == Step::AcquireOutput
             && let Err(code) = super::shared_capture::initialize_source(record)
         {
-            job.fail(record, code, now);
+            job.fail(record, StreamFailure::critical(code), now);
             return true;
         }
         if job.step == Step::AcquireOutput
@@ -521,7 +564,7 @@ impl Pipeline {
             };
         }
         if let Err(code) = super::source_preparation::redirect(record, job) {
-            job.fail(record, code, now);
+            job.fail(record, StreamFailure::critical(code), now);
             return true;
         }
         if job.step == Step::CreateOwnedVirtualDisplay {
@@ -565,7 +608,7 @@ impl Pipeline {
             let mut document = match self.journal.with_record(record) {
                 Ok(document) => document,
                 Err(code) => {
-                    job.fail(record, code, now);
+                    job.fail(record, StreamFailure::critical(code), now);
                     return true;
                 }
             };
@@ -595,7 +638,9 @@ impl Pipeline {
             record.fail_cleanup(
                 amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                 "persist_journal",
-                "lifecycle_journal_write_unconfirmed",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "lifecycle_journal_write_unconfirmed",
+                ),
             );
             self.reply(record, job, send);
             return false;
@@ -604,7 +649,11 @@ impl Pipeline {
         self.sequence = match self.sequence.checked_add(1) {
             Some(value) => value,
             None => {
-                job.fail(record, "operation_counter_exhausted", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("operation_counter_exhausted"),
+                    now,
+                );
                 return true;
             }
         };
@@ -752,9 +801,11 @@ impl Pipeline {
         if job.step == Step::NotifyCaptureInvalidated {
             job.fail(
                 record,
-                record
-                    .lifecycle_invalid_reason
-                    .unwrap_or("capture_binding_invalid"),
+                StreamFailure::critical(
+                    record
+                        .lifecycle_invalid_reason
+                        .unwrap_or("capture_binding_invalid"),
+                ),
                 now,
             );
             return true;
@@ -817,7 +868,11 @@ impl Pipeline {
                 && serde_json::to_vec(&payload["settings"])
                     .is_ok_and(|bytes| bytes.len() <= 16_384);
             if !valid {
-                job.fail(record, "processing_settings_unavailable", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("processing_settings_unavailable"),
+                    now,
+                );
                 return true;
             }
             record.processing_frozen = Some((
@@ -864,7 +919,11 @@ impl Pipeline {
                 // Bypassing the processor cannot change the source dynamic range.
                 && (enabled != Some(false) || actual_source.is_none_or(|actual| actual == actual_output));
             if !valid {
-                job.fail(record, "processing_plan_rejected", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("processing_plan_rejected"),
+                    now,
+                );
                 return true;
             }
             let required_source = if enabled == Some(false) {
@@ -913,11 +972,19 @@ impl Pipeline {
                             .map(|candidate| candidate.plan_revision)
                     )
             {
-                job.fail(record, "lifecycle_authority_rejected", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("lifecycle_authority_rejected"),
+                    now,
+                );
                 return true;
             }
             if job.step == Step::StartLifecycle && payload["all_consumers_acknowledged"] != true {
-                job.fail(record, "lifecycle_consumers_unconfirmed", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("lifecycle_consumers_unconfirmed"),
+                    now,
+                );
                 return true;
             }
             job.lifecycle_lookup = false;
@@ -943,14 +1010,22 @@ impl Pipeline {
                             && token.len() <= 512
                             && !token.chars().any(char::is_control)
                     }) else {
-                        job.fail(record, "input_binding_unavailable", now);
+                        job.fail(
+                            record,
+                            StreamFailure::critical("input_binding_unavailable"),
+                            now,
+                        );
                         return true;
                     };
                     let Some(revision) = payload["geometry_revision"]
                         .as_u64()
                         .filter(|revision| *revision > 0)
                     else {
-                        job.fail(record, "input_binding_unavailable", now);
+                        job.fail(
+                            record,
+                            StreamFailure::critical("input_binding_unavailable"),
+                            now,
+                        );
                         return true;
                     };
                     let expected_revision = if start.lifecycle_capture_mode.is_external() {
@@ -968,7 +1043,11 @@ impl Pipeline {
                             .map_or(0, |candidate| candidate.geometry_revision)
                     };
                     if revision != expected_revision {
-                        job.fail(record, "input_binding_unavailable", now);
+                        job.fail(
+                            record,
+                            StreamFailure::critical("input_binding_unavailable"),
+                            now,
+                        );
                         return true;
                     }
                     record.lifecycle_input_token = Some(token.to_owned());
@@ -1009,7 +1088,11 @@ impl Pipeline {
                 || payload["stream"] != record.resources[&Resource::Video]
                 || !payload["observed_capture"].is_object()
             {
-                job.fail(record, "capture_observation_unavailable", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("capture_observation_unavailable"),
+                    now,
+                );
             } else {
                 record.lifecycle_observation = Some(payload["observed_capture"].clone());
                 job.step = Step::AckLifecycleCapture;
@@ -1060,18 +1143,18 @@ impl Pipeline {
                 }
                 super::virtual_display::ReferenceStatus::Missing => {
                     let code = super::virtual_display::creation_failure(record);
-                    job.fail(record, code, now);
+                    job.fail(record, StreamFailure::critical(code), now);
                 }
                 super::virtual_display::ReferenceStatus::Failed => {
                     let code = super::virtual_display::creation_failure(record);
-                    job.fail(record, code, now);
+                    job.fail(record, StreamFailure::critical(code), now);
                 }
             }
             return true;
         }
         if job.step == Step::SnapshotDisplay {
             if let Err(code) = super::virtual_display::build_display_request(record, &payload) {
-                job.fail(record, code, now);
+                job.fail(record, StreamFailure::critical(code), now);
             } else {
                 job.step = Step::CheckDisplay;
             }
@@ -1096,7 +1179,7 @@ impl Pipeline {
                 } else {
                     "busy".into()
                 };
-                job.fail(record, "display_unavailable", now);
+                job.fail(record, StreamFailure::critical("display_unavailable"), now);
             }
             return true;
         }
@@ -1123,7 +1206,11 @@ impl Pipeline {
             }
             super::display::accept_apply(record, &payload);
             if payload["ok"] == false && payload["recovery_required"] != true {
-                job.fail(record, "display_apply_rejected", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("display_apply_rejected"),
+                    now,
+                );
             } else {
                 job.step = Step::FindDisplay;
             }
@@ -1159,7 +1246,11 @@ impl Pipeline {
                 ));
                 return self.deliver_success(record, job, now, send);
             }
-            job.fail(record, "display_status_unverified", now);
+            job.fail(
+                record,
+                StreamFailure::critical("display_status_unverified"),
+                now,
+            );
             return true;
         }
         if matches!(
@@ -1173,13 +1264,17 @@ impl Pipeline {
                     payload["error"]["code"].as_str(),
                     Some("startup_reconciliation_pending" | "busy")
                 ) {
-                    job.fail(record, "virtual_display_create_failed", now);
+                    job.fail(
+                        record,
+                        StreamFailure::critical("virtual_display_create_failed"),
+                        now,
+                    );
                 }
             } else {
                 match super::virtual_display::accept_ready(record, &payload) {
                     Ok(true) => job.step = Step::AcquireOutput,
                     Ok(false) => {}
-                    Err(code) => job.fail(record, code, now),
+                    Err(code) => job.fail(record, StreamFailure::critical(code), now),
                 }
             }
             return true;
@@ -1241,7 +1336,7 @@ impl Pipeline {
                 record.session_effects.vigem_missing(record.id);
                 match accept_controller_batch_failure(record, &payload) {
                     Ok(()) => return false,
-                    Err(code) => job.fail(record, code, now),
+                    Err(code) => job.fail(record, StreamFailure::critical(code), now),
                 }
                 return true;
             }
@@ -1255,7 +1350,7 @@ impl Pipeline {
                 job.step,
                 safe_dependency_code(&payload),
             );
-            job.fail(record, "dependency_rejected", now);
+            job.fail(record, StreamFailure::critical("dependency_rejected"), now);
             return true;
         }
         let result = (|| match job.step {
@@ -1790,7 +1885,7 @@ impl Pipeline {
         })();
         match result {
             Ok(retain) => retain,
-            Err(code) => self.fail_record(record, job, code, now),
+            Err(code) => self.fail_record(record, job, StreamFailure::critical(code), now),
         }
     }
 
@@ -1929,7 +2024,11 @@ impl Pipeline {
                     if intent.active() {
                         if !intent.dd_use_sunshine_virtual_display_driver {
                             record.virtual_display_state = "unsupported_driver".into();
-                            job.fail(record, "unsupported_virtual_display_driver", now);
+                            job.fail(
+                                record,
+                                StreamFailure::critical("unsupported_virtual_display_driver"),
+                                now,
+                            );
                             return Ok(true);
                         }
                         record.virtual_display_state = "creating".into();
@@ -2096,7 +2195,11 @@ impl Pipeline {
         }) {
             false
         } else {
-            job.fail(record, "completion_unavailable", now);
+            job.fail(
+                record,
+                StreamFailure::critical("completion_unavailable"),
+                now,
+            );
             true
         }
     }
@@ -2111,10 +2214,10 @@ impl Pipeline {
         &self,
         record: &mut Record,
         job: &mut Job,
-        code: &'static str,
+        failure: StreamFailure,
         now: u64,
     ) -> bool {
-        job.fail(record, code, now);
+        job.fail(record, failure, now);
         true
     }
 
@@ -2169,12 +2272,18 @@ impl Pipeline {
             record.fail_cleanup(
                 amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
                 "persist_journal",
-                "lifecycle_journal_write_failed",
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "lifecycle_journal_write_failed",
+                ),
             );
             self.reply(record, job, send);
             return false;
         }
-        job.fail(record, "lifecycle_journal_write_failed", now);
+        job.fail(
+            record,
+            StreamFailure::critical("lifecycle_journal_write_failed"),
+            now,
+        );
         true
     }
 }

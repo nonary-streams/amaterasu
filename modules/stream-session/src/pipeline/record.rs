@@ -296,7 +296,88 @@ pub(super) struct UncertainJournalWrite {
     pub next_poll: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum FailureEffect {
+    Stop,
+    CancelUnconfirmed,
+    ReleaseBindings,
+    CleanupUnconfirmed,
+}
+
 impl Record {
+    /// Every failure-driven record transition delegates its final decision to
+    /// the common handler. Report-only outcomes cannot change native state.
+    #[track_caller]
+    pub(super) fn raise_failure(
+        &mut self,
+        failure: amaterasu_module_sdk::stream_lifecycle::StreamFailure,
+        dependency: amaterasu_module_sdk::stream_lifecycle::LifecycleLayer,
+        phase: &str,
+        effect: FailureEffect,
+    ) -> bool {
+        use amaterasu_module_sdk::stream_lifecycle::{
+            LifecycleLayer, StreamFailureDecision, StreamFailureHandler,
+        };
+        let code = failure.code();
+        let operation = self
+            .config
+            .rtsp_operation_id
+            .as_deref()
+            .unwrap_or("local-stream-session");
+        let mut report = failure.at(operation, LifecycleLayer::StreamSession, phase);
+        if dependency != LifecycleLayer::StreamSession {
+            report = report.caused_by(dependency);
+        }
+        let repeated_cleanup = matches!(effect, FailureEffect::CleanupUnconfirmed)
+            && self.state == State::CleanupFailed
+            && self.cleanup_error == Some(code);
+        if matches!(effect, FailureEffect::CleanupUnconfirmed) && report.is_critical() {
+            report.code = "cleanup_failed".into();
+        }
+        match StreamFailureHandler::decide(report) {
+            StreamFailureDecision::Terminate(permit) => {
+                permit.terminate(|issue| {
+                    if self.config.rtsp_operation_id.is_some() && !repeated_cleanup {
+                        self.issues.push(issue);
+                    }
+                    match effect {
+                        FailureEffect::CleanupUnconfirmed => {
+                            self.remember_cleanup_failure("cleanup_failed");
+                            self.cleanup_error = Some(code);
+                            self.state = State::CleanupFailed;
+                        }
+                        FailureEffect::Stop
+                        | FailureEffect::CancelUnconfirmed
+                        | FailureEffect::ReleaseBindings => {
+                            self.error.get_or_insert(code);
+                            self.outcome = if matches!(effect, FailureEffect::CancelUnconfirmed) {
+                                State::Cancelled
+                            } else {
+                                State::Failed
+                            };
+                            self.history.stopping(code);
+                            self.state = State::Stopping;
+                            if let Some(plane) = self.plane.as_mut() {
+                                plane.stop();
+                            }
+                            if matches!(effect, FailureEffect::ReleaseBindings) {
+                                self.plane = None;
+                            }
+                        }
+                    }
+                });
+                true
+            }
+            StreamFailureDecision::Continue(issue) => {
+                if self.config.rtsp_operation_id.is_some() {
+                    self.issues.push(issue);
+                }
+                false
+            }
+            StreamFailureDecision::Invalid(_) => false,
+        }
+    }
+
     pub fn accept_negotiated_unit(&mut self, payload: &Value) -> Result<(), &'static str> {
         let Some(profile) = self
             .start

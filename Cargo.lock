@@ -464,6 +464,7 @@ dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
  "amaterasu-media",
+ "amaterasu-module-sdk",
  "amaterasu-timing-metrics",
  "cbc",
  "ring",

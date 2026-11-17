@@ -2611,7 +2611,7 @@ fn pending_play(record: &Record) -> (Negotiation, u64) {
         panic!("announce action");
     };
     negotiation
-        .complete(record.id, ticket, true)
+        .complete(record.id, ticket)
         .expect("announce accepted");
     let NegotiationStep::Action { ticket, .. } = negotiation
         .handle(record.id, &request(Method::Play, "/", 7, true))
@@ -2925,7 +2925,7 @@ fn unavailable_play_response_never_marks_the_ticket_playing() {
     );
 
     assert!(record.state == State::Closing);
-    assert_eq!(record.failure, Some("start_rejected"));
+    assert_eq!(record.failure, Some("response_unavailable"));
 }
 
 #[test]
@@ -3651,7 +3651,11 @@ fn lifecycle_prepare_deadline_and_late_success_preserve_cleanup_only_admission()
             // The coordinator reply may be available after the transport has
             // already committed to closing. It remains cleanup evidence.
             let mut record = controller.records.remove(&5).unwrap();
-            record.close(Some("network_disconnected"));
+            record.close(Some(
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                    "network_disconnected",
+                ),
+            ));
             let mut job = controller.job.take().unwrap();
             job.network = None;
             controller.consume_result(&mut record, job, reply, 2, &runtime);

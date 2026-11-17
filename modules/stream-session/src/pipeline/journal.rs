@@ -330,9 +330,14 @@ impl Entry {
             .map(VirtualDisplayRecovery::recovery_intent);
         record.display_operation_id = self.display_operation_id.clone();
         record.display_attempted = self.display_attempted;
-        record.state = super::record::State::Stopping;
-        record.outcome = super::record::State::Failed;
-        record.error = Some("host_restart_recovery");
+        record.raise_failure(
+            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                "host_restart_recovery",
+            ),
+            amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+            "restart",
+            super::record::FailureEffect::Stop,
+        );
         Ok(record)
     }
 }

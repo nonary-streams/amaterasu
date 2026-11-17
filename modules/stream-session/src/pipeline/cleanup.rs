@@ -424,7 +424,9 @@ impl Pipeline {
                 record.fail_cleanup(
                     lifecycle_issues::step_layer(job.step),
                     &lifecycle_issues::step_label(job.step),
-                    "component_cleanup_failed",
+                    amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                        "component_cleanup_failed",
+                    ),
                 );
                 self.reply(record, job, send);
                 false
@@ -473,7 +475,7 @@ impl Pipeline {
             record.fail_cleanup(
                 lifecycle_issues::step_layer(job.step),
                 &lifecycle_issues::step_label(job.step),
-                code,
+                amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(code),
             );
         }
         self.reply(record, job, send);

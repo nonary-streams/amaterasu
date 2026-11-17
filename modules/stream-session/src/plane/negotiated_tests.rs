@@ -458,7 +458,7 @@ fn client_selects(
     let NegotiatedVideoFormat::Extension(profile) = value.video.format else {
         return Err("profile");
     };
-    machine.complete(7, ticket, true).map_err(|_| "complete")?;
+    machine.complete(7, ticket).map_err(|_| "complete")?;
     Ok(profile)
 }
 fn exercise<P: FramingProvider>(framer: P, selector: u32, marker: u8) {

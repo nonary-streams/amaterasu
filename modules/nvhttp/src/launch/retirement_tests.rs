@@ -451,7 +451,7 @@ fn retirement_attempt_ids_stay_bounded_and_counter_exhaustion_is_reported() {
     assert!(operation.len() <= 128);
     assert!(operation.is_ascii());
     record.lifecycle_application_retirement = record::ApplicationRetirementState::Failed;
-    record.fail_cleanup("lifecycle_application_retirement_unconfirmed");
+    record.fail_cleanup(amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical("lifecycle_application_retirement_unconfirmed"));
     let status = controller.management_status(None);
     let launch = &status["launch"];
     let reply = controller.management_stop(

@@ -32,7 +32,7 @@ impl Pipeline {
                 // Let active background work finish within its original bounded
                 // deadline so the ordinary stop can drain the native plane.
                 // Persist startup ownership before cancelling dependent work.
-                job.fail(record, "host_stopping", now);
+                job.fail(record, StreamFailure::critical("host_stopping"), now);
                 job.deadline = job.deadline.min(deadline);
             }
             if self.job.is_none()

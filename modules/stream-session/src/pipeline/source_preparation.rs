@@ -146,7 +146,11 @@ pub(super) fn consume(record: &mut Record, job: &mut Job, payload: &Value, now: 
                 serde_json::from_value::<display_settings::Scope>(payload["scope"].clone());
             if payload["ok"] != true || !parsed.as_ref().is_ok_and(|scope| scope.validate().is_ok())
             {
-                job.fail(record, "display_scope_unavailable", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("display_scope_unavailable"),
+                    now,
+                );
                 return true;
             }
             scope_mut(record).scope = parsed.ok();
@@ -177,7 +181,11 @@ pub(super) fn consume(record: &mut Record, job: &mut Job, payload: &Value, now: 
                     .is_some_and(|r| !r.is_empty() && r.len() <= 128)
                 || !payload["settings"].is_object()
             {
-                job.fail(record, "source_plugin_settings_unavailable", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("source_plugin_settings_unavailable"),
+                    now,
+                );
                 return true;
             }
             record.source_hook_settings = Some((
@@ -188,7 +196,11 @@ pub(super) fn consume(record: &mut Record, job: &mut Job, payload: &Value, now: 
         }
         Step::PrepareSourceHook => {
             if payload["ok"] != true || payload["scope"] != json!(scope(record).scope) {
-                job.fail(record, "source_plugin_preparation_failed", now);
+                job.fail(
+                    record,
+                    StreamFailure::critical("source_plugin_preparation_failed"),
+                    now,
+                );
                 return true;
             }
             record.source_hook_index += 1;

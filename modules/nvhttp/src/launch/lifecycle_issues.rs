@@ -134,6 +134,7 @@ fn plain_code(code: &str) -> bool {
 impl Record {
     /// Record a failure that ends this launch. The first one recorded for a
     /// stream stays its root cause.
+    #[allow(dead_code)]
     #[track_caller]
     pub(super) fn record_failure(&mut self, code: &str) {
         let issue = self.attributed(StreamIssue::critical(
@@ -201,7 +202,7 @@ impl Record {
     /// reaction to the job it was handling, or to the stage it was waiting
     /// in, it names that dependency in `caused_by`; the dependency reports
     /// its own failure itself.
-    fn attributed(&self, mut issue: StreamIssue) -> StreamIssue {
+    pub(super) fn attributed(&self, mut issue: StreamIssue) -> StreamIssue {
         issue.layer = LifecycleLayer::Nvhttp;
         let dependency = match &self.failure_context {
             Some(context) => {
