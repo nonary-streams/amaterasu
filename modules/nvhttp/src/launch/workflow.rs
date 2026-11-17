@@ -2674,13 +2674,18 @@ impl Controller {
                         safe_rtsp_provider_code(&payload["cleanup_error"]),
                     );
                     record.rtsp_ticket = Some(ticket);
-                    record.request_failure_cleanup(
-                        amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
-                            "rtsp_not_ready",
-                        ),
-                        Some(safe_rtsp_provider_code(&payload["failure"])),
-                        now,
-                    );
+                    if record.state == State::Starting {
+                        record.request_failure_cleanup(
+                            amaterasu_module_sdk::stream_lifecycle::StreamFailure::critical(
+                                "rtsp_not_ready",
+                            ),
+                            Some(safe_rtsp_provider_code(&payload["failure"])),
+                            now,
+                        );
+                    } else {
+                        // This late result supplies a ticket to the retirement already in progress.
+                        record.request_cleanup(None, now);
+                    }
                 }
                 Err("ticket_not_found") if job.phase == Phase::LookupRtsp => {
                     if record

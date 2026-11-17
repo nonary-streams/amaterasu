@@ -143,7 +143,7 @@ impl Controller {
             .and_then(|negotiation| negotiation.handle(ticket, &request));
         match result {
             Ok(NegotiationStep::Reply(reply)) => {
-                self.deliver_negotiation_reply(&mut record, connection, &reply);
+                self.deliver_replayable_reply(&mut record, connection, &reply);
             }
             Ok(NegotiationStep::Action {
                 ticket: action_ticket,
@@ -284,11 +284,10 @@ impl Controller {
                         );
                     }
                     StreamFailureDecision::Continue(continuation) => {
-                        self.mark_noncritical_connection(connection);
                         if let Ok(reply) =
                             serialize_response(error.status(), request.cseq, &[], &[])
                         {
-                            self.deliver_negotiation_reply(&mut record, connection, &reply);
+                            self.deliver_scoped_reply(&mut record, connection, &reply);
                         }
                         record.issues.push(continuation.into_issue());
                     }
@@ -419,22 +418,29 @@ impl Controller {
         }
     }
 
-    fn deliver_negotiation_reply(
+    fn deliver_replayable_reply(
         &mut self,
         record: &mut Record,
         connection: u64,
         reply: &[u8],
     ) -> bool {
+        if self.deliver_scoped_reply(record, connection, reply) {
+            return true;
+        }
+        if record.failure.is_none() {
+            record.close(Some(StreamFailure::demoted(
+                "negotiation_reply_unavailable",
+                "retry_request",
+            )));
+        }
+        false
+    }
+
+    fn deliver_scoped_reply(&mut self, record: &mut Record, connection: u64, reply: &[u8]) -> bool {
         self.mark_noncritical_connection(connection);
         match self.deliver_reply(connection, reply) {
             Ok(()) => true,
-            Err("connection_not_found") => {
-                record.close(Some(StreamFailure::demoted(
-                    "negotiation_reply_unavailable",
-                    "retry_request",
-                )));
-                false
-            }
+            Err("connection_not_found") => false,
             Err(code) => {
                 // With an unusable authenticated response channel (including
                 // nonce exhaustion), another socket cannot recover this ticket.
@@ -509,7 +515,7 @@ impl Controller {
                 }
             };
             if !native_start {
-                return self.deliver_negotiation_reply(record, connection, &reply);
+                return self.deliver_replayable_reply(record, connection, &reply);
             }
             if self.reply_bytes(connection, &reply) {
                 return true;
@@ -541,7 +547,7 @@ impl Controller {
                 record.issues.push(continuation.into_issue());
                 match reply {
                     Ok(reply) => {
-                        self.deliver_negotiation_reply(record, connection, &reply);
+                        self.deliver_scoped_reply(record, connection, &reply);
                     }
                     Err(_) => {
                         record.close(Some(StreamFailure::critical("negotiation_failed")));
