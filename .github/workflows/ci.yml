@@ -68,6 +68,12 @@ jobs:
         run: cargo clippy --manifest-path scripts/stream-failure-audit/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test stream rejection scenarios against the checkout
         run: python scripts/test_summarize_stream_failures.py
+      - name: Use the canonical temporary path for macOS test fixtures
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          temp_path=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+          printf 'TMPDIR=%s\n' "$temp_path" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - name: Test Rust workspace
         id: workspace_tests
