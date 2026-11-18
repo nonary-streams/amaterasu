@@ -987,6 +987,7 @@ fn publish_service_readiness(root: &Path, digest: &str) -> PackageResult<()> {
             digest: digest.into(),
         },
     )
+    .map_err(|error| format!("cannot publish service readiness: {error}"))
 }
 
 fn remove_service_readiness(root: &Path) {

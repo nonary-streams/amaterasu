@@ -309,6 +309,9 @@ fn replace_file(source: &Path, destination: &Path) -> StorageResult<()> {
 
     const REPLACE_EXISTING: u32 = 0x1;
     const WRITE_THROUGH: u32 = 0x8;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const RETRY_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
     let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
     let destination: Vec<u16> = destination
         .as_os_str()
@@ -316,18 +319,28 @@ fn replace_file(source: &Path, destination: &Path) -> StorageResult<()> {
         .chain(Some(0))
         .collect();
 
-    // SAFETY: both paths are live, NUL-terminated UTF-16 buffers.
-    let succeeded = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            REPLACE_EXISTING | WRITE_THROUGH,
-        )
-    };
-    if succeeded == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+    let deadline = std::time::Instant::now() + RETRY_WINDOW;
+    loop {
+        // SAFETY: both paths are live, NUL-terminated UTF-16 buffers.
+        let succeeded = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                REPLACE_EXISTING | WRITE_THROUGH,
+            )
+        };
+        if succeeded != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        // Readers without delete sharing can briefly hold either file open.
+        // Keep the old data intact and retry the same atomic replacement.
+        if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION) || remaining.is_zero() {
+            return Err(error.to_string());
+        }
+        std::thread::sleep(remaining.min(RETRY_DELAY));
     }
-    Ok(())
 }
 
 /// Prefix of the error [`RootLock::acquire`] returns while another holder has
@@ -359,6 +372,40 @@ impl RootLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_replacement_retries_a_short_windows_sharing_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::time::Duration;
+
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-sharing-{}",
+            crate::random_identifier().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let old = root.join("state.json");
+        let new = root.join(".replacement");
+        fs::write(&old, b"old state").unwrap();
+        fs::write(&new, b"new state").unwrap();
+
+        // FILE_SHARE_READ | FILE_SHARE_WRITE deliberately excludes delete.
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&old)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(reader);
+        });
+        let result = replace_file(&new, &old);
+        release.join().unwrap();
+        result.unwrap();
+        assert_eq!(fs::read(&old).unwrap(), b"new state");
+        assert!(!new.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn temporary_name_collision_preserves_the_existing_writers_file() {
