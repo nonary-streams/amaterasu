@@ -43,11 +43,16 @@ class Console:
         self.process.stdin.flush()
 
     def receive(self):
-        reply = self.replies.get(timeout=15)
+        try:
+            reply = self.replies.get(timeout=15)
+        except queue.Empty as error:
+            raise AssertionError(f"host console did not reply\n{''.join(self.errors[-12:])}") from error
         assert reply is not None, "".join(self.errors)
         return reply
 
     def request(self, service, payload):
+        if self.sequence == 0 and os.name == "posix":
+            worker_pid(self, timeout=30)
         self.sequence += 1
         self.send({"op": "request", "service": service, "payload": payload,
                    "timeout_ms": 2000, "operation_id": f"host-test.{self.sequence}"})
@@ -65,14 +70,15 @@ class Console:
             self.process.wait(timeout=8)
 
 
-def worker_pid(console):
-    for _ in range(100):
+def worker_pid(console, timeout=2):
+    deadline = time.monotonic() + timeout
+    while console.process.poll() is None and time.monotonic() < deadline:
         pids = [int(line.strip().split("pid=")[1]) for line in console.errors
                 if line.startswith("Development worker ready: pid=")]
         if pids:
             return pids[-1]
         time.sleep(0.02)
-    raise AssertionError("worker never reported readiness")
+    raise AssertionError(f"worker never reported readiness\n{''.join(console.errors[-12:])}")
 
 
 def wait_gone(pid, timeout=2):
