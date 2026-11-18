@@ -105,7 +105,7 @@ mod tests {
         Candidate {
             slot: SLOT.into(),
             implementation: IMPLEMENTATION.into(),
-            version: "0.1.0".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             kind: CandidateKind::NativeSet,
             manifest_sha256: digest.to_string().repeat(64),
         }
