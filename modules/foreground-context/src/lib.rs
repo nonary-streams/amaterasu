@@ -28,6 +28,7 @@ impl Settings {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn new_snapshot(executable: String, fullscreen: Option<bool>) -> Option<Snapshot> {
     let snapshot = Snapshot {
         executable,

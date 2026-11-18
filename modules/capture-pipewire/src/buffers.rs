@@ -122,6 +122,7 @@ pub struct Mailbox {
     frames: Mutex<Frames>,
     in_flight: AtomicBool,
     pub delivered: AtomicU64,
+    #[cfg(any(amaterasu_pipewire, test))]
     pub rejected: AtomicU64,
     pub copied: AtomicU64,
     #[cfg(any(amaterasu_pipewire, test))]

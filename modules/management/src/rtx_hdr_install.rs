@@ -190,7 +190,7 @@ impl Installer {
         })
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     pub fn mark_activation_requested(&mut self) {
         self.phase = "waiting_stream";
         self.error = None;

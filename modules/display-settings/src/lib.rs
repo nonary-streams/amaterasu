@@ -38,7 +38,9 @@ impl engine::Store for FileStore {
     }
 }
 struct Work {
+    #[cfg(target_os = "linux")]
     request: u64,
+    #[cfg(target_os = "linux")]
     caller: String,
     #[cfg(target_os = "linux")]
     operation: display_settings::Operation,
@@ -151,7 +153,7 @@ impl ManagedModule for Provider {
         }
         if let Response::Request {
             id,
-            caller,
+            caller: _caller,
             service,
             payload,
             ..
@@ -174,8 +176,10 @@ impl ManagedModule for Provider {
                         .as_ref()
                         .ok_or("display_worker_closed")?
                         .send(Work {
+                            #[cfg(target_os = "linux")]
                             request: id,
-                            caller,
+                            #[cfg(target_os = "linux")]
+                            caller: _caller,
                             #[cfg(target_os = "linux")]
                             operation,
                         })
