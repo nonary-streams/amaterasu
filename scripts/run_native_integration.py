@@ -57,31 +57,31 @@ class ProcessInfo(ct.Structure):
 def windows_api():
     security = ct.WinDLL("advapi32", use_last_error=True)
     kernel = ct.WinDLL("kernel32", use_last_error=True)
-    functions = {
-        security.OpenProcessToken: (wt.BOOL, wt.HANDLE, wt.DWORD, ct.POINTER(wt.HANDLE)),
-        security.GetTokenInformation: (
+    functions = [
+        (security.OpenProcessToken, wt.BOOL, wt.HANDLE, wt.DWORD, ct.POINTER(wt.HANDLE)),
+        (security.GetTokenInformation,
             wt.BOOL, wt.HANDLE, wt.DWORD, wt.LPVOID, wt.DWORD, ct.POINTER(wt.DWORD),
         ),
-        security.SetTokenInformation: (wt.BOOL, wt.HANDLE, wt.DWORD, wt.LPVOID, wt.DWORD),
-        security.ConvertStringSidToSidW: (wt.BOOL, wt.LPCWSTR, ct.POINTER(wt.LPVOID)),
-        security.GetLengthSid: (wt.DWORD, wt.LPVOID),
-        security.CreateRestrictedToken: (
+        (security.SetTokenInformation, wt.BOOL, wt.HANDLE, wt.DWORD, wt.LPVOID, wt.DWORD),
+        (security.ConvertStringSidToSidW, wt.BOOL, wt.LPCWSTR, ct.POINTER(wt.LPVOID)),
+        (security.GetLengthSid, wt.DWORD, wt.LPVOID),
+        (security.CreateRestrictedToken,
             wt.BOOL, wt.HANDLE, wt.DWORD, wt.DWORD, ct.POINTER(SidAndAttributes),
             wt.DWORD, wt.LPVOID, wt.DWORD, wt.LPVOID, ct.POINTER(wt.HANDLE),
         ),
-        security.CreateProcessAsUserW: (
+        (security.CreateProcessAsUserW,
             wt.BOOL, wt.HANDLE, wt.LPCWSTR, wt.LPWSTR, wt.LPVOID, wt.LPVOID,
             wt.BOOL, wt.DWORD, wt.LPVOID, wt.LPCWSTR,
             ct.POINTER(StartupInfo), ct.POINTER(ProcessInfo),
         ),
-        kernel.GetCurrentProcess: (wt.HANDLE,),
-        kernel.LocalFree: (wt.LPVOID, wt.LPVOID),
-        kernel.CloseHandle: (wt.BOOL, wt.HANDLE),
-        kernel.WaitForSingleObject: (wt.DWORD, wt.HANDLE, wt.DWORD),
-        kernel.GetExitCodeProcess: (wt.BOOL, wt.HANDLE, ct.POINTER(wt.DWORD)),
-        kernel.TerminateProcess: (wt.BOOL, wt.HANDLE, wt.UINT),
-    }
-    for function, (result, *arguments) in functions.items():
+        (kernel.GetCurrentProcess, wt.HANDLE,),
+        (kernel.LocalFree, wt.LPVOID, wt.LPVOID),
+        (kernel.CloseHandle, wt.BOOL, wt.HANDLE),
+        (kernel.WaitForSingleObject, wt.DWORD, wt.HANDLE, wt.DWORD),
+        (kernel.GetExitCodeProcess, wt.BOOL, wt.HANDLE, ct.POINTER(wt.DWORD)),
+        (kernel.TerminateProcess, wt.BOOL, wt.HANDLE, wt.UINT),
+    ]
+    for function, result, *arguments in functions:
         function.restype = result
         function.argtypes = arguments
     return security, kernel
