@@ -19,10 +19,25 @@ fn test_root(label: &str) -> PathBuf {
 #[test]
 fn healthy_process_releases_its_root_lock_normally() {
     let root = test_root("healthy");
-    let lock = ProcessRootLock::new(RootLock::acquire(&root).unwrap());
+    let lock = ProcessRootLock {
+        lock: Some(RootLock::acquire(&root).unwrap()),
+        process: Arc::new(NativeProcessState::default()),
+    };
     assert!(RootLock::acquire(&root).is_err());
     drop(lock);
-    drop(RootLock::acquire(&root).unwrap());
+    // A parallel test can be between fork and exec on macOS. Its temporary
+    // copy of the close-on-exec descriptor cannot keep admission indefinitely.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let reacquired = loop {
+        match RootLock::acquire(&root) {
+            Ok(lock) => break lock,
+            Err(error) => {
+                assert!(std::time::Instant::now() < deadline, "{error}");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    };
+    drop(reacquired);
     std::fs::remove_dir_all(root).unwrap();
 }
 

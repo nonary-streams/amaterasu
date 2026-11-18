@@ -159,7 +159,7 @@ pub(crate) struct ProcessRootLock {
     process: Arc<NativeProcessState>,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 impl ProcessRootLock {
     pub(crate) fn new(lock: amaterasu_package::RootLock) -> Self {
         Self {
