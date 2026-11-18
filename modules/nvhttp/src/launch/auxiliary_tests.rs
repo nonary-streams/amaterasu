@@ -1898,7 +1898,8 @@ fn application_launch_join_binds_the_fresh_borrowed_reservation_before_rtsp() {
         .unwrap();
     let open = commands.iter().position(|command| matches!(command,
         Command::Request {service, payload, ..} if service == "amaterasu.rtsp/1" && payload["action"] == "open"
-            && payload["borrowed_capture"]["reservation_id"] == joining.reservation_id)).unwrap();
+            && payload["borrowed_capture"]["reservation_id"] == joining.reservation_id
+            && payload.get("shared_source_operation_id").is_none())).unwrap();
     assert!(bind < verify && verify < open);
     assert!(!commands.iter().any(|command| matches!(command,
         Command::CallApi {method, ..} if method == "bind_application")));

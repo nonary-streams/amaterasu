@@ -1549,7 +1549,10 @@ impl Controller {
                     .to_string()
             );
             payload["lifecycle_intent"] = json!(record.lifecycle_intent());
+            // Only stream-session's owned display uses this operation
+            // reference. Exact-output joins carry their presentation lease.
             if record.lifecycle_capture_mode.is_external()
+                && record.capture_output == super::OWNED_DISPLAY_OUTPUT
                 && let Some(application) = record.application_session
             {
                 payload["shared_source_operation_id"] = json!(
@@ -1581,7 +1584,7 @@ impl Controller {
                 "mode":source.mode,
             });
         }
-        if matches!(phase, Phase::OpenRtsp) && record.shared_capture.is_some() {
+        if matches!(phase, Phase::OpenRtsp) && record.uses_existing_capture() {
             for key in [
                 "display_policy_snapshot",
                 "display_request",
@@ -1615,7 +1618,7 @@ impl Controller {
                 .remove("display_request");
         }
         if matches!(phase, Phase::OpenRtsp)
-            && record.shared_capture.is_none()
+            && !record.uses_existing_capture()
             && (record.display_request.is_some()
                 || record.virtual_display_intent.is_some()
                 || record.application_display_settings.is_some())
@@ -1688,12 +1691,13 @@ impl Controller {
                         pending.peer,
                         connect_data,
                         proton,
+                        record.application_session.is_some(),
                     )
                     .ok()
                 });
-                if let Some(candidate) =
-                    candidate.filter(|candidate| !candidate.legacy_display_conflict())
-                {
+                if let Some(candidate) = candidate.filter(|candidate| {
+                    record.application_session.is_some() || !candidate.legacy_display_conflict()
+                }) {
                     if candidate.stream_key() == record.request.remote_input_key
                         || self.retire_stream_key(record.request.remote_input_key)
                     {
@@ -2697,12 +2701,13 @@ impl Controller {
                         pending.peer,
                         connect_data,
                         fallback,
+                        record.application_session.is_some(),
                     )
                     .ok()
                 });
-                if let Some(candidate) =
-                    candidate.filter(|candidate| !candidate.legacy_display_conflict())
-                {
+                if let Some(candidate) = candidate.filter(|candidate| {
+                    record.application_session.is_some() || !candidate.legacy_display_conflict()
+                }) {
                     if candidate.stream_key() == record.request.remote_input_key
                         || self.retire_stream_key(record.request.remote_input_key)
                     {
@@ -4172,7 +4177,7 @@ pub(super) fn reject_resume(record: &mut Record, replies: &mut Vec<(u64, Reply)>
 }
 
 fn advance_resume_display(record: &mut Record, now: Instant) {
-    if record.desktop {
+    if record.desktop || record.application_session.is_some() {
         record.stage = Stage::OpenRtsp;
     } else if record
         .virtual_display_intent
@@ -5487,11 +5492,11 @@ fn rtsp_response<'a>(
         || payload.get("failure").is_none()
         || payload.get("cleanup_error").is_none()
         || payload.get("display_policy_snapshot")
-            != Some(
-                if record.shared_capture.is_some() { &Value::Null } else {
+            != Some(if record.uses_existing_capture() {
+                    &Value::Null
+                } else {
                     record.display_policy_snapshot.as_ref().unwrap_or(&Value::Null)
-                },
-            )
+                })
         || payload.get("display_request")
             != Some(record.display_request.as_ref().unwrap_or(&Value::Null))
         || (record.display_request.is_some()

@@ -433,33 +433,9 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
-        if let Some(profile) = configuration.configuration.extension_profile.clone() {
-            let Some(route) = record.extension_route.as_ref().filter(|route| {
-                owner == "amaterasu.rtsp"
-                    && configuration.client_feature_flags.is_some()
-                    && record.extension_limits.is_some()
-                    && route.profile == profile
-            }) else {
-                rpc::complete(send, request, error("extension_profile_not_offered"));
-                return;
-            };
-            let mut expected = record
-                .config
-                .extension_probe
-                .clone()
-                .expect("offered profile has probe configuration");
-            expected.extension_profile = Some(profile);
-            if configuration.configuration != expected
-                || configuration.source_id.is_some()
-                || configuration.encoder_provider.is_some()
-                || configuration.encoder_options.is_some()
-            {
-                rpc::complete(send, request, error("extension_configuration_mismatch"));
-                return;
-            }
-            configuration.source_id = Some(route.source_id);
-            configuration.encoder_provider = Some(route.encoder_provider.clone());
-            configuration.encoder = route.encoder.clone();
+        if let Err(code) = resolve_extension_start(record, &mut configuration) {
+            rpc::complete(send, request, error(code));
+            return;
         }
         if let Err(code) =
             validate_start_configuration(lifecycle_admitter, record, &mut configuration)
@@ -576,7 +552,7 @@ impl Pipeline {
                 return;
             }
             if let Err(code) =
-                validate_start_configuration(lifecycle_admitter, record, &mut configuration)
+                validate_stop_configuration(lifecycle_admitter, record, &mut configuration)
             {
                 rpc::complete(send, request, error(code));
                 return;
@@ -761,6 +737,65 @@ fn unix_time_millis() -> i64 {
     }
 }
 
+/// Translate an RTSP-selected extension into the approved native encoder route.
+fn resolve_extension_start(
+    record: &Record,
+    configuration: &mut StartConfig,
+) -> Result<(), &'static str> {
+    let Some(profile) = configuration.configuration.extension_profile.as_ref() else {
+        return Ok(());
+    };
+    let route = record
+        .extension_route
+        .as_ref()
+        .filter(|route| {
+            record.owner == "amaterasu.rtsp"
+                && configuration.client_feature_flags.is_some()
+                && record.extension_limits.is_some()
+                && &route.profile == profile
+        })
+        .ok_or("extension_profile_not_offered")?;
+    let mut expected = record
+        .config
+        .extension_probe
+        .clone()
+        .expect("offered profile has probe configuration");
+    expected.extension_profile = Some(profile.clone());
+    if configuration.configuration != expected
+        || configuration.source_id.is_some()
+        || configuration.encoder_provider.is_some()
+        || configuration.encoder_options.is_some()
+    {
+        return Err("extension_configuration_mismatch");
+    }
+    configuration.source_id = Some(route.source_id);
+    configuration.encoder_provider = Some(route.encoder_provider.clone());
+    configuration.encoder = route.encoder.clone();
+    Ok(())
+}
+
+/// Match cleanup to the accepted start even after its capture lease has detached.
+fn validate_stop_configuration(
+    lifecycle_admitter: bool,
+    record: &Record,
+    configuration: &mut StartConfig,
+) -> Result<(), &'static str> {
+    let Some(start) = &record.start else {
+        // Cleanup-only adoption has no stored configuration to compare.
+        return validate_start_configuration(lifecycle_admitter, record, configuration);
+    };
+    // RTSP repeats the negotiated fields; stream-session owns the native
+    // encoder fields added to a start that actually used the extension.
+    if start.source_id.is_some() && start.configuration.extension_profile.is_some() {
+        resolve_extension_start(record, configuration)?;
+    }
+    configuration.configuration.normalize_codec()?;
+    if start != configuration {
+        return Err("start_conflict");
+    }
+    Ok(())
+}
+
 /// Startup and cleanup adoption share the same owner, frozen configuration and
 /// coordinator binding checks. Validation alone never opens native resources.
 fn validate_start_configuration(
@@ -843,11 +878,7 @@ fn validate_start_configuration(
             && candidate.selector["output"].as_str().is_some_and(|output| {
                 output.starts_with("kwin:Virtual-") && valid_name(output)
             })
-            && (configuration.source_id.is_none()
-                || record
-                    .extension_route
-                    .as_ref()
-                    .is_some_and(|route| route.submitted))
+            && super::shared_capture::uses_capture_frames(record, configuration)
             && (record
                 .extension_route
                 .as_ref()
@@ -868,7 +899,8 @@ fn validate_start_configuration(
         return Err("source_capture_context_changed");
     }
     if let Some(source) = &record.config.borrowed_capture
-        && (configuration.output != source.output || configuration.source_id.is_some())
+        && (configuration.output != source.output
+            || !super::shared_capture::uses_capture_frames(record, configuration))
     {
         return Err("borrowed_capture_changed");
     }

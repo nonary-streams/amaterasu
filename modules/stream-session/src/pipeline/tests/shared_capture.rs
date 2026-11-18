@@ -459,6 +459,144 @@ fn joins_reject_unready_foreign_and_changed_sources_before_capture() {
 }
 
 #[test]
+fn submitted_extension_joins_and_retires_on_the_existing_capture_output() {
+    use amaterasu_media::{VIDEO_FRAMING_LIMITS_VERSION, VideoFramingLimits};
+
+    let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
+        "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
+        "payload_type":100,"encoding_name":"EXAMPLE"});
+    for (submitted, exact_output) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut host = host();
+        let first = launch(&mut host, 1, false);
+        let source = host.pipeline.records[&first]
+            .shared_capture
+            .clone()
+            .unwrap();
+        host.pipeline.settings.extension_route = Some(
+            serde_json::from_value(json!({"profile":profile,
+                "source_id":42,"submitted":submitted,"encoder_provider":"fixture",
+                "encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
+                "video_unit_service":"example.units/1","framer_service":"example.framer/1",
+                "plan_transport_service":"example.plan/1"}))
+            .unwrap(),
+        );
+        host.broker.extension_probe_supported = true;
+        host.extension_probe_limits = Some(VideoFramingLimits {
+            size: size_of::<VideoFramingLimits>() as u32,
+            version: VIDEO_FRAMING_LIMITS_VERSION,
+            packet_size: 1024,
+            crypto_overhead: 16,
+            network_overhead: 28,
+            allowed_extensions: 0,
+            max_datagrams: 64,
+            max_queue_bytes: 65536,
+            min_parity_shards: 2,
+            max_fec_percentage: 255,
+            max_wire_bytes: 65536,
+            min_fec_percentage: 20,
+            max_fec_blocks: 1,
+            fec_policy_flags: 0,
+            reserved: 0,
+        });
+        let mut prepare = preparation(2, true);
+        let mut start = configuration(0, 2, true);
+        if exact_output {
+            prepare
+                .as_object_mut()
+                .unwrap()
+                .remove("shared_source_operation_id");
+            prepare["borrowed_capture"] = json!({
+                "client_id":"paired-client", "session_id":"retained-source",
+                "generation":7, "reservation_id":"source-hold",
+                "transport_id":"nvhttp-client-2", "transport_epoch":"ab".repeat(16),
+                "output":source.output, "mode":{
+                    "width":source.width, "height":source.height,
+                    "refresh_millihz":source.refresh_millihz, "hdr":source.hdr_enabled
+                }
+            });
+            start["configuration"]["output"] = json!(source.output);
+        }
+        start["configuration"]["configuration"]["width"] = json!(960);
+        start["configuration"]["configuration"]["height"] = json!(540);
+        start["configuration"]["configuration"]["fps"] = json!(60);
+        prepare["extension_probe"] = start["configuration"]["configuration"].clone();
+        let prepared = host.response_from(20, OWNER, prepare);
+        let expected_profile = if submitted { &profile } else { &Value::Null };
+        assert_eq!(
+            &prepared["extension_profile"], expected_profile,
+            "{prepared}"
+        );
+        let second = prepared["session"].as_u64().unwrap();
+        start["session"] = json!(second);
+        start["configuration"]["client_feature_flags"] = json!(0);
+        start["configuration"]["configuration"]["extension_profile"] = profile.clone();
+
+        let stop = json!({"action":"stop","session":second,
+            "lifecycle_configuration":start["configuration"]});
+        let result = host.response_from(21, OWNER, start);
+        assert_eq!(host.pipeline.records[&first].state, State::Active);
+        assert_eq!(display_calls(&host, "create"), 1);
+        assert_eq!(display_calls(&host, "remove"), 0);
+        let video_operation = host.pipeline.records[&second].operation(Resource::Video);
+        let video = host.broker.calls.iter().find(|call| {
+            call.service == Resource::Video.service()
+                && call.payload["action"] == "open"
+                && call.payload["operation_id"] == video_operation
+        });
+        if submitted {
+            assert_eq!(result["state"], "active", "{result}");
+            let video = video.expect("joined encoder opened");
+            assert_eq!(video.payload["source_id"], 42);
+            assert_eq!(video.payload["capture_provider"], "pipewire");
+            assert_eq!(
+                video.payload["output"],
+                json!(host.pipeline.records[&first].virtual_display_output)
+            );
+            assert_eq!(video.payload["configuration"]["width"], 960);
+            assert_eq!(video.payload["configuration"]["height"], 540);
+            assert_eq!(video.payload["configuration"]["fps"], 60);
+            assert_ne!(source.width, 960);
+            if exact_output {
+                continue;
+            }
+            assert_eq!(
+                host.pipeline.records[&second].shared_capture.as_ref(),
+                Some(&source)
+            );
+
+            // RTSP sends the same negotiated configuration on Stop that it
+            // sent on Start, without the encoder ID that stream-session adds.
+            let mut wrong_stop = stop.clone();
+            wrong_stop["lifecycle_configuration"]["lifecycle_target"]["generation"] = json!(2);
+            assert_eq!(
+                host.response_from(22, OWNER, wrong_stop)["code"],
+                "start_conflict"
+            );
+            assert_eq!(host.pipeline.records[&second].state, State::Active);
+            host.broker.lifecycle_retirement_override = Some(json!({
+                "status":"succeeded", "target":target("client-2"), "plan_revision":null,
+                "consumer_retired":true, "resources_released":false,
+                "shared_retained":true, "shared_source":target("client-1")
+            }));
+            let stopped = host.response_from(23, OWNER, stop.clone());
+            assert_eq!(stopped["state"], "stopped", "{stopped}");
+            assert_eq!(stopped["lifecycle_consumer_retired"], true, "{stopped}");
+            assert_eq!(stopped["lifecycle_shared_retained"], true, "{stopped}");
+            assert_eq!(
+                host.response_from(24, OWNER, stop)["state"],
+                "stopped",
+                "an exact retry is idempotent"
+            );
+            assert_eq!(host.pipeline.records[&first].state, State::Active);
+            assert_eq!(display_calls(&host, "remove"), 0);
+        } else {
+            assert_eq!(result["code"], "extension_profile_not_offered");
+            assert!(video.is_none());
+        }
+    }
+}
+
+#[test]
 fn shared_source_journal_carries_exact_native_cleanup_reference_for_every_consumer() {
     let mut host = host();
     let first = launch(&mut host, 1, false);

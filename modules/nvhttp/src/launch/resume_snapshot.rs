@@ -64,6 +64,7 @@ impl ResumeSnapshot {
         peer: PeerIdentity,
         connect_data: u32,
         global_proton_dualsense_compatibility: bool,
+        joining: bool,
     ) -> Result<Self, &'static str> {
         let config = controller.config.as_ref().ok_or("streaming_disabled")?;
         if !controller.output_settings_ready || connect_data == 0 {
@@ -162,11 +163,24 @@ impl ResumeSnapshot {
             .unwrap_or_default();
         let mut profile = config.profile.clone();
         workflow::project_application_policy(&mut stream, &application, &mut profile)?;
-        stream.virtual_display_intent = if stream.shared_capture.is_some() {
-            None
-        } else {
-            workflow::virtual_display_intent(&stream)?
-        };
+        if joining {
+            // The joining transport can negotiate its own media, but the
+            // application already owns the capture route and display policy.
+            stream.capture_provider = retained.capture_provider.clone();
+            stream.capture_output.clone_from(&retained.capture_output);
+            stream.constant_rate = retained.constant_rate;
+            stream.global_display_revision = retained.global_display_revision;
+            stream
+                .global_display_policy
+                .clone_from(&retained.global_display_policy);
+            stream
+                .display_policy_snapshot
+                .clone_from(&retained.display_policy_snapshot);
+            return Ok(Self { stream });
+        }
+        if stream.shared_capture.is_none() {
+            stream.virtual_display_intent = workflow::virtual_display_intent(&stream)?;
+        }
         let selected_mode = peer
             .client_capture
             .or(application.capture)
@@ -315,7 +329,7 @@ mod tests {
         let original = controller.records.values().next().unwrap();
         let application_operation = original.application_operation.clone();
         let candidate =
-            ResumeSnapshot::build(&controller, original, next, peer(1), 42, true).unwrap();
+            ResumeSnapshot::build(&controller, original, next, peer(1), 42, true, false).unwrap();
         let retained = controller.records.values_mut().next().unwrap();
         candidate.apply(retained);
         assert_eq!(retained.request.width, 1280);
@@ -340,7 +354,10 @@ mod tests {
         let width = original.request.width;
         let mut invalid = request(2);
         invalid.width = 50_000;
-        assert!(ResumeSnapshot::build(&controller, original, invalid, peer(1), 42, true).is_err());
+        assert!(
+            ResumeSnapshot::build(&controller, original, invalid, peer(1), 42, true, false)
+                .is_err()
+        );
         assert_eq!(
             controller.records.values().next().unwrap().request.width,
             width
@@ -359,7 +376,10 @@ mod tests {
         let mut invalid = request(2);
         invalid.audio_channels = 6;
         let retained = controller.records.values().next().unwrap();
-        assert!(ResumeSnapshot::build(&controller, retained, invalid, peer(1), 42, true).is_err());
+        assert!(
+            ResumeSnapshot::build(&controller, retained, invalid, peer(1), 42, true, false)
+                .is_err()
+        );
         let retained = controller.records.values().next().unwrap();
         assert_eq!(retained.application_launch, Some(77));
         assert_eq!(retained.request.audio_channels, 2);

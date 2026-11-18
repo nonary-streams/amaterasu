@@ -211,6 +211,89 @@ fn two_clients_have_distinct_transports_and_one_running_application() {
 }
 
 #[test]
+fn joined_client_keeps_the_active_display_and_capture_route() {
+    for resume in [false, true] {
+        let (mut controller, mut broker, now) = one_client_application();
+        let original = controller.records.values().next().unwrap();
+        let original_capture = broker
+            .broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => {
+                    Some(payload["capture"].clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let original_revision = original.global_display_revision.unwrap();
+        controller.set_global_display_policy(original_revision + 1, json!({}));
+        let mut joining = peer(2);
+        joining.client_capture = Some(CaptureMode::Wgcc);
+        joining.client_keyboard = Some(false);
+        joining.client_display_overrides = json!({
+            "virtual_display_mode":"disabled",
+            "dd_configuration_option":"ensure_only_display",
+            "adapter_name":"replacement-adapter"
+        });
+        let mut next_stream = request(2);
+        next_stream.width = 1024;
+        next_stream.height = 576;
+        let command_count = broker.broker.commands.len();
+        let response = if resume {
+            controller.resume(11, next_stream, &joining, now)
+        } else {
+            controller.launch(11, next_stream, joining, now)
+        };
+        assert!(response.is_none());
+        assert_eq!(broker.reply(&mut controller, now).1.status, 200);
+        controller.reply_delivered(11, now);
+
+        let commands = &broker.broker.commands[command_count..];
+        let joined = commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("joined RTSP open");
+        assert_eq!(joined["capture"], original_capture);
+        assert_eq!(
+            joined["lifecycle_settings_revision"],
+            original_revision.to_string()
+        );
+        assert_eq!(joined["profile"]["width"], 1024);
+        assert_eq!(joined["profile"]["height"], 576);
+        assert_eq!(joined["keyboard"], false);
+        assert!(joined["adapter_name"].is_null());
+        assert!(joined.get("display_request").is_none());
+        assert!(joined.get("display_policy_snapshot").is_none());
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.display/1"
+                    || payload["action"] == "prepare_display_admission"
+        )));
+        assert!(
+            controller
+                .records
+                .values()
+                .all(|record| record.state == State::Ready)
+        );
+        assert!(
+            controller
+                .records
+                .values()
+                .all(|record| record.stream_warnings.is_empty())
+        );
+    }
+}
+
+#[test]
 fn disconnecting_either_client_preserves_the_other_and_the_application() {
     for departing in [71, 72] {
         let (mut controller, mut broker, now) = two_client_application();

@@ -25,6 +25,10 @@ impl Record {
         self.application_session.unwrap_or(self.id)
     }
 
+    pub(super) fn uses_existing_capture(&self) -> bool {
+        self.application_session.is_some() || self.shared_capture.is_some()
+    }
+
     pub(super) fn lifecycle_intent(&self) -> &'static str {
         if self.application_session.is_some() {
             "join"
@@ -268,13 +272,11 @@ impl Controller {
             peer.clone(),
             connect_data,
             proton,
+            true,
         ) {
-            Ok(candidate) if !candidate.legacy_display_conflict() => candidate,
-            _ => {
-                return Some(private_error(
-                    503,
-                    "shared display settings are unavailable",
-                ));
+            Ok(candidate) => candidate,
+            Err(_) => {
+                return Some(private_error(503, "stream settings are unavailable"));
             }
         };
         let operation = operation_id(&self.nonce, id, "rtsp");

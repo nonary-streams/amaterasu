@@ -178,7 +178,7 @@ pub(super) fn validate_start(record: &Record, start: &StartConfig) -> Result<(),
     if !record.shared_capture_attached
         || !source.valid()
         || start.output != "amaterasu-owned-display"
-        || start.source_id.is_some()
+        || !uses_capture_frames(record, start)
         || json!(start.capture_provider) != source.capture_provider
         || !start.lifecycle_capture_mode.is_external()
         || start.lifecycle_shared_source.as_ref() != Some(&source.stream)
@@ -186,6 +186,19 @@ pub(super) fn validate_start(record: &Record, start: &StartConfig) -> Result<(),
         return Err("shared_capture_configuration_changed");
     }
     Ok(())
+}
+
+/// Submitted encoders consume the existing capture frames. Source plugins
+/// produce their own frames and cannot stand in for a leased capture output.
+pub(super) fn uses_capture_frames(record: &Record, start: &StartConfig) -> bool {
+    start.source_id.is_none_or(|source_id| {
+        record.extension_route.as_ref().is_some_and(|route| {
+            route.submitted
+                && route.source_id == source_id
+                && start.encoder_provider.as_ref() == Some(&route.encoder_provider)
+                && start.configuration.extension_profile.as_ref() == Some(&route.profile)
+        })
+    })
 }
 
 pub(super) fn initialize_source(record: &mut Record) -> Result<(), &'static str> {
