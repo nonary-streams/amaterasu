@@ -231,13 +231,31 @@ def test_service_mode_holds_root_until_controlled_stop(harness):
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
     )
+    readiness = harness.root / "service-ready.json"
     try:
-        time.sleep(0.5)
-        assert process.poll() is None, process.stderr.read()
+        deadline = time.monotonic() + 30
+        while True:
+            assert process.poll() is None, process.stderr.read()
+            try:
+                state = json.loads(readiness.read_text())
+            except FileNotFoundError:
+                state = {}
+            if state.get("process_id") == process.pid:
+                assert state["schema"] == 1 and state["digest"] == harness.state()["active"], state
+                break
+            assert time.monotonic() < deadline, "service did not publish readiness"
+            time.sleep(0.02)
+
         replacement = harness.package(2)
-        run(harness.publisher, "stage", harness.root, replacement, expect_success=False)
+        staged = subprocess.run(
+            [str(harness.publisher), "stage", str(harness.root), str(replacement)],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert staged.returncode != 0 and "host root is busy" in staged.stderr, staged
         process.stdin.close()
         assert process.wait(timeout=8) == 0, process.stderr.read()
+        assert not readiness.exists(), readiness
+        harness.stage(replacement)
     finally:
         if process.poll() is None:
             process.kill()
