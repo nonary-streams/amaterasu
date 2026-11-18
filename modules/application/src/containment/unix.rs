@@ -33,7 +33,7 @@ impl ContainedChild {
         Ok(self.successful_exit()?.is_some())
     }
 
-    pub fn successful_exit(&mut self) -> io::Result<Option<bool>> {
+    pub fn successful_exit(&self) -> io::Result<Option<bool>> {
         // SAFETY: info is initialized writable storage. WNOWAIT deliberately keeps
         // our exclusive child unreaped, pinning its PID/PGID until final signaling.
         // The embedding host must not install SIGCHLD=SIG_IGN, SA_NOCLDWAIT, or reap
@@ -104,7 +104,7 @@ impl ContainedChild {
         }
         #[cfg(target_os = "macos")]
         {
-            return Ok(!macos_group_is_dead(self.id())?);
+            Ok(self.successful_exit()?.is_none() || !macos_group_is_dead(self.id())?)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -444,42 +444,40 @@ fn linux_pidfd_revents(revents: i16) -> io::Result<bool> {
 
 #[cfg(target_os = "macos")]
 fn macos_group_is_dead(group: u32) -> io::Result<bool> {
-    // Darwin killpg returns EPERM when a group contains only zombies. Never
-    // suppress a real permission failure: inspect every member before accepting
-    // this case. The unreaped leader still reserves the group identity.
-    let mut members = [0i32; 4096];
-    let capacity = std::mem::size_of_val(&members) as i32;
+    // Callers first confirm the leader has exited with waitid(WNOWAIT), so
+    // that identity still reserves this group while libproc lists its members.
+    let group = group as libc::pid_t;
+    let mut members = [0 as libc::pid_t; 4096];
+    let capacity = std::mem::size_of_val(&members) as libc::c_int;
     // SAFETY: members is writable aligned storage of exactly capacity bytes.
-    let size =
-        unsafe { libc::proc_listpgrppids(group as i32, members.as_mut_ptr().cast(), capacity) };
-    if size <= 0 {
-        // The libproc wrapper converts syscall errors to zero, so an empty or
-        // failed scan cannot prove that the process group is dead.
+    let count = unsafe { libc::proc_listpgrppids(group, members.as_mut_ptr().cast(), capacity) };
+    if count <= 0 || count as usize >= members.len() {
         return Ok(false);
     }
-    if size as usize >= members.len() {
+    let members = &members[..count as usize];
+    if !members.contains(&group) {
         return Ok(false);
     }
 
     Ok(super::macos_members_are_dead(
-        members[..size as usize].iter().copied(),
+        members.iter().copied(),
         |pid| {
-            // SAFETY: zero is valid initialization and proc_pidinfo receives the
-            // matching buffer size/flavor. This is inspection only, never PID signaling.
+            if pid == group {
+                return Some(true);
+            }
+            // SAFETY: zero is valid initialization and the buffer matches the
+            // flavor. A nonzero argument asks Darwin to include zombie processes.
             let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
             let read = unsafe {
                 libc::proc_pidinfo(
                     pid,
                     libc::PROC_PIDTBSDINFO,
-                    0,
+                    1,
                     (&mut info as *mut libc::proc_bsdinfo).cast(),
-                    std::mem::size_of_val(&info) as i32,
+                    std::mem::size_of_val(&info) as libc::c_int,
                 )
             };
-            if read == 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                return Some(true);
-            }
-            (read as usize == std::mem::size_of_val(&info))
+            (read as usize == std::mem::size_of_val(&info) && info.pbi_pgid == group as u32)
                 .then_some(info.pbi_status == libc::SZOMB)
         },
     ))
