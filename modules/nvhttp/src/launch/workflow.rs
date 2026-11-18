@@ -2751,13 +2751,10 @@ impl Controller {
                     record.rtsp_stream_ending = matches!(
                         payload["state"].as_str(),
                         Some("closing" | "closed" | "failed" | "cleanup_failed")
-                    )
-                        || matches!(
-                            payload["stream_state"].as_str(),
-                            Some(
-                                "stopping" | "stopped" | "failed" | "cancelled" | "cleanup_failed"
-                            )
-                        );
+                    ) || matches!(
+                        payload["stream_state"].as_str(),
+                        Some("stopping" | "stopped" | "failed" | "cancelled" | "cleanup_failed")
+                    );
                 }
                 match observed {
                     Ok((_, _, "ready" | "arming" | "playing", true))
