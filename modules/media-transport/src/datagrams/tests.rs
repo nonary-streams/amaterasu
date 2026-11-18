@@ -446,9 +446,17 @@ fn discovery_timeout_names_the_lane_that_still_needs_a_ping() {
             Medium::Video => video,
             Medium::Audio => audio,
         };
-        sender().send_to(&ping(token, 1), target).unwrap();
-        delivery.tick();
-        assert!(delivery.peer_port(ready_lane).is_some());
+        let sender = sender();
+        sender.send_to(&ping(token, 1), target).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while delivery.peer_port(ready_lane).is_none() && Instant::now() < deadline {
+            delivery.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            delivery.peer_port(ready_lane),
+            Some(sender.local_addr().unwrap().port())
+        );
         delivery.discovery_window.as_mut().unwrap().0 = Instant::now();
         delivery.tick();
         let failure = delivery.first_failure.unwrap();

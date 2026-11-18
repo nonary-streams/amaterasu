@@ -65,7 +65,10 @@ fn assert_reported_here(issue: &StreamIssue, operation: &str) {
     assert_eq!(issue.layer, LifecycleLayer::Application);
     assert_eq!(issue.caused_by, None);
     assert!(
-        issue.site.contains("modules/launch/src/"),
+        issue
+            .site
+            .replace('\\', "/")
+            .contains("modules/launch/src/"),
         "reported from this module: {}",
         issue.site
     );

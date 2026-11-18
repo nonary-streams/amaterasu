@@ -2547,8 +2547,7 @@ fn accepted_rtsp_connections_are_kept_on_the_old_listener_until_it_is_idle() {
         .add_ticket(23, old_local.ip(), &[7; 16])
         .unwrap();
     let connection = TcpStream::connect(old_local).unwrap();
-    controller.transport.as_mut().unwrap().poll(1);
-    assert_eq!(controller.transport.as_ref().unwrap().connection_count(), 1);
+    assert_transport_connection_count(controller.transport.as_mut().unwrap(), 1, 1);
 
     let port = free_base_port();
     let pending = controller
@@ -2558,10 +2557,22 @@ fn accepted_rtsp_connections_are_kept_on_the_old_listener_until_it_is_idle() {
     assert_eq!(controller.local, Some(old_local));
 
     drop(connection);
-    controller.transport.as_mut().unwrap().poll(3);
-    assert_eq!(controller.transport.as_ref().unwrap().connection_count(), 0);
+    assert_transport_connection_count(controller.transport.as_mut().unwrap(), 3, 0);
     controller.reconcile_network_port(4);
     assert_eq!(controller.local.unwrap().port(), port + 21);
+}
+
+fn assert_transport_connection_count(
+    transport: &mut crate::transport::Transport,
+    now: u64,
+    count: usize,
+) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while transport.connection_count() != count && Instant::now() < deadline {
+        transport.poll(now);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(transport.connection_count(), count);
 }
 
 fn request(method: Method, target: &str, cseq: u32, session: bool) -> Request {

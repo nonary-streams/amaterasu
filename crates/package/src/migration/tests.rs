@@ -166,7 +166,7 @@ fn discovery_keeps_case_distinct_roots_on_case_sensitive_filesystems() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn discovery_keeps_distinct_non_unicode_roots() {
     use std::os::unix::ffi::OsStringExt;

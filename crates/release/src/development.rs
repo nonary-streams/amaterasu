@@ -1798,6 +1798,7 @@ mod provision_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn signed_rtx_package_can_omit_unselected_optional_plugins() {
         let base = fixture("rtx-without-optional-plugins");
@@ -1877,6 +1878,7 @@ mod provision_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn default_rtx_package_does_not_require_foreground_observation() {
         let base = fixture("rtx-without-foreground");
@@ -1948,6 +1950,7 @@ mod provision_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn signed_rtx_package_orders_selected_replacement_capability_providers() {
         use crate::profiles::linux_session::{
@@ -2182,6 +2185,7 @@ mod provision_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn signed_rtx_graph_accepts_selected_lifecycle_and_registry_identities() {
         use crate::profiles::linux_session::{CapabilityBinding, default_rtx_hdr_selection};
@@ -2387,6 +2391,7 @@ mod provision_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     fn replace_identity(value: &mut serde_json::Value, old: &str, new: &str) {
         match value {
             serde_json::Value::String(text) if text == old => *text = new.into(),
@@ -2407,6 +2412,7 @@ mod provision_tests {
 
     /// Package the RTX profile with one core role served by an external
     /// component, renaming every policy reference to the role's identities.
+    #[cfg(target_os = "linux")]
     fn package_role_replacement(
         name: &str,
         (original, replacement): (&str, &str),
@@ -2511,6 +2517,7 @@ mod provision_tests {
         (base, bootstrap, output)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn signed_rtx_graph_selects_a_replacement_stream_owner() {
         use crate::profiles::linux_session::CapabilityBinding;
@@ -2575,6 +2582,7 @@ mod provision_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn signed_rtx_graph_selects_a_replacement_video_contract() {
         use crate::profiles::linux_session::{CapabilityBinding, VIDEO_COMPONENT_ID};
@@ -2657,6 +2665,7 @@ mod provision_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn selected_builtin_foreground_also_requires_a_signed_binding() {
         use crate::profiles::linux_session::{
@@ -2757,6 +2766,7 @@ mod provision_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn independently_packaged_rtx_provider_binds_into_an_existing_sdk_host() {
         let base = fixture("external-rtx-sdk");

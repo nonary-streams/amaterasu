@@ -507,6 +507,7 @@ fn shared_source_journal_carries_exact_native_cleanup_reference_for_every_consum
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn owned_source_uses_processing_input_range_while_video_keeps_hdr_output() {
     for (provider, control, processor, source_hdr) in [

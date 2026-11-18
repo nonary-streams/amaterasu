@@ -605,8 +605,16 @@ fn lost_negotiation_responses_replay_exact_data_over_a_fresh_authenticated_conne
         };
         drop(dropped);
         now += 10_000;
-        assert!(transport.poll(now).into_iter().any(|event| matches!(event,
-            Event::Disconnected { connection: closed, .. } if closed == connection)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let disconnected = transport.poll(now).into_iter().any(|event| matches!(event,
+                Event::Disconnected { connection: closed, .. } if closed == connection));
+            if disconnected {
+                break;
+            }
+            assert!(Instant::now() < deadline, "expected the listener to retire the connection");
+            thread::sleep(Duration::from_millis(1));
+        }
         controller.handle_network(connection, ticket, authenticated, 10);
 
         let retry = exchange(&mut controller, &mut sealer, &mut opener, &request);

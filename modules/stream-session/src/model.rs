@@ -1788,21 +1788,22 @@ fn mapped(value: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn ten_bit_extension_probe_preserves_both_output_ranges() {
+    fn ten_bit_extension_probe_enforces_platform_support_for_both_output_ranges() {
+        let supports_ten_bit = cfg!(target_os = "linux");
         for range in ["sdr", "hdr"] {
             let mut config: super::VideoConfiguration = serde_json::from_value(serde_json::json!({
                 "width":2560,"height":1440,"fps":120,"bitrate":56800000,
                 "video_stream_format":{"codec":"hevc","bit_depth":10,"dynamic_range":range}
             }))
             .unwrap();
-            assert!(config.valid_extension_probe());
+            assert_eq!(config.valid_extension_probe(), supports_ten_bit);
             config.extension_profile = Some(serde_json::from_value(serde_json::json!({
                 "codec":{"namespace_id":1,"value":4,"schema":1}, "framing":{"namespace_id":1,"value":2,"schema":1},
                 "wire_selector":3,"payload_type":99,"encoding_name":"PYROWAVE",
                 "media_format":{"bit_depth":10,"dynamic_range":"hdr","chroma_sampling":"yuv420"}
             })).unwrap());
             config.normalize_codec().unwrap();
-            assert!(config.valid());
+            assert_eq!(config.valid(), supports_ten_bit);
             assert_eq!(
                 serde_json::to_value(config).unwrap()["video_stream_format"]["dynamic_range"],
                 range

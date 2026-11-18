@@ -100,7 +100,10 @@ fn an_open_refusal_is_reported_under_the_launch_owners_stream_key() {
     assert_eq!(issue.disposition, IssueDisposition::CriticalFailure);
     assert!(issue.is_origin());
     assert!(
-        issue.site.contains("rtsp/src/controller/actions.rs:"),
+        issue
+            .site
+            .replace('\\', "/")
+            .contains("rtsp/src/controller/actions.rs:"),
         "{}",
         issue.site
     );
@@ -180,7 +183,10 @@ fn a_stream_session_failure_is_reported_as_rtsps_reaction_once() {
     assert_eq!(issue.code, "stream_failed");
     assert_eq!(issue.caused_by, Some(LifecycleLayer::StreamSession));
     assert!(
-        issue.site.contains("rtsp/src/controller/workflow.rs:"),
+        issue
+            .site
+            .replace('\\', "/")
+            .contains("rtsp/src/controller/workflow.rs:"),
         "{}",
         issue.site
     );

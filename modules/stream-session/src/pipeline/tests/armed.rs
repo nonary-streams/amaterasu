@@ -107,6 +107,7 @@ fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
     (id, target)
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
     for (enabled, source_hdr, output_hdr, bad_revision, omit_ranges, expected_open) in [
@@ -179,6 +180,7 @@ fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn external_capture_receives_source_requirement_from_frozen_processing_plan() {
     for (enabled, hdr_output, omit_disabled, selected) in [
@@ -262,6 +264,7 @@ fn selected_processing_rejects_legacy_stream_without_frozen_authority() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn processing_provider_context_reaches_video_without_changing_frozen_settings() {
     let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});

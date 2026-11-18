@@ -60,7 +60,10 @@ fn a_refused_open_is_reported_under_the_callers_operation() {
     assert_eq!(issue.disposition, IssueDisposition::CriticalFailure);
     assert!(issue.is_origin());
     assert!(
-        issue.site.contains("media-transport/src/controller.rs:"),
+        issue
+            .site
+            .replace('\\', "/")
+            .contains("media-transport/src/controller.rs:"),
         "{}",
         issue.site
     );
@@ -104,7 +107,10 @@ fn a_delivery_failure_is_reported_once_at_the_line_that_raised_it() {
     assert!(!record.contains("video_token-1234"));
     assert!(!record.contains("audio_token-1234"));
     assert!(
-        issue.site.contains("media-transport/src/datagrams.rs:"),
+        issue
+            .site
+            .replace('\\', "/")
+            .contains("media-transport/src/datagrams.rs:"),
         "{}",
         issue.site
     );

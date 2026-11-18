@@ -51,7 +51,10 @@ fn a_refused_open_is_reported_under_the_callers_operation() {
     assert_eq!(issue.disposition, IssueDisposition::CriticalFailure);
     assert!(issue.is_origin());
     assert!(
-        issue.site.contains("control-transport/src/controller.rs:"),
+        issue
+            .site
+            .replace('\\', "/")
+            .contains("control-transport/src/controller.rs:"),
         "{}",
         issue.site
     );
@@ -80,7 +83,10 @@ fn a_stream_failure_is_reported_once_at_the_line_that_raised_it() {
     assert_eq!(issue.phase, "control");
     assert_eq!(issue.code, "authentication_timeout");
     assert!(
-        issue.site.contains("control-transport/src/stream.rs:"),
+        issue
+            .site
+            .replace('\\', "/")
+            .contains("control-transport/src/stream.rs:"),
         "{}",
         issue.site
     );

@@ -257,7 +257,8 @@ fn four_k_pyrowave_bandwidth_announcement_returns_200_and_reaches_play() {
             .replace("2560", "3840")
             .replace("1440", "2160")
             .replace("maxFPS:120", "maxFPS:60")
-            .replace("100000", "19600");
+            .replace("100000", "19600")
+            .replace("encoderCscMode:0", "encoderCscMode:2");
         announcement.body = if hdr {
             fixture
         } else {
