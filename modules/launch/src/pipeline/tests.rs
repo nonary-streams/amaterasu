@@ -2262,7 +2262,7 @@ fn output_path_is_snapshotted_at_preflight_and_forwarded_unchanged_on_replay() {
     let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request.clone());
     assert_eq!(preflight["ok"], true, "{preflight}");
     assert!(harness.sessions.is_empty() && harness.processes.is_empty());
-    let expected = std::path::Path::new(&original_root).join("application.log");
+    let expected = format!("{original_root}/application.log");
     pipeline
         .environment
         .insert("OUTPUT_ROOT".into(), "changed-after-preflight".into());

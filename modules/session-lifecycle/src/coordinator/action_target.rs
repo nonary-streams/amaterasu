@@ -672,16 +672,12 @@ impl Coordinator {
             let Some(transfer) = &work.action_transfer else {
                 return false;
             };
-            if receipt.caller != self.settings.action_service
-                || transfer.service != self.settings.action_service
-                || transfer.binding.operation_id != operation_id
-                || transfer.binding.action_id != action_id
-                || serde_json::to_value(&transfer.binding.target).ok().as_ref()
-                    != Some(&target_value)
-            {
-                return false;
-            }
-            true
+            receipt.caller == self.settings.action_service
+                && transfer.service == self.settings.action_service
+                && transfer.binding.operation_id == operation_id
+                && transfer.binding.action_id == action_id
+                && serde_json::to_value(&transfer.binding.target).ok().as_ref()
+                    == Some(&target_value)
         });
         let Some(receipt) = matches.next() else {
             return false;
