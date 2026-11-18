@@ -51,10 +51,10 @@ unsafe extern "C" fn invoke(
     abi::STATUS_OK
 }
 
-fn runtime(state: Arc<Mutex<EndpointState>>) -> RuntimeClient {
+fn runtime(state: &Arc<Mutex<EndpointState>>) -> RuntimeClient {
     let api = HostApi {
         header: AbiHeader::of::<HostApi>(),
-        context: Arc::as_ptr(&state).cast_mut().cast(),
+        context: Arc::as_ptr(state).cast_mut().cast(),
         invoke,
     };
     // SAFETY: the caller retains the Arc containing the callback context.
@@ -136,7 +136,7 @@ fn a_fresh_runtime_reconciles_the_persisted_port_after_restart() {
         result: applied(port),
         ..EndpointState::default()
     }));
-    let runtime = runtime(state.clone());
+    let runtime = runtime(&state);
     let mut network = NetworkSettings::default();
     let mut settings = ProductSettings::new("Bootstrap".into(), 47_989);
 
@@ -186,7 +186,7 @@ fn pending_stream_apply_is_reported_as_persisted_and_retried_after_idle() {
         result: pending(port, Some(old_port)),
         ..EndpointState::default()
     }));
-    let runtime = runtime(state.clone());
+    let runtime = runtime(&state);
     let mut network = NetworkSettings::default();
     let mut settings = ProductSettings::new("Bootstrap".into(), old_port);
     settings.set_active_ports(Some(port), Some(crate::settings::https_port(port)));
@@ -241,7 +241,7 @@ fn failed_result_release_retries_cleanup_without_replaying_network_update() {
         release_failures_remaining: 1,
         ..EndpointState::default()
     }));
-    let runtime = runtime(state.clone());
+    let runtime = runtime(&state);
     let mut network = NetworkSettings::default();
     let mut settings = ProductSettings::new("Bootstrap".into(), port);
 
@@ -282,7 +282,7 @@ fn listener_success_without_udp_preflight_is_not_reported_as_applied() {
         result: listener_without_udp_preflight(port),
         ..EndpointState::default()
     }));
-    let runtime = runtime(state.clone());
+    let runtime = runtime(&state);
     let mut network = NetworkSettings {
         active_base_port: Some(old_port),
         ..NetworkSettings::default()
@@ -322,7 +322,7 @@ fn ambiguous_request_submission_retries_the_same_idempotency_key() {
         request_transport_failures_remaining: 1,
         ..EndpointState::default()
     }));
-    let runtime = runtime(state.clone());
+    let runtime = runtime(&state);
     let mut network = NetworkSettings::default();
     let mut settings = ProductSettings::new("Bootstrap".into(), port);
 
@@ -361,7 +361,7 @@ fn assert_rejected_active_addresses(addresses: Option<Value>) {
         result,
         ..EndpointState::default()
     }));
-    let runtime = runtime(state.clone());
+    let runtime = runtime(&state);
     let mut network = NetworkSettings::default();
     let mut settings = ProductSettings::new("Bootstrap".into(), 47_989);
     network.finish(
@@ -411,7 +411,7 @@ fn missing_active_policy_fields_cannot_confirm_listener_application() {
             result,
             ..EndpointState::default()
         }));
-        let runtime = runtime(state);
+        let runtime = runtime(&state);
         let mut network = NetworkSettings::default();
         let mut settings = ProductSettings::new("Bootstrap".into(), port);
 
@@ -461,7 +461,7 @@ fn explicitly_lost_rtsp_endpoints_clear_cached_state_and_retry_the_old_desired_p
         result: applied(old_port),
         ..EndpointState::default()
     }));
-    let runtime = runtime(state.clone());
+    let runtime = runtime(&state);
     let mut network = NetworkSettings::default();
     let mut settings = ProductSettings::new("Bootstrap".into(), old_port);
     let mut old_target = settings.rtsp_target();
@@ -509,7 +509,7 @@ fn incomplete_same_policy_response_invalidates_cached_application_and_retries() 
         result: applied(port),
         ..EndpointState::default()
     }));
-    let runtime = runtime(state.clone());
+    let runtime = runtime(&state);
     let mut network = NetworkSettings::default();
     let mut settings = ProductSettings::new("Bootstrap".into(), port);
     let target = settings.rtsp_target();
@@ -556,7 +556,7 @@ fn reverting_pending_policy_reconfigures_the_owner_before_qualifying_old_endpoin
         result: applied(old_port),
         ..EndpointState::default()
     }));
-    let runtime = runtime(state.clone());
+    let runtime = runtime(&state);
     let mut network = NetworkSettings::default();
     let mut settings = ProductSettings::new("Bootstrap".into(), old_port);
     let old_target = settings.rtsp_target();
