@@ -2271,6 +2271,7 @@ fn desktop_launch_and_cancel_only_manage_rtsp_and_history() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn pipewire_launch_carries_the_owned_display_request_to_rtsp() {
     let now = Instant::now();
@@ -4235,9 +4236,10 @@ fn sparse_application_display_fields_are_frozen_before_launch_and_checked_on_rea
 }
 
 #[test]
-fn paired_client_display_policy_overrides_application_fields_without_global_defaults() {
+fn paired_client_display_policy_overrides_application_fields() {
     let now = Instant::now();
     let certificate = vec![13; 32];
+    let physical_mode = cfg!(windows).then(|| "disabled".to_owned());
     let paired = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
         .unwrap()
         .with_paired_identity(
@@ -4278,27 +4280,26 @@ fn paired_client_display_policy_overrides_application_fields_without_global_defa
         snapshot["application_overrides"]["dd_refresh_rate_option"],
         "manual"
     );
-    assert_eq!(
-        snapshot["client_overrides"],
-        json!({
-            "dd_refresh_rate_option":"disabled", "dd_hdr_option":"auto"
-        })
-    );
-    assert_eq!(
-        snapshot["effective_overrides"],
-        json!({
-            "dd_refresh_rate_option":"disabled",
-            "dd_hdr_option":"auto",
-            "dd_manual_refresh_rate":"59.94",
-            "dd_configuration_option":"verify_only"
-        })
-    );
+    let client = json!({"dd_refresh_rate_option":"disabled", "dd_hdr_option":"auto"});
+    let mut effective = json!({
+        "dd_refresh_rate_option":"disabled",
+        "dd_hdr_option":"auto",
+        "dd_manual_refresh_rate":"59.94",
+        "dd_configuration_option":"verify_only"
+    });
+    let mut global = json!({});
+    if let Some(mode) = physical_mode {
+        global["virtual_display_mode"] = json!(mode);
+        effective["virtual_display_mode"] = json!(mode);
+    }
+    assert_eq!(snapshot["client_overrides"], client);
+    assert_eq!(snapshot["effective_overrides"], effective);
     assert!(
         snapshot["effective_overrides"]
             .get("dd_resolution_option")
             .is_none()
     );
-    assert_eq!(snapshot["global_overrides"], json!({}));
+    assert_eq!(snapshot["global_overrides"], global);
     assert!(snapshot["global_revision"].is_null());
     assert_eq!(
         opened_rtsp_payload(&broker)["display_request"]["mode_policy"]["configuration_option"],
@@ -4519,13 +4520,13 @@ fn disabled_display_policy_skips_provider_and_mutating_policy_fails_before_launc
 fn global_display_policy_is_frozen_and_resolves_below_application_and_client() {
     let now = Instant::now();
     let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
-    controller.set_physical_fixture_display_policy(
-        17,
-        json!({
-            "dd_refresh_rate_option":"auto",
-            "dd_hdr_option":"disabled"
-        }),
-    );
+    let mut global = json!({"dd_refresh_rate_option":"auto", "dd_hdr_option":"disabled"});
+    let mut effective = json!({"dd_refresh_rate_option":"manual", "dd_hdr_option":"auto"});
+    if cfg!(windows) {
+        global["virtual_display_mode"] = json!("disabled");
+        effective["virtual_display_mode"] = json!("disabled");
+    }
+    controller.set_global_display_policy(17, global.clone());
     let mut broker = Broker {
         application_input_overrides: Some(json!({"dd_refresh_rate_option":"manual"})),
         ..Broker::default()
@@ -4548,18 +4549,8 @@ fn global_display_policy_is_frozen_and_resolves_below_application_and_client() {
     assert_eq!(reply.status, 200);
     let snapshot = &opened_rtsp_payload(&broker)["display_policy_snapshot"];
     assert_eq!(snapshot["global_revision"], 17);
-    assert_eq!(
-        snapshot["global_overrides"],
-        json!({
-            "dd_refresh_rate_option":"auto", "dd_hdr_option":"disabled"
-        })
-    );
-    assert_eq!(
-        snapshot["effective_overrides"],
-        json!({
-            "dd_refresh_rate_option":"manual", "dd_hdr_option":"auto"
-        })
-    );
+    assert_eq!(snapshot["global_overrides"], global);
+    assert_eq!(snapshot["effective_overrides"], effective);
     assert!(
         opened_rtsp_payload(&broker)
             .get("display_request")

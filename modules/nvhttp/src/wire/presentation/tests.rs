@@ -683,7 +683,11 @@ fn launch_and_resume_refusals_identify_the_rejected_input() {
                     issue.requested,
                     value.map(amaterasu_module_sdk::stream_warnings::WarningValue::Integer)
                 );
-                assert!(issue.site.contains("wire/streaming.rs"), "{}", issue.site);
+                assert!(
+                    issue.site.replace('\\', "/").contains("wire/streaming.rs"),
+                    "{}",
+                    issue.site
+                );
                 let record = serde_json::to_string(&issue).unwrap();
                 assert!(!record.contains("123456789"));
                 assert!(!record.contains("arbitrary_text"));

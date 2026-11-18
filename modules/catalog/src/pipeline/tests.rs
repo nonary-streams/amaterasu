@@ -3202,7 +3202,9 @@ fn exported_launch_preflight_preserves_sparse_rtss_limit_types() {
             override_value["rtss_frame_limit_type"]
         );
         assert_eq!(
-            result["entry"]["config_overrides"].is_null(),
+            result["entry"]["config_overrides"]
+                .get("rtss_frame_limit_type")
+                .is_none(),
             override_value["rtss_frame_limit_type"].is_null()
         );
     }

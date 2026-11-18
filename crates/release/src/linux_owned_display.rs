@@ -103,7 +103,7 @@ pub(crate) fn desktop_entry(host: &Path) -> PackageResult<String> {
         "[Desktop Entry]\nType=Application\nName=Amaterasu Streaming Host\nNoDisplay=true\nExec=\"{host}\"\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1\n"
     ))
 }
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 pub(crate) fn install_script() -> &'static str {
     r#"#!/bin/sh
 set -eu

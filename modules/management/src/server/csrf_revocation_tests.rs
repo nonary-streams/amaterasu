@@ -191,7 +191,7 @@ fn origin_revocation_releases_completed_verifying_and_dispatched_requests() {
         let runtime = runtime(&recorder);
         let mut server = tls_server();
         let client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-        server.accept().unwrap();
+        accept_fixture_connection(&mut server);
         assert_eq!(server.connections.len(), 1);
         let connection = &mut server.connections[0];
         let request = protected_request(&client.peer_addr().unwrap().to_string());
@@ -241,7 +241,7 @@ fn narrowing_exception_list_does_not_cancel_explicit_bearer_authorization() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     let authority = client.peer_addr().unwrap().to_string();
     let bytes = format!(
         "POST /v1/management_settings/get HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nOrigin: {TRUSTED}\r\nAuthorization: Bearer explicit-token\r\n\r\n{{}}"
@@ -278,7 +278,7 @@ fn shutdown_retries_connection_request_release_before_retiring() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     server.connections[0].stage = Stage::Dispatching {
         request_id: 43,
         login: false,
@@ -314,7 +314,7 @@ fn broker_deadline_settles_the_caller_only_after_result_release() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     server.connections[0].stage = Stage::Dispatching {
         request_id: 47,
         login: false,
@@ -345,7 +345,7 @@ fn revocation_cancels_authority_but_keeps_unconfirmed_work_fenced() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     server.connections[0].csrf_exception = Some(TRUSTED.into());
     server.connections[0].stage = Stage::Dispatching {
         request_id: 48,
@@ -374,7 +374,7 @@ fn result_transport_failure_retains_request_for_shutdown() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     server.connections[0].stage = Stage::Dispatching {
         request_id: 45,
         login: false,
@@ -408,7 +408,7 @@ fn lost_release_ack_preserves_result_across_all_request_stages() {
         let runtime = runtime(&recorder);
         let mut server = tls_server();
         let client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-        server.accept().unwrap();
+        accept_fixture_connection(&mut server);
         let request = protected_request(&client.peer_addr().unwrap().to_string());
         server.connections[0].stage = match kind {
             0 => Stage::Verifying {
@@ -455,7 +455,7 @@ fn lost_release_ack_can_retire_during_shutdown() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     server.connections[0].stage = Stage::Dispatching {
         request_id: 52,
         login: false,
@@ -484,7 +484,7 @@ fn deadline_result_is_settled_without_claiming_provider_retirement() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     server.connections[0].stage = Stage::Dispatching {
         request_id: 53,
         login: false,
@@ -512,6 +512,21 @@ fn deadline_result_is_settled_without_claiming_provider_retirement() {
     // separately verifies caller result release preserves the provider's unretired receipt.
 }
 
+fn accept_fixture_connection(server: &mut Server) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while server.connections.is_empty() && Instant::now() < deadline {
+        server.accept().unwrap();
+        if server.connections.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        server.connections.len(),
+        1,
+        "expected one loopback connection"
+    );
+}
+
 #[test]
 fn downstream_dispatch_error_does_not_resurrect_released_verification() {
     let recorder = RuntimeRecorder::default();
@@ -524,7 +539,7 @@ fn downstream_dispatch_error_does_not_resurrect_released_verification() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     let mut request = protected_request(&client.peer_addr().unwrap().to_string());
     request.target =
         RequestTarget::Api(crate::routes::resolve("/v1/capture/pipewire_selection_begin").unwrap());
@@ -552,7 +567,7 @@ fn lost_admission_is_fenced_without_replaying_an_unparented_effect() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     let mut sequence = OperationSequence::new().unwrap();
     assert!(
         server.connections[0]
@@ -589,7 +604,7 @@ fn lost_typed_api_admission_is_retained_without_replay() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     let command = Command::CallApi {
         service: "extension.example/1".into(),
         method: "begin".into(),
@@ -630,7 +645,7 @@ fn conflicting_or_unexpected_submit_response_is_not_assumed_absent() {
         let runtime = runtime(&recorder);
         let mut server = tls_server();
         let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-        server.accept().unwrap();
+        accept_fixture_connection(&mut server);
         let mut sequence = OperationSequence::new().unwrap();
         assert!(
             server.connections[0]
@@ -665,7 +680,7 @@ fn lookup_reconciles_lost_request_without_submitting_it_again() {
         let runtime = runtime(&recorder);
         let mut server = tls_server();
         let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-        server.accept().unwrap();
+        accept_fixture_connection(&mut server);
         let mut sequence = OperationSequence::new().unwrap();
         assert!(
             server.connections[0]
@@ -714,7 +729,7 @@ fn typed_lookup_uses_exact_contract_and_waits_for_provider_result() {
         let runtime = runtime(&recorder);
         let mut server = tls_server();
         let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-        server.accept().unwrap();
+        accept_fixture_connection(&mut server);
         assert!(
             server.connections[0]
                 .submit_command(
@@ -761,7 +776,7 @@ fn expired_lookup_window_remains_fenced() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     let mut sequence = OperationSequence::new().unwrap();
     server.connections[0]
         .submit(&runtime, "test.effect/1", json!({}), &mut sequence)
@@ -784,7 +799,7 @@ fn lookup_absence_after_retention_window_is_not_retirement_proof() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     let mut sequence = OperationSequence::new().unwrap();
     server.connections[0]
         .submit(&runtime, "test.effect/1", json!({}), &mut sequence)
@@ -807,7 +822,7 @@ fn shutdown_announcement_does_not_accept_or_dispatch_new_requests() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let _first = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     assert_eq!(server.connections.len(), 1);
     server.prepare_shutdown();
     let _second = TcpStream::connect(server.tls_address().unwrap()).unwrap();
@@ -827,7 +842,7 @@ fn tls_write_failure_retires_the_inflight_request() {
     let runtime = runtime(&recorder);
     let mut server = tls_server();
     let client = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-    server.accept().unwrap();
+    accept_fixture_connection(&mut server);
     let connection = &mut server.connections[0];
     connection.stage = Stage::Dispatching {
         request_id: 44,
