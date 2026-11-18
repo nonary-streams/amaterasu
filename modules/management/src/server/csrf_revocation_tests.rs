@@ -513,13 +513,10 @@ fn deadline_result_is_settled_without_claiming_provider_retirement() {
 }
 
 fn accept_fixture_connection(server: &mut Server) {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while server.connections.is_empty() && Instant::now() < deadline {
+    wait_for_fixture_peer(|| {
         server.accept().unwrap();
-        if server.connections.is_empty() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
+        (!server.connections.is_empty()).then_some(())
+    });
     assert_eq!(
         server.connections.len(),
         1,

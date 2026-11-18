@@ -148,14 +148,19 @@ fn same_path(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::settings::Document;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static NEXT_TEMPORARY_ROOT: AtomicU64 = AtomicU64::new(0);
+
     fn temporary_root() -> PathBuf {
+        let index = NEXT_TEMPORARY_ROOT.fetch_add(1, Ordering::Relaxed);
+        let process = std::process::id();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("amaterasu-host-config-{nonce}"))
+        std::env::temp_dir().join(format!("amaterasu-host-config-{process}-{nonce}-{index}"))
     }
 
     #[test]

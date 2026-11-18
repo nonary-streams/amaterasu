@@ -1847,11 +1847,27 @@ fn service_status(payload: &Value, login: bool, operational_health: bool) -> u16
 }
 
 #[cfg(test)]
+fn wait_for_fixture_peer<T>(mut poll: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(value) = poll() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "loopback peer was not ready");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
 fn test_stream_pair() -> (std::net::TcpStream, TcpStream) {
     let network = Network::test_provider();
     let listener = network.bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
     let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (stream, _) = listener.accept().unwrap();
+    let stream = wait_for_fixture_peer(|| match listener.accept() {
+        Ok((stream, _)) => Some(stream),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(error) => panic!("could not accept loopback fixture peer: {error}"),
+    });
     (peer, stream)
 }
 
@@ -1890,14 +1906,30 @@ mod tests {
             Some(tls),
         )
         .unwrap();
-        let _closed_http = TcpStream::connect(server.address()).unwrap();
-        let _closed_tls = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-        server.accept().unwrap();
-        assert!(server.connections.is_empty());
+        for address in [
+            server.address().parse().unwrap(),
+            server.tls_address().unwrap(),
+        ] {
+            let closed_peer = TcpStream::connect(address).unwrap();
+            closed_peer.set_nonblocking(true).unwrap();
+            wait_for_fixture_peer(|| {
+                server.accept().unwrap();
+                assert!(server.connections.is_empty());
+                match closed_peer.peek(&mut [0]) {
+                    Ok(0) => Some(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => Some(()),
+                    result => panic!("unexpected result from rejected loopback peer: {result:?}"),
+                }
+            });
+        }
         server.set_peer_policy(Some(PeerTier::Pc));
         let _http = TcpStream::connect(server.address()).unwrap();
         let _tls = TcpStream::connect(server.tls_address().unwrap()).unwrap();
-        server.accept().unwrap();
+        wait_for_fixture_peer(|| {
+            server.accept().unwrap();
+            (server.connections.len() >= 2).then_some(())
+        });
         assert_eq!(server.connections.len(), 2);
         assert!(
             server
