@@ -1,7 +1,7 @@
 use super::*;
 use amaterasu_module_sdk::stream_lifecycle::{
     LifecycleLayer, StreamFailure, StreamFailureDecision, StreamFailureEffect, StreamFailureFact,
-    StreamFailureHandler,
+    StreamFailureHandler, StreamIssue,
 };
 
 #[derive(Debug)]
@@ -54,13 +54,7 @@ impl Controller {
                     connection,
                     ticket,
                     reason,
-                } => {
-                    eprintln!(
-                        "amaterasu rtsp connection closed reason={reason} authenticated={}",
-                        ticket.is_some()
-                    );
-                    self.disconnected(connection, ticket, reason);
-                }
+                } => self.disconnected(connection, ticket, reason),
             }
         }
     }
@@ -78,7 +72,6 @@ impl Controller {
         request: Request,
         now: u64,
     ) {
-        eprintln!("amaterasu rtsp request method={:?}", request.method);
         let Some(mut record) = self.records.remove(&ticket) else {
             self.reply_status(
                 connection,
@@ -171,6 +164,22 @@ impl Controller {
                     None,
                 );
                 if completed && success {
+                    if record.extension_offer.is_some()
+                        && request.header("x-amaterasu-codec-fallback")
+                            == Some("pyrowave_bitstream_mismatch")
+                    {
+                        record.issues.push_logged(
+                            None,
+                            StreamIssue::demoted(
+                                record.config.operation_id.clone(),
+                                LifecycleLayer::Rtsp,
+                                "announce",
+                                "client_codec_fallback",
+                                "standard_video",
+                            )
+                            .because("client_reported_pyrowave_bitstream_mismatch"),
+                        );
+                    }
                     for adjustment in &record.adjustments {
                         if self.pending_adjustment_logs.len() < 64 {
                             self.pending_adjustment_logs.push_back(
@@ -262,8 +271,9 @@ impl Controller {
             }
             Err(error) => {
                 eprintln!(
-                    "amaterasu rtsp rejection method={:?} status={} reason={error:?}",
+                    "amaterasu rtsp rejection ticket={ticket} method={:?} cseq={} status={} reason={error:?}",
                     request.method,
+                    request.cseq,
                     error.status()
                 );
                 let failure = if error.leaves_request_unchanged() {
@@ -704,6 +714,10 @@ impl Controller {
             self.records.insert(ticket, record);
             return;
         }
+        eprintln!(
+            "amaterasu rtsp connection interrupted ticket={ticket} state={:?} reason={reason}",
+            record.state
+        );
         let pending_mutation = self
             .job
             .iter_mut()

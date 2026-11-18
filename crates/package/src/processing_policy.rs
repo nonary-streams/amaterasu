@@ -1,4 +1,5 @@
 //! Trusted assembly of a selected SDK frame-processing graph.
+use crate::PackageResult;
 use amaterasu_contracts::{ApiMethod, ApiMethodApproval, RuntimeConfig};
 use amaterasu_module_sdk::{
     extension_api::ExtensionDescriptor,
@@ -8,10 +9,11 @@ use amaterasu_module_sdk::{
         ProcessingRegistration, ProcessingSelection, SettingsAccessGrant, SettingsScopeGrant,
     },
 };
-use amaterasu_package::PackageResult;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+
+pub mod rtx_hdr;
 
 const STREAM_CONTRACT: &str = sdk::STREAM_OWNER_CONTRACT;
 
@@ -26,7 +28,7 @@ struct Metadata {
 
 /// Prepare only trusted selections and approvals. Provider-private settings
 /// remain with their owning implementations.
-pub(super) fn install(
+pub fn install(
     policy: &mut RuntimeConfig,
     selection: &ProcessingSelection,
     metadata: &str,

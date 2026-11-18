@@ -1734,11 +1734,7 @@ impl Router {
                     match parsed {
                         Ok(request) => Some(request),
                         Err(error) => {
-                            return Some(self.launches.refuse_stream_request(
-                                400,
-                                error,
-                                "request_parsing",
-                            ));
+                            return Some(self.launches.refuse_stream_query(error));
                         }
                     }
                 };

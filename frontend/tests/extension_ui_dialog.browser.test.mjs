@@ -10,7 +10,7 @@ import ts from "typescript";
 
 const chromiumPath = "/usr/bin/chromium";
 const tick = () => new Promise(resolve => setTimeout(resolve, 40));
-const sourceFiles = ["ui.ts", "extension_ui.ts", "extension_ui_layout.ts", "extension_ui_feedback.ts", "extension_ui_dialog.ts"];
+const sourceFiles = ["ui.ts", "extension_ui.ts", "extension_ui_elements.ts", "extension_ui_layout.ts", "extension_ui_feedback.ts", "extension_ui_dialog.ts", "extension_ui_charts.ts"];
 const sources = await Promise.all(sourceFiles.map(file => readFile(`src/${file}`, "utf8")));
 const transpiled = sources.map(source => ts.transpile(source, { target: ts.ScriptTarget.ES2022 })).join("\n");
 const stylesheet = await readFile("public/styles.css", "utf8");
@@ -29,6 +29,8 @@ window.Amaterasu = {
 <script>
 window.createExtensionUiV1 = (...args) => Amaterasu.createExtensionUiV1(...args);
 window.createExtensionUiWithFeedbackV1 = (...args) => Amaterasu.createExtensionUiWithFeedbackV1(...args);
+window.el = (...args) => Amaterasu.el(...args);
+window.button = (...args) => Amaterasu.button(...args);
 window.localizedTextNode = source => Amaterasu.localizedTextNode(source);
 window.localeFormattedTextNode = format => Amaterasu.localeFormattedTextNode(format);
 window.translateText = source => Amaterasu.translateText(source);
@@ -132,6 +134,15 @@ async function press(cdp, key, code, windowsVirtualKeyCode) {
   await tick();
 }
 
+async function waitForCloseCallbacks(cdp, minimum) {
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const reasons = await cdp.evaluate("window.__reasons");
+    if (reasons.length >= minimum) return reasons;
+    await tick();
+  }
+  throw new Error("Chromium did not dispatch the expected dialog close events.");
+}
+
 let browser;
 test.before(async t => {
   if (!existsSync(chromiumPath)) {
@@ -230,6 +241,90 @@ test("Chromium rejects initial focus outside content and nodes from another docu
   assert.match(result.documentError, /owned by this document/);
 });
 
+test("Chromium mounts inline footer actions with native keyboard behavior and keeps Cancel as the default", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.command("Emulation.setDeviceMetricsOverride", {width:320,height:640,deviceScaleFactor:1,mobile:false});
+  const footer = await cdp.evaluate(`(() => {
+    window.__reset();
+    window.__footerCloseReasons = [];
+    window.__footerOpener = document.createElement("button");
+    window.__footerOpener.textContent = "Edit profile";
+    const confirm = window.__ui.button({ label:"Confirm", variant:"primary", onClick:() => dialog.close() });
+    const dialog = window.__ui.dialog({
+      title:"Confirm profile",
+      content:"Apply your changes?",
+      actions:[confirm.element],
+      onClose:reason => window.__footerCloseReasons.push(reason),
+    });
+    window.__footerDialog = dialog;
+    window.__mount.append(window.__footerOpener, dialog.element);
+    window.__footerOpener.focus();
+    dialog.open();
+    const actions = dialog.element.querySelector(".plugin-dialog-actions");
+    const [cancel, accept] = actions.querySelectorAll("button");
+    return {
+      labels:[cancel.textContent,accept.textContent],
+      inline:Math.abs(cancel.getBoundingClientRect().top - accept.getBoundingClientRect().top) < 1,
+      cancelFocused:document.activeElement === cancel,
+      inBody:Boolean(dialog.element.querySelector(".plugin-dialog-content button")),
+      footerFits:actions.scrollWidth <= actions.clientWidth,
+    };
+  })()`);
+  assert.deepEqual(footer, {
+    labels: ["Cancel", "Confirm"], inline: true, cancelFocused: true, inBody: false, footerFits: true,
+  });
+  await press(cdp, "Tab", "Tab", 9);
+  assert.equal(await cdp.evaluate("document.activeElement.textContent"), "Confirm");
+  await press(cdp, " ", "Space", 32);
+  assert.equal(await cdp.evaluate("window.__footerDialog.element.open"), false);
+  assert.equal(await cdp.evaluate("document.activeElement === window.__footerOpener"), true);
+  assert.deepEqual(await cdp.evaluate("window.__footerCloseReasons"), ["close"]);
+
+  const nativeFocus = await cdp.evaluate(`(() => {
+    const action = document.createElement("button");
+    action.type = "button";
+    const wrapper = document.createElement("div");
+    wrapper.append(action);
+    const dialog = window.__ui.dialog({title:"Native action", actions:[wrapper], initialFocus:action});
+    window.__mount.append(dialog.element);
+    dialog.open();
+    const focused = document.activeElement === action;
+    dialog.dispose();
+    return focused;
+  })()`);
+  assert.equal(nativeFocus, true);
+  await cdp.command("Emulation.clearDeviceMetricsOverride");
+});
+
+test("Chromium rejects foreign or overlapping footer actions before moving supplied DOM", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  const result = await cdp.evaluate(`(() => {
+    window.__reset();
+    const content = document.createElement("div");
+    const action = document.createElement("button");
+    content.append(action);
+    window.__mount.append(content);
+    const foreign = document.implementation.createHTMLDocument("foreign").createElement("button");
+    const errorFor = options => {
+      try { window.__ui.dialog({ title:"Invalid actions", ...options }); }
+      catch (error) { return error.message; }
+      return "";
+    };
+    return {
+      foreign:errorFor({actions:[foreign]}),
+      overlap:errorFor({content,actions:[action]}),
+      duplicate:errorFor({actions:[action,action]}),
+      stillMounted:action.parentElement === content && content.parentElement === window.__mount,
+    };
+  })()`);
+  assert.match(result.foreign, /actions must be elements owned by this document/);
+  assert.match(result.overlap, /actions must be separate/);
+  assert.match(result.duplicate, /actions must be separate/);
+  assert.equal(result.stillMounted, true);
+});
+
 test("Chromium supports fragment initial focus and concurrent dialog focus restoration", async t => {
   if (!browser) return t.skip("Chromium browser setup unavailable.");
   const {cdp} = browser;
@@ -251,13 +346,11 @@ test("Chromium supports fragment initial focus and concurrent dialog focus resto
   const ids = await cdp.evaluate(`({first:window.__first.element.getAttribute('aria-labelledby'),second:window.__second.element.getAttribute('aria-labelledby')})`);
   assert.notEqual(ids.first, ids.second);
   await cdp.evaluate("window.__second.close(); true");
-  await tick();
+  assert.deepEqual(await waitForCloseCallbacks(cdp, 1), ["second:close"]);
   assert.equal(await cdp.evaluate("document.activeElement === window.__openSecond"), true);
-  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["second:close"]);
   await cdp.evaluate("window.__first.close(); true");
-  await tick();
+  assert.deepEqual(await waitForCloseCallbacks(cdp, 2), ["second:close", "first:close"]);
   assert.equal(await cdp.evaluate("document.activeElement === window.__outerOpener"), true);
-  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["second:close", "first:close"]);
 });
 
 test("Chromium correlates native and method=dialog closes before allowing immediate reopen", async t => {
@@ -434,13 +527,14 @@ test("Chromium always completes disposal when an onClose callback throws", async
 });
 
 
-test("Chromium styles modal backdrops for both Okami themes and keeps tall dialog actions reachable on narrow screens", async t => {
+test("Chromium themes modal backdrops and keeps tall dialog actions reachable on narrow screens", async t => {
   if (!browser) return t.skip("Chromium browser setup unavailable.");
   const {cdp} = browser;
   await cdp.command("Emulation.setDeviceMetricsOverride", {width:360,height:640,deviceScaleFactor:1,mobile:true});
   await cdp.evaluate(`window.__reset();
     const content=document.createElement("div");
-    window.__visualRange=document.createElement("input"); window.__visualRange.type="range"; content.append(window.__visualRange);
+    window.__visualRange=document.createElement("input"); window.__visualRange.type="range";
+    window.__visualRange.style.color="var(--accent)"; content.append(window.__visualRange);
     for(let index=0;index<24;index++){const paragraph=document.createElement("p");paragraph.textContent="Scrollable plugin setting "+(index+1);content.append(paragraph);}
     window.__visualDialog=window.__ui.dialog({title:"Narrow plugin settings",description:"Long content should remain scrollable.",content});
     window.__mount.append(window.__visualDialog.element); window.__visualDialog.open(); true`);
@@ -458,7 +552,7 @@ test("Chromium styles modal backdrops for both Okami themes and keeps tall dialo
   assert.equal(narrow.scrollable, true);
   assert.equal(narrow.horizontalOverflow, false);
   assert.equal(darkBackdrop, "rgba(13, 10, 7, 0.76)");
-  assert.equal(darkRangeAccent, "rgb(177, 50, 35)");
+  assert.equal(darkRangeAccent, await cdp.evaluate("getComputedStyle(window.__visualRange).color"));
   await cdp.evaluate("window.__visualDialog.element.tabIndex=-1; window.__visualDialog.element.scrollTop=0; window.__visualDialog.element.focus(); true");
   await press(cdp, "PageDown", "PageDown", 34);
   assert.equal(await cdp.evaluate("window.__visualDialog.element.scrollTop>0"), true);
@@ -473,7 +567,148 @@ test("Chromium styles modal backdrops for both Okami themes and keeps tall dialo
   const lightRangeAccent = await cdp.evaluate("getComputedStyle(window.__visualRange).accentColor");
   assert.equal(reachedActions, true);
   assert.equal(lightBackdrop, "rgba(60, 42, 28, 0.56)");
-  assert.equal(lightRangeAccent, "rgb(181, 47, 34)");
+  assert.equal(lightRangeAccent, await cdp.evaluate("getComputedStyle(window.__visualRange).color"));
+  assert.notEqual(lightRangeAccent, darkRangeAccent);
   await cdp.command("Emulation.clearDeviceMetricsOverride");
   await cdp.evaluate("window.__visualDialog.dispose(); document.documentElement.removeAttribute('data-theme'); true");
+});
+
+test("Chromium renders localized text badges with explicit tone and disposes them with the plugin", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  const badges = await cdp.evaluate(`(() => {
+    window.__reset();
+    const ui = Amaterasu.createExtensionUiElementsV1(window.__controller.signal);
+    const tones = [undefined, "success", "warning", "error", "info"];
+    const components = tones.map(tone => ui.badge({
+      label: { source: "Warning", translations: { [navigator.language]: "<img src=x>" } }, tone,
+    }));
+    window.__mount.append(...components.map(component => component.element));
+    return {
+      tones: components.map(component => component.element.dataset.tone),
+      text: components[0].element.textContent,
+      image: Boolean(components[0].element.querySelector("img")),
+      frozen: components.every(Object.isFrozen),
+      invalidRejected: (() => {
+        try { ui.badge({label: "Invalid", tone: "rainbow"}); } catch { return true; }
+        return false;
+      })(),
+    };
+  })()`);
+  assert.deepEqual(badges, {
+    tones: ["neutral", "success", "warning", "error", "info"],
+    text: "<img src=x>",
+    image: false,
+    frozen: true,
+    invalidRejected: true,
+  });
+  assert.equal(await cdp.evaluate(`window.__controller.abort();
+    document.querySelectorAll(".plugin-badge").length`), 0);
+});
+
+test("Chromium tooltips keep action descriptions and support focus, Escape, pointer handoff and viewport edges", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.command("Emulation.setDeviceMetricsOverride", {width:360,height:640,deviceScaleFactor:1,mobile:false});
+  await cdp.evaluate(`window.__reset();
+    const ui = Amaterasu.createExtensionUiElementsV1(window.__controller.signal);
+    window.__tipAction = window.__ui.button({label: "Edit profile", help: "Edit settings", onClick() {}});
+    window.__tipHandle = ui.tooltip({trigger: window.__tipAction.element, message: "Change the name, preferences, or display picture for this profile."});
+    window.__tipButton = window.__tipAction.element.querySelector("button");
+    window.__tip = window.__tipHandle.element.querySelector('[role="tooltip"]');
+    Object.assign(window.__tipHandle.element.style, {position:"absolute", right:"8px", bottom:"8px"});
+    window.__mount.append(window.__tipHandle.element);
+    true`);
+  assert.equal(await cdp.evaluate("window.__tip.hidden"), true);
+  assert.deepEqual(await cdp.evaluate(`(async () => {
+    window.__tipAction.setState({help: null, error: "Invalid profile"});
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    return window.__tipButton.getAttribute("aria-describedby").split(" ").map(id => document.getElementById(id).textContent);
+  })()`), [
+    "Invalid profile", "Change the name, preferences, or display picture for this profile.",
+  ]);
+  await cdp.evaluate("window.__tipButton.focus(); true");
+  const edges = await cdp.evaluate(`(() => {
+    const {left, right, top, bottom} = window.__tip.getBoundingClientRect();
+    return {
+      visible: !window.__tip.hidden,
+      fits: left >= 7 && right <= innerWidth - 7 && top > 0 && bottom <= window.__tipHandle.element.getBoundingClientRect().top + 1,
+      placement: window.__tip.dataset.placement,
+    };
+  })()`);
+  assert.deepEqual(edges, { visible: true, fits: true, placement: "above" });
+  await press(cdp, "Escape", "Escape", 27);
+  assert.equal(await cdp.evaluate("window.__tip.hidden && document.activeElement === window.__tipButton"), true);
+  await cdp.evaluate("window.__tipButton.blur(); true");
+
+  const moveTo = async (selector) => {
+    const {x, y} = await cdp.evaluate(`(() => {
+      const {left, top, width, height} = ${selector}.getBoundingClientRect();
+      return {x: left + width / 2, y: top + height / 2};
+    })()`);
+    await cdp.command("Input.dispatchMouseEvent", {type:"mouseMoved", x, y});
+  };
+  await moveTo("window.__tipButton");
+  assert.equal(await cdp.evaluate("window.__tip.hidden"), false);
+  await moveTo("window.__tip");
+  assert.equal(await cdp.evaluate("window.__tip.hidden"), false);
+  await cdp.command("Input.dispatchMouseEvent", {type:"mouseMoved", x:0, y:0});
+  assert.equal(await cdp.evaluate("window.__tip.hidden"), true);
+  assert.deepEqual(await cdp.evaluate(`window.__tipHandle.dispose();
+    [window.__tipHandle.element.isConnected, window.__tipHandle.element.childElementCount,
+      window.__tipButton.getAttribute("aria-describedby") === window.__tipAction.element.querySelector('[role="alert"]').id]`), [
+    false, 0, true,
+  ]);
+  await cdp.command("Emulation.clearDeviceMetricsOverride");
+});
+
+test("Chromium sparkline charts wrap in a narrow panel and expose latest and inspected samples", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.command("Emulation.setDeviceMetricsOverride", {width:320,height:640,deviceScaleFactor:1,mobile:false});
+  const initial = await cdp.evaluate(`(() => {
+    window.__reset();
+    const ui = Amaterasu.createExtensionUiChartsV1(window.__controller.signal);
+    const series = [{id:"cpu", label:"CPU", points:[
+      {time:0,value:4}, {time:500,value:null}, {time:1000,value:0},
+    ]}];
+    const options = {label:"CPU usage", unit:"%", series, minimum:0, maximum:10};
+    window.__sparkline = ui.metricChart({...options, appearance:"sparkline"});
+    const legacy = ui.metricChart(options);
+    const chart = window.__sparkline.element;
+    chart.style.width = "155px";
+    window.__mount.append(chart, legacy.element);
+    window.__sparklinePlot = chart.querySelector("svg");
+    const plot = window.__sparklinePlot;
+    const plotRect = plot.getBoundingClientRect();
+    return {
+      latest: chart.querySelector(".plugin-chart-latest").textContent,
+      accessible: plot.getAttribute("aria-label"),
+      wraps: plotRect.top >= chart.querySelector("h3").getBoundingClientRect().bottom,
+      overflow: chart.scrollWidth > chart.clientWidth,
+      nullGaps: (plot.querySelector("path").getAttribute("d").match(/M/g) ?? []).length,
+      graphHeight: plotRect.height,
+      legacyControls: legacy.element.querySelectorAll(".plugin-chart-controls button").length,
+      legacySeries: legacy.element.querySelectorAll(".plugin-chart-legend button").length,
+    };
+  })()`);
+  assert.equal(initial.latest, "0%");
+  assert.match(initial.accessible, /CPU usage.*Latest: CPU: 0%.*2 measured values/);
+  assert.equal(initial.wraps, true);
+  assert.equal(initial.overflow, false);
+  assert.equal(initial.nullGaps, 2);
+  assert.ok(initial.graphHeight < 28);
+  assert.equal(initial.legacyControls, 3);
+  assert.equal(initial.legacySeries, 1);
+
+  await cdp.evaluate("window.__sparklinePlot.focus(); true");
+  await press(cdp, "Home", "Home", 36);
+  assert.match(await cdp.evaluate('window.__sparkline.element.querySelector(".plugin-chart-readout").textContent'), /CPU: 4%/);
+  assert.equal(await cdp.evaluate('window.__sparkline.element.querySelector(".plugin-chart-latest").textContent'), "0%");
+  const missing = await cdp.evaluate(`window.__sparkline.setData([{id:"cpu",label:"CPU",points:[
+    {time:0,value:4}, {time:1000,value:null},
+  ]}]);
+  window.__sparkline.element.querySelector(".plugin-chart-latest").textContent`);
+  assert.equal(missing, "Unavailable");
+  await cdp.command("Emulation.clearDeviceMetricsOverride");
 });

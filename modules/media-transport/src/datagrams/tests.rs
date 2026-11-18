@@ -72,6 +72,9 @@ fn would_block_and_interrupt_retain_exact_datagram_then_fatal_error_clears_visib
     assert_eq!(delivery.bytes, 2);
     assert!(!delivery.record_send(Err(io::Error::from(io::ErrorKind::PermissionDenied))));
     assert_eq!(delivery.failure, Some("udp_send_failed"));
+    let failure = delivery.first_failure.as_ref().unwrap();
+    assert_eq!(failure.reason, "video_send_bytes.PermissionDenied");
+    assert_eq!(failure.requested, Some(2));
     assert_eq!(delivery.discarded_datagrams, 1);
     assert_eq!(delivery.queued(), 0);
     assert_eq!(delivery.bytes, 0);
@@ -282,6 +285,9 @@ fn partial_batch_send_result_fails_without_counting_any_datagrams_as_sent() {
 
     assert_eq!(sent, 0);
     assert_eq!(delivery.failure, Some("udp_send_failed"));
+    let failure = delivery.first_failure.as_ref().unwrap();
+    assert_eq!(failure.reason, "video_batch_invalid_accepted_bytes");
+    assert_eq!((failure.requested, failure.observed), (Some(12), Some(11)));
     assert_eq!(delivery.sent_datagrams, 0);
     assert_eq!(delivery.discarded_datagrams, 3);
     assert_eq!(delivery.queued(), 0);
@@ -310,6 +316,10 @@ fn prolonged_queue_stall_fails_visibly_without_a_blocking_wait() {
     delivery.last_progress = Instant::now() - Duration::from_secs(6);
     delivery.tick();
     assert_eq!(delivery.failure, Some("udp_stalled"));
+    let failure = delivery.first_failure.as_ref().unwrap();
+    assert_eq!(failure.reason, "queue_without_progress_ms");
+    assert_eq!(failure.requested, Some(5_000));
+    assert!(failure.observed.unwrap() >= 6_000);
     assert_eq!(delivery.discarded_datagrams, 1);
     assert_eq!(delivery.queued(), 0);
 }
@@ -403,7 +413,7 @@ fn expired_discovery_rejects_already_queued_valid_pings() {
     let audio = sender();
     video.send_to(&ping(VIDEO_TOKEN, 1), video_local).unwrap();
     audio.send_to(&ping(AUDIO_TOKEN, 1), audio_local).unwrap();
-    delivery.discovery_deadline = Some(Instant::now() - Duration::from_millis(1));
+    delivery.discovery_window.as_mut().unwrap().0 = Instant::now() - Duration::from_millis(1);
 
     delivery.tick();
 
@@ -411,6 +421,41 @@ fn expired_discovery_rejects_already_queued_valid_pings() {
     assert_eq!(delivery.failure, Some("udp_discovery_timeout"));
     assert_eq!(delivery.peer_port(Medium::Video), None);
     assert_eq!(delivery.peer_port(Medium::Audio), None);
+}
+
+#[test]
+fn discovery_timeout_names_the_lane_that_still_needs_a_ping() {
+    for (token, ready_lane, expected) in [
+        (VIDEO_TOKEN, Medium::Video, "awaiting_audio_ping_timeout_ms"),
+        (AUDIO_TOKEN, Medium::Audio, "awaiting_video_ping_timeout_ms"),
+    ] {
+        let local = "127.0.0.1:0".parse().unwrap();
+        let mut delivery = Delivery::discover(
+            local,
+            local,
+            local.ip(),
+            DiscoveryTokens {
+                video: VIDEO_TOKEN,
+                audio: AUDIO_TOKEN,
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let (video, audio) = delivery.addresses().unwrap();
+        let target = match ready_lane {
+            Medium::Video => video,
+            Medium::Audio => audio,
+        };
+        sender().send_to(&ping(token, 1), target).unwrap();
+        delivery.tick();
+        assert!(delivery.peer_port(ready_lane).is_some());
+        delivery.discovery_window.as_mut().unwrap().0 = Instant::now();
+        delivery.tick();
+        let failure = delivery.first_failure.unwrap();
+        assert_eq!(failure.code, "udp_discovery_timeout");
+        assert_eq!(failure.reason, expected);
+        assert_eq!(failure.requested, Some(10_000));
+    }
 }
 
 #[test]

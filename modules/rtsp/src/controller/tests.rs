@@ -4642,8 +4642,7 @@ fn extension_bit_depth_follows_the_launch_dynamic_range() {
         } else {
             announcement
         };
-        // The Windows PyroWave client leaves the legacy encoder CSC hint at
-        // its default. The extension bitstream owns its color metadata.
+        // Moonlight can request BT.601 limited via its default CSC hint.
         let announcement = announcement.replace(
             "x-nv-video[0].encoderCscMode:2",
             "x-nv-video[0].encoderCscMode:0",
@@ -4671,6 +4670,10 @@ fn extension_bit_depth_follows_the_launch_dynamic_range() {
         assert_eq!(
             payload["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],
             if hdr { "hdr" } else { "sdr" }
+        );
+        assert_eq!(
+            payload["configuration"]["configuration"]["color_mode"],
+            "bt601_limited"
         );
         assert_eq!(
             payload["configuration"]["configuration"]["max_reference_frames"],

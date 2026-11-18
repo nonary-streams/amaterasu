@@ -168,6 +168,11 @@ impl InputTranslator {
         }
     }
 
+    /// Update pointer mapping without losing ownership of pressed inputs.
+    pub fn set_absolute_viewport(&mut self, viewport: Option<AbsoluteViewport>) {
+        self.absolute_viewport = viewport;
+    }
+
     /// Translate one authenticated control input record into one bounded input
     /// service batch. Empty batches are deliberate for duplicate releases and
     /// zero-delta scroll records.
@@ -234,13 +239,18 @@ impl InputTranslator {
         // Preserve the original byte until the input consumer applies the
         // selected keybindings exactly once. Backend validation checks the
         // resolved destination; a remapped source need not have a native key.
-        let key_index = incoming_key;
-        let held = self.held_keys[usize::from(key_index)];
+        let key_index = usize::from(incoming_key);
         if !pressed {
+            // Some clients alternate between the generic and left-specific
+            // modifier codes. Prefer the exact source if both are held and
+            // always release using the original press's code and mode.
+            let held = self.held_keys[key_index].take().or_else(|| {
+                let alias = left_modifier_alias(incoming_key)?;
+                self.held_keys[usize::from(alias)].take()
+            });
             let Some(held) = held else {
                 return Ok(Vec::new());
             };
-            self.held_keys[usize::from(key_index)] = None;
             return Ok(vec![InputEvent::Key {
                 virtual_key: held.virtual_key,
                 normalized: held.normalized,
@@ -252,13 +262,13 @@ impl InputTranslator {
 
         // Vibeshine ignores duplicate client downs and owns the repeat timer
         // per client. The input service now schedules that repeat by lease.
-        if held.is_some() {
+        if self.held_keys[key_index].is_some() {
             return Ok(Vec::new());
         }
-        let held_key = held.unwrap_or(HeldKey {
+        let held_key = HeldKey {
             virtual_key: incoming_key,
             normalized,
-        });
+        };
         let mut synthetic = Vec::new();
         if !is_modifier(held_key.virtual_key) {
             for (mask, key) in [(1, 0x10), (2, 0x11), (4, 0x12)] {
@@ -300,7 +310,7 @@ impl InputTranslator {
             temporary_modifier: true,
             state: KeyState::Up,
         }));
-        self.held_keys[usize::from(key_index)] = Some(held_key);
+        self.held_keys[key_index] = Some(held_key);
         Ok(events)
     }
 
@@ -421,6 +431,18 @@ fn is_modifier(key: u8) -> bool {
         key,
         0x10 | 0x11 | 0x12 | 0x5b | 0x5c | 0xa0 | 0xa1 | 0xa2 | 0xa3 | 0xa4 | 0xa5
     )
+}
+
+fn left_modifier_alias(key: u8) -> Option<u8> {
+    match key {
+        0x10 => Some(0xa0),
+        0xa0 => Some(0x10),
+        0x11 => Some(0xa2),
+        0xa2 => Some(0x11),
+        0x12 => Some(0xa4),
+        0xa4 => Some(0x12),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -611,6 +633,57 @@ mod tests {
                 .events()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn modifier_alias_release_uses_the_original_press_and_allows_another_press() {
+        for (generic, left) in [(0x10, 0xa0), (0x11, 0xa2), (0x12, 0xa4)] {
+            for (down, up) in [(generic, left), (left, generic)] {
+                let mut translator = InputTranslator::default();
+                let mut send = |pressed, key_code, flags| {
+                    translator
+                        .translate(Input::Keyboard {
+                            pressed,
+                            key_code,
+                            modifiers: 0,
+                            flags,
+                        })
+                        .unwrap()
+                };
+                for _ in 0..2 {
+                    assert_eq!(send(true, u16::from(down), 1).events().len(), 1);
+                    assert_eq!(
+                        send(false, 0x8000 | u16::from(up), 0).events(),
+                        &[InputEvent::Key {
+                            virtual_key: down,
+                            normalized: false,
+                            repeat_modifiers: 0,
+                            temporary_modifier: false,
+                            state: KeyState::Up,
+                        }]
+                    );
+                    assert!(send(false, 0x8000 | u16::from(up), 0).events().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generic_modifier_release_cannot_release_a_right_modifier() {
+        let mut translator = InputTranslator::default();
+        let mut send = |pressed, key_code| {
+            translator
+                .translate(Input::Keyboard {
+                    pressed,
+                    key_code,
+                    modifiers: 0,
+                    flags: 0,
+                })
+                .unwrap()
+        };
+        assert_eq!(send(true, 0x80a1).events().len(), 1);
+        assert!(send(false, 0x8010).events().is_empty());
+        assert_eq!(send(false, 0x80a1).events().len(), 1);
     }
 
     #[test]

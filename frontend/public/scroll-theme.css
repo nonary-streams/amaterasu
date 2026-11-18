@@ -1,0 +1,328 @@
+@font-face {
+  font-family: "Kaushan Script";
+  src: url("./kaushan-script.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+}
+
+:root {
+  --font-brush: "Kaushan Script", "Segoe Print", cursive;
+  --crest-image: url("./sun-crest.svg");
+  --brush-image: url("./ink-swipe.svg");
+  --paper-image: url("./washi-paper.webp");
+  --landscape-image: url("./scroll-foothills.svg");
+  --ornament-image: url("./scroll-blossoms.svg");
+}
+
+:root, [data-theme="dark"] {
+  --paper-glaze: rgb(35 32 29 / .965);
+  --landscape-filter: brightness(.87) saturate(.87);
+  --ornament-opacity: .86;
+  --paper-surface: color-mix(in srgb, var(--panel) 91%, transparent);
+}
+
+[data-theme="light"] {
+  --paper-glaze: rgb(240 232 220 / .76);
+  --landscape-filter: none;
+  --ornament-opacity: 1;
+  --paper-surface: color-mix(in srgb, var(--panel) 57%, transparent);
+}
+
+body {
+  color: var(--fg);
+  background: var(--bg);
+}
+
+h1, h2, h3, .brand { font-family: var(--font-display); }
+.brand-symbol {
+  border: 0;
+  background: var(--crest-image) center / contain no-repeat;
+}
+.brand-symbol::after { content: none; }
+
+.amaterasu-paper, .login-layout, .amaterasu-banner {
+  color: var(--fg);
+  background: linear-gradient(var(--paper-glaze), var(--paper-glaze)),
+    var(--paper-image) 0 0 / 415px auto repeat, var(--bg);
+}
+
+.console-columns {
+  position: relative;
+  isolation: isolate;
+}
+
+.console-columns::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0 auto;
+  z-index: -1;
+  width: clamp(150px, 21vw, 380px);
+  height: clamp(48px, 6.7vw, 120px);
+  background: var(--ornament-image) right bottom / contain no-repeat;
+  filter: var(--landscape-filter);
+  pointer-events: none;
+}
+
+.content .page-heading h1 {
+  font-size: clamp(1.75rem, 3vw, 2.65rem);
+  letter-spacing: -.035em;
+}
+
+.content .panel, .plugin-ui-card {
+  background-color: var(--paper-surface);
+}
+
+.amaterasu-banner, .plugin-ui-card[data-appearance="illustrated"] {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+
+.amaterasu-banner {
+  display: grid;
+  align-content: center;
+  min-height: 115px;
+  padding: clamp(14px, 2.25vw, 26px);
+  border: 1px solid var(--line);
+  border-radius: var(--surface-radius);
+}
+.amaterasu-banner > * { max-width: 61%; }
+
+.amaterasu-banner::after,
+.plugin-ui-card[data-appearance="illustrated"]::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0 0 0 53%;
+  pointer-events: none;
+  background: var(--landscape-image) right bottom / contain no-repeat;
+  filter: var(--landscape-filter);
+  mask-image: linear-gradient(to right, transparent, black 28%);
+}
+
+.amaterasu-blossom-panel {
+  position: relative;
+  isolation: isolate;
+}
+.amaterasu-blossom-panel::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: auto 0 0 auto;
+  width: min(48%, 140px);
+  aspect-ratio: 2;
+  background: var(--ornament-image) right bottom / contain no-repeat;
+  filter: var(--landscape-filter);
+  pointer-events: none;
+}
+
+.login-layout {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  min-height: 100svh;
+}
+.login-intro {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: clamp(88px, 8.1vw, 132px);
+  padding: 16px clamp(18px, 4.5vw, 80px);
+  color: var(--fg);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+}
+.login-intro::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: url("./scroll-masthead.svg") center bottom / min(100%, 1720px) 100% no-repeat;
+  filter: var(--landscape-filter);
+  pointer-events: none;
+}
+.login-intro .brand {
+  gap: .25em;
+  font: 700 clamp(1.75rem, 3.6vw, 3.65rem)/1.1 var(--font-display);
+  letter-spacing: .02em;
+  text-transform: uppercase;
+}
+.login-intro .brand-symbol { width: .85em; height: .85em; }
+.login-intro .login-intro-copy { display: block; margin: 3px 0 0; }
+.login-intro-copy h1 {
+  margin: 0;
+  font: 600 .81rem/1.25 var(--font-display);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.login-intro-copy p { display: none; }
+.login-side {
+  position: relative;
+  isolation: isolate;
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: clamp(26px, 5vw, 75px) 16px;
+  background: transparent;
+}
+.login-side::before, .login-side::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: auto auto 0 0;
+  width: min(37vw, 585px);
+  aspect-ratio: 1.6;
+  background: var(--landscape-image) left bottom / contain no-repeat;
+  filter: var(--landscape-filter);
+  pointer-events: none;
+}
+.login-side::after {
+  inset: auto 0 0 auto;
+  width: min(28vw, 440px);
+  background: var(--ornament-image) right bottom / contain no-repeat;
+}
+.login-card {
+  max-width: 448px;
+  padding: clamp(21px, 3.5vw, 39px);
+  border: 1px solid var(--line);
+  border-radius: var(--surface-radius);
+  background: var(--panel);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--ink) 8%, transparent);
+}
+.login-card h2 {
+  margin: 0 0 8px;
+  font: 400 clamp(1.75rem, 3.6vw, 2.35rem)/1.35 var(--font-brush);
+  letter-spacing: -.015em;
+}
+.login-card > .muted { margin-bottom: 20px; }
+.login-card .field { margin-bottom: 16px; }
+.login-card .link-button { font-size: .84rem; }
+
+@media (max-width: 640px) {
+  .amaterasu-banner { padding-bottom: 72px; }
+  .amaterasu-banner > * { max-width: none; }
+  .amaterasu-banner::after { inset: auto 0 0 25%; height: 70px; }
+  .console-columns::after { width: 105px; }
+  .login-intro { min-height: 76px; padding: 12px 16px; }
+  .login-intro::after {
+    left: 54%;
+    background-position: right bottom;
+    background-size: auto 100%;
+    mask-image: linear-gradient(to right, transparent, black 20%);
+  }
+  .login-intro-copy h1 { font-size: .7rem; }
+  .login-side { align-content: start; padding-bottom: 90px; }
+}
+
+@media (forced-colors: active) {
+  .amaterasu-paper, .amaterasu-banner, .login-layout, .login-intro, .login-side { background: Canvas; }
+  .console-columns::after, .login-intro::after, .login-side::before, .login-side::after,
+  .amaterasu-banner::after, .amaterasu-blossom-panel::after, .plugin-dialog::after, .plugin-ui-card[data-appearance="illustrated"]::before {
+    display: none;
+  }
+}
+
+/* Bundled Kaushan Script font license
+
+Copyright (c) 2011, Pablo Impallari (www.impallari.com|impallari@gmail.com),
+Copyright (c) 2011, Igino Marini. (www.ikern.com|mail@iginomarini.com),
+with Reserved Font Name Kaushan Script.
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+This license is copied below, and is also available with a FAQ at:
+http://scripts.sil.org/OFL
+
+
+-----------------------------------------------------------
+SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+-----------------------------------------------------------
+
+PREAMBLE
+The goals of the Open Font License (OFL) are to stimulate worldwide
+development of collaborative font projects, to support the font creation
+efforts of academic and linguistic communities, and to provide a free and
+open framework in which fonts may be shared and improved in partnership
+with others.
+
+The OFL allows the licensed fonts to be used, studied, modified and
+redistributed freely as long as they are not sold by themselves. The
+fonts, including any derivative works, can be bundled, embedded, 
+redistributed and/or sold with any software provided that any reserved
+names are not used by derivative works. The fonts and derivatives,
+however, cannot be released under any other type of license. The
+requirement for fonts to remain under this license does not apply
+to any document created using the fonts or their derivatives.
+
+DEFINITIONS
+"Font Software" refers to the set of files released by the Copyright
+Holder(s) under this license and clearly marked as such. This may
+include source files, build scripts and documentation.
+
+"Reserved Font Name" refers to any names specified as such after the
+copyright statement(s).
+
+"Original Version" refers to the collection of Font Software components as
+distributed by the Copyright Holder(s).
+
+"Modified Version" refers to any derivative made by adding to, deleting,
+or substituting -- in part or in whole -- any of the components of the
+Original Version, by changing formats or by porting the Font Software to a
+new environment.
+
+"Author" refers to any designer, engineer, programmer, technical
+writer or other person who contributed to the Font Software.
+
+PERMISSION & CONDITIONS
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of the Font Software, to use, study, copy, merge, embed, modify,
+redistribute, and sell modified and unmodified copies of the Font
+Software, subject to the following conditions:
+
+1) Neither the Font Software nor any of its individual components,
+in Original or Modified Versions, may be sold by itself.
+
+2) Original or Modified Versions of the Font Software may be bundled,
+redistributed and/or sold with any software, provided that each copy
+contains the above copyright notice and this license. These can be
+included either as stand-alone text files, human-readable headers or
+in the appropriate machine-readable metadata fields within text or
+binary files as long as those fields can be easily viewed by the user.
+
+3) No Modified Version of the Font Software may use the Reserved Font
+Name(s) unless explicit written permission is granted by the corresponding
+Copyright Holder. This restriction only applies to the primary font name as
+presented to the users.
+
+4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
+Software shall not be used to promote, endorse or advertise any
+Modified Version, except to acknowledge the contribution(s) of the
+Copyright Holder(s) and the Author(s) or with their explicit written
+permission.
+
+5) The Font Software, modified or unmodified, in part or in whole,
+must be distributed entirely under this license, and must not be
+distributed under any other license. The requirement for fonts to
+remain under this license does not apply to any document created
+using the Font Software.
+
+TERMINATION
+This license becomes null and void if any of the above conditions are
+not met.
+
+DISCLAIMER
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
+OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
+DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
+OTHER DEALINGS IN THE FONT SOFTWARE.
+*/

@@ -40,8 +40,7 @@ selects Amaterasu's active runtime state store. An omitted or empty
 `credentials_file` inherits `file_state`. `min_log_level` is a typed enum with
 `product_default`, `verbose`, `debug`, `info`, `warning`, `error`, `fatal`, and
 `none`. `values.min_log_level` preserves the selected policy. The effective
-value resolves `product_default` using the built product channel: stable uses
-`info` and prerelease uses `debug`.
+value resolves `product_default` to `info` across release channels.
 
 Every request rejects unknown fields. The provider accepts `readiness` and
 `get` from granted consumer modules, and accepts `update` only from the

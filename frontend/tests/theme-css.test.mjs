@@ -57,13 +57,27 @@ test("selected navigation and radio appearance use shared semantic styles", () =
 });
 
 
-test("brush and botanical decorations remain decorative and responsive", () => {
-  const botanical = readFileSync(new URL("../public/okami-botanical.svg", import.meta.url), "utf8");
+test("the signed UI loads local scalable artwork and the brush font from its own stylesheets", () => {
+  const readPublic = (name) => readFileSync(new URL(`../public/${name}`, import.meta.url));
+  const html = readPublic("index.html").toString();
   const build = readFileSync(new URL("../scripts/build.mjs", import.meta.url), "utf8");
-  assert.match(css, /\.page-heading h1::after/);
-  assert.match(css, /\.overview-status::after/);
-  assert.match(css, /mask: url\("\.\/okami-botanical\.svg"\)/);
-  assert.match(css, /@media \(max-width: 640px\) \{\s*\.overview-status::after \{ display: none; \}/);
-  assert.ok(botanical.startsWith("<svg "));
-  assert.match(build, /okami-botanical\.svg/);
+  const sheets = [...html.matchAll(/rel="stylesheet" href="([^"]+)"/g)].map((match) => match[1]);
+  const assets = new Set();
+  for (const sheet of sheets) {
+    assert.ok(build.includes(`"${sheet}"`), `unpackaged stylesheet: ${sheet}`);
+    for (const [, name] of readPublic(sheet).toString().matchAll(/url\("\.\/([^"]+)"\)/g)) {
+      assert.ok(build.includes(`"${name}"`), `unpackaged asset in ${sheet}: ${name}`);
+      assets.add(name);
+    }
+  }
+  for (const name of ["sun-crest.svg", "scroll-masthead.svg", "scroll-foothills.svg",
+    "scroll-blossoms.svg", "ink-seal.svg", "ink-swipe.svg", "okami-botanical.svg"]) {
+    assert.ok(assets.has(name), `no stylesheet references ${name}`);
+    const svg = readPublic(name).toString();
+    assert.match(svg, /<svg\s[^>]*viewBox=/, name);
+    assert.doesNotMatch(svg, /<image\b/, `embedded bitmap in ${name}`);
+  }
+  assert.ok(assets.has("kaushan-script.woff2") && assets.has("washi-paper.webp"));
+  assert.equal(readPublic("kaushan-script.woff2").toString("ascii", 0, 4), "wOF2");
+  assert.equal(readPublic("washi-paper.webp").toString("ascii", 8, 12), "WEBP");
 });

@@ -35,32 +35,91 @@ enum RequestKind {
     Resume,
 }
 
-pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static str> {
+/// Only fixed protocol field names and bounded numbers can reach a refusal record.
+#[derive(Debug)]
+pub(crate) struct StreamQueryError {
+    pub message: &'static str,
+    pub field: Option<&'static str>,
+    pub requested: Option<i64>,
+    pub site: &'static std::panic::Location<'static>,
+}
+
+impl StreamQueryError {
+    #[track_caller]
+    fn field(message: &'static str, field: &'static str) -> Self {
+        Self {
+            message,
+            field: Some(field),
+            requested: None,
+            site: std::panic::Location::caller(),
+        }
+    }
+
+    #[track_caller]
+    fn numeric(message: &'static str, field: &'static str, value: Option<&str>) -> Self {
+        Self {
+            requested: safe_integer(value),
+            ..Self::field(message, field)
+        }
+    }
+}
+
+fn safe_integer(value: Option<&str>) -> Option<i64> {
+    value?
+        .parse::<i64>()
+        .ok()
+        .filter(|value| (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(value))
+}
+
+pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, StreamQueryError> {
     streaming_request(query, RequestKind::Launch)
 }
 
 /// A resume may omit its application selection. Zero remains unresolved here;
 /// the authenticated session owner must supply the actual target later.
-pub(super) fn resume_request(query: &Query) -> Result<LaunchRequest, &'static str> {
+pub(super) fn resume_request(query: &Query) -> Result<LaunchRequest, StreamQueryError> {
     streaming_request(query, RequestKind::Resume)
 }
 
-fn streaming_request(query: &Query, kind: RequestKind) -> Result<LaunchRequest, &'static str> {
-    query.require_only(LAUNCH_FIELDS)?;
+fn streaming_request(query: &Query, kind: RequestKind) -> Result<LaunchRequest, StreamQueryError> {
+    query
+        .require_only(LAUNCH_FIELDS)
+        .map_err(|message| StreamQueryError {
+            message,
+            field: None,
+            requested: None,
+            site: std::panic::Location::caller(),
+        })?;
     let mut warnings = validate_metadata(query)?;
     let app_id = match (kind, query.get("appid")) {
         (RequestKind::Resume, None) => 0,
-        (_, Some(value)) => application_id(value)?,
-        (RequestKind::Launch, None) => return Err("missing query field"),
+        (_, Some(value)) => application_id(value)
+            .map_err(|message| StreamQueryError::numeric(message, "appid", Some(value)))?,
+        (RequestKind::Launch, None) => {
+            return Err(StreamQueryError::field("missing query field", "appid"));
+        }
     };
-    let (width, height, fps) = mode(query.required("mode")?)?;
-    let key = hex_bytes(query.required("rikey")?, 16)?;
+    let (width, height, fps) = mode(
+        query
+            .required("mode")
+            .map_err(|message| StreamQueryError::field(message, "mode"))?,
+    )?;
+    let key = query
+        .required("rikey")
+        .and_then(|value| hex_bytes(value, 16))
+        .map_err(|message| StreamQueryError::field(message, "rikey"))?;
     let remote_input_key: [u8; 16] = key
         .try_into()
-        .map_err(|_| "remote input key must contain 16 bytes")?;
-    let key_id = key_id(query.required("rikeyid")?)?;
+        .map_err(|_| StreamQueryError::field("remote input key must contain 16 bytes", "rikey"))?;
+    let key_id = query
+        .required("rikeyid")
+        .and_then(key_id)
+        .map_err(|message| StreamQueryError::field(message, "rikeyid"))?;
     let host_audio_enabled = query.get("localAudioPlayMode") == Some("1");
-    let audio_channels = surround_audio_channels(query.get("surroundAudioInfo"))?;
+    let audio_channels =
+        surround_audio_channels(query.get("surroundAudioInfo")).map_err(|message| {
+            StreamQueryError::numeric(message, "surroundAudioInfo", query.get("surroundAudioInfo"))
+        })?;
     let name = query.get("clientName").unwrap_or_default();
     let device_name = if name.is_empty() {
         None
@@ -94,9 +153,11 @@ fn application_id(value: &str) -> Result<u32, &'static str> {
     Ok(app_id)
 }
 
-fn validate_metadata(query: &Query) -> Result<Vec<StreamWarning>, &'static str> {
+fn validate_metadata(query: &Query) -> Result<Vec<StreamWarning>, StreamQueryError> {
     if query.get("uniqueid").is_some() {
-        query.client_id()?;
+        query
+            .client_id()
+            .map_err(|message| StreamQueryError::field(message, "uniqueid"))?;
     }
     if let Some(uuid) = query.get("uuid")
         && (uuid.is_empty()
@@ -105,7 +166,10 @@ fn validate_metadata(query: &Query) -> Result<Vec<StreamWarning>, &'static str> 
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
     {
-        return Err("invalid request identifier");
+        return Err(StreamQueryError::field(
+            "invalid request identifier",
+            "uuid",
+        ));
     }
     // SOPS and VRR are advisory; accepting them does not mutate host display policy.
     let mut warnings = Vec::new();
@@ -147,17 +211,21 @@ fn validate_metadata(query: &Query) -> Result<Vec<StreamWarning>, &'static str> 
             warnings.push(ignored_hint(query, field, true));
         }
     }
-    require_optional_value(query, "corever", "1", "unsupported Moonlight core version")?;
+    if let Some(version) = query.get("corever")
+        && version != "1"
+    {
+        return Err(StreamQueryError::numeric(
+            "unsupported Moonlight core version",
+            "corever",
+            Some(version),
+        ));
+    }
     Ok(warnings)
 }
 
 fn ignored_hint(query: &Query, field: &str, numeric: bool) -> StreamWarning {
     let requested = if numeric {
-        query
-            .get(field)
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|value| (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(value))
-            .map(WarningValue::Integer)
+        safe_integer(query.get(field)).map(WarningValue::Integer)
     } else {
         None
     };
@@ -183,10 +251,14 @@ fn surround_audio_channels(value: Option<&str>) -> Result<u32, &'static str> {
     }
 }
 
-fn optional_boolean(query: &Query, name: &str) -> Result<(), &'static str> {
+fn optional_boolean(query: &Query, name: &'static str) -> Result<(), StreamQueryError> {
     match query.get(name) {
         None | Some("0" | "1") => Ok(()),
-        Some(_) => Err("invalid boolean query field"),
+        Some(value) => Err(StreamQueryError::numeric(
+            "invalid boolean query field",
+            name,
+            Some(value),
+        )),
     }
 }
 
@@ -195,19 +267,6 @@ fn optional_decimal_mask(query: &Query, name: &str, maximum: u32) -> Result<(), 
         None => Ok(()),
         Some(value) if decimal_u32(value).is_ok_and(|mask| mask <= maximum) => Ok(()),
         Some(_) => Err("invalid controller capability mask"),
-    }
-}
-
-fn require_optional_value(
-    query: &Query,
-    name: &str,
-    expected: &str,
-    error: &'static str,
-) -> Result<(), &'static str> {
-    match query.get(name) {
-        None => Ok(()),
-        Some(value) if value == expected => Ok(()),
-        Some(_) => Err(error),
     }
 }
 
@@ -220,29 +279,46 @@ fn decimal_u32(value: &str) -> Result<u32, &'static str> {
         .map_err(|_| "unsigned decimal value is out of range")
 }
 
-fn mode(value: &str) -> Result<(u32, u32, u32), &'static str> {
+fn mode(value: &str) -> Result<(u32, u32, u32), StreamQueryError> {
     let mut fields = value.split('x');
-    let width = mode_component(fields.next())?;
-    let height = mode_component(fields.next())?;
-    let fps = mode_component(fields.next())?;
+    let width = mode_component(fields.next(), "mode.width")?;
+    let height = mode_component(fields.next(), "mode.height")?;
+    let fps = mode_component(fields.next(), "mode.fps")?;
     if fields.next().is_some() {
-        return Err("invalid streaming mode");
+        return Err(StreamQueryError::field("invalid streaming mode", "mode"));
     }
-    if width < 16 || height < 16 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err("streaming dimensions must be even and at least 16 pixels");
+    for (field, value) in [("mode.width", width), ("mode.height", height)] {
+        if value < 16 || !value.is_multiple_of(2) {
+            return Err(StreamQueryError {
+                requested: Some(value.into()),
+                ..StreamQueryError::field(
+                    "streaming dimensions must be even and at least 16 pixels",
+                    field,
+                )
+            });
+        }
     }
     if fps == 0 {
-        return Err("streaming frame rate must be positive");
+        return Err(StreamQueryError {
+            requested: Some(fps.into()),
+            ..StreamQueryError::field("streaming frame rate must be positive", "mode.fps")
+        });
     }
     Ok((width, height, fps))
 }
 
-fn mode_component(value: Option<&str>) -> Result<u32, &'static str> {
-    let value = value.ok_or("invalid streaming mode")?;
+fn mode_component(value: Option<&str>, field: &'static str) -> Result<u32, StreamQueryError> {
+    let value = value.ok_or_else(|| StreamQueryError::field("invalid streaming mode", field))?;
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("invalid streaming mode");
+        return Err(StreamQueryError::numeric(
+            "invalid streaming mode",
+            field,
+            Some(value),
+        ));
     }
-    value.parse().map_err(|_| "streaming mode is out of range")
+    value.parse().map_err(|_| {
+        StreamQueryError::numeric("streaming mode is out of range", field, Some(value))
+    })
 }
 
 fn key_id(value: &str) -> Result<u32, &'static str> {
@@ -265,11 +341,11 @@ fn key_id(value: &str) -> Result<u32, &'static str> {
 mod tests {
     use super::*;
 
-    fn parse(fields: &str) -> Result<LaunchRequest, &'static str> {
+    fn parse(fields: &str) -> Result<LaunchRequest, StreamQueryError> {
         launch_request(&Query::parse(&format!("/launch?{fields}")).unwrap())
     }
 
-    fn parse_resume(fields: &str) -> Result<LaunchRequest, &'static str> {
+    fn parse_resume(fields: &str) -> Result<LaunchRequest, StreamQueryError> {
         resume_request(&Query::parse(&format!("/resume?{fields}")).unwrap())
     }
 
@@ -494,7 +570,13 @@ mod tests {
             let fields = format!(
                 "appid=1&mode=1920x1080x60&rikey=00112233445566778899aabbccddeeff&rikeyid=1&{field}=attacker"
             );
-            assert!(matches!(parse(&fields), Err("unsupported query field")));
+            assert!(matches!(
+                parse(&fields),
+                Err(StreamQueryError {
+                    message: "unsupported query field",
+                    ..
+                })
+            ));
         }
     }
 
@@ -732,7 +814,10 @@ mod tests {
         }
         assert!(matches!(
             parse(&format!("{base}&clientVrrRequested=1&vrrUnsupported=1")),
-            Err("unsupported query field")
+            Err(StreamQueryError {
+                message: "unsupported query field",
+                ..
+            })
         ));
     }
 }

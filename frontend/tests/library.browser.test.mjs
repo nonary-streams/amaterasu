@@ -48,8 +48,11 @@ test("Library owns integration navigation, preserves drafts and scopes, and reti
         throw new Error("Unexpected mocked route: " + route);
       }
     };
+    const extensionDiscovery = new Promise(resolve => { window.finishExtensionDiscovery = resolve; });
     Amaterasu.ExtensionPages = class {
-      reset() {} dispose() {} isDirty() { return false; } async discover() { return []; }
+      reset() {} dispose() {} isDirty() { return false; }
+      discover() { return extensionDiscovery; }
+      async mount() {}
     };
     Object.assign(globalThis, Amaterasu);
     location.hash = "catalog";
@@ -75,6 +78,31 @@ test("Library owns integration navigation, preserves drafts and scopes, and reti
       assert(nav.includes('Library') && !nav.includes('Applications') && !nav.includes('Steam'), 'retired sidebar entries');
       assert(!calls.includes('application/list') && !calls.includes('launch/list'), 'removed Applications polling');
       assert(document.querySelectorAll('#main h1').length === 1, 'single library heading');
+      const mastheadContext = document.querySelector('#console-route-title');
+      assert(mastheadContext.textContent === 'Library', 'core route title in masthead');
+      Amaterasu.applyLocale('fr');
+      assert(mastheadContext.textContent === Amaterasu.translateText('Library') && mastheadContext.textContent !== 'Library', 'core masthead title updates with locale');
+      Amaterasu.applyLocale('en');
+
+      const toggle = document.querySelector('.menu-toggle');
+      const rail = document.getElementById(toggle.getAttribute('aria-controls'));
+      const firstNavButton = rail.querySelector('.nav-item');
+      const account = rail.querySelector('.console-account');
+      const summary = account.querySelector('summary');
+      const key = (target, value, options = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: value, bubbles: true, ...options }));
+      assert(getComputedStyle(rail).visibility === 'hidden' && !account.open, 'mobile rail and account utilities start closed');
+      toggle.click();
+      assert(document.activeElement === firstNavButton && toggle.getAttribute('aria-expanded') === 'true', 'opening rail focuses navigation');
+      key(firstNavButton, 'Tab', { shiftKey: true, cancelable: true });
+      assert(document.activeElement === summary, 'drawer tab wrap skips collapsed account controls');
+      summary.click();
+      const signOut = [...account.querySelectorAll('button')].find(node => node.textContent === 'Sign out');
+      assert(account.open && signOut.getClientRects().length > 0, 'account disclosure reveals sign-out and preferences');
+      signOut.focus();
+      key(signOut, 'Tab', { cancelable: true });
+      assert(document.activeElement === firstNavButton, 'drawer tab wrap includes revealed account controls');
+      key(firstNavButton, 'Escape');
+      assert(document.activeElement === toggle && toggle.getAttribute('aria-expanded') === 'false', 'Escape closes navigation and restores toggle focus');
 
       document.querySelector('#library-tab-games').focus();
       document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
@@ -129,6 +157,12 @@ test("Library owns integration navigation, preserves drafts and scopes, and reti
       await navigate('catalog/integrations', () => !findButton('Back to integrations'));
       await navigate('catalog/integrations/steam', () => !!findButton('Force catalog sync'));
       assert(document.querySelector('#main').textContent.includes('Steam status unavailable'), 'refresh-only session stays read-restricted');
+
+      await navigate('extension/reference', () => mastheadContext.textContent === 'Overview');
+      finishExtensionDiscovery([{ id: 'reference', name: 'Overview', placements: ['page'] }]);
+      await wait(() => document.querySelector('#main').getAttribute('aria-labelledby') === mastheadContext.id, 'extension deep link resolves after discovery');
+      Amaterasu.applyLocale('fr');
+      assert(Amaterasu.translateText('Overview') !== 'Overview' && mastheadContext.textContent === 'Overview', 'extension masthead uses registered literal name');
       document.body.dataset.qualification = 'passed';
     })().catch(error => {
       document.body.dataset.qualification = 'failed';
@@ -138,8 +172,9 @@ test("Library owns integration navigation, preserves drafts and scopes, and reti
   const directory = mkdtempSync(join(tmpdir(), "amaterasu-library-browser-"));
   const html = join(directory, "library.html");
   writeFileSync(join(directory, "app.js"), `${compile(source)}\n${host}\n${compile(readFileSync("src/app.ts", "utf8"))}\n${checks}`);
-  writeFileSync(html, `<!doctype html><html><head><meta charset="utf-8">
-    <link rel="stylesheet" href="${pathToFileURL(resolve("public/styles.css"))}"></head><body><div id="app"></div>
+  writeFileSync(html, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="${pathToFileURL(resolve("public/styles.css"))}">
+    <link rel="stylesheet" href="${pathToFileURL(resolve("public/console-shell.css"))}"></head><body><div id="app"></div>
     <script>window.addEventListener('error', event => {
       document.body.dataset.qualification = 'failed';
       const result = document.createElement('pre'); result.id = 'failure'; result.textContent = event.message; document.body.append(result);
@@ -148,7 +183,7 @@ test("Library owns integration navigation, preserves drafts and scopes, and reti
       const result = document.createElement('pre'); result.id = 'failure'; result.textContent = event.reason?.stack ?? event.reason; document.body.append(result);
     });</script><script src="./app.js"></script></body></html>`);
   try {
-    const output = execFileSync(browser, ["--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
+    const output = execFileSync(browser, ["--headless", "--no-sandbox", "--disable-gpu", "--no-first-run", "--window-size=680,800",
       "--allow-file-access-from-files", "--virtual-time-budget=15000", "--dump-dom",
       `--user-data-dir=${join(directory, "profile")}`, pathToFileURL(html).href],
     { encoding: "utf8", timeout: 30000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });

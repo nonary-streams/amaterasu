@@ -111,6 +111,17 @@ impl Pipeline {
             job.cancel(record, now);
         }
         if now >= job.deadline {
+            if job.step == Step::ProbeExtensionSource {
+                if let Some(mut pending) = job.pending.take()
+                    && pending.was_sent()
+                {
+                    pending.cancel();
+                    record.shutdown_observations.push(pending);
+                }
+                record.extension_checked = true;
+                record.report_extension_probe_fallback("probe_deadline");
+                return self.deliver_success(record, job, now, send);
+            }
             if job.cleanup {
                 if let Some(mut pending) = job.pending.take() {
                     pending.cancel();
@@ -770,11 +781,13 @@ impl Pipeline {
                     }
                 };
             }
-            if payload["ok"] != true {
-                eprintln!(
-                    "amaterasu extension source preflight rejected code={:?}",
-                    payload["code"].as_str().unwrap_or("invalid_response")
-                );
+            if record.extension_limits.is_none() {
+                let reason = if payload["ok"] != true {
+                    safe_dependency_code(&payload)
+                } else {
+                    "probe_unusable"
+                };
+                record.report_extension_probe_fallback(reason);
             }
             if record.extension_limits.is_none() {
                 let reason = if payload["ok"] != true {

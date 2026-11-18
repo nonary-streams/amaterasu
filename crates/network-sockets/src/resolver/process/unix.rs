@@ -88,7 +88,7 @@ impl Process {
         }
         // The unreaped group leader still reserves its identity when the final
         // containment signal is delivered. Reap only after this signal.
-        self.signal_group()?;
+        self.signal_group(true)?;
         self.exit = self.child.try_wait()?;
         Ok(self.exit)
     }
@@ -97,8 +97,8 @@ impl Process {
         if self.exit.is_some() {
             return Ok(());
         }
-        self.observe_owned_child()?;
-        self.signal_group()
+        let exited = self.observe_owned_child()?;
+        self.signal_group(exited)
     }
 
     fn observe_owned_child(&self) -> io::Result<bool> {
@@ -124,19 +124,50 @@ impl Process {
         Ok(child != 0)
     }
 
-    fn signal_group(&self) -> io::Result<()> {
+    fn signal_group(
+        &self,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] leader_exited: bool,
+    ) -> io::Result<()> {
         let group = libc::pid_t::try_from(self.child.id())
             .map_err(|_| io::Error::other("resolver process group is invalid"))?;
         // SAFETY: process_group(0) created this exact group and waitid just
         // confirmed unreaped child ownership. Never signal after reaping.
         if unsafe { libc::kill(-group, libc::SIGKILL) } != 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
             }
+            // Darwin may exclude the unreaped leader from group signalling
+            // and return EPERM. Accept it only when the exited leader still
+            // owns the group and the kernel lists no other member.
+            #[cfg(target_os = "macos")]
+            if leader_exited
+                && error.raw_os_error() == Some(libc::EPERM)
+                && only_unreaped_leader(group)
+            {
+                return Ok(());
+            }
+            return Err(error);
         }
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn only_unreaped_leader(group: libc::pid_t) -> bool {
+    const PROC_PGRP_ONLY: u32 = 2;
+    let mut members = [0 as libc::pid_t; 2];
+    // SAFETY: libproc writes only within the supplied buffer. Two slots
+    // distinguish exactly one member from a full or truncated enumeration.
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            group as u32,
+            members.as_mut_ptr().cast(),
+            std::mem::size_of_val(&members) as libc::c_int,
+        )
+    };
+    bytes == std::mem::size_of::<libc::pid_t>() as libc::c_int && members[0] == group
 }
 
 #[cfg(target_os = "linux")]

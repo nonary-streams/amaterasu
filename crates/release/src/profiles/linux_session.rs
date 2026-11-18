@@ -42,97 +42,9 @@ use std::path::Path;
 
 pub use amaterasu_module_sdk::processing_composition::{CapabilityBinding, ProcessingSelection};
 
-/// The standard Linux product explicitly selects its built-in providers.
-/// Other compositions can select different principals and service aliases.
-pub fn default_rtx_hdr_selection() -> ProcessingSelection {
-    use amaterasu_module_sdk::{extension_api, media::native_contracts};
-    let binding = |principal: &str, service: &str, contract: &str| CapabilityBinding {
-        principal: principal.into(),
-        service: service.into(),
-        contract: contract.into(),
-        interface_major: 1,
-        interface_minor: 0,
-    };
-    ProcessingSelection {
-        processor: binding(
-            RTX_HDR_COMPONENT.id,
-            "amaterasu.rtx-hdr/1",
-            native_contracts::FRAME_PROCESSOR,
-        ),
-        frame_consumer: binding(
-            VIDEO_COMPONENT_ID,
-            "amaterasu.video/1",
-            amaterasu_module_sdk::video::CONTRACT,
-        ),
-        frame_settings: None,
-        stream_owner: Some(binding(
-            "amaterasu.stream-session",
-            "amaterasu.stream-session/1",
-            "amaterasu.stream-session/1",
-        )),
-        lifecycle: Some(binding(
-            SESSION_LIFECYCLE.id,
-            extension_api::SESSION_LIFECYCLE_SERVICE,
-            extension_api::SESSION_LIFECYCLE_SERVICE,
-        )),
-        settings_registry: Some(binding(
-            EXTENSION_REGISTRY.id,
-            extension_api::EXTENSION_REGISTRY_SERVICE,
-            extension_api::EXTENSION_REGISTRY_SERVICE,
-        )),
-        display_settings: Some(binding(
-            DISPLAY_SETTINGS.id,
-            amaterasu_module_sdk::display_settings::SERVICE,
-            amaterasu_module_sdk::display_settings::SERVICE,
-        )),
-        foreground: None,
-        source_preflight_consumers: ["amaterasu.remote-session".into()].into(),
-        request_ancestors: [
-            "amaterasu.management",
-            "amaterasu.nvhttp",
-            "amaterasu.rtsp",
-            CONSOLE_ID,
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
-        settings_editors: ["amaterasu.management", CONSOLE_ID]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        prepared_context_consumers: ["amaterasu.launch".into()].into(),
-        lifecycle_admitters: ["amaterasu.rtsp".into()].into(),
-        history_owners: ["amaterasu.nvhttp".into()].into(),
-    }
-}
-
-/// The standard selection for an installed policy, which may hold fewer
-/// components than the current profile. Optional consumers it does not approve
-/// are left out. Foreground restrictions need the built-in foreground provider,
-/// so it is bound exactly when this policy approves that component; a persisted
-/// foreground-only setting then has a provider to reach instead of failing
-/// stream configuration.
-pub fn default_rtx_hdr_selection_for(policy: &RuntimeConfig) -> ProcessingSelection {
-    let mut selection = default_rtx_hdr_selection();
-    selection
-        .source_preflight_consumers
-        .retain(|principal| policy.principals.contains_key(principal));
-    let service = amaterasu_module_sdk::foreground_context::SERVICE;
-    let approved = policy
-        .principals
-        .get(FOREGROUND_CONTEXT.id)
-        .is_some_and(|grants| grants.provide.contains(service));
-    if approved {
-        selection.foreground = Some(CapabilityBinding {
-            principal: FOREGROUND_CONTEXT.id.into(),
-            service: service.into(),
-            contract: service.into(),
-            interface_major: 1,
-            interface_minor: 0,
-        });
-    }
-    selection
-}
+pub use amaterasu_package::processing_policy::rtx_hdr::{
+    default_rtx_hdr_selection, default_rtx_hdr_selection_for,
+};
 
 /// Authorization generations are profile-specific and never reused: the
 /// development policy holds 13 and the installer policy 14. Advance this whenever
@@ -274,7 +186,7 @@ pub const RTX_HDR_COMPONENT: ComponentDefinition = ComponentDefinition {
     native_uses: &[],
 };
 
-const FOREGROUND_CONTEXT: ComponentDefinition = ComponentDefinition {
+pub(crate) const FOREGROUND_CONTEXT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.foreground-context",
     library: "amaterasu_foreground_context",
     provides: &["amaterasu.foreground-context/1"],

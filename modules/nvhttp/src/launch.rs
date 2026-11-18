@@ -943,7 +943,7 @@ impl Controller {
         if let Some((level, event)) = self.restart_sweep.poll(now, send)
             && let Some(logger) = &self.logger
         {
-            let _ = logger.emit(level, "launch", event);
+            let _ = logger.emit(level, "launch", &event);
         }
     }
 
@@ -2417,6 +2417,15 @@ impl Controller {
 
 #[track_caller]
 fn private_error(status: u16, message: &str) -> Reply {
+    private_error_with_input(status, message, None)
+}
+
+#[track_caller]
+fn private_error_with_input(
+    status: u16,
+    message: &str,
+    input: Option<&crate::wire::StreamQueryError>,
+) -> Reply {
     let reason = if message.len() <= 64
         && message
             .bytes()
@@ -2426,7 +2435,22 @@ fn private_error(status: u16, message: &str) -> Reply {
     } else {
         "redacted"
     };
-    eprintln!("amaterasu launch rejection status={status} reason={reason}");
+    if let Some(input) = input
+        && let Some(field) = input.field
+    {
+        match input.requested {
+            Some(value) => eprintln!(
+                "amaterasu launch rejection status={status} reason={} field={field} requested={value}",
+                rejection_code(message)
+            ),
+            None => eprintln!(
+                "amaterasu launch rejection status={status} reason={} field={field}",
+                rejection_code(message)
+            ),
+        }
+    } else {
+        eprintln!("amaterasu launch rejection status={status} reason={reason}");
+    }
     let mut reply = xml::error(status, message);
     reply.requires_paired_tls = true;
     reply.rejection = Some(crate::wire::Rejection {

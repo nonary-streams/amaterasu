@@ -1,5 +1,5 @@
 //! Host-owned selection records. Every source keeps its original signature.
-use super::{PluginManifest, compose, digest};
+use super::{PluginManifest, digest, installed::resolve_composition};
 use crate::{
     BootstrapConfig, ComponentManifest, PackageResult, read_bounded, read_json,
     repository::{Candidate, CandidateKind, RepositoryStore, verify_candidate},
@@ -137,10 +137,6 @@ pub fn verify_composition(
             verify_source(store, source, bootstrap, now)
         })
         .collect::<PackageResult<_>>()?;
-    let components = compose(
-        base,
-        plugins.iter().map(|plugin| &plugin.manifest),
-        bootstrap,
-    )?;
+    let (components, _) = resolve_composition(base, bootstrap, &plugins)?;
     Ok((components, plugins))
 }

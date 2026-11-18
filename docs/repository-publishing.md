@@ -12,8 +12,10 @@ Amaterasu's own modules ship together as **Amaterasu Core**. One catalog per
 platform lists the Core set, and a host moves from one set to the next as a
 whole: the host verifies a complete set under one signature, tries it, and
 returns to the previous set if it does not start. An update can change any
-module of the set and can add one. A module from another publisher is that
-publisher's to list in its own repository.
+module of the set and can add one. The same catalog can list independently
+signed native plugins. The [RTX HDR publishing guide](rtx-hdr-repository-publishing.md)
+covers the Linux add-on. A module from another publisher is that publisher's to
+list in its own repository.
 
 | | |
 | --- | --- |
@@ -118,10 +120,10 @@ not been done: the set has to carry the policy it proposes, and the console
 has to show an administrator what a new module asks for before the host
 records the approval.
 
-A module from another publisher cannot yet be installed beside Core at all.
-The host runs one set from one publisher, so a second publisher would have to
-ship every module. Installing and updating one module on its own needs the
-host to compose a set from more than one signed source.
+Independent native plugins use the [plugin installation workflow](plugin-driver-installation.md).
+The host preserves each publisher's signature and checks the plugin alongside
+Core. The official RTX HDR installer derives its processing connections from
+host policy and stages the NVIDIA runtime before activation.
 
 ## What is not automated yet
 

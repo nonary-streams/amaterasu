@@ -1,16 +1,22 @@
-// Optional real-browser qualification: node tests/browser-slider-qualification.mjs
+// Optional real-browser qualification: node tests/application-sections-browser-qualification.mjs
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import ts from "typescript";
+import { consoleSource, consoleStyles, serveConsoleAsset } from "./browser-console-fixture.mjs";
 import { createServer } from "node:http";
 const plugin = readFileSync("../examples/web-extension/application.js", "utf8");
 const rtxPlugin = readFileSync("../modules/rtx-hdr/ui/application.js", "utf8");
 const server = createServer((request, response) => {
+  if (serveConsoleAsset(request, response)) return;
+  if (request.url.endsWith("/application.css")) {
+    response.setHeader("Content-Type", "text/css");
+    response.end(readFileSync("../modules/rtx-hdr/ui/application.css"));
+    return;
+  }
   response.setHeader("Content-Type", request.url.endsWith(".js") ? "text/javascript" : "text/html");
-  response.end(request.url.endsWith(".js") ? (request.url.endsWith("rtx-application.js") ? rtxPlugin : plugin) : "<main><div id=sections></div></main>");
+  response.end(request.url.endsWith(".js") ? (request.url.endsWith("rtx-application.js") ? rtxPlugin : plugin) : `<!doctype html><meta charset="utf-8">${consoleStyles}<main><div id=sections></div></main>`);
 });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const origin = `http://127.0.0.1:${server.address().port}`;
@@ -49,8 +55,7 @@ try {
     return result.result.value;
   };
   for (let i = 0; i < 100 && !await evaluate(`!!document.querySelector('#sections')`); i++) await new Promise(resolve => setTimeout(resolve, 20));
-  const source = ['locale-catalogs.ts','locale.ts','ui.ts','extension_ui.ts','extension_ui_layout.ts','extension_ui_tabs.ts','extension_ui_feedback.ts','extension_ui_dialog.ts','extension_ui_charts.ts','extension_slots.ts','extensions.ts','extension_fields.ts','session_extensions.ts'].map(file => readFileSync(`src/${file}`, 'utf8')).join('\n');
-  await evaluate(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }));
+  await evaluate(consoleSource);
   const descriptor = JSON.parse(readFileSync('../modules/rtx-hdr/metadata/linux.json', 'utf8')).descriptor;
   await evaluate(`
     window.failures=[]; window.saved=null; window.greetings=0; window.values={}; window.revision=1;
@@ -66,18 +71,18 @@ try {
     }}};
     Amaterasu.renderApplicationPluginSections(window.context,document.querySelector('#sections'),{id:'app-0000000000000001',name:'Example game'});
   `);
-  for(let i=0;i<150&&!await evaluate(`!!document.querySelector('.application-plugin-section input')`);i++)await new Promise(resolve=>setTimeout(resolve,20));
+  for(let i=0;i<150&&!await evaluate(`!!document.querySelector('.application-plugin-sections .application-plugin-section input')`);i++)await new Promise(resolve=>setTimeout(resolve,20));
   assert.deepEqual(await evaluate(`window.failures`),[]);
   assert.equal(await evaluate(`document.querySelectorAll('.catalog-plugin-override-row').length`),descriptor.options.filter(option=>option.allowed_scopes.includes('application')).length);
-  assert.equal(await evaluate(`document.querySelector('.application-plugin-section').textContent.includes('Tools for Example game')`),true);
+  assert.equal(await evaluate(`document.querySelector('.application-plugin-sections').textContent.includes('Tools for Example game')`),true);
   assert.equal(await evaluate(`Amaterasu.applicationPluginOverridesDirty(document.querySelector('#sections'))`),false);
   await evaluate(`const slider=document.querySelector('.catalog-plugin-overrides-form input[type=range]');slider.value='1500';slider.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('.catalog-plugin-overrides-form').requestSubmit();`);
   for(let i=0;i<100&&!await evaluate(`!!window.saved`);i++)await new Promise(resolve=>setTimeout(resolve,20));
   assert.deepEqual(await evaluate(`window.saved.values`),{rtx_hdr_peak_brightness:1500});
   assert.equal(await evaluate(`window.saved.scope.id`),'app-0000000000000001');
-  await evaluate(`const message=document.querySelector('.application-plugin-section input');message.value='Application action';message.dispatchEvent(new Event('input',{bubbles:true}));`);
+  await evaluate(`const message=document.querySelector('.application-plugin-sections .application-plugin-section input');message.value='Application action';message.dispatchEvent(new Event('input',{bubbles:true}));`);
   assert.equal(await evaluate(`Amaterasu.applicationPluginOverridesDirty(document.querySelector('#sections'))`),true);
-  await evaluate(`window.detachedButton=document.querySelector('.application-plugin-section button');window.detachedButton.click();`);
+  await evaluate(`window.detachedButton=document.querySelector('.application-plugin-sections .application-plugin-section button');window.detachedButton.click();`);
   assert.equal(await evaluate(`Amaterasu.applicationPluginOverridesSaving(document.querySelector('#sections'))`),true);
   await evaluate(`window.releaseGreeting()`);
   for(let i=0;i<100&&await evaluate(`Amaterasu.applicationPluginOverridesSaving(document.querySelector('#sections'))`);i++)await new Promise(resolve=>setTimeout(resolve,20));
@@ -100,12 +105,12 @@ try {
   for(let i=0;i<150&&!await evaluate(`document.querySelectorAll('.rtx-hdr-setting').length===9`);i++)await new Promise(resolve=>setTimeout(resolve,20));
   assert.equal(await evaluate(`document.querySelectorAll('.rtx-hdr-setting').length`),9);
   assert.equal(await evaluate(`document.querySelectorAll('.catalog-plugin-overrides-form').length`),0,'a selected plugin UI replaces the generic form');
-  await evaluate(`{const peak=document.querySelector('.application-plugin-section input[type=range]');peak.value='1400';peak.dispatchEvent(new Event('input',{bubbles:true}));}`);
+  await evaluate(`{const peak=document.querySelector('.application-plugin-sections .application-plugin-section input[type=range]');peak.value='1400';peak.dispatchEvent(new Event('input',{bubbles:true}));}`);
   assert.equal(await evaluate(`Amaterasu.applicationPluginOverridesDirty(document.querySelector('#sections'))`),true);
   for(let i=0;i<150&&!await evaluate(`window.saved?.values?.rtx_hdr_peak_brightness===1400`);i++)await new Promise(resolve=>setTimeout(resolve,20));
   assert.deepEqual(await evaluate(`window.saved.values`),{rtx_hdr_peak_brightness:1400});
   assert.equal(await evaluate(`window.saved.scope.id`),'app-0000000000000002');
-  await evaluate(`{const peak=document.querySelector('.application-plugin-section input[type=range]');peak.value='1600';peak.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#sections').remove();}`);
+  await evaluate(`{const peak=document.querySelector('.application-plugin-sections .application-plugin-section input[type=range]');peak.value='1600';peak.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#sections').remove();}`);
   await new Promise(resolve=>setTimeout(resolve,300));
   assert.equal(await evaluate(`window.saved.values.rtx_hdr_peak_brightness`),1400,'closing the app cancels pending autosave');
   assert.deepEqual(await evaluate(`window.failures`),[]);

@@ -77,6 +77,8 @@ namespace Amaterasu {
       driver_publisher_not_approved:"This driver's publisher needs approval on this computer.",
       plugin_revision_conflict:"This installation changed. Review the plugin again before continuing.",
       driver_stale_approval:"The required drivers changed. Review setup again before approving installation.",
+      rtx_hdr_addon_host_update_required:"Update the Amaterasu host and Core package before adding RTX HDR.",
+      rtx_hdr_already_in_core:"RTX HDR is included in this host's Core package.",
       plugin_trial_failed:"The plugin could not start. The previous working modules have been restored.",
       driver_not_cancellable:"Installation has reached a step that must finish before it can stop.",
     };

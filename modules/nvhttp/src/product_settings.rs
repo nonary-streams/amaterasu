@@ -1430,6 +1430,10 @@ impl ProductSettings {
         self.record_listener_apply_failure(&target, message);
     }
 
+    pub(crate) fn listener_error(&self) -> Option<&str> {
+        self.listener_error.as_deref()
+    }
+
     pub fn record_listener_apply_failure(&mut self, target: &NetworkTarget, message: String) {
         self.listener_error = Some(message.clone());
         if let Some(completion) = self

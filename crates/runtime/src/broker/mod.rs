@@ -165,7 +165,7 @@ impl Broker {
         self.requests.expire(now);
         if let Some(reports) = self.requests.take_timing(now) {
             for report in reports {
-                self.record_diagnostic(false, "broker.timing", report);
+                self.record_diagnostic("broker.timing", report);
             }
         }
         self.hooks.expire(now);
@@ -520,6 +520,9 @@ impl Broker {
                                 self.configuration.host_context.running_components
                             );
                         }
+                        if self.configuration.host_context.rtx_hdr_addon_supported {
+                            payload["rtx_hdr_addon_supported"] = true.into();
+                        }
                         Response::Result { payload }
                     }
                     None => Response::error(
@@ -866,17 +869,17 @@ impl Broker {
             && (caller == "amaterasu.management" || caller == DIAGNOSTICS_COMPONENT)
     }
 
-    /// Records one of the runtime's own diagnostics. A periodic window is
-    /// written whether or not anything happened, so it is a debug record; only
-    /// an event a person would notice belongs in the default log.
-    pub(crate) fn record_diagnostic(&mut self, notable: bool, target: &str, report: String) {
+    /// Writes runtime performance details to the debug log.
+    pub(crate) fn record_diagnostic(&mut self, target: &str, report: String) {
         const DEBUG_LEVEL: u8 = 1;
-        const INFO_LEVEL: u8 = 2;
-        let level = if notable { INFO_LEVEL } else { DEBUG_LEVEL };
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&report) {
             for part in amaterasu_timing_metrics::window_parts(&value) {
-                let _ =
-                    self.enqueue_log("amaterasu.runtime", level, target.into(), part.to_string());
+                let _ = self.enqueue_log(
+                    "amaterasu.runtime",
+                    DEBUG_LEVEL,
+                    target.into(),
+                    part.to_string(),
+                );
             }
         }
     }
@@ -915,7 +918,16 @@ impl Broker {
         }
         if self.log_events.len() >= LOG_EVENT_QUEUE_CAPACITY {
             self.dropped_log_records = self.dropped_log_records.saturating_add(1);
-            return Response::Ok;
+            const WARNING_LEVEL: u8 = 3;
+            if level < WARNING_LEVEL {
+                return Response::Ok;
+            }
+            let Some(index) = self.log_events.iter().position(|event| {
+                matches!(event, HostLogEvent::Record { level, .. } if *level < WARNING_LEVEL)
+            }) else {
+                return Response::Ok;
+            };
+            self.log_events.remove(index);
         }
         self.log_events.push_back(HostLogEvent::Record {
             level,

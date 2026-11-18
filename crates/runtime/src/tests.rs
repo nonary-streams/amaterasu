@@ -500,14 +500,14 @@ fn only_diagnostics_can_queue_revisioned_logging_policy_updates() {
 }
 
 #[test]
-fn bounded_log_queue_drops_records_before_rejecting_a_policy_update() {
+fn bounded_log_queue_preserves_failures_and_policy_during_routine_log_bursts() {
     let mut broker = logging_broker();
     for index in 0..512 {
         assert!(matches!(
             broker.dispatch(
                 "producer",
                 Command::Log {
-                    level: 2,
+                    level: 1,
                     target: "server".into(),
                     message: format!("record {index}"),
                 }
@@ -515,6 +515,17 @@ fn bounded_log_queue_drops_records_before_rejecting_a_policy_update() {
             Response::Ok
         ));
     }
+    assert!(matches!(
+        broker.dispatch(
+            "producer",
+            Command::Log {
+                level: 4,
+                target: "server".into(),
+                message: "listener failed".into(),
+            }
+        ),
+        Response::Ok
+    ));
     assert!(matches!(
         broker.dispatch(
             DIAGNOSTICS_COMPONENT,
@@ -544,7 +555,11 @@ fn bounded_log_queue_drops_records_before_rejecting_a_policy_update() {
         events.extend(batch);
     }
     assert_eq!(events.len(), 512);
-    assert_eq!(dropped_records, 1);
+    assert_eq!(dropped_records, 2);
+    assert!(matches!(
+        &events[events.len() - 2],
+        HostLogEvent::Record { level: 4, message, .. } if message == "listener failed"
+    ));
     assert!(matches!(
         events.last(),
         Some(HostLogEvent::Policy { revision: 1, .. })
@@ -592,6 +607,7 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
         running_modules: Vec::new(),
         running_components: Vec::new(),
         plugin_setup_pending: false,
+        rtx_hdr_addon_supported: true,
         schema: 1,
         state_root: Some(r"C:\\ProgramData\\Amaterasu\\runtime\\user-state\\S-1-5-21-1".into()),
         package_root: Some(r"C:\\ProgramData\\Amaterasu\\packages".into()),
@@ -666,6 +682,7 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
     else {
         panic!("management did not receive the running package digest");
     };
+    assert_eq!(payload["rtx_hdr_addon_supported"], true);
     assert_eq!(
         payload,
         serde_json::json!({"digest":"a".repeat(64),"modules":[]})

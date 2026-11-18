@@ -365,6 +365,18 @@ fn the_collector_thread_retains_history_for_a_management_surface() {
     assert_eq!(snapshot["slow"][0]["by"], "producer");
     assert!(snapshot["slow"][0]["observed_unix_ms"].as_u64().unwrap() > 0);
     hub.shutdown();
+    let logs = broker.lock().unwrap().dispatch(
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        amaterasu_contracts::Command::DrainLogEvents {},
+    );
+    let amaterasu_contracts::Response::LogEvents { events, .. } = logs else {
+        panic!("expected host log events");
+    };
+    assert!(events.iter().any(|event| matches!(
+        event,
+        amaterasu_contracts::HostLogEvent::Record { level: 1, target, .. }
+            if target == "amaterasu.runtime::trace.slow_span"
+    )));
     // Shutdown is idempotent and leaves history readable.
     hub.shutdown();
     assert_eq!(hub.snapshot()["slow"].as_array().unwrap().len(), 1);
@@ -544,23 +556,6 @@ fn a_long_run_of_slow_frames_is_one_moment_and_a_brief_call_is_not_blamed_for_it
     // A 1.7 ms call did not make a 13 ms step slow.
     assert_eq!(run["held_by"], serde_json::Value::Null);
     assert_eq!(slow[2]["label"], "amaterasu.pairing");
-}
-
-#[test]
-fn only_a_pause_a_person_would_notice_reaches_the_default_log() {
-    use super::report::is_notable;
-    let flow = |total_us: u64| serde_json::json!({"total_us": total_us, "budget_us": 12_000});
-    // A frame just over its limit is routine; one twice over is an event.
-    assert!(!is_notable("trace.slow_flow", &flow(12_100)));
-    assert!(is_notable("trace.slow_flow", &flow(24_000)));
-    let span = |us: u64| serde_json::json!({"span": "host.tick", "us": us});
-    assert!(!is_notable("trace.slow_span", &span(SLOW_SPAN_US + 1_000)));
-    assert!(is_notable("trace.slow_span", &span(SLOW_SPAN_US * 2)));
-    // A window is written every ten seconds whatever happened.
-    assert!(!is_notable(
-        "trace.window",
-        &serde_json::json!({"records": 10_000})
-    ));
 }
 
 #[test]

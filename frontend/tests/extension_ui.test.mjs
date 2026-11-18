@@ -33,7 +33,15 @@ class Element {
 
 function setupConsumer({ features = ["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2"], withUi = true } = {}) {
   let registered;
-  const document = { activeElement: null, createElement(tag) { const element = new Element(tag); element.ownerDocument = this; return element; } };
+  const document = {
+    activeElement: null,
+    createElement(tag) { const element = new Element(tag); element.ownerDocument = this; return element; },
+    createElementNS(namespace, tag) {
+      const element = this.createElement(tag);
+      element.namespaceURI = namespace;
+      return element;
+    },
+  };
   const localeAttributeFormatters = [];
   let testLocale = "fr-CA";
   const context = vm.createContext({
@@ -555,5 +563,127 @@ test("fields, actions, and choices reject blank or whitespace-only accessible la
     () => page.sdk.ui.button({ label: blankLocalized, onClick() {} }),
   ];
   for (const create of rejects) assert.throws(create, /label|text/i);
+  page.cleanup();
+});
+
+test("checkbox and search inherit native field semantics, validation, and lifecycle", () => {
+  const page = setupConsumer();
+  const controls = page.context.Amaterasu.createExtensionUiControlsV3(page.controller.signal);
+  const changes = [];
+  const checkbox = controls.checkbox({
+    label: "Include archived entries",
+    value: false,
+    required: true,
+    help: "Archived entries are hidden by default.",
+    onChange: (value) => changes.push(value),
+  });
+  const search = controls.searchField({
+    label: "Search entries",
+    value: "",
+    maxLength: 6,
+    placeholder: { source: "Name", translations: { fr: "Nom" } },
+    onChange: (value) => changes.push(value),
+  });
+  const [checkboxLabel, checkboxInput, checkboxHelp] = checkbox.element.children;
+  const [searchLabel, searchInput] = search.element.children;
+  assert.match(checkbox.element.className, /plugin-checkbox/);
+  assert.equal(checkboxInput.type, "checkbox");
+  assert.equal(checkboxInput.required, true);
+  assert.equal(checkboxLabel.htmlFor, checkboxInput.id);
+  assert.equal(checkboxInput.attributes["aria-describedby"], checkboxHelp.id);
+  assert.match(search.element.className, /plugin-search-field/);
+  assert.equal(searchInput.type, "search");
+  assert.equal(searchLabel.htmlFor, searchInput.id);
+  assert.equal(searchInput.placeholder, "Nom");
+  page.setLocale("en");
+  assert.equal(searchInput.placeholder, "Name");
+
+  checkboxInput.checked = true;
+  checkboxInput.dispatch("change");
+  searchInput.value = "ink";
+  searchInput.dispatch("input");
+  assert.deepEqual(changes, [true, "ink"]);
+  assert.throws(() => search.setValue("too long"), /maximum length/);
+  assert.equal(search.value(), "ink");
+  checkbox.setState({ readOnly: true, error: "This choice is managed by the host." });
+  checkboxInput.checked = false;
+  checkboxInput.dispatch("change");
+  assert.equal(checkbox.value(), true);
+  assert.equal(checkboxInput.attributes["aria-readonly"], "true");
+  assert.equal(checkboxInput.attributes["aria-invalid"], "true");
+  assert.deepEqual(changes, [true, "ink"]);
+  page.controller.abort();
+  assert.ok(checkboxInput.listeners.change[0].signal.aborted);
+  assert.ok(searchInput.listeners.input[0].signal.aborted);
+  assert.throws(() => controls.checkbox({ label: "Expired", value: false }), /no longer active/);
+  page.cleanup();
+});
+
+test("icon actions have localized names, decorative glyphs, and native async state", async () => {
+  const page = setupConsumer();
+  const controls = page.context.Amaterasu.createExtensionUiControlsV3(page.controller.signal);
+  let finish;
+  let calls = 0;
+  const action = controls.iconButton({
+    icon: "refresh",
+    label: { source: "Refresh catalog", translations: { fr: "Actualiser le catalogue" } },
+    variant: "outline",
+    onClick() {
+      calls++;
+      return new Promise((resolve) => { finish = resolve; });
+    },
+  });
+  const [button] = action.element.children;
+  const [icon] = button.children;
+  assert.equal(button.type, "button");
+  assert.match(button.className, /\boutline\b.*\bicon-button\b/);
+  assert.equal(button.attributes["aria-label"], "Actualiser le catalogue");
+  assert.equal(icon.namespaceURI, "http://www.w3.org/2000/svg");
+  assert.equal(icon.attributes["aria-hidden"], "true");
+  assert.equal(icon.tagName, "SVG");
+  page.setLocale("de");
+  assert.equal(button.attributes["aria-label"], "Refresh catalog");
+  assert.throws(() => controls.iconButton({ icon: "constructor", label: "Bad icon", onClick() {} }), /action icon/);
+  assert.throws(() => controls.iconButton({ icon: "close", label: "  ", onClick() {} }), /label/);
+
+  button.dispatch("click");
+  button.dispatch("click");
+  assert.equal(calls, 1);
+  assert.equal(button.disabled, true);
+  assert.equal(button.attributes["aria-busy"], "true");
+  finish();
+  await new Promise(setImmediate);
+  assert.equal(action.busy(), false);
+  assert.equal(button.disabled, false);
+  page.controller.abort();
+  button.dispatch("click");
+  assert.equal(calls, 1);
+  page.cleanup();
+});
+
+test("text actions accept outline and ghost variants", () => {
+  const page = setupConsumer();
+  for (const variant of ["outline", "ghost"]) {
+    const action = page.sdk.ui.button({ label: "Edit", variant, onClick() {} });
+    assert.equal(action.element.children[0].className, `button ${variant} plugin-action-button`);
+    action.dispose();
+  }
+  page.cleanup();
+});
+
+test("synchronous actions keep the opener enabled while opening another control", () => {
+  const page = setupConsumer();
+  let button;
+  const action = page.sdk.ui.button({
+    label: "Open settings",
+    onClick() {
+      assert.equal(button.disabled, false);
+      assert.equal(page.context.document.activeElement, button);
+    },
+  });
+  [button] = action.element.children;
+  button.focus();
+  button.dispatch("click");
+  action.dispose();
   page.cleanup();
 });

@@ -58,10 +58,16 @@ pub struct Closed {
     pub response_delivered: bool,
 }
 
+#[derive(Clone)]
+struct BoundListener {
+    socket: NetworkTcpListener,
+    address: SocketAddr,
+}
+
 pub struct Server {
     network: Network,
-    http: Vec<NetworkTcpListener>,
-    https: Vec<NetworkTcpListener>,
+    http: Vec<BoundListener>,
+    https: Vec<BoundListener>,
     connections: BTreeMap<u64, Connection>,
     next_id: u64,
     configuration: Option<Arc<ServerConfig>>,
@@ -104,17 +110,11 @@ impl Server {
     }
 
     pub fn http_addresses(&self) -> Vec<SocketAddr> {
-        self.http
-            .iter()
-            .map(|listener| listener.local_addr().expect("bound HTTP listener"))
-            .collect()
+        self.http.iter().map(|listener| listener.address).collect()
     }
 
     pub fn https_addresses(&self) -> Vec<SocketAddr> {
-        self.https
-            .iter()
-            .map(|listener| listener.local_addr().expect("bound HTTPS listener"))
-            .collect()
+        self.https.iter().map(|listener| listener.address).collect()
     }
 
     /// Rebinds the HTTP pair while retaining existing accepted connections.
@@ -390,7 +390,7 @@ impl Server {
         let listeners = if secure { &self.https } else { &self.http };
         for listener in listeners {
             for _ in 0..4 {
-                let (socket, remote) = match listener.accept() {
+                let (socket, remote) = match listener.socket.accept() {
                     Ok(value) => value,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
@@ -491,8 +491,8 @@ fn bind_network_listener(
     network: &Network,
     address: SocketAddr,
     name: &str,
-) -> Result<NetworkTcpListener, String> {
-    network
+) -> Result<BoundListener, String> {
+    let socket = network
         .bind_tcp_with_options(
             address,
             TcpListenOptions {
@@ -500,19 +500,31 @@ fn bind_network_listener(
                 ..TcpListenOptions::default()
             },
         )
-        .map_err(|_| format!("{name} listener unavailable"))
+        .map_err(|error| {
+            format!(
+                "{name} listener bind {address} failed ({:?}): {error}",
+                error.kind()
+            )
+        })?;
+    let address = socket.local_addr().map_err(|error| {
+        format!(
+            "{name} listener local address lookup for {address} failed ({:?}): {error}",
+            error.kind()
+        )
+    })?;
+    Ok(BoundListener { socket, address })
 }
 
 #[cfg(test)]
 fn bind_listener(address: SocketAddr, name: &str) -> Result<NetworkTcpListener, String> {
-    bind_network_listener(&Network::test_provider(), address, name)
+    bind_network_listener(&Network::test_provider(), address, name).map(|listener| listener.socket)
 }
 
 fn bind_listeners(
     network: &Network,
     addresses: Vec<SocketAddr>,
     name: &str,
-) -> Result<Vec<NetworkTcpListener>, String> {
+) -> Result<Vec<BoundListener>, String> {
     let mut listeners = Vec::with_capacity(addresses.len());
     let mut selected_port = None;
     for mut address in addresses {
@@ -522,7 +534,7 @@ fn bind_listeners(
             address.set_port(port);
         }
         let listener = bind_network_listener(network, address, name)?;
-        selected_port.get_or_insert_with(|| listener.local_addr().expect("bound listener").port());
+        selected_port.get_or_insert(listener.address.port());
         listeners.push(listener);
     }
     Ok(listeners)
@@ -531,10 +543,10 @@ fn bind_listeners(
 fn replacement_listeners(
     network: &Network,
     addresses: &[SocketAddr],
-    old_http: &[NetworkTcpListener],
-    old_https: &[NetworkTcpListener],
+    old_http: &[BoundListener],
+    old_https: &[BoundListener],
     name: &str,
-) -> Result<Vec<NetworkTcpListener>, String> {
+) -> Result<Vec<BoundListener>, String> {
     let mut replacements = Vec::with_capacity(addresses.len());
     for address in addresses {
         // A TCP listener is protocol-neutral; TLS/plain handling is chosen by
@@ -543,11 +555,9 @@ fn replacement_listeners(
         let existing = old_http
             .iter()
             .chain(old_https)
-            .find(|listener| listener.local_addr().ok() == Some(*address));
+            .find(|listener| listener.address == *address);
         let listener = match existing {
-            Some(listener) => listener
-                .try_clone()
-                .map_err(|_| format!("{name} listener clone failed"))?,
+            Some(listener) => listener.clone(),
             None => bind_network_listener(network, *address, name)?,
         };
         replacements.push(listener);
@@ -1410,7 +1420,7 @@ mod tests {
         let mut server = Server::bind(&settings).unwrap();
         let old_http = server.http_address();
         let old_https = server.https_address();
-        let (_occupied_https, base_port) = (0..100)
+        let (occupied_https, base_port) = (0..100)
             .find_map(|_| {
                 let listener = TcpListener::bind("127.0.0.1:0").ok()?;
                 let base_port = listener
@@ -1428,7 +1438,12 @@ mod tests {
             })
             .expect("find a valid HTTPS port for the occupied-pair test");
 
-        assert!(server.rebind_port(base_port).is_err());
+        let error = server.rebind_port(base_port).unwrap_err();
+        let address = occupied_https.local_addr().unwrap();
+        assert!(
+            error.contains(&format!("HTTPS listener bind {address} failed (AddrInUse)")),
+            "{error}"
+        );
         assert_eq!(server.http_address(), old_http);
         assert_eq!(server.https_address(), old_https);
     }

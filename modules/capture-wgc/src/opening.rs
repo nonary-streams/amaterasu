@@ -494,6 +494,26 @@ mod tests {
         STATUS_OK
     }
 
+    struct FixtureBackend(Arc<AtomicUsize>);
+
+    impl Backend for FixtureBackend {
+        fn supported(&self) -> bool {
+            true
+        }
+
+        fn enumerate(&self) -> crate::model::CaptureResult<Vec<crate::model::Output>> {
+            Ok(Vec::new())
+        }
+
+        fn open(
+            &self,
+            _: &str,
+        ) -> crate::model::CaptureResult<Box<dyn crate::backend::CaptureSession>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Session))
+        }
+    }
+
     struct Session;
 
     impl crate::backend::CaptureSession for Session {
@@ -514,11 +534,7 @@ mod tests {
             })
         };
         let calls = Arc::new(AtomicUsize::new(0));
-        let backend_calls = calls.clone();
-        let backend = crate::NativeBackend::with_opener(move |_| {
-            backend_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(Session))
-        });
+        let backend = FixtureBackend(calls.clone());
         let mut controller = Controller::new(backend, true);
         controller.fail_next_opening_observation();
         let controller = Arc::new(Mutex::new(controller));

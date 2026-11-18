@@ -7,7 +7,6 @@
 //! module's tick on the SDK's stream-report topic, where the runtime stamps
 //! this module as the reporter.
 use crate::controller::Controller;
-use crate::datagrams::FailureOrigin;
 use crate::stream::Stream;
 use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue, StreamIssueOutbox};
 use amaterasu_module_sdk::stream_warnings::WarningValue;
@@ -65,15 +64,21 @@ impl StreamIssueReports {
         if stream.failure_reported {
             return;
         }
-        let Some(FailureOrigin { code, site }) = stream.delivery.first_failure else {
+        let Some(failure) = &stream.delivery.first_failure else {
             return;
         };
         stream.failure_reported = true;
         let Some(operation) = &stream.operation_id else {
             return;
         };
-        let mut issue = StreamIssue::critical(operation, LAYER, DELIVERY_PHASE, code);
-        issue.site = format!("{}:{}", site.file(), site.line());
+        let mut issue = StreamIssue::critical(operation, LAYER, DELIVERY_PHASE, failure.code)
+            .because(&failure.reason)
+            .with_values(
+                failure.requested.map(WarningValue::Integer),
+                failure.observed.map(WarningValue::Integer),
+            );
+        issue.os_error = failure.os_error;
+        issue.site = format!("{}:{}", failure.site.file(), failure.site.line());
         self.outbox.push(issue);
     }
 

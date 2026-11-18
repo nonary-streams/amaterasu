@@ -107,6 +107,25 @@ test("progress uses a labeled native progress element with bounded and indetermi
   assert.equal(progress.element.children[2].children[0], "Back to work");
 });
 
+test("dismissible alerts keep the close action outside the live message and remove its listener", () => {
+  const { controller, feedback } = setup();
+  const alert = feedback.alert({ message: "Saved", severity: "success", dismissible: true });
+  assert.equal(alert.element.getAttribute("data-dismissible"), "");
+  const [message, dismiss] = alert.element.children;
+  assert.equal(message.getAttribute("role"), "alert");
+  assert.equal(dismiss.getAttribute("aria-label"), "Dismiss alert");
+  alert.setMessage("Saved again");
+  assert.deepEqual(message.children, ["Saved again"]);
+  assert.equal(alert.element.children[1], dismiss);
+  const [click] = dismiss.listeners.click;
+  click.callback();
+  assert.equal(alert.element.hidden, true);
+  assert.equal(click.signal, controller.signal);
+  alert.dispose();
+  assert.deepEqual(dismiss.listeners.click, []);
+  assert.throws(() => feedback.alert({ message: "Invalid", dismissible: "yes" }), /dismissible/);
+});
+
 test("localized text uses provided locale fallback and arbitrary markup remains text", () => {
   const { feedback } = setup();
   const status = feedback.status({ message: { source: "Uploading", translations: { fr: "Téléversement" } } });

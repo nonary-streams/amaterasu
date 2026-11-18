@@ -3,8 +3,8 @@ use amaterasu_gamestream::control::HostFeedback;
 use amaterasu_gamestream::control::{
     AbsoluteViewport, ControllerArrival, ControllerBattery, ControllerBatteryState,
     ControllerMotion, ControllerMotionType, ControllerTouch, ControllerTouchEvent, Input,
-    InputEvent, InputTranslator, MAX_CONTROLLER_SLOT, MouseButton, PenTouch, PointerDevice,
-    PointerEvent, ScrollAxis, TranslatedKeyState, TranslationError,
+    InputEvent, MAX_CONTROLLER_SLOT, MouseButton, PenTouch, PointerDevice, PointerEvent,
+    ScrollAxis, TranslatedKeyState, TranslationError,
 };
 use amaterasu_media::CaptureGeometry;
 use amaterasu_module_sdk::input::{
@@ -254,7 +254,7 @@ pub(super) fn configure_absolute_input(
         record.capture_geometry = None;
         record.touch_port = None;
         record.input_absolute_pointer = false;
-        record.input_translator = InputTranslator::default();
+        record.input_translator.set_absolute_viewport(None);
         return Ok(());
     };
     let geometry: CaptureGeometry =
@@ -270,7 +270,7 @@ pub(super) fn configure_absolute_input(
             Some(geometry)
         };
     record.input_absolute_pointer = false;
-    record.input_translator = InputTranslator::default();
+    record.input_translator.set_absolute_viewport(None);
     Ok(())
 }
 
@@ -1167,7 +1167,7 @@ pub(super) fn configure_translator(
 ) -> Result<(), &'static str> {
     record.input_absolute_pointer = absolute_pointer;
     let Some(geometry) = record.capture_geometry.filter(|_| absolute_pointer) else {
-        record.input_translator = InputTranslator::default();
+        record.input_translator.set_absolute_viewport(None);
         return Ok(());
     };
     let normalized = geometry
@@ -1187,7 +1187,7 @@ pub(super) fn configure_translator(
             || port.content_height < 2.0
         {
             record.input_absolute_pointer = false;
-            record.input_translator = InputTranslator::default();
+            record.input_translator.set_absolute_viewport(None);
             return Ok(());
         }
         let horizontal = f64::from(port.width) - 1.0;
@@ -1202,7 +1202,9 @@ pub(super) fn configure_translator(
             )
             .map_err(|_| "invalid_capture_geometry")?;
     }
-    record.input_translator = InputTranslator::new(Some(viewport));
+    record
+        .input_translator
+        .set_absolute_viewport(Some(viewport));
     Ok(())
 }
 

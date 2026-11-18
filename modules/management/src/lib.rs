@@ -28,7 +28,9 @@ mod tray_events;
 mod csrf_adversarial_tests;
 
 use amaterasu_module_sdk::network::Network;
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, LogLevel, ManagedModule, ModuleResult, Response, RuntimeClient,
+};
 use amaterasu_package::repository::RepositoryStore;
 use peer_policy::PeerTier;
 use serde::Deserialize;
@@ -146,7 +148,10 @@ impl ManagedModule for ManagementModule {
                 settings.web.map(assets::Assets::new).transpose()?,
                 settings.tls_bind,
                 tls_configuration,
-            )?;
+            )
+            .inspect_err(|error| {
+                let _ = runtime.log(LogLevel::Error, "management.listener", error);
+            })?;
             let processing = runtime
                 .processing_composition()?
                 .map(|composition| -> ModuleResult<_> {

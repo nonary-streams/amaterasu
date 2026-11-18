@@ -247,6 +247,9 @@ pub struct RuntimeHostContext {
     /// Resume admission blocking before a recovered installer can receive work.
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub plugin_setup_pending: bool,
+    /// The loader supports the official RTX HDR add-on composition.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub rtx_hdr_addon_supported: bool,
 }
 fn bool_is_false(value: &bool) -> bool {
     !*value

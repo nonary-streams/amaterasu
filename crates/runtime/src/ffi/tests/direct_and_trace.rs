@@ -324,6 +324,9 @@ fn every_endpoint_can_trace_and_only_management_reads_the_history() {
             if first == second
     ));
 
+    // The fallback clock starts at runtime creation. Give the timestamp
+    // enough history before backdating the arrival on that clock.
+    std::thread::sleep(Duration::from_millis(35));
     let track = tracer.track("input");
     let flow = amaterasu_module_sdk::trace::flow_id(9, 1);
     tracer.mark_at(

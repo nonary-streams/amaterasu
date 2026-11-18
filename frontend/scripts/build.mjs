@@ -9,7 +9,22 @@ const result = spawnSync(
 if (result.status !== 0) process.exit(result.status ?? 1);
 await mkdir("dist", { recursive: true });
 await Promise.all(
-  ["index.html", "styles.css", "okami-mountains.svg", "okami-botanical.svg"].map((name) =>
-    copyFile(`public/${name}`, `dist/${name}`),
-  ),
+  [
+    "index.html",
+    "styles.css",
+    "okami-botanical.svg",
+    "washi-paper.webp",
+    "sun-crest.svg",
+    "scroll-theme.css",
+    "ink-components.css",
+    "ink-summary.css",
+    "console-shell.css",
+    "overview-scroll.css",
+    "scroll-masthead.svg",
+    "scroll-foothills.svg",
+    "scroll-blossoms.svg",
+    "ink-swipe.svg",
+    "ink-seal.svg",
+    "kaushan-script.woff2",
+  ].map((name) => copyFile(`public/${name}`, `dist/${name}`)),
 );

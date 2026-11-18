@@ -42,6 +42,12 @@ class FakeElement {
 
   setAttribute(name, value) { this.attributes.set(name, value); }
 
+  get classList() {
+    return {
+      add: (name) => { this.className = [this.className, name].filter(Boolean).join(" "); },
+    };
+  }
+
   click() {
     this.listeners.get("click")?.();
   }
@@ -60,7 +66,7 @@ class FakeElement {
 }
 
 const pageTestContext = createPageContext();
-for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/diagnostic_alerts.ts", "src/pages.ts"]) {
+for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/extension_ui_summary.ts", "src/diagnostic_alerts.ts", "src/pages.ts"]) {
   vm.runInContext(
     ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
@@ -154,9 +160,10 @@ test("overview reports partial service failures and only offers permitted action
   assert.match(content.textContent, /Not available to this account/);
   const descendants = (node) => [node, ...node.children.flatMap((child) =>
     child instanceof FakeElement ? descendants(child) : [])];
-  const managementStatus = descendants(content).find((node) => node.className === "overview-status");
+  const managementStatus = descendants(content).find((node) => node.className?.split(" ").includes("overview-status"));
   assert.equal(managementStatus.attributes.get("role"), "status");
   assert.equal(managementStatus.attributes.get("aria-live"), "polite");
+  assert.equal(managementStatus.attributes.get("data-summary-tone"), "warning");
   const actions = descendants(content).filter((node) => node.className === "button quick-action");
   assert.equal(actions.length, 1);
   assert.match(actions[0].textContent, /Library/);
@@ -198,6 +205,32 @@ function liveStatus(count = 0) {
       device_name: "Client", codec: "hevc", width: 1920, height: 1080, target_fps: 60,
       target_bitrate_kbps: 10000, frames_sent: "1", bytes_sent: "2", sequence_gaps: "0" })) };
 }
+
+test("overview uses scoped response counts in the illustrated management status and info cards", async (t) => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  cleanupOverview(t, content);
+  const replies = {
+    "catalog/list": { entries: [{}, {}], next_cursor: null },
+    "session/list": { sessions: [{}], next_offset: 3 },
+    "application/list": { processes: [{}, {}, {}], next_offset: null },
+    "steam/status": { game_count: 128, scanning: true },
+  };
+  pages.renderOverview({ content, navigate() {}, notify() {}, api: {
+    allows: () => false,
+    async post(route) { return replies[route]; },
+  } });
+  await waitFor(() => content.textContent.includes("Management services responding"), "management status");
+  const descendants = (node) => [node, ...node.children.flatMap((child) =>
+    child instanceof FakeElement ? descendants(child) : [])];
+  const nodes = descendants(content);
+  const status = nodes.find((node) => node.className?.split(" ").includes("overview-status"));
+  assert.equal(status.attributes.get("data-summary-tone"), "success");
+  assert.match(status.textContent, /does not indicate stream readiness/);
+  const values = nodes.filter((node) => node.className === "ink-info-value").map((node) => node.textContent);
+  assert.deepEqual(values, ["2", "1+", "3", "128"]);
+  assert.match(content.textContent, /Scanning local libraries/);
+});
 
 test("overview presents reported stream activity without treating it as client delivery", async (t) => {
   const content = new FakeElement("main");

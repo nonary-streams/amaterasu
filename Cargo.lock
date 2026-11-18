@@ -769,6 +769,7 @@ name = "amaterasu-package"
 version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
+ "amaterasu-configuration-schema",
  "amaterasu-contracts",
  "amaterasu-module-sdk",
  "amaterasu-storage",
@@ -824,6 +825,7 @@ dependencies = [
  "amaterasu-input-companion",
  "amaterasu-module-sdk",
  "amaterasu-package",
+ "amaterasu-rtx-runtime",
  "libc",
  "libloading",
  "serde",

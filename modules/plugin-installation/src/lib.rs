@@ -2,6 +2,8 @@
 pub mod adapters;
 pub mod broker;
 pub mod helper;
+#[cfg(target_os = "linux")]
+mod rtx_hdr;
 mod security;
 mod transport;
 use amaterasu_module_sdk::network::Network;
@@ -43,13 +45,14 @@ struct Installer {
     next_work: std::time::Instant,
 }
 impl Installer {
+    fn running_package(&self) -> ModuleResult<Value> {
+        match self.runtime.send(Command::GetRunningPackageDigest {})? {
+            Response::Result { payload } => Ok(payload),
+            _ => Err("plugin_host_context_unavailable".into()),
+        }
+    }
     fn base(&self) -> ModuleResult<String> {
-        let Response::Result { payload } =
-            self.runtime.send(Command::GetRunningPackageDigest {})?
-        else {
-            return Err("plugin_host_context_unavailable".into());
-        };
-        payload["digest"]
+        self.running_package()?["digest"]
             .as_str()
             .map(str::to_owned)
             .ok_or("plugin_host_context_unavailable".into())
@@ -264,11 +267,13 @@ impl Installer {
             .runtime_state_root()?
             .join("plugin-installation");
         let base = self.base()?;
+        #[cfg(target_os = "linux")]
+        let rtx_hdr_addon_supported = self.running_package()?["rtx_hdr_addon_supported"] == true;
         self.job = Some(thread::spawn(move || {
             let store = RepositoryStore::new(repositories)?;
             let approved = store.approved(&repository)?;
             let transport =
-                transport::Transport::new(&approved.location, network, cancelled.clone());
+                transport::Transport::new(&approved.location, network.clone(), cancelled.clone());
             if store
                 .catalog(
                     &repository,
@@ -307,6 +312,17 @@ impl Installer {
                 &cancelled,
                 amaterasu_package::unix_timestamp(),
             )?;
+            #[cfg(target_os = "linux")]
+            if operation.sources.iter().any(|source| {
+                source.repository == repository
+                    && source.manifest_digest == digest
+                    && amaterasu_package::plugins::rtx_hdr::is_official(source)
+            }) {
+                if !rtx_hdr_addon_supported {
+                    return Err("rtx_hdr_addon_host_update_required".into());
+                }
+                rtx_hdr::ensure_runtime(&bootstrap, &root, network, cancelled)?;
+            }
             operation.id = placeholder.id;
             operation.revision = placeholder.revision + 1;
             OperationStore::new(state)?.save((&operation.id, placeholder.revision), &operation)

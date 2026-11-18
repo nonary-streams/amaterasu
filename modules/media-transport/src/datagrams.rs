@@ -15,6 +15,7 @@ use std::{
 use udp_batch::{BatchError, BatchSender};
 
 const RECEIVES_PER_LANE: usize = 16;
+const STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const SS_PING_BYTES: usize = DISCOVERY_TOKEN_BYTES + size_of::<u32>();
 const MAX_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 const MAX_VIDEO_BATCH_BYTES: usize = 64 * 1024;
@@ -132,7 +133,7 @@ pub struct Delivery {
     video: Lane,
     audio: Lane,
     discovery_peer_ip: Option<IpAddr>,
-    discovery_deadline: Option<Instant>,
+    discovery_window: Option<(Instant, Duration)>,
     queue: VecDeque<Datagram>,
     bytes: usize,
     video_max_batch_size_kb: u8,
@@ -147,10 +148,14 @@ pub struct Delivery {
     timing: DeliveryTiming,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct FailureOrigin {
     pub code: &'static str,
     pub site: &'static Location<'static>,
+    pub reason: String,
+    pub requested: Option<i64>,
+    pub observed: Option<i64>,
+    pub os_error: Option<i32>,
 }
 
 impl Delivery {
@@ -225,14 +230,14 @@ impl Delivery {
         discovery_peer_ip: Option<IpAddr>,
         discovery_timeout: Option<Duration>,
     ) -> Self {
-        let discovery_deadline = discovery_peer_ip
+        let discovery_window = discovery_peer_ip
             .zip(discovery_timeout)
-            .map(|(_, timeout)| Instant::now() + timeout);
+            .map(|(_, timeout)| (Instant::now() + timeout, timeout));
         Self {
             video,
             audio,
             discovery_peer_ip,
-            discovery_deadline,
+            discovery_window,
             queue: VecDeque::new(),
             bytes: 0,
             video_max_batch_size_kb: 64,
@@ -403,8 +408,14 @@ impl Delivery {
                 return 0;
             }
         }
-        if !self.queue.is_empty() && self.last_progress.elapsed() >= Duration::from_secs(5) {
-            self.fail("udp_stalled");
+        if !self.queue.is_empty() && self.last_progress.elapsed() >= STALL_TIMEOUT {
+            self.fail_with_context(
+                "udp_stalled",
+                "queue_without_progress_ms".into(),
+                i64::try_from(STALL_TIMEOUT.as_millis()).ok(),
+                i64::try_from(self.last_progress.elapsed().as_millis()).ok(),
+                None,
+            );
             return 0;
         }
         self.send_queued(send_limit.min(MAX_VIDEO_BATCH_PACKETS), send_batch)
@@ -448,7 +459,13 @@ impl Delivery {
                                     || bytes > payload.len()
                                     || !bytes.is_multiple_of(packet_bytes)
                                 {
-                                    self.fail("udp_send_failed");
+                                    self.fail_with_context(
+                                        "udp_send_failed",
+                                        "video_batch_invalid_accepted_bytes".into(),
+                                        i64::try_from(payload.len()).ok(),
+                                        i64::try_from(bytes).ok(),
+                                        None,
+                                    );
                                     break;
                                 }
                                 let accepted = bytes / packet_bytes;
@@ -472,8 +489,13 @@ impl Delivery {
                                     self.timing.send_retries.saturating_add(1);
                                 break;
                             }
-                            Err(BatchError::Failed(_error)) => {
-                                self.fail("udp_send_failed");
+                            Err(BatchError::Failed(error)) => {
+                                self.fail_io(
+                                    "udp_send_failed",
+                                    "video_batch_send_bytes",
+                                    &error,
+                                    Some(payload.len()),
+                                );
                                 break;
                             }
                         }
@@ -535,19 +557,34 @@ impl Delivery {
         let Some(peer_ip) = self.discovery_peer_ip else {
             return;
         };
-        if self
-            .discovery_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
+        if let Some((deadline, timeout)) = self.discovery_window
+            && Instant::now() >= deadline
         {
-            self.fail("udp_discovery_timeout");
+            let waiting = match (self.video.peer.is_none(), self.audio.peer.is_none()) {
+                (true, true) => "awaiting_video_and_audio_ping_timeout_ms",
+                (true, false) => "awaiting_video_ping_timeout_ms",
+                (false, true) => "awaiting_audio_ping_timeout_ms",
+                (false, false) => return,
+            };
+            self.fail_with_context(
+                "udp_discovery_timeout",
+                waiting.into(),
+                i64::try_from(timeout.as_millis()).ok(),
+                None,
+                None,
+            );
             return;
         }
-        if self.video.receive_ping(peer_ip).is_err() || self.audio.receive_ping(peer_ip).is_err() {
-            self.fail("udp_discovery_failed");
+        if let Err(error) = self.video.receive_ping(peer_ip) {
+            self.fail_io("udp_discovery_failed", "video_ping", &error, None);
+            return;
+        }
+        if let Err(error) = self.audio.receive_ping(peer_ip) {
+            self.fail_io("udp_discovery_failed", "audio_ping", &error, None);
             return;
         }
         if self.ready() {
-            self.discovery_deadline = None;
+            self.discovery_window = None;
         }
     }
 
@@ -576,8 +613,27 @@ impl Delivery {
                 self.timing.send_retries = self.timing.send_retries.saturating_add(1);
                 false
             }
-            _ => {
-                self.fail("udp_send_failed");
+            result => {
+                let (operation, bytes) = match self.queue.front() {
+                    Some(packet) => (
+                        match packet.medium {
+                            Medium::Video => "video_send_bytes",
+                            Medium::Audio => "audio_send_bytes",
+                        },
+                        Some(packet.bytes.len()),
+                    ),
+                    None => ("send_without_datagram", None),
+                };
+                match result {
+                    Err(error) => self.fail_io("udp_send_failed", operation, &error, bytes),
+                    Ok(accepted) => self.fail_with_context(
+                        "udp_send_failed",
+                        format!("{operation}.unexpected_length"),
+                        bytes.and_then(|bytes| i64::try_from(bytes).ok()),
+                        i64::try_from(accepted).ok(),
+                        None,
+                    ),
+                }
                 false
             }
         }
@@ -621,12 +677,49 @@ impl Delivery {
     }
 
     #[track_caller]
+    fn fail_io(
+        &mut self,
+        code: &'static str,
+        operation: &str,
+        error: &io::Error,
+        bytes: Option<usize>,
+    ) {
+        self.fail_with_context(
+            code,
+            format!("{operation}.{:?}", error.kind()),
+            bytes.and_then(|n| i64::try_from(n).ok()),
+            None,
+            error.raw_os_error(),
+        );
+    }
+
+    #[track_caller]
     pub fn fail(&mut self, code: &'static str) {
-        if self.failure.is_none() {
-            eprintln!("amaterasu media transport failed code={code}");
+        self.fail_with_context(code, code.into(), None, None, None);
+    }
+
+    #[track_caller]
+    fn fail_with_context(
+        &mut self,
+        code: &'static str,
+        reason: String,
+        requested: Option<i64>,
+        observed: Option<i64>,
+        os_error: Option<i32>,
+    ) {
+        if self.first_failure.is_none() {
+            eprintln!(
+                "amaterasu media transport failed code={code} reason={reason} requested={requested:?} observed={observed:?} os_error={os_error:?} queued_datagrams={} queued_bytes={}",
+                self.queue.len(),
+                self.bytes
+            );
             self.first_failure = Some(FailureOrigin {
                 code,
                 site: Location::caller(),
+                reason,
+                requested,
+                observed,
+                os_error,
             });
         }
         self.failure = Some(code);

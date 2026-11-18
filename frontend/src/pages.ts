@@ -7,23 +7,74 @@ namespace Amaterasu {
     return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
   }
 
+  const overviewIcons = {
+    catalog: "M3 5h18v14H3z M3 9h18 M7 13h4 M7 16h8",
+    sessions: "M4 8h15m-3-3 3 3-3 3 M20 16H5m3-3-3 3 3 3",
+    activity: "M3 12h4l3-6 4 12 3-6h4",
+    settings: "M4 6h16m-16 6h16m-16 6h16 M8 4v4m8 2v4m-6 2v4",
+    host: "M4 5h16v11H4z M8 20h8m-4-4v4",
+    arrow: "M4 12h15m-6-6 6 6-6 6",
+  } as const;
+
+  function overviewIcon(name: keyof typeof overviewIcons): SVGSVGElement {
+    const namespace = "http://www.w3.org/2000/svg";
+    const icon = document.createElementNS(namespace, "svg");
+    icon.setAttribute("viewBox", "0 0 24 24");
+    icon.setAttribute("class", "overview-icon");
+    icon.setAttribute("aria-hidden", "true");
+    icon.setAttribute("focusable", "false");
+    const path = document.createElementNS(namespace, "path");
+    path.setAttribute("d", overviewIcons[name]);
+    icon.append(path);
+    return icon;
+  }
+
   export function renderOverview(context: PageContext): void {
-    const area = el("div");
+    const metricArea = el("div", "overview-metric-area");
     const activityArea = el("div", "overview-activity-area");
+    const serviceArea = el("div", "overview-service-area");
+    const serviceDetails = panel("Service access");
+    serviceDetails.classList.add("overview-detail-panel");
+    const details = el("div", "overview-details", serviceDetails);
     const hostMetricsArea = el("div", "overview-plugin-sections");
-    area.append(el("p", "muted overview-loading", "Loading host information…"));
+    serviceArea.append(el("p", "muted overview-loading", "Loading host information…"));
+    const quickActions = el("div", "quick-actions");
+    for (const [page, label, detail, scope] of [
+      ["host", "Host & devices", "Review pairing and host services", "configuration.read"],
+      ["catalog", "Library", "Manage applications in your library", "catalog.read"],
+      ["sessions", "Sessions", "View sessions and host metrics", "session.read"],
+      ["settings", "Settings", "Configure your host", "configuration.read"],
+    ] as const) {
+      if (!context.api.allows(scope)) continue;
+      const action = button(label, () => context.navigate(page), "quick-action");
+      action.append(
+        el("span", "overview-quick-icon", overviewIcon(page)),
+        el("small", "muted", detail),
+        el("span", "quick-action-arrow", overviewIcon("arrow")),
+      );
+      quickActions.append(action);
+    }
+    if (quickActions.hasChildNodes()) {
+      const actionsPanel = panel("Quick actions", quickActions);
+      actionsPanel.classList.add("overview-detail-panel");
+      details.append(actionsPanel);
+    }
     let refreshGeneration = 0;
     let refreshActivity = (): void => {};
-    context.content.append(
-      sectionHeading(
-        "Host overview",
-        "Your applications, sessions, and local services in one place.",
-        button("Refresh", () => { void load(); refreshActivity(); }),
-      ),
-      activityArea,
-      hostMetricsArea,
-      area,
+    const masthead = sectionHeading(
+      "Host overview",
+      "Your applications, sessions, and local services in one place.",
+      button("Refresh", () => { void load(); refreshActivity(); }, "outline"),
     );
+    masthead.classList.add("overview-masthead");
+    const sheet = el("div", "overview-sheet",
+      masthead,
+      el("div", "overview-summary", serviceArea, activityArea),
+      metricArea,
+      details,
+      hostMetricsArea,
+    );
+    context.content.append(sheet);
     refreshActivity = renderOverviewActivity(context, activityArea);
     renderExtensionSlot(context, hostMetricsArea, "overview");
     async function load(): Promise<void> {
@@ -34,20 +85,17 @@ namespace Amaterasu {
         context.api.post<ProcessReply>("application/list", { limit: 16 }),
         context.api.post<SteamStatus>("steam/status"),
       ]);
-      if (!context.content.isConnected || generation !== refreshGeneration) return;
+      if (!sheet.isConnected || generation !== refreshGeneration) return;
       const [catalog, sessions, applications, steam] = snapshots;
       const metrics = el("div", "metrics");
-      const addMetric = (label: string, value: string, detail: string) =>
-        metrics.append(
-          el(
-            "div",
-            "metric",
-            el("span", "muted", label),
-            el("strong", "", pagesTextLiteral(value)),
-            el("small", "muted", detail),
-          ),
-        );
+      const addMetric = (icon: ExtensionUiInfoIcon,
+        label: string, value: string, description: string): void => {
+        const metric = summaryInfoCard({ icon, label, value: pagesTextLiteral(value), description });
+        metric.classList.add("metric");
+        metrics.append(metric);
+      };
       addMetric(
+        "catalog",
         "Catalog applications",
         catalog?.status === "fulfilled"
           ? countLabel(catalog.value.entries.length, catalog.value.next_cursor)
@@ -55,6 +103,7 @@ namespace Amaterasu {
         "Catalog entries returned",
       );
       addMetric(
+        "sessions",
         "Session records",
         sessions?.status === "fulfilled"
           ? countLabel(
@@ -65,6 +114,7 @@ namespace Amaterasu {
         "Caller-scoped coordination records",
       );
       addMetric(
+        "processes",
         "Tracked processes",
         applications?.status === "fulfilled"
           ? countLabel(
@@ -75,6 +125,7 @@ namespace Amaterasu {
         "Running and recently exited",
       );
       addMetric(
+        "discoveries",
         "Steam discoveries",
         steam?.status === "fulfilled" ? String(steam.value.game_count) : "—",
         steam?.status === "fulfilled" && steam.value.scanning
@@ -82,48 +133,35 @@ namespace Amaterasu {
           : "Latest provider scan",
       );
       const available = snapshots.filter((snapshot) => snapshot.status === "fulfilled").length;
-      const status = el(
-        "section", "overview-status",
-        el("div", "overview-status-icon", available === snapshots.length ? "✓" : "!"),
-        el("div", "overview-status-copy",
-          el("p", "overview-status-label", "MANAGEMENT SERVICE ACCESS"),
-          el("h2", "", available === snapshots.length ? "Management services responding" : "Some information is unavailable"),
-          el("p", "muted", available === snapshots.length
-            ? "Catalog, session coordination, applications, and Steam responded to the latest refresh. This does not indicate stream readiness."
-            : "Some management requests could not be completed. Check service access below for details.")),
-      );
-      const quickActions = el("div", "quick-actions");
-      for (const [page, label, detail, scope] of [
-        ["host", "Host & devices", "Review pairing and host services", "configuration.read"],
-        ["catalog", "Library", "Manage applications in your library", "catalog.read"],
-        ["sessions", "Sessions", "View sessions and host metrics", "session.read"],
-        ["settings", "Settings", "Configure your host", "configuration.read"],
-      ] as const) {
-        if (!context.api.allows(scope)) continue;
-        const action = button(label, () => context.navigate(page), "quick-action");
-        action.append(el("small", "muted", detail), el("span", "quick-action-arrow", "→"));
-        quickActions.append(action);
-      }
-      const serviceRows = snapshots.map((snapshot, index) => [
-        el(
-          "strong",
-          "",
-          pagesTextMessage(["Catalog", "Session coordination", "Applications", "Steam provider"][index] ?? ""),
-        ),
-        snapshot.status === "fulfilled"
-          ? badge(pagesTextMessage("Available"), "good")
-          : badge(pagesTextMessage("Unavailable")),
-        snapshot.status === "rejected"
-          ? messageOf(snapshot.reason)
-          : pagesTextMessage("Responded to the latest refresh"),
-      ]);
+      const servicesResponding = available === snapshots.length;
+      const status = summaryStatusCard({
+        label: "MANAGEMENT SERVICE ACCESS",
+        title: servicesResponding ? "Management services responding" : "Some information is unavailable",
+        description: servicesResponding
+          ? "Catalog, session coordination, applications, and Steam responded to the latest refresh. This does not indicate stream readiness."
+          : "Some management requests could not be completed. Check service access below for details.",
+        tone: servicesResponding ? "success" : "warning",
+      });
+      status.classList.add("overview-status");
+      const serviceRows = snapshots.map((snapshot, index) => {
+        const row: (HTMLElement | string)[] = [
+          el("strong", "", pagesTextMessage(["Catalog", "Session coordination", "Applications", "Steam provider"][index] ?? "")),
+          snapshot.status === "fulfilled"
+            ? badge(pagesTextMessage("Available"), "good")
+            : badge(pagesTextMessage("Unavailable"), "bad"),
+        ];
+        if (!servicesResponding) row.push(snapshot.status === "rejected" ? messageOf(snapshot.reason) : "—");
+        return row;
+      });
       status.setAttribute("role", "status");
       status.setAttribute("aria-live", "polite");
       status.setAttribute("aria-atomic", "true");
-      const details = el("div", "overview-details", panel("Service access", table(["Service", "Status", "Details"], serviceRows)));
-      if (quickActions.hasChildNodes()) details.append(panel("Quick actions", quickActions));
-      area.replaceChildren(status, metrics, details);
-
+      serviceArea.replaceChildren(status);
+      metricArea.replaceChildren(metrics);
+      serviceDetails.replaceChildren(
+        el("h2", "", "Service access"),
+        table(servicesResponding ? ["Service", "Status"] : ["Service", "Status", "Details"], serviceRows),
+      );
     }
     void load();
   }
@@ -140,13 +178,18 @@ namespace Amaterasu {
     summary.setAttribute("aria-atomic", "true");
     const launchStatus = el("p", "muted");
     const observation = el("p", "muted");
-    const icon = el("div", "overview-status-icon", "↗");
+    const icon = el("span", "ink-seal ink-status-seal", overviewIcon("activity"));
     icon.setAttribute("aria-hidden", "true");
-    container.append(el("section", "overview-activity-panel",
+    const activity = el("section", "overview-activity-panel",
+      el("p", "overview-status-label", "STREAM ACTIVITY"),
       el("div", "overview-activity-state", icon,
-        el("div", "overview-activity-copy", el("p", "overview-status-label", "STREAM ACTIVITY"),
-          el("h2", "overview-activity-summary", summary), launchStatus, observation)),
-      button("View sessions", () => context.navigate("sessions"))));
+        el("div", "overview-activity-copy",
+          el("h2", "overview-activity-summary", summary),
+          launchStatus,
+          observation,
+          button("View sessions", () => context.navigate("sessions"), "outline"),
+        )));
+    container.append(activity);
 
     let generation = 0;
     let timer: number | undefined;
@@ -186,11 +229,13 @@ namespace Amaterasu {
         const snapshot = {streams:value.sessions, sampledAtUnixMs:Number(value.sampled_at_unix_ms)};
         if (!current(request)) return;
         const count = snapshot.streams.length;
+        activity.setAttribute("data-tone", count === 0 ? "idle" : "live");
         summary.textContent = count === 0 ? "No active streams reported" :
           `${count} active ${count === 1 ? "stream" : "streams"} reported`;
         observation.textContent = `Host observation: ${new Date(snapshot.sampledAtUnixMs).toLocaleString()}. Client media delivery is not verified.`;
       }).catch(() => {
         if (!current(request)) return;
+        activity.setAttribute("data-tone", "attention");
         summary.textContent = "Live stream status is unavailable";
         observation.textContent = "The host did not provide a current stream status. Try refreshing.";
       }).finally(() => {

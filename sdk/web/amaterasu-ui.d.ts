@@ -33,6 +33,12 @@ declare namespace AmaterasuPluginUi {
       onChange?: (value: string) => void;
     }
 
+  interface ExtensionUiBooleanFieldOptions extends ExtensionUiFieldOptions {
+      label: ExtensionUiText;
+      value: boolean;
+      onChange?: (value: boolean) => void;
+    }
+
   interface ExtensionUiNumberFieldOptions extends ExtensionUiFieldOptions {
       label: ExtensionUiText;
       value: number;
@@ -52,7 +58,7 @@ declare namespace AmaterasuPluginUi {
 
   interface ExtensionUiActionOptions {
       label: ExtensionUiText;
-      variant?: "primary" | "secondary" | "danger";
+      variant?: "primary" | "secondary" | "danger" | "outline" | "ghost";
       disabled?: boolean;
       busy?: boolean;
       help?: ExtensionUiText;
@@ -84,9 +90,21 @@ declare namespace AmaterasuPluginUi {
       label: ExtensionUiText;
     }
 
+  type ExtensionUiIcon = "settings" | "edit" | "delete" | "more" | "refresh" | "search" | "close";
+
+  interface ExtensionUiIconButtonOptions extends ExtensionUiActionOptions {
+      icon: ExtensionUiIcon;
+    }
+
+  interface ExtensionUiControlsV3 {
+      checkbox(options: ExtensionUiBooleanFieldOptions): ExtensionUiControl<boolean>;
+      searchField(options: ExtensionUiTextFieldOptions): ExtensionUiControl<string>;
+      iconButton(options: ExtensionUiIconButtonOptions): ExtensionUiActionControl;
+    }
+
   interface ExtensionUiV1 {
       readonly version: 1;
-      toggle(options: ExtensionUiFieldOptions & { label: ExtensionUiText; value: boolean; onChange?: (value: boolean) => void }): ExtensionUiControl<boolean>;
+      toggle(options: ExtensionUiBooleanFieldOptions): ExtensionUiControl<boolean>;
       select(options: ExtensionUiFieldOptions & { label: ExtensionUiText; choices: readonly ExtensionUiOption[]; value: string; onChange?: (value: string) => void }): ExtensionUiChoiceControl;
       radioGroup(options: ExtensionUiFieldOptions & { label: ExtensionUiText; choices: readonly ExtensionUiOption[]; value: string; onChange?: (value: string) => void }): ExtensionUiChoiceControl;
       slider(options: ExtensionUiFieldOptions & { label: ExtensionUiText; minimum: number; maximum: number; value: number; step?: number; onChange?: (value: number) => void }): ExtensionUiControl<number>;
@@ -95,8 +113,54 @@ declare namespace AmaterasuPluginUi {
       button(options: ExtensionUiActionOptions): ExtensionUiActionControl;
     }
 
+  type ExtensionUiBadgeTone = "neutral" | "success" | "warning" | "error" | "info";
+
+  interface ExtensionUiBadgeOptions {
+      label: ExtensionUiText;
+      tone?: ExtensionUiBadgeTone;
+    }
+
+  interface ExtensionUiTooltipOptions {
+      trigger: HTMLElement;
+      message: ExtensionUiText;
+    }
+
+  interface ExtensionUiElement {
+      readonly element: HTMLElement;
+      dispose(): void;
+    }
+
+  interface ExtensionUiElementsV1 {
+      readonly version: 1;
+      badge(options: ExtensionUiBadgeOptions): ExtensionUiElement;
+      tooltip(options: ExtensionUiTooltipOptions): ExtensionUiElement;
+    }
+
+  type ExtensionUiInfoIcon = "gpu" | "capture" | "encoder" | "catalog" | "sessions" | "processes" | "discoveries";
+
+  interface ExtensionUiStatusCardOptions<T = ExtensionUiText> {
+      title: T;
+      label?: T;
+      description?: T;
+      tone?: ExtensionUiBadgeTone;
+    }
+
+  interface ExtensionUiInfoCardOptions<T = ExtensionUiText> {
+      label: T;
+      value: T;
+      description?: T;
+      icon?: ExtensionUiInfoIcon;
+    }
+
+  interface ExtensionUiSummaryV1 {
+      readonly version: 1;
+      statusCard(options: ExtensionUiStatusCardOptions): ExtensionUiElement;
+      infoCard(options: ExtensionUiInfoCardOptions): ExtensionUiElement;
+    }
+
   interface ExtensionUiCardOptions {
       label: ExtensionUiText;
+      appearance?: "plain" | "brush" | "illustrated";
     }
 
   interface ExtensionUiCard {
@@ -136,6 +200,7 @@ declare namespace AmaterasuPluginUi {
   interface ExtensionUiFeedbackAlertOptions {
       message: ExtensionUiText;
       severity?: "info" | "success" | "warning" | "error";
+      dismissible?: boolean;
     }
 
   interface ExtensionUiFeedbackProgressOptions {
@@ -181,6 +246,7 @@ declare namespace AmaterasuPluginUi {
       title: ExtensionUiText;
       description?: ExtensionUiText;
       content?: string | Node | readonly (string | Node)[];
+      actions?: readonly HTMLElement[];
       initialFocus?: HTMLElement;
       cancelLabel?: ExtensionUiText;
       onClose?: (reason: ExtensionUiDialogCloseReason) => void;
@@ -230,11 +296,20 @@ declare namespace AmaterasuPluginUi {
 
   interface ExtensionChartSeries { id: string; label: string; points: readonly ExtensionChartPoint[] }
 
+  interface ExtensionUiMetricChartOptions {
+      label: string;
+      unit: string;
+      series: readonly ExtensionChartSeries[];
+      minimum?: number;
+      maximum?: number;
+      appearance?: "full" | "sparkline";
+    }
+
   interface ExtensionUiChartsV1 {
       metricGauge(options: { label: string; value: number | null; maximum?: number; unit?: string; detail?: string }): {
         element: HTMLElement; setValue(value: number | null, detail?: string): void; dispose(): void;
       };
-      metricChart(options: { label: string; unit: string; series: readonly ExtensionChartSeries[]; minimum?: number; maximum?: number }): {
+      metricChart(options: ExtensionUiMetricChartOptions): {
         element: HTMLElement; setData(series: readonly ExtensionChartSeries[]): void; dispose(): void;
       };
     }
@@ -327,7 +402,8 @@ declare namespace AmaterasuPluginUi {
       readonly version: 1;
       readonly signal: AbortSignal;
       readonly features?: readonly string[];
-      readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1 & ExtensionUiChartsV1;
+      readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1 & ExtensionUiChartsV1
+        & ExtensionUiControlsV3 & ExtensionUiElementsV1 & ExtensionUiSummaryV1;
       readonly assets?: { stylesheet(path: string): Promise<void> };
       canCall?(method: string): boolean;
       readonly application?: Pick<ApplicationExtensionContext, "id" | "name"> & { readonly notifyChanged?: () => void };

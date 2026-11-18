@@ -39,8 +39,9 @@ def main():
                 member.name = "/".join(member.name.split("/")[1:])
                 if member.name:
                     archive.extract(member, destination, filter="data")
-    patch_path = Path(__file__).with_name("pyrowave") / "import-ownership.patch"
-    subprocess.run(["patch", "-p1", "--batch", "-i", str(patch_path.resolve())], cwd=root / "source", check=True)
+    for name in ("import-ownership.patch", "negotiated-color.patch"):
+        patch_path = Path(__file__).with_name("pyrowave") / name
+        subprocess.run(["patch", "-p1", "--batch", "-i", str(patch_path.resolve())], cwd=root / "source", check=True)
     subprocess.run(["cmake", "-S", str(root / "source"), "-B", str(root / "build"), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"], check=True)
     check_source = Path(__file__).with_name("check_pyrowave_abi.c")
     check_binary = root / "build/check-pyrowave-abi"

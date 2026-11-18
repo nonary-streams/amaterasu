@@ -9,7 +9,7 @@ use super::{
     record::{Record, Stage},
     workflow::Phase,
 };
-use crate::wire::Reply;
+use crate::wire::{Reply, StreamQueryError};
 use amaterasu_module_sdk::stream_lifecycle::{
     LifecycleLayer, StreamIssue, StreamIssueFeed, StreamLifecycleSnapshot, StreamReport,
 };
@@ -123,7 +123,7 @@ pub(super) fn label(value: impl Debug) -> String {
     label
 }
 
-fn plain_code(code: &str) -> bool {
+pub(super) fn plain_code(code: &str) -> bool {
     !code.is_empty()
         && code.len() <= PROVIDER_CODE_LIMIT
         && code
@@ -305,7 +305,13 @@ impl Controller {
     /// A refusal sent before any launch record existed is a stream of its
     /// own in the store: one entry naming the line that refused.
     pub(crate) fn record_refusal(&mut self, reply: &mut Reply, phase: &str) {
-        self.record_refusal_with_status_kind(reply, phase, "http");
+        self.record_refusal_with_status_kind(reply, phase, "http", None);
+    }
+
+    pub(crate) fn refuse_stream_query(&mut self, error: StreamQueryError) -> Reply {
+        let mut reply = super::private_error_with_input(400, error.message, Some(&error));
+        self.record_refusal_with_status_kind(&mut reply, "request_parsing", "http", Some(&error));
+        reply
     }
 
     fn record_refusal_with_status_kind(
@@ -313,6 +319,7 @@ impl Controller {
         reply: &mut Reply,
         phase: &str,
         status_kind: &str,
+        input: Option<&StreamQueryError>,
     ) {
         let Some(rejection) = reply.rejection.take() else {
             return;
@@ -332,7 +339,18 @@ impl Controller {
         };
         let mut issue =
             StreamIssue::critical(key.clone(), layer, phase, rejection.code).because(reason);
-        issue.site = format!("{}:{}", rejection.site.file(), rejection.site.line());
+        let site = if let Some(input) = input {
+            if let Some(field) = input.field {
+                issue.reason = format!("{}.{field}", issue.reason);
+            }
+            issue.requested = input
+                .requested
+                .map(amaterasu_module_sdk::stream_warnings::WarningValue::Integer);
+            input.site
+        } else {
+            rejection.site
+        };
+        issue.site = format!("{}:{}", site.file(), site.line());
         self.stream_lifecycle
             .commit_logged(self.logger.as_ref(), NVHTTP_PUBLISHER, issue);
         self.stream_lifecycle.end(&key);
@@ -374,7 +392,7 @@ impl Controller {
             code: super::rejection_code(code),
             site: std::panic::Location::caller(),
         });
-        self.record_refusal_with_status_kind(reply, phase, "protocol");
+        self.record_refusal_with_status_kind(reply, phase, "protocol", None);
     }
 
     #[track_caller]
@@ -385,7 +403,7 @@ impl Controller {
             code: super::rejection_code(code),
             site: std::panic::Location::caller(),
         });
-        self.record_refusal_with_status_kind(&mut reply, "request_transport", "transport");
+        self.record_refusal_with_status_kind(&mut reply, "request_transport", "transport", None);
     }
 }
 

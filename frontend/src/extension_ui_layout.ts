@@ -1,6 +1,7 @@
 namespace Amaterasu {
   export interface ExtensionUiCardOptions {
     label: ExtensionUiText;
+    appearance?: "plain" | "brush" | "illustrated";
   }
 
   export interface ExtensionUiCard {
@@ -82,6 +83,9 @@ namespace Amaterasu {
     extensionUiLayoutLifecycle(signal);
     if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("Invalid plugin UI card.");
     extensionUiLayoutRequiredText(options.label, "card label");
+    const appearance = options.appearance === undefined ? "plain" : options.appearance;
+    if (appearance !== "plain" && appearance !== "brush" && appearance !== "illustrated")
+      throw new Error("Invalid plugin UI card appearance.");
 
     const id = `amaterasu-plugin-card-${++nextExtensionUiLayoutId}`;
     const heading = el("h2", "", extensionUiLayoutTextNode(options.label));
@@ -89,6 +93,7 @@ namespace Amaterasu {
     const content = el("div", "plugin-ui-card-content");
     const element = el("section", "panel plugin-ui-card", heading, content);
     element.setAttribute("aria-labelledby", heading.id);
+    if (appearance !== "plain") element.setAttribute("data-appearance", appearance);
     let disposed = false;
     const dispose = (): void => {
       if (disposed) return;

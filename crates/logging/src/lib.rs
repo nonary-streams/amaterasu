@@ -65,6 +65,8 @@ impl Level {
 pub struct MinimumLevel(u8);
 
 impl MinimumLevel {
+    pub const PRODUCT_DEFAULT: Self = Self(Level::Info as u8);
+
     pub fn new(value: u8) -> Result<Self, String> {
         if value <= 6 {
             Ok(Self(value))
@@ -94,22 +96,6 @@ impl MinimumLevel {
         }
     }
 
-    pub fn default_for_version(version: &str) -> Self {
-        let prerelease = version
-            .split_once('-')
-            .map(|(_, prerelease)| prerelease)
-            .unwrap_or_default();
-        Self::default_for_prerelease(prerelease)
-    }
-
-    pub fn default_for_prerelease(prerelease: &str) -> Self {
-        if is_prerelease_channel(prerelease) {
-            Self(1)
-        } else {
-            Self(2)
-        }
-    }
-
     pub fn value(self) -> u8 {
         self.0
     }
@@ -117,11 +103,6 @@ impl MinimumLevel {
     pub fn allows(self, level: Level) -> bool {
         (level as u8) >= self.0
     }
-}
-
-fn is_prerelease_channel(version: &str) -> bool {
-    let first_identifier = version.split(['.', '+']).next().unwrap_or_default();
-    !first_identifier.is_empty() && !first_identifier.eq_ignore_ascii_case("stable")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,7 +142,7 @@ impl LoggingPolicy {
         global: Option<&serde_json::Value>,
         state_root: impl Into<PathBuf>,
     ) -> Result<Self, String> {
-        let default_level = MinimumLevel::default_for_version(env!("CARGO_PKG_VERSION"));
+        let default_level = MinimumLevel::PRODUCT_DEFAULT;
         let minimum_level = global
             .and_then(|settings| settings.get("min_log_level"))
             .and_then(serde_json::Value::as_str)
@@ -1139,14 +1120,14 @@ mod tests {
     }
 
     #[test]
-    fn source_levels_and_channel_defaults_match_pinned_policy() {
-        assert_eq!(MinimumLevel::default_for_version("1.2.3").value(), 2);
-        assert_eq!(MinimumLevel::default_for_version("1.2.3-rc.2").value(), 1);
-        assert_eq!(
-            MinimumLevel::default_for_version("1.2.3-stable.4").value(),
-            2
-        );
-        assert_eq!(MinimumLevel::default_for_version("1.2.3-StAbLe").value(), 2);
+    fn source_levels_and_product_default_match_pinned_policy() {
+        let root = std::env::temp_dir();
+        let default = LoggingPolicy::from_global(0, None, &root).unwrap();
+        assert!(default.minimum_level.allows(Level::Info));
+        assert!(!default.minimum_level.allows(Level::Debug));
+        let explicit = serde_json::json!({"min_log_level":"debug"});
+        let debug = LoggingPolicy::from_global(0, Some(&explicit), &root).unwrap();
+        assert!(debug.minimum_level.allows(Level::Debug));
         for (setting, expected) in [
             ("verbose", 0),
             ("debug", 1),
@@ -1203,10 +1184,7 @@ mod tests {
             "log_path": "../outside.log"
         });
         let fallback = LoggingPolicy::from_global(8, Some(&invalid), &state_root).unwrap();
-        assert_eq!(
-            fallback.minimum_level,
-            MinimumLevel::default_for_version(env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(fallback.minimum_level, MinimumLevel::PRODUCT_DEFAULT);
         assert_eq!(fallback.log_path, PathBuf::from("amaterasu.log"));
     }
 

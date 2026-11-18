@@ -48,6 +48,9 @@ function setup(entries, { applicationOnly = false, deferLoad = false, write = tr
   context.createExtensionUiWithDialogsV1 = (signal) => Object.freeze({ version: 1, signal, feedback: true, card() {}, table() {}, dialog: true });
   context.createExtensionUiChartsV1 = () => Object.freeze({});
   context.createExtensionUiTabsV1 = (signal) => Object.freeze({ signal, tabs: true });
+  context.createExtensionUiControlsV3 = () => Object.freeze({ iconButton() {} });
+  context.createExtensionUiElementsV1 = () => Object.freeze({ badge() {}, tooltip() {} });
+  context.createExtensionUiSummaryV1 = () => Object.freeze({ statusCard() {}, infoCard() {} });
   const source = readFileSync(new URL("../src/extensions.ts", import.meta.url), "utf8");
   vm.runInContext(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), context);
   const api = { allows: () => write, async post(route, payload) {
@@ -68,7 +71,11 @@ test("extension registration is bound to a loaded signed script and calls use de
   assert.equal((await env.pages.discover()).length, 1);
   await env.pages.mount("hello", {});
   assert.equal(env.mounts(), 1);
-  assert.deepEqual(Array.from(env.sdk().features), ["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", "ui.charts/1", "ui.assets/1"]);
+  assert.deepEqual(Array.from(env.sdk().features), [
+    "ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1",
+    "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1", "ui.sparklines/1", "ui.assets/1", "ui.controls/3", "ui.elements/1",
+    "ui.summary/1",
+  ]);
   assert.equal(Object.isFrozen(env.sdk().features), true);
   assert.equal(env.sdk().ui.version, 1);
   assert.equal(env.sdk().ui.signal, env.sdk().signal);
@@ -77,6 +84,11 @@ test("extension registration is bound to a loaded signed script and calls use de
   assert.equal(typeof env.sdk().ui.table, "function");
   assert.equal(env.sdk().ui.tabs, true);
   assert.equal(env.sdk().ui.dialog, true);
+  assert.equal(typeof env.sdk().ui.iconButton, "function");
+  assert.equal(typeof env.sdk().ui.badge, "function");
+  assert.equal(typeof env.sdk().ui.tooltip, "function");
+  assert.equal(typeof env.sdk().ui.statusCard, "function");
+  assert.equal(typeof env.sdk().ui.infoCard, "function");
   assert.equal((await env.sdk().call("status", { value: 1 })).answer, 42);
   assert.deepEqual(JSON.parse(JSON.stringify(env.calls.at(-1))), { route: "extensions/call", payload: { id: "hello", digest: valid.digest, method: "status", payload: { value: 1 } } });
   await assert.rejects(env.sdk().call("other"));

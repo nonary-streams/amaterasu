@@ -13,6 +13,15 @@ pub fn pack(
     signer: &SigningKey,
 ) -> PackageResult<()> {
     let manifest: PluginManifest = read_json(template)?;
+    pack_manifest(&manifest, artifacts, output, signer)
+}
+
+pub(crate) fn pack_manifest(
+    manifest: &PluginManifest,
+    artifacts: &Path,
+    output: &Path,
+    signer: &SigningKey,
+) -> PackageResult<()> {
     manifest.validate(amaterasu_package::unix_timestamp())?;
     let files = manifest.artifacts()?;
     // The template already binds sizes and hashes. Packaging never silently
@@ -26,7 +35,7 @@ pub fn pack(
             fs::copy(artifacts.join(&artifact.file), output.join(&artifact.file))
                 .map_err(|e| e.to_string())?;
         }
-        let raw = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
+        let raw = serde_json::to_vec(manifest).map_err(|e| e.to_string())?;
         fs::write(output.join("manifest.json"), &raw).map_err(|e| e.to_string())?;
         let public = signer.verifying_key().to_bytes();
         let fingerprint = sha256(&public);

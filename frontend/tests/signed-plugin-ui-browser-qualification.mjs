@@ -1,7 +1,7 @@
 // Drives an owned Chromium against an isolated signed host and packaged web extension.
-import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { extname } from "node:path";
 
 const options = JSON.parse(readFileSync(0, "utf8"));
 const check = (condition, message) => { if (!condition) throw new Error(message); };
@@ -10,6 +10,13 @@ const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const assetBytes = readFileSync(options.assetPath);
 check(sha256(assetBytes) === options.assetSha256, "fixture digest mismatch before browser run");
 for (const asset of options.themeAssets) check(sha256(readFileSync(asset.path)) === asset.sha256, `theme fixture digest mismatch: ${asset.name}`);
+const themeAssetNames = new Set(options.themeAssets.map((asset) => asset.name));
+const themeAssetTypes = new Map([
+  [".css", "text/css"],
+  [".svg", "image/svg+xml"],
+  [".webp", "image/webp"],
+  [".woff2", "font/woff2"],
+]);
 
 class Debugger {
   sequence = 0;
@@ -73,6 +80,7 @@ const networkRequests = new Map();
 const assetResponses = [];
 const themeRequests = new Map();
 const themeResponses = new Map();
+const loadedThemeRequests = new Set();
 const failedThemeAssets = [];
 const showcaseRequests = new Map();
 const showcaseResponses = new Map();
@@ -109,8 +117,10 @@ try {
       if (showcaseMatch) showcaseRequests.set(event.params.requestId, {
         digest: showcaseMatch[1], name: showcaseMatch[2], path: url.pathname, origin: url.origin,
       });
-      const match = url.pathname.match(/^\/web\/([a-f0-9]{64})\/(okami-botanical|okami-mountains)\.svg$/);
-      if (match) themeRequests.set(event.params.requestId, { digest: match[1], name: `${match[2]}.svg`, path: url.pathname });
+      const match = url.pathname.match(/^\/web\/([a-f0-9]{64})\/([^/]+)$/);
+      if (match && themeAssetNames.has(match[2])) themeRequests.set(event.params.requestId, {
+        digest: match[1], name: match[2], path: url.pathname, origin: url.origin,
+      });
     } else if (event.method === "Network.responseReceived") {
       const path = networkRequests.get(event.params.requestId);
       if (path) assetResponses.push({ requestId: event.params.requestId, path, status: event.params.response.status });
@@ -132,6 +142,8 @@ try {
         ...primitivesRequest, requestId: event.params.requestId, status: event.params.response.status,
         contentType: header("content-type"), csp: header("content-security-policy"),
       });
+    } else if (event.method === "Network.loadingFinished" && themeRequests.has(event.params.requestId)) {
+      loadedThemeRequests.add(event.params.requestId);
     } else if (event.method === "Network.loadingFailed") {
       const themeRequest = themeRequests.get(event.params.requestId);
       if (themeRequest) failedThemeAssets.push(themeRequest.name);
@@ -144,6 +156,10 @@ try {
   await debuggerClient.command("Page.enable", {}, sessionId);
   await debuggerClient.command("Runtime.enable", {}, sessionId);
   await debuggerClient.command("Network.enable", {}, sessionId);
+  const setDesktopViewport = (width, height, deviceScaleFactor) => debuggerClient.command("Emulation.setDeviceMetricsOverride", {
+    width, height, mobile: false, deviceScaleFactor,
+  }, sessionId);
+  await setDesktopViewport(1360, 900, 1);
   await debuggerClient.command("Page.navigate", { url: `${options.origin}/#extension/plugin-ui-qualification` }, sessionId);
 
   const evaluate = async (expression) => {
@@ -177,11 +193,19 @@ try {
         event.text = "\r";
         event.unmodifiedText = "\r";
       }
+      if (type === "keyDown" && name === " ") {
+        event.text = name;
+        event.unmodifiedText = name;
+      }
       await debuggerClient.command("Input.dispatchKeyEvent", event, sessionId);
     }
   };
 
   await wait("!!document.querySelector('input[name=username]')", "sign-in form");
+  check(await evaluate(`getComputedStyle(document.querySelector('.login-intro'), '::after')
+    .backgroundImage.includes('scroll-masthead.svg') &&
+    getComputedStyle(document.querySelector('.login-side'), '::before').backgroundImage.includes('scroll-foothills.svg')`),
+  "sign-in artwork was not applied by the signed stylesheet");
   await evaluate(`(() => {
     const username = document.querySelector('input[name=username]');
     username.value = ${JSON.stringify(options.username)};
@@ -286,35 +310,60 @@ try {
     "navigation disposal hook");
   await wait("!!document.querySelector('.overview-status')", "overview theme panel");
   await wait(`(() => {
-    const botanical = getComputedStyle(document.querySelector('.overview-status'), '::after');
-    const mountains = getComputedStyle(document.querySelector('.sidebar-bottom'), '::after');
-    return botanical.content !== 'none' && botanical.opacity !== '0' &&
-      botanical.maskImage.includes('okami-botanical.svg') &&
-      mountains.content !== 'none' && mountains.opacity !== '0' &&
-      mountains.backgroundImage.includes('okami-mountains.svg');
+    const banner = document.querySelector('.console-masthead');
+    const mountains = getComputedStyle(banner, '::before');
+    const crest = getComputedStyle(banner.querySelector('.brand-symbol'));
+    const foothills = getComputedStyle(document.querySelector('.overview-status'), '::after');
+    const blossoms = getComputedStyle(document.querySelector('.overview-activity-panel'), '::after');
+    const brush = getComputedStyle(document.querySelector('.navigation .nav-item.selected'), '::before');
+    return mountains.content !== 'none' && mountains.backgroundImage.includes('scroll-masthead.svg') &&
+      crest.backgroundImage.includes('sun-crest.svg') &&
+      foothills.content !== 'none' && foothills.backgroundImage.includes('scroll-foothills.svg') &&
+      blossoms.content !== 'none' && blossoms.backgroundImage.includes('scroll-blossoms.svg') &&
+      brush.content !== 'none' && brush.maskImage.includes('ink-swipe.svg');
   })()`,
-    "both SVGs rendered by the signed stylesheet");
-  const themeDeadline = Date.now() + 10000;
-  while (Date.now() < themeDeadline &&
-    !["okami-botanical.svg", "okami-mountains.svg"].every((name) => themeResponses.has(name))) {
-    await delay(40);
-  }
-  check(["okami-botanical.svg", "okami-mountains.svg"].every((name) => themeResponses.has(name)),
-    "both signed SVG asset responses");
-  check(failedThemeAssets.length === 0, `signed SVG asset requests failed: ${failedThemeAssets.join(', ')}`);
-  for (const asset of options.themeAssets) {
-    const response = themeResponses.get(asset.name);
-    check(response && response.status === 200, `signed ${asset.name} response was not HTTP 200`);
-    check(response.digest === selectedDigest && response.path === `/web/${selectedDigest}/${asset.name}`,
-      `${asset.name} did not use the selected signed web bundle digest route`);
-    check(response.contentType.toLowerCase().startsWith("image/svg+xml"),
-      `${asset.name} returned unexpected content type: ${response.contentType}`);
-    check(response.csp.includes("img-src 'self' blob:") && response.csp.includes("style-src 'self'"),
-      `${asset.name} response did not retain the actual signed asset CSP`);
-    const served = await debuggerClient.command("Network.getResponseBody", { requestId: response.requestId }, sessionId);
-    const bytes = served.base64Encoded ? Buffer.from(served.body, "base64") : Buffer.from(served.body);
-    check(sha256(bytes) === asset.sha256, `served signed ${asset.name} bytes differ from packaged bytes`);
-    check(bytes.toString("utf8").includes("<svg"), `served signed ${asset.name} is not SVG markup`);
+    "painted masthead, crest, foothills, blossoms, and selected navigation brush applied under signed CSS");
+  await wait(`[...document.fonts].some((font) => font.family.includes('Kaushan Script') && font.status === 'loaded')`,
+    "signed brush font decoded by Chromium");
+  const verifyThemeAssets = async (assets) => {
+    const names = new Set(assets.map(({ name }) => name));
+    const failed = () => failedThemeAssets.filter((name) => names.has(name));
+    const allThemeResponsesReceived = () => assets.every(({ name }) =>
+      loadedThemeRequests.has(themeResponses.get(name)?.requestId));
+    const themeDeadline = Date.now() + 10000;
+    while (Date.now() < themeDeadline && failed().length === 0 && !allThemeResponsesReceived()) {
+      await delay(40);
+    }
+    check(failed().length === 0, `signed theme asset requests failed: ${failed().join(', ')}`);
+    check(allThemeResponsesReceived(), `browser did not finish loading ${assets.filter(({ name }) =>
+      !loadedThemeRequests.has(themeResponses.get(name)?.requestId)).map(({ name }) => name).join(', ')}`);
+    for (const asset of assets) {
+      const response = themeResponses.get(asset.name);
+      check(response && response.status === 200, `signed ${asset.name} response was not HTTP 200`);
+      check(response.origin === options.origin && response.digest === selectedDigest &&
+        response.path === `/web/${selectedDigest}/${asset.name}`,
+        `${asset.name} did not use the selected signed web bundle digest route`);
+      const extension = extname(asset.name);
+      const mimeType = themeAssetTypes.get(extension);
+      check(mimeType && response.contentType.toLowerCase().split(";", 1)[0].trim() === mimeType,
+        `${asset.name} returned unexpected content type: ${response.contentType}`);
+      check(response.csp.includes("img-src 'self' blob:") && response.csp.includes("style-src 'self'"),
+        `${asset.name} response did not retain the actual signed asset CSP`);
+      const served = await debuggerClient.command("Network.getResponseBody", { requestId: response.requestId }, sessionId);
+      const bytes = served.base64Encoded ? Buffer.from(served.body, "base64") : Buffer.from(served.body);
+      check(sha256(bytes) === asset.sha256, `served signed ${asset.name} bytes differ from packaged bytes`);
+      if (extension === ".svg") check(/^(?:\s*<\?xml[^>]*\?>)?\s*<svg\b/.test(bytes.toString("utf8")),
+        `served signed ${asset.name} is not an SVG`);
+      if (extension === ".webp") check(bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP",
+        `served signed ${asset.name} is not a WebP`);
+      if (extension === ".woff2") check(bytes.toString("ascii", 0, 4) === "wOF2",
+        `served signed ${asset.name} is not a WOFF2 font`);
+    }
+  };
+  const appliedStylesheets = await evaluate("[...document.styleSheets].map((sheet) => sheet.href)");
+  for (const { name } of options.themeAssets.filter((asset) => asset.name.endsWith(".css"))) {
+    check(appliedStylesheets.includes(`${options.origin}/web/${selectedDigest}/${name}`),
+      `signed stylesheet ${name} did not attach to the document`);
   }
   check(await evaluate(`!document.querySelector('[data-plugin-ui-qualification]') &&
     !document.querySelector('#plugin-ui-generic-controls')`),
@@ -330,14 +379,21 @@ try {
   await evaluate("location.hash = 'overview'");
   await wait("window.__pluginUiQualificationCleanups === 2", "second extension disposal");
 
+  await evaluate(`(() => {
+    const locale = document.querySelector('#global-locale');
+    locale.value = 'en';
+    locale.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await wait(`document.querySelector('#global-locale')?.value === 'en' &&
+    [...document.querySelectorAll('.nav-item')].some((item) => item.textContent.includes('Overview'))`,
+    "English labels restored before showcase qualification");
   await evaluate("location.hash = 'extension/showcase'");
-  await wait("!!document.querySelector('main.okami-showcase') && document.querySelector('main.okami-showcase').dataset.stylesheetState === 'loaded'",
+  await wait("document.querySelector('.okami-showcase')?.dataset.stylesheetState === 'loaded'",
     "signed showcase and same-origin stylesheet load");
   await wait(`getComputedStyle(document.querySelector('.okami-showcase')).display === 'grid' &&
-    getComputedStyle(document.querySelector('.okami-showcase')).gap === '20px' &&
     getComputedStyle(document.querySelector('.showcase-theme-grid')).display === 'grid'`,
     "showcase CSS rendering under the host CSP");
-  check(await evaluate('!document.querySelector("main.okami-showcase style")'),
+  check(await evaluate('!document.querySelector(".okami-showcase style")'),
     "showcase inserted inline CSS despite the host CSP");
   const showcaseCss = showcaseResponses.get("showcase.css");
   check(showcaseCss && showcaseCss.status === 200, "signed showcase CSS was not delivered");
@@ -360,6 +416,116 @@ try {
     check(sha256(bytes) === asset.sha256,
       `signed showcase ${asset.name} differs from the packaged bytes`);
   }
+
+  const lightShowcase = '.okami-showcase .showcase-theme[data-theme="light"]';
+  const darkShowcase = '.okami-showcase .showcase-theme[data-theme="dark"]';
+  const showcaseThemeTabs = '.okami-showcase .showcase-theme-grid [role="tablist"]';
+  const showcaseSelector = (selector) => JSON.stringify(lightShowcase + " " + selector);
+  await wait(`(() => {
+    const light = document.querySelector(${JSON.stringify(lightShowcase)});
+    const dark = document.querySelector(${JSON.stringify(darkShowcase)});
+    return light?.getClientRects().length > 0 && dark?.getClientRects().length === 0;
+  })()`, "visible light and hidden dark showcase boards");
+  await evaluate(`document.querySelector(${JSON.stringify(showcaseThemeTabs + ' [role="tab"]')}).focus()`);
+  await key("ArrowRight", "ArrowRight", 39);
+  await wait(`document.querySelector(${JSON.stringify(darkShowcase)})?.getClientRects().length > 0 &&
+    document.querySelector(${JSON.stringify(lightShowcase)})?.getClientRects().length === 0`,
+    "keyboard-selected dark showcase board");
+  await key("ArrowLeft", "ArrowLeft", 37);
+  await wait(`document.querySelector(${JSON.stringify(lightShowcase)})?.getClientRects().length > 0`,
+    "keyboard-selected light showcase board");
+
+  const checkbox = showcaseSelector('.plugin-checkbox input[type="checkbox"]');
+  const search = showcaseSelector('.plugin-search-field input[type="search"]');
+  const initialCheckbox = await evaluate(`(() => {
+    const checkbox = document.querySelector(${checkbox});
+    const search = document.querySelector(${search});
+    const labelText = (input) => input?.getAttribute('aria-label') ||
+      [...(input?.labels || [])].map((label) => label.textContent).join(' ');
+    return {
+      checked: checkbox?.checked,
+      associatedCheckboxLabel: labelText(checkbox).trim().length > 0,
+      associatedSearchLabel: labelText(search).includes('Find a device'),
+      placeholder: search?.placeholder,
+    };
+  })()`);
+  check(typeof initialCheckbox.checked === "boolean" && initialCheckbox.associatedCheckboxLabel &&
+    initialCheckbox.associatedSearchLabel && initialCheckbox.placeholder === "Search by name",
+    "signed showcase did not render shared native checkbox and search controls with accessible labels");
+  await evaluate(`document.querySelector(${checkbox}).focus()`);
+  await key(" ", "Space", 32);
+  check(await evaluate(`document.querySelector(${checkbox}).checked === ${!initialCheckbox.checked}`),
+    "keyboard did not toggle the shared showcase checkbox");
+  await evaluate(`document.querySelector(${search}).focus()`);
+  await debuggerClient.command("Input.insertText", { text: "Living room" }, sessionId);
+  check(await evaluate(`document.querySelector(${search}).value === 'Living room'`),
+    "shared showcase search input did not accept keyboard text");
+
+  const iconButton = showcaseSelector('.plugin-tooltip-anchor button[aria-label="Edit profile"]');
+  await evaluate(`document.querySelector(${iconButton}).focus()`);
+  await wait(`(() => {
+    const button = document.querySelector(${iconButton});
+    const tooltip = button?.closest('.plugin-tooltip-anchor')?.querySelector('.plugin-tooltip[role="tooltip"]');
+    return document.activeElement === button && tooltip && !tooltip.hidden &&
+      button.getAttribute('aria-describedby')?.split(/\\s+/).includes(tooltip.id) &&
+      !!button.querySelector('svg[aria-hidden="true"]');
+  })()`, "focused shared icon action with an accessible tooltip");
+  await key("Escape", "Escape", 27);
+  check(await evaluate(`(() => {
+    const button = document.querySelector(${iconButton});
+    return document.activeElement === button &&
+      button.closest('.plugin-tooltip-anchor').querySelector('[role="tooltip"]').hidden;
+  })()`), "Escape did not dismiss the shared icon tooltip and preserve focus");
+
+  check(await evaluate(`(() => {
+    const light = document.querySelector(${JSON.stringify(lightShowcase)});
+    return !!light.querySelector('.plugin-badge[data-tone]') && [...light.querySelectorAll('table')].some((table) =>
+      table.caption?.textContent.trim() === 'Sample paired devices' &&
+      [...table.querySelectorAll('th[scope="col"]')].map((cell) => cell.textContent.trim()).join(',') ===
+        'Name,Status,Type,Last seen');
+  })()`), "shared showcase badges or semantic table missing");
+  check(await evaluate(`(() => {
+    const light = document.querySelector(${JSON.stringify(lightShowcase)});
+    const seal = light.querySelector('.ink-status-card[data-summary-tone="success"] .ink-status-seal');
+    return seal && getComputedStyle(seal, '::before').maskImage.includes('ink-seal.svg') &&
+      light.querySelectorAll('.ink-info-card').length === 3;
+  })()`), "shared showcase painted status seal or hardware info cards missing");
+  check(await evaluate(`(() => {
+    const light = document.querySelector(${JSON.stringify(lightShowcase)});
+    const sparklines = [...light.querySelectorAll('.plugin-metric-chart-sparkline')];
+    return sparklines.map((chart) => chart.querySelector('.plugin-chart-latest').textContent).join(',') ===
+      '4%,3%,0%,0 Mbps' && sparklines.every((chart) => chart.querySelector('svg[tabindex="0"]'));
+  })()`), "showcase did not render four keyboard-accessible sparklines with the sample values");
+  const cpuPlot = showcaseSelector('.plugin-metric-chart-sparkline svg');
+  const cpuReadout = showcaseSelector('.plugin-metric-chart-sparkline .plugin-chart-readout');
+  const cpuCursor = showcaseSelector('.plugin-metric-chart-sparkline .plugin-chart-cursor');
+  await evaluate(`document.querySelector(${cpuPlot}).focus()`);
+  await key("Home", "Home", 36);
+  const firstCpuCursor = await evaluate(`document.querySelector(${cpuCursor})?.getAttribute('d')`);
+  check(firstCpuCursor && await evaluate(`document.querySelector(${cpuReadout}).textContent.includes('CPU:')`),
+    "Home did not inspect the first signed showcase CPU sample");
+  await key("End", "End", 35);
+  const lastCpuCursor = await evaluate(`document.querySelector(${cpuCursor})?.getAttribute('d')`);
+  check(lastCpuCursor && lastCpuCursor !== firstCpuCursor &&
+    await evaluate(`document.querySelector(${cpuReadout}).textContent.includes('CPU: 4%')`),
+    "End did not inspect the final signed showcase CPU sample");
+  const showcaseButtons = showcaseSelector('button');
+  await evaluate(`([...document.querySelectorAll(${showcaseButtons})].find((button) =>
+    button.textContent.trim() === 'Open dialog')).focus()`);
+  await key("Enter", "Enter", 13);
+  const showcaseDialogFooter = showcaseSelector('dialog[open] .plugin-dialog-actions');
+  await wait(`(() => {
+    const footer = document.querySelector(${showcaseDialogFooter});
+    const actions = [...(footer?.querySelectorAll('button') ?? [])].map((button) => button.textContent.trim());
+    return actions.includes('Cancel') && actions.includes('Confirm');
+  })()`, "shared showcase dialog with built-in Cancel and plugin Confirm in its footer");
+  await evaluate(`([...document.querySelector(${showcaseDialogFooter}).querySelectorAll('button')].find((button) =>
+    button.textContent.trim() === 'Confirm')).focus()`);
+  await key("Enter", "Enter", 13);
+  await wait(`!document.querySelector(${showcaseSelector('dialog[open]')}) &&
+    document.activeElement?.textContent.trim() === 'Open dialog'`,
+    "keyboard-confirmed showcase dialog and restored trigger focus");
+  await verifyThemeAssets(options.themeAssets);
 
   await evaluate("location.hash = 'extension/signed-ui-primitives'");
   await wait("!!document.querySelector('[data-signed-ui-primitives]')",
@@ -515,10 +681,23 @@ try {
       !h.tabs.element.isConnected;
   })()`), "aborted page controls accepted a late update or remained connected");
 
+  await debuggerClient.command("Page.navigate", { url: "about:blank" }, sessionId);
+  await wait("location.href === 'about:blank'", "blank page before changing pixel density");
+  themeResponses.delete("scroll-masthead.svg");
+  await setDesktopViewport(1920, 1080, 2);
+  await debuggerClient.command("Page.navigate", { url: `${options.origin}/#overview` }, sessionId);
+  await wait(`(() => {
+    const hero = document.querySelector('.console-masthead');
+    return window.devicePixelRatio === 2 && window.innerWidth === 1920 && window.innerHeight === 1080 &&
+      hero && getComputedStyle(hero, '::before').backgroundImage.includes('scroll-masthead.svg');
+  })()`, "signed vector masthead at 3840 by 2160 physical pixels");
+  await verifyThemeAssets(options.themeAssets.filter(({ name }) => name === "scroll-masthead.svg"));
+
   console.log(`Verified signed UI primitives asset at ${primitives.path}: same-origin digest route, matching signed bytes, JavaScript content type, and restrictive host CSP.`);
   console.log("Verified dialog keyboard focus/escape, tabs keyboard navigation, semantic layout, live feedback, locale updates, feature fallback, and page-abort cleanup.");
   console.log(`Verified signed showcase CSS at ${showcaseCss.path}: same-origin, matching bytes, text/css, rendered under the host CSP.`);
-  console.log(`Verified selected signed web digest ${selectedDigest}: both theme SVGs returned matching packaged bytes as image/svg+xml and rendered under the signed CSP.`);
+  console.log("Verified shared showcase tabs, checkbox, search, tooltip, badges, table, painted summary cards, sparklines, and dialog footer actions under the signed CSP.");
+  console.log(`Verified selected signed web digest ${selectedDigest}: theme stylesheets and artwork matched packaged bytes and loaded under the signed CSP.`);
   console.log("PASS: signed web asset delivery, packaged UI primitives under CSP, extension keyboard use and host call, generic control keyboard/save, locale update, and navigation cleanup/remount");
 } finally {
   if (target) {

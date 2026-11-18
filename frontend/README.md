@@ -1,7 +1,7 @@
 # Amaterasu web console
 
 An independently replaceable frontend for the versioned management HTTP API.
-It has no runtime dependencies, CDN requests, embedded fonts, or service worker.
+The console loads its artwork, stylesheets and Kaushan Script brush typeface from the signed web bundle.
 The only project dependency is a pinned TypeScript compiler for development.
 
 ## Build and verify
@@ -57,8 +57,8 @@ service is changed. This qualifies the controlled Linux host/browser path;
 installed-service trust, physical platform TLS provisioning, and other browsers
 remain separate gates.
 
-The deterministic output is exactly `dist/index.html`, `dist/app.js`, and
-`dist/styles.css`. Built assets are included for the native package builder;
+The build emits `dist/index.html`, `dist/app.js`, and the local stylesheets, font
+and artwork listed in `scripts/build.mjs`. Built assets are included for the native package builder;
 `node_modules` is not. Source files are small TypeScript namespace modules compiled
 into one script, with no bundler/runtime module loader. The Rust management module
 owns signed bundle verification and HTTP delivery; this frontend never writes or

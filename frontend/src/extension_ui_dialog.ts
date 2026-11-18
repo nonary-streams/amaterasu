@@ -5,6 +5,7 @@ namespace Amaterasu {
     title: ExtensionUiText;
     description?: ExtensionUiText;
     content?: string | Node | readonly (string | Node)[];
+    actions?: readonly HTMLElement[];
     initialFocus?: HTMLElement;
     cancelLabel?: ExtensionUiText;
     onClose?: (reason: ExtensionUiDialogCloseReason) => void;
@@ -41,16 +42,32 @@ namespace Amaterasu {
       translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? translateText(value.source));
   }
 
+  function extensionUiDialogOwnsNode(value: unknown, allowedTypes: readonly number[]): value is Node {
+    if (!value || typeof value !== "object") return false;
+    const node = value as Node;
+    return node.ownerDocument === document && allowedTypes.includes(node.nodeType);
+  }
+
   function extensionUiDialogContent(content: ExtensionUiDialogOptions["content"]): Node[] {
     if (content === undefined) return [];
     const values = Array.isArray(content) ? [...content] : [content];
     return values.map((value) => {
       if (typeof value === "string") return document.createTextNode(value);
-      if (!value || typeof value !== "object" || value.ownerDocument !== document ||
-          ![1, 3, 11].includes(value.nodeType))
+      if (!extensionUiDialogOwnsNode(value, [1, 3, 11]))
         throw new Error("Dialog content must be text or a node owned by this document.");
       return value;
     });
+  }
+
+  function extensionUiDialogActions(actions: ExtensionUiDialogOptions["actions"], content: readonly Node[]): readonly HTMLElement[] {
+    if (actions === undefined) return [];
+    if (!Array.isArray(actions) || actions.some(action => !(action instanceof HTMLElement) || !extensionUiDialogOwnsNode(action, [1])))
+      throw new Error("Dialog actions must be elements owned by this document.");
+    if (new Set(actions).size !== actions.length || actions.some(action =>
+      content.some(node => node.contains(action) || action.contains(node)) ||
+      actions.some(other => other !== action && action.contains(other))))
+      throw new Error("Dialog actions must be separate from the dialog content and from each other.");
+    return [...actions];
   }
 
   export function createExtensionUiDialogsV1(signal: AbortSignal): ExtensionUiDialogsV1 {
@@ -70,11 +87,11 @@ namespace Amaterasu {
           ? null : extensionUiDialogTextNode(options.description);
         const cancelLabel = extensionUiDialogTextNode(options.cancelLabel ?? "Cancel");
         const contentNodes = extensionUiDialogContent(options.content);
+        const actionNodes = extensionUiDialogActions(options.actions, contentNodes);
         const initialFocus = options.initialFocus;
         if (initialFocus !== undefined && (!initialFocus || typeof initialFocus.focus !== "function" ||
-            initialFocus.ownerDocument !== document || !contentNodes.some((node) => node === initialFocus ||
-              ((node.nodeType === 1 || node.nodeType === 11) && node.contains(initialFocus)))))
-          throw new Error("Dialog initial focus must be inside its content.");
+            initialFocus.ownerDocument !== document || ![...contentNodes, ...actionNodes].some(node => node.contains(initialFocus))))
+          throw new Error("Dialog initial focus must be inside its content or actions.");
 
         const instanceId = ++nextExtensionUiDialogId;
         const titleId = `amaterasu-plugin-dialog-title-${instanceId}`;
@@ -103,9 +120,9 @@ namespace Amaterasu {
         actions.className = "actions plugin-dialog-actions";
         const cancelButton = document.createElement("button");
         cancelButton.type = "button";
-        cancelButton.className = "button secondary";
+        cancelButton.className = actionNodes.length ? "button outline" : "button secondary";
         cancelButton.append(cancelLabel);
-        actions.append(cancelButton);
+        actions.append(cancelButton, ...actionNodes);
         element.append(actions);
 
         const controller = new AbortController();

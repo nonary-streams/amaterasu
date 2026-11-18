@@ -37,13 +37,7 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ColorMode {
-    Bt601Limited,
-    Bt601Full,
-    Bt709Limited,
-    Bt709Full,
-}
+pub use amaterasu_media::ColorMode;
 
 pub use amaterasu_contracts::encoder::VideoCodec;
 

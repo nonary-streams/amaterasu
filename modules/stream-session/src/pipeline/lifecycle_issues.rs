@@ -124,12 +124,14 @@ impl Record {
         let Some(operation) = self.config.rtsp_operation_id.clone() else {
             return;
         };
-        self.issues.push(
-            StreamIssue::advisory(
+        self.issues.push_logged(
+            None,
+            StreamIssue::demoted(
                 operation,
                 LifecycleLayer::StreamSession,
                 "probe_extension_source",
                 "extension_source_unavailable",
+                "negotiate_standard_video",
             )
             .because(reason)
             .caused_by(LifecycleLayer::EncodeVideo),

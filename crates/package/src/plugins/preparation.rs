@@ -118,17 +118,12 @@ pub fn prepare(
     };
     // Re-read every approval and catalog after retrieval; a revoked or replaced
     // candidate cannot acquire a prepared operation by winning a download race.
-    let verified_sources = sources
-        .iter()
-        .map(|source| super::composition::verify_source(store, source, context.bootstrap, now))
-        .collect::<PackageResult<Vec<_>>>()?;
-    let approved = super::installed::policy_for(context.bootstrap, &verified_sources)?;
     let (_, verified) = verify_composition(
         &composition,
         context.base_digest,
         context.components,
         store,
-        &approved,
+        context.bootstrap,
         now,
     )?;
     check_cancelled(cancelled)?;

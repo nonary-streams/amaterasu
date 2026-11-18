@@ -148,11 +148,9 @@ All reports reach the host log under `amaterasu.runtime`:
 | `trace.slow_span` | a span lasted 8 ms or more | the span, its label and its recorder |
 | `trace.window` | every ten seconds with activity | per track: completed, slow and abandoned flows, the budget, total and per-step timing; the spans with the most time |
 
-The default log holds only what a person would notice: a flow or span at least
-twice over its limit. A flow or span nearer its limit is routine on a busy
-host, and a window is written whatever happened, so those are debug records
-(see [latency diagnostics](streaming-latency-diagnostics.md) for the level).
-Every one of them still counts in the report below.
+All three targets use Debug. The Performance panel keeps recent slow flows,
+slow spans and timing summaries at any log level. See
+[latency diagnostics](streaming-latency-diagnostics.md) for recording a timing log.
 
 Slow reports are limited to twenty per track and twenty spans per window; the
 window states how many were suppressed and the worst one. Percentiles are

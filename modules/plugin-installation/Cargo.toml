@@ -14,6 +14,8 @@ amaterasu-input-companion.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+amaterasu-rtx-runtime = { path = "../../crates/rtx-runtime" }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 [lints]

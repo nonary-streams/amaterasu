@@ -35,7 +35,21 @@ SHOWCASE_ID = "showcase"
 PRIMITIVES_ID = "signed-ui-primitives"
 SHOWCASE_SOURCE = WORKSPACE / "examples/web-extension"
 SHOWCASE_ASSETS = ("showcase.js", "showcase.css")
-THEME_ASSETS = ("okami-botanical.svg", "okami-mountains.svg")
+THEME_ASSETS = (
+    "scroll-theme.css",
+    "console-shell.css",
+    "overview-scroll.css",
+    "ink-components.css",
+    "ink-summary.css",
+    "scroll-masthead.svg",
+    "scroll-foothills.svg",
+    "scroll-blossoms.svg",
+    "ink-swipe.svg",
+    "ink-seal.svg",
+    "sun-crest.svg",
+    "washi-paper.webp",
+    "kaushan-script.woff2",
+)
 METHODS = WORKSPACE / "examples/web-extension/methods.json"
 FIXTURE = WORKSPACE / "frontend/tests/fixtures/plugin-ui-browser/example.js"
 PRIMITIVES_FIXTURE = WORKSPACE / "frontend/tests/fixtures/plugin-ui-browser/primitives.js"
@@ -215,7 +229,7 @@ def run_browser(
                     "name": name,
                     "path": str(WORKSPACE / "frontend/dist" / name),
                     "sha256": hashlib.sha256(
-                        (WORKSPACE / "frontend/dist" / name).read_bytes()
+                        (WORKSPACE / "frontend/public" / name).read_bytes()
                     ).hexdigest(),
                 }
                 for name in THEME_ASSETS
@@ -279,6 +293,9 @@ def main() -> None:
         xdg_runtime = harness.directory / "xdg-runtime"
         xdg_runtime.mkdir(mode=0o700)
         os.environ["XDG_RUNTIME_DIR"] = str(xdg_runtime)
+        xdg_state = harness.directory / "xdg-state"
+        xdg_state.mkdir(mode=0o700)
+        os.environ["XDG_STATE_HOME"] = str(xdg_state)
         private.SERVER_ADDRESS = "127.0.0.1"
         certificate = private.configure_host(harness)
         asset_digest, showcase_digests, primitives_digest = configure_signed_extension(harness)

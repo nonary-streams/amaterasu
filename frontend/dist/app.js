@@ -12822,7 +12822,7 @@ var Amaterasu;
                     });
                 });
                 refresh.disabled = !context.api.allows("diagnostics.read");
-                form.append(Amaterasu.field("Minimum log level", level, "Product default uses the release channel's policy. Diagnostic records below this level are filtered."), Amaterasu.field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records when diagnostics confirms the policy."), Amaterasu.el("p", "muted", settingsTextLiteral(`Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`)), Amaterasu.el("p", "muted", "The host confirms logging application during save; diagnostics status checks disk delivery. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."), applicationStatus, refresh, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                form.append(Amaterasu.field("Minimum log level", level, "Select Debug to include detailed performance diagnostics."), Amaterasu.field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records when diagnostics confirms the policy."), Amaterasu.el("p", "muted", settingsTextLiteral(`Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`)), Amaterasu.el("p", "muted", "The host confirms logging application during save; diagnostics status checks disk delivery. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."), applicationStatus, refresh, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (!form.reportValidity())
@@ -15619,6 +15619,8 @@ var Amaterasu;
             driver_publisher_not_approved: "This driver's publisher needs approval on this computer.",
             plugin_revision_conflict: "This installation changed. Review the plugin again before continuing.",
             driver_stale_approval: "The required drivers changed. Review setup again before approving installation.",
+            rtx_hdr_addon_host_update_required: "Update the Amaterasu host and Core package before adding RTX HDR.",
+            rtx_hdr_already_in_core: "RTX HDR is included in this host's Core package.",
             plugin_trial_failed: "The plugin could not start. The previous working modules have been restored.",
             driver_not_cancellable: "Installation has reached a step that must finish before it can stop.",
         };
@@ -16452,6 +16454,10 @@ var Amaterasu;
                 if (page.signal.aborted || request !== loadRequest || driverRequest !== driverReadRequest)
                     return;
                 const previousPhase = ready(driverStatus)?.operation?.phase;
+                if (previousPhase === "activating" && !status.supported) {
+                    scheduleDriverPoll();
+                    return;
+                }
                 driverStatus = { state: "ready", value: status };
                 driverFailure = null;
                 if (status.operation?.phase === "ready" && previousPhase !== "ready") {
@@ -16489,12 +16495,18 @@ var Amaterasu;
             driverChanging = true;
             ++driverReadRequest;
             driverFailure = null;
+            if (action === "activate" && operation) {
+                driverStatus = { state: "ready", value: { ...status, operation: { ...operation,
+                            phase: "activating", cancellable: false } } };
+            }
             showView("drivers");
             render();
             try {
                 await api.post(`plugins/${action}`, payload);
             }
             catch (error) {
+                if (action === "activate" && error instanceof Amaterasu.ApiError && error.status < 500)
+                    driverStatus = { state: "ready", value: status };
                 driverFailure = error;
             }
             finally {
@@ -17088,10 +17100,14 @@ var Amaterasu;
             const installing = [];
             if (!(plugin.status === "installed" && plugin.runningThisPackage)) {
                 if (plugin.kind === "native_plugin") {
-                    const supported = ready(driverStatus)?.supported === true;
-                    const add = Amaterasu.button(plugin.status === "update" ? "Update plugin" : "Add plugin", () => changeDriverSetup("prepare", plugin));
-                    add.disabled = !canManage || !supported || driverChanging;
-                    installing.push(add, Amaterasu.el("p", "muted", supported ? "Setup checks this plugin's dependencies and prompts for any required drivers before activation." : "This host needs a provisioned plugin installation service to add independent plugins."));
+                    if (plugin.status !== "installed") {
+                        const supported = ready(driverStatus)?.supported === true;
+                        const add = Amaterasu.button(plugin.status === "update" ? "Update plugin" : "Add plugin", () => changeDriverSetup("prepare", plugin));
+                        add.disabled = !canManage || !supported || driverChanging;
+                        installing.push(add, Amaterasu.el("p", "muted", supported ? "Setup checks this plugin's dependencies and prompts for any required drivers before activation." : "This host needs a provisioned plugin installation service to add independent plugins."));
+                        if (plugin.slot === "amaterasu.rtx-hdr")
+                            installing.push(Amaterasu.el("p", "muted", "Setup downloads the verified NVIDIA runtime. Activation waits for streams to end."));
+                    }
                 }
                 else if (plugin.slot === "amaterasu.rtx-hdr" && plugin.status === "available") {
                     installing.push(Amaterasu.el("p", "", "RTX HDR is installed from Integrations, which also downloads the NVIDIA runtime it needs."), Amaterasu.button("Set up RTX HDR", () => context.navigate("integrations")));
@@ -19326,14 +19342,59 @@ var Amaterasu;
     function pagesTextMessage(value) {
         return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
     }
+    const overviewIcons = {
+        catalog: "M3 5h18v14H3z M3 9h18 M7 13h4 M7 16h8",
+        sessions: "M4 8h15m-3-3 3 3-3 3 M20 16H5m3-3-3 3 3 3",
+        activity: "M3 12h4l3-6 4 12 3-6h4",
+        settings: "M4 6h16m-16 6h16m-16 6h16 M8 4v4m8 2v4m-6 2v4",
+        host: "M4 5h16v11H4z M8 20h8m-4-4v4",
+        arrow: "M4 12h15m-6-6 6 6-6 6",
+    };
+    function overviewIcon(name) {
+        const namespace = "http://www.w3.org/2000/svg";
+        const icon = document.createElementNS(namespace, "svg");
+        icon.setAttribute("viewBox", "0 0 24 24");
+        icon.setAttribute("class", "overview-icon");
+        icon.setAttribute("aria-hidden", "true");
+        icon.setAttribute("focusable", "false");
+        const path = document.createElementNS(namespace, "path");
+        path.setAttribute("d", overviewIcons[name]);
+        icon.append(path);
+        return icon;
+    }
     function renderOverview(context) {
-        const area = Amaterasu.el("div");
+        const metricArea = Amaterasu.el("div", "overview-metric-area");
         const activityArea = Amaterasu.el("div", "overview-activity-area");
+        const serviceArea = Amaterasu.el("div", "overview-service-area");
+        const serviceDetails = Amaterasu.panel("Service access");
+        serviceDetails.classList.add("overview-detail-panel");
+        const details = Amaterasu.el("div", "overview-details", serviceDetails);
         const hostMetricsArea = Amaterasu.el("div", "overview-plugin-sections");
-        area.append(Amaterasu.el("p", "muted overview-loading", "Loading host information…"));
+        serviceArea.append(Amaterasu.el("p", "muted overview-loading", "Loading host information…"));
+        const quickActions = Amaterasu.el("div", "quick-actions");
+        for (const [page, label, detail, scope] of [
+            ["host", "Host & devices", "Review pairing and host services", "configuration.read"],
+            ["catalog", "Library", "Manage applications in your library", "catalog.read"],
+            ["sessions", "Sessions", "View sessions and host metrics", "session.read"],
+            ["settings", "Settings", "Configure your host", "configuration.read"],
+        ]) {
+            if (!context.api.allows(scope))
+                continue;
+            const action = Amaterasu.button(label, () => context.navigate(page), "quick-action");
+            action.append(Amaterasu.el("span", "overview-quick-icon", overviewIcon(page)), Amaterasu.el("small", "muted", detail), Amaterasu.el("span", "quick-action-arrow", overviewIcon("arrow")));
+            quickActions.append(action);
+        }
+        if (quickActions.hasChildNodes()) {
+            const actionsPanel = Amaterasu.panel("Quick actions", quickActions);
+            actionsPanel.classList.add("overview-detail-panel");
+            details.append(actionsPanel);
+        }
         let refreshGeneration = 0;
         let refreshActivity = () => { };
-        context.content.append(Amaterasu.sectionHeading("Host overview", "Your applications, sessions, and local services in one place.", Amaterasu.button("Refresh", () => { void load(); refreshActivity(); })), activityArea, hostMetricsArea, area);
+        const masthead = Amaterasu.sectionHeading("Host overview", "Your applications, sessions, and local services in one place.", Amaterasu.button("Refresh", () => { void load(); refreshActivity(); }, "outline"));
+        masthead.classList.add("overview-masthead");
+        const sheet = Amaterasu.el("div", "overview-sheet", masthead, Amaterasu.el("div", "overview-summary", serviceArea, activityArea), metricArea, details, hostMetricsArea);
+        context.content.append(sheet);
         refreshActivity = renderOverviewActivity(context, activityArea);
         Amaterasu.renderExtensionSlot(context, hostMetricsArea, "overview");
         async function load() {
@@ -19344,56 +19405,55 @@ var Amaterasu;
                 context.api.post("application/list", { limit: 16 }),
                 context.api.post("steam/status"),
             ]);
-            if (!context.content.isConnected || generation !== refreshGeneration)
+            if (!sheet.isConnected || generation !== refreshGeneration)
                 return;
             const [catalog, sessions, applications, steam] = snapshots;
             const metrics = Amaterasu.el("div", "metrics");
-            const addMetric = (label, value, detail) => metrics.append(Amaterasu.el("div", "metric", Amaterasu.el("span", "muted", label), Amaterasu.el("strong", "", pagesTextLiteral(value)), Amaterasu.el("small", "muted", detail)));
-            addMetric("Catalog applications", catalog?.status === "fulfilled"
+            const addMetric = (icon, label, value, description) => {
+                const metric = Amaterasu.summaryInfoCard({ icon, label, value: pagesTextLiteral(value), description });
+                metric.classList.add("metric");
+                metrics.append(metric);
+            };
+            addMetric("catalog", "Catalog applications", catalog?.status === "fulfilled"
                 ? Amaterasu.countLabel(catalog.value.entries.length, catalog.value.next_cursor)
                 : "—", "Catalog entries returned");
-            addMetric("Session records", sessions?.status === "fulfilled"
+            addMetric("sessions", "Session records", sessions?.status === "fulfilled"
                 ? Amaterasu.countLabel(sessions.value.sessions.length, sessions.value.next_offset)
                 : "—", "Caller-scoped coordination records");
-            addMetric("Tracked processes", applications?.status === "fulfilled"
+            addMetric("processes", "Tracked processes", applications?.status === "fulfilled"
                 ? Amaterasu.countLabel(applications.value.processes.length, applications.value.next_offset)
                 : "—", "Running and recently exited");
-            addMetric("Steam discoveries", steam?.status === "fulfilled" ? String(steam.value.game_count) : "—", steam?.status === "fulfilled" && steam.value.scanning
+            addMetric("discoveries", "Steam discoveries", steam?.status === "fulfilled" ? String(steam.value.game_count) : "—", steam?.status === "fulfilled" && steam.value.scanning
                 ? "Scanning local libraries"
                 : "Latest provider scan");
             const available = snapshots.filter((snapshot) => snapshot.status === "fulfilled").length;
-            const status = Amaterasu.el("section", "overview-status", Amaterasu.el("div", "overview-status-icon", available === snapshots.length ? "✓" : "!"), Amaterasu.el("div", "overview-status-copy", Amaterasu.el("p", "overview-status-label", "MANAGEMENT SERVICE ACCESS"), Amaterasu.el("h2", "", available === snapshots.length ? "Management services responding" : "Some information is unavailable"), Amaterasu.el("p", "muted", available === snapshots.length
-                ? "Catalog, session coordination, applications, and Steam responded to the latest refresh. This does not indicate stream readiness."
-                : "Some management requests could not be completed. Check service access below for details.")));
-            const quickActions = Amaterasu.el("div", "quick-actions");
-            for (const [page, label, detail, scope] of [
-                ["host", "Host & devices", "Review pairing and host services", "configuration.read"],
-                ["catalog", "Library", "Manage applications in your library", "catalog.read"],
-                ["sessions", "Sessions", "View sessions and host metrics", "session.read"],
-                ["settings", "Settings", "Configure your host", "configuration.read"],
-            ]) {
-                if (!context.api.allows(scope))
-                    continue;
-                const action = Amaterasu.button(label, () => context.navigate(page), "quick-action");
-                action.append(Amaterasu.el("small", "muted", detail), Amaterasu.el("span", "quick-action-arrow", "→"));
-                quickActions.append(action);
-            }
-            const serviceRows = snapshots.map((snapshot, index) => [
-                Amaterasu.el("strong", "", pagesTextMessage(["Catalog", "Session coordination", "Applications", "Steam provider"][index] ?? "")),
-                snapshot.status === "fulfilled"
-                    ? Amaterasu.badge(pagesTextMessage("Available"), "good")
-                    : Amaterasu.badge(pagesTextMessage("Unavailable")),
-                snapshot.status === "rejected"
-                    ? Amaterasu.messageOf(snapshot.reason)
-                    : pagesTextMessage("Responded to the latest refresh"),
-            ]);
+            const servicesResponding = available === snapshots.length;
+            const status = Amaterasu.summaryStatusCard({
+                label: "MANAGEMENT SERVICE ACCESS",
+                title: servicesResponding ? "Management services responding" : "Some information is unavailable",
+                description: servicesResponding
+                    ? "Catalog, session coordination, applications, and Steam responded to the latest refresh. This does not indicate stream readiness."
+                    : "Some management requests could not be completed. Check service access below for details.",
+                tone: servicesResponding ? "success" : "warning",
+            });
+            status.classList.add("overview-status");
+            const serviceRows = snapshots.map((snapshot, index) => {
+                const row = [
+                    Amaterasu.el("strong", "", pagesTextMessage(["Catalog", "Session coordination", "Applications", "Steam provider"][index] ?? "")),
+                    snapshot.status === "fulfilled"
+                        ? Amaterasu.badge(pagesTextMessage("Available"), "good")
+                        : Amaterasu.badge(pagesTextMessage("Unavailable"), "bad"),
+                ];
+                if (!servicesResponding)
+                    row.push(snapshot.status === "rejected" ? Amaterasu.messageOf(snapshot.reason) : "—");
+                return row;
+            });
             status.setAttribute("role", "status");
             status.setAttribute("aria-live", "polite");
             status.setAttribute("aria-atomic", "true");
-            const details = Amaterasu.el("div", "overview-details", Amaterasu.panel("Service access", Amaterasu.table(["Service", "Status", "Details"], serviceRows)));
-            if (quickActions.hasChildNodes())
-                details.append(Amaterasu.panel("Quick actions", quickActions));
-            area.replaceChildren(status, metrics, details);
+            serviceArea.replaceChildren(status);
+            metricArea.replaceChildren(metrics);
+            serviceDetails.replaceChildren(Amaterasu.el("h2", "", "Service access"), Amaterasu.table(servicesResponding ? ["Service", "Status"] : ["Service", "Status", "Details"], serviceRows));
         }
         void load();
     }
@@ -19409,9 +19469,10 @@ var Amaterasu;
         summary.setAttribute("aria-atomic", "true");
         const launchStatus = Amaterasu.el("p", "muted");
         const observation = Amaterasu.el("p", "muted");
-        const icon = Amaterasu.el("div", "overview-status-icon", "↗");
+        const icon = Amaterasu.el("span", "ink-seal ink-status-seal", overviewIcon("activity"));
         icon.setAttribute("aria-hidden", "true");
-        container.append(Amaterasu.el("section", "overview-activity-panel", Amaterasu.el("div", "overview-activity-state", icon, Amaterasu.el("div", "overview-activity-copy", Amaterasu.el("p", "overview-status-label", "STREAM ACTIVITY"), Amaterasu.el("h2", "overview-activity-summary", summary), launchStatus, observation)), Amaterasu.button("View sessions", () => context.navigate("sessions"))));
+        const activity = Amaterasu.el("section", "overview-activity-panel", Amaterasu.el("p", "overview-status-label", "STREAM ACTIVITY"), Amaterasu.el("div", "overview-activity-state", icon, Amaterasu.el("div", "overview-activity-copy", Amaterasu.el("h2", "overview-activity-summary", summary), launchStatus, observation, Amaterasu.button("View sessions", () => context.navigate("sessions"), "outline"))));
+        container.append(activity);
         let generation = 0;
         let timer;
         let disposed = false;
@@ -19462,12 +19523,14 @@ var Amaterasu;
                 if (!current(request))
                     return;
                 const count = snapshot.streams.length;
+                activity.setAttribute("data-tone", count === 0 ? "idle" : "live");
                 summary.textContent = count === 0 ? "No active streams reported" :
                     `${count} active ${count === 1 ? "stream" : "streams"} reported`;
                 observation.textContent = `Host observation: ${new Date(snapshot.sampledAtUnixMs).toLocaleString()}. Client media delivery is not verified.`;
             }).catch(() => {
                 if (!current(request))
                     return;
+                activity.setAttribute("data-tone", "attention");
                 summary.textContent = "Live stream status is unavailable";
                 observation.textContent = "The host did not provide a current stream status. Try refreshing.";
             }).finally(() => {
@@ -21409,7 +21472,8 @@ var Amaterasu;
         if (!value || typeof value.source !== "string" || !value.source.trim())
             throw new Error("Invalid plugin UI text.");
         const translations = value.translations ?? {};
-        if (Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+        if (typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
             throw new Error("Invalid plugin UI translations.");
         return translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source);
     }
@@ -21427,11 +21491,12 @@ var Amaterasu;
             return Amaterasu.localizedTextNode(value);
         return Amaterasu.localeFormattedTextNode((locale) => extensionUiTextForLocale(value, locale));
     }
-    function extensionUiSetPlaceholder(control, value) {
+    Amaterasu.extensionUiTextNode = extensionUiTextNode;
+    function extensionUiSetTextAttribute(control, name, value) {
         if (typeof value === "string")
-            Amaterasu.setLocalizedAttribute(control, "placeholder", value);
+            Amaterasu.setLocalizedAttribute(control, name, value);
         else
-            Amaterasu.setLocalizedAttributeFormatter(control, "placeholder", (locale) => extensionUiTextForLocale(value, locale));
+            Amaterasu.setLocalizedAttributeFormatter(control, name, (locale) => extensionUiTextForLocale(value, locale));
     }
     function extensionUiLabel(text) {
         extensionUiValidateLabel(text);
@@ -21606,59 +21671,247 @@ var Amaterasu;
         updateState.refreshControls = (nextControls) => { activeControls = [...nextControls]; sync(); };
         return updateState;
     }
-    function createExtensionUiV1(signal) {
-        if (!signal || typeof signal.addEventListener !== "function")
+    function validateExtensionUiSignal(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
             throw new Error("Plugin UI requires a lifecycle signal.");
-        const makeController = () => {
-            if (signal.aborted)
-                throw new Error("Plugin page is no longer active.");
-            return new AbortController();
+    }
+    function extensionUiController(signal) {
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+        return new AbortController();
+    }
+    const extensionUiIconPaths = {
+        settings: "M4 6h16 M4 12h16 M4 18h16 M8 4v4 M16 10v4 M10 16v4",
+        edit: "M4 20l4-1 12-12-3-3L5 16z M14 7l3 3",
+        delete: "M4 7h16 M9 7V4h6v3 M6 7l1 13h10l1-13 M10 10v7 M14 10v7",
+        more: "M5 12h.01 M12 12h.01 M19 12h.01",
+        refresh: "M20 4v5h-5 M20 9a8 8 0 1 0 .2 5",
+        search: "M15.5 15.5L21 21 M17 10.5a6.5 6.5 0 1 1-13 0 6.5 6.5 0 1 1 13 0",
+        close: "M6 6l12 12 M18 6L6 18",
+    };
+    function extensionUiIconNode(icon) {
+        const namespace = "http://www.w3.org/2000/svg";
+        const svg = document.createElementNS(namespace, "svg");
+        svg.setAttribute("class", "plugin-action-icon");
+        svg.setAttribute("aria-hidden", "true");
+        svg.setAttribute("focusable", "false");
+        svg.setAttribute("viewBox", "0 0 24 24");
+        svg.setAttribute("width", "18");
+        svg.setAttribute("height", "18");
+        svg.setAttribute("fill", "none");
+        svg.setAttribute("stroke", "currentColor");
+        svg.setAttribute("stroke-width", "2");
+        svg.setAttribute("stroke-linecap", "round");
+        svg.setAttribute("stroke-linejoin", "round");
+        const path = document.createElementNS(namespace, "path");
+        path.setAttribute("d", extensionUiIconPaths[icon]);
+        svg.append(path);
+        return svg;
+    }
+    function createExtensionUiBooleanField(signal, options, kind) {
+        if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "boolean")
+            throw new Error("Invalid plugin toggle.");
+        validateExtensionUiFieldOptions(options);
+        const controller = extensionUiController(signal);
+        const checkbox = Amaterasu.input("", "", "checkbox");
+        checkbox.checked = options.value;
+        let currentValue = options.value;
+        const state = {
+            disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+            help: options.help, error: options.error,
         };
+        checkbox.addEventListener("click", (event) => {
+            if (state.readOnly) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        }, { capture: true, signal: controller.signal });
+        checkbox.addEventListener("change", (event) => {
+            if (state.disabled || state.readOnly) {
+                checkbox.checked = currentValue;
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                return;
+            }
+            currentValue = checkbox.checked;
+            options.onChange?.(currentValue);
+        }, { signal: controller.signal });
+        const element = Amaterasu.el("div", `field plugin-control plugin-${kind}`, extensionUiControlLabel(options.label, checkbox), checkbox);
+        const setState = extensionUiFieldState(element, [checkbox], state, (next) => {
+            checkbox.disabled = next.disabled;
+            checkbox.required = next.required;
+            if (next.readOnly)
+                checkbox.setAttribute("aria-readonly", "true");
+            else
+                checkbox.removeAttribute("aria-readonly");
+        });
+        return extensionUiControl(element, () => checkbox.checked, (value) => {
+            if (typeof value !== "boolean")
+                throw new Error("Toggle value must be boolean.");
+            currentValue = value;
+            checkbox.checked = value;
+        }, controller, signal, undefined, undefined, setState);
+    }
+    function createExtensionUiStringField(signal, options, kind) {
+        if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "string")
+            throw new Error("Invalid plugin text field.");
+        validateExtensionUiFieldOptions(options);
+        if (options.maxLength !== undefined && (!Number.isSafeInteger(options.maxLength) || options.maxLength < 1 || options.maxLength > 65536))
+            throw new Error("Invalid plugin text field maximum length.");
+        if (options.maxLength !== undefined && options.value.length > options.maxLength)
+            throw new Error("Plugin text field value exceeds its maximum length.");
+        const controller = extensionUiController(signal);
+        const textInput = Amaterasu.input("", options.value, kind);
+        if (options.placeholder !== undefined)
+            extensionUiSetTextAttribute(textInput, "placeholder", options.placeholder);
+        if (options.maxLength !== undefined)
+            textInput.maxLength = options.maxLength;
+        let currentValue = options.value;
+        const state = {
+            disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+            help: options.help, error: options.error,
+        };
+        textInput.addEventListener("input", (event) => {
+            if (state.disabled || state.readOnly) {
+                textInput.value = currentValue;
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                return;
+            }
+            if (options.maxLength !== undefined && textInput.value.length > options.maxLength) {
+                textInput.value = currentValue;
+                textInput.setAttribute("aria-invalid", "true");
+                return;
+            }
+            currentValue = textInput.value;
+            if (state.error === undefined)
+                textInput.removeAttribute("aria-invalid");
+            options.onChange?.(currentValue);
+        }, { capture: true, signal: controller.signal });
+        const fieldClass = kind === "search" ? "field plugin-control plugin-search-field" : "field plugin-control";
+        const element = Amaterasu.el("div", fieldClass, extensionUiControlLabel(options.label, textInput), textInput);
+        const setState = extensionUiFieldState(element, [textInput], state, (next) => {
+            textInput.disabled = next.disabled;
+            textInput.readOnly = next.readOnly;
+            textInput.required = next.required;
+            if (next.readOnly)
+                textInput.setAttribute("aria-readonly", "true");
+            else
+                textInput.removeAttribute("aria-readonly");
+        });
+        return extensionUiControl(element, () => textInput.value, (value) => {
+            if (typeof value !== "string")
+                throw new Error("Text field value must be a string.");
+            if (options.maxLength !== undefined && value.length > options.maxLength)
+                throw new Error("Text field value exceeds its maximum length.");
+            currentValue = value;
+            textInput.value = value;
+            if (state.error === undefined)
+                textInput.removeAttribute("aria-invalid");
+        }, controller, signal, undefined, undefined, setState);
+    }
+    function createExtensionUiAction(signal, options, icon) {
+        if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.onClick !== "function" ||
+            options.variant !== undefined && !["primary", "secondary", "danger", "outline", "ghost"].includes(options.variant))
+            throw new Error("Invalid plugin action button.");
+        validateExtensionUiFieldOptions(options);
+        extensionUiValidateLabel(options.label);
+        const controller = extensionUiController(signal);
+        const buttonClass = `button ${options.variant ?? "secondary"} plugin-action-button${icon ? " icon-button" : ""}`;
+        const button = Amaterasu.el("button", buttonClass, icon ? extensionUiIconNode(icon) : extensionUiTextNode(options.label));
+        if (icon)
+            extensionUiSetTextAttribute(button, "aria-label", options.label);
+        button.type = "button";
+        const state = {
+            disabled: options.disabled === true, busy: options.busy === true, readOnly: false, required: false,
+            help: options.help, error: options.error,
+        };
+        const element = Amaterasu.el("div", icon ? "field plugin-control plugin-action plugin-icon-action" : "field plugin-control plugin-action", button);
+        let pendingActions = 0;
+        let disposed = false;
+        const setFieldState = extensionUiFieldState(element, [button], state, (next) => {
+            button.disabled = next.disabled || next.busy || pendingActions > 0;
+        }, false, () => pendingActions > 0);
+        const updateState = (patch) => {
+            if (!controller.signal.aborted) {
+                if (Object.keys(patch).some((key) => !["disabled", "busy", "help", "error"].includes(key)))
+                    throw new Error("Unsupported plugin action button state.");
+                setFieldState(patch);
+            }
+        };
+        const settleAction = (restoreFocus) => {
+            pendingActions = Math.max(0, pendingActions - 1);
+            if (!disposed) {
+                setFieldState({});
+                if (restoreFocus && !button.disabled && document.activeElement === document.body)
+                    button.focus();
+            }
+        };
+        button.addEventListener("click", (event) => {
+            if (state.disabled || state.busy || pendingActions > 0)
+                return;
+            const restoreFocus = document.activeElement === button;
+            pendingActions++;
+            try {
+                const result = options.onClick(event);
+                if (result && typeof result.then === "function") {
+                    if (!disposed)
+                        setFieldState({});
+                    void Promise.resolve(result).then(() => settleAction(restoreFocus), (error) => { settleAction(restoreFocus); throw error; });
+                }
+                else
+                    settleAction(restoreFocus);
+            }
+            catch (error) {
+                settleAction(restoreFocus);
+                throw error;
+            }
+        }, { signal: controller.signal });
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            controller.abort();
+            signal.removeEventListener("abort", dispose);
+        };
+        if (signal.aborted)
+            dispose();
+        else
+            signal.addEventListener("abort", dispose, { once: true });
+        return Object.freeze({
+            element,
+            busy: () => state.busy || pendingActions > 0,
+            setState: (patch) => { if (!disposed)
+                updateState(patch); },
+            dispose,
+        });
+    }
+    function createExtensionUiControlsV3(signal) {
+        validateExtensionUiSignal(signal);
+        const controls = {
+            checkbox(options) {
+                return createExtensionUiBooleanField(signal, options, "checkbox");
+            },
+            searchField(options) {
+                return createExtensionUiStringField(signal, options, "search");
+            },
+            iconButton(options) {
+                const icon = options?.icon;
+                if (typeof icon !== "string" || !Object.hasOwn(extensionUiIconPaths, icon))
+                    throw new Error("Invalid plugin UI action icon.");
+                return createExtensionUiAction(signal, options, icon);
+            },
+        };
+        return Object.freeze(controls);
+    }
+    Amaterasu.createExtensionUiControlsV3 = createExtensionUiControlsV3;
+    function createExtensionUiV1(signal) {
+        validateExtensionUiSignal(signal);
+        const makeController = () => extensionUiController(signal);
         const ui = {
             version: 1,
             toggle(options) {
-                if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "boolean")
-                    throw new Error("Invalid plugin toggle.");
-                validateExtensionUiFieldOptions(options);
-                const controller = makeController();
-                const checkbox = Amaterasu.input("", "", "checkbox");
-                checkbox.checked = options.value;
-                let currentValue = options.value;
-                const state = {
-                    disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
-                    help: options.help, error: options.error,
-                };
-                checkbox.addEventListener("click", (event) => {
-                    if (state.readOnly) {
-                        event.preventDefault();
-                        event.stopImmediatePropagation();
-                    }
-                }, { capture: true, signal: controller.signal });
-                checkbox.addEventListener("change", (event) => {
-                    if (state.disabled || state.readOnly) {
-                        checkbox.checked = currentValue;
-                        event.preventDefault();
-                        event.stopImmediatePropagation();
-                        return;
-                    }
-                    currentValue = checkbox.checked;
-                    options.onChange?.(currentValue);
-                }, { signal: controller.signal });
-                const element = Amaterasu.el("div", "field plugin-control plugin-toggle", extensionUiControlLabel(options.label, checkbox), checkbox);
-                const setState = extensionUiFieldState(element, [checkbox], state, (next) => {
-                    checkbox.disabled = next.disabled;
-                    checkbox.required = next.required;
-                    if (next.readOnly)
-                        checkbox.setAttribute("aria-readonly", "true");
-                    else
-                        checkbox.removeAttribute("aria-readonly");
-                });
-                return extensionUiControl(element, () => checkbox.checked, (value) => {
-                    if (typeof value !== "boolean")
-                        throw new Error("Toggle value must be boolean.");
-                    currentValue = value;
-                    checkbox.checked = value;
-                }, controller, signal, undefined, undefined, setState);
+                return createExtensionUiBooleanField(signal, options, "toggle");
             },
             select(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object")
@@ -21752,61 +22005,7 @@ var Amaterasu;
                 return extensionUiControl(group.node, group.value, group.setValue, controller, signal, group.dispose, setChoices, setState);
             },
             textField(options) {
-                if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "string")
-                    throw new Error("Invalid plugin text field.");
-                validateExtensionUiFieldOptions(options);
-                if (options.maxLength !== undefined && (!Number.isSafeInteger(options.maxLength) || options.maxLength < 1 || options.maxLength > 65536))
-                    throw new Error("Invalid plugin text field maximum length.");
-                if (options.maxLength !== undefined && options.value.length > options.maxLength)
-                    throw new Error("Plugin text field value exceeds its maximum length.");
-                const controller = makeController();
-                const textInput = Amaterasu.input("", options.value, "text");
-                if (options.placeholder !== undefined)
-                    extensionUiSetPlaceholder(textInput, options.placeholder);
-                if (options.maxLength !== undefined)
-                    textInput.maxLength = options.maxLength;
-                let currentValue = options.value;
-                const state = {
-                    disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
-                    help: options.help, error: options.error,
-                };
-                textInput.addEventListener("input", (event) => {
-                    if (state.disabled || state.readOnly) {
-                        textInput.value = currentValue;
-                        event.preventDefault();
-                        event.stopImmediatePropagation();
-                        return;
-                    }
-                    if (options.maxLength !== undefined && textInput.value.length > options.maxLength) {
-                        textInput.value = currentValue;
-                        textInput.setAttribute("aria-invalid", "true");
-                        return;
-                    }
-                    currentValue = textInput.value;
-                    if (state.error === undefined)
-                        textInput.removeAttribute("aria-invalid");
-                    options.onChange?.(currentValue);
-                }, { capture: true, signal: controller.signal });
-                const element = Amaterasu.el("div", "field plugin-control", extensionUiControlLabel(options.label, textInput), textInput);
-                const setState = extensionUiFieldState(element, [textInput], state, (next) => {
-                    textInput.disabled = next.disabled;
-                    textInput.readOnly = next.readOnly;
-                    textInput.required = next.required;
-                    if (next.readOnly)
-                        textInput.setAttribute("aria-readonly", "true");
-                    else
-                        textInput.removeAttribute("aria-readonly");
-                });
-                return extensionUiControl(element, () => textInput.value, (value) => {
-                    if (typeof value !== "string")
-                        throw new Error("Text field value must be a string.");
-                    if (options.maxLength !== undefined && value.length > options.maxLength)
-                        throw new Error("Text field value exceeds its maximum length.");
-                    currentValue = value;
-                    textInput.value = value;
-                    if (state.error === undefined)
-                        textInput.removeAttribute("aria-invalid");
-                }, controller, signal, undefined, undefined, setState);
+                return createExtensionUiStringField(signal, options, "text");
             },
             numberField(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "number")
@@ -21826,7 +22025,7 @@ var Amaterasu;
                     numberInput.max = String(options.maximum);
                 numberInput.step = String(options.step ?? "any");
                 if (options.placeholder !== undefined)
-                    extensionUiSetPlaceholder(numberInput, options.placeholder);
+                    extensionUiSetTextAttribute(numberInput, "placeholder", options.placeholder);
                 let currentValue = options.value;
                 const state = {
                     disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
@@ -21890,76 +22089,7 @@ var Amaterasu;
                 }, controller, signal, undefined, undefined, setState);
             },
             button(options) {
-                if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.onClick !== "function" ||
-                    options.variant !== undefined && !["primary", "secondary", "danger"].includes(options.variant))
-                    throw new Error("Invalid plugin action button.");
-                validateExtensionUiFieldOptions(options);
-                extensionUiValidateLabel(options.label);
-                const controller = makeController();
-                const button = Amaterasu.el("button", `button ${options.variant ?? "secondary"} plugin-action-button`, extensionUiTextNode(options.label));
-                button.type = "button";
-                const state = {
-                    disabled: options.disabled === true, busy: options.busy === true, readOnly: false, required: false,
-                    help: options.help, error: options.error,
-                };
-                const element = Amaterasu.el("div", "field plugin-control plugin-action", button);
-                let pendingActions = 0;
-                let disposed = false;
-                const setFieldState = extensionUiFieldState(element, [button], state, (next) => {
-                    button.disabled = next.disabled || next.busy || pendingActions > 0;
-                }, false, () => pendingActions > 0);
-                const updateState = (patch) => {
-                    if (!controller.signal.aborted) {
-                        if (Object.keys(patch).some((key) => !["disabled", "busy", "help", "error"].includes(key)))
-                            throw new Error("Unsupported plugin action button state.");
-                        setFieldState(patch);
-                    }
-                };
-                const settleAction = (restoreFocus) => {
-                    pendingActions = Math.max(0, pendingActions - 1);
-                    if (!disposed) {
-                        setFieldState({});
-                        if (restoreFocus && !button.disabled && document.activeElement === document.body)
-                            button.focus();
-                    }
-                };
-                button.addEventListener("click", (event) => {
-                    if (state.disabled || state.busy || pendingActions > 0)
-                        return;
-                    const restoreFocus = document.activeElement === button;
-                    pendingActions++;
-                    setFieldState({});
-                    try {
-                        const result = options.onClick(event);
-                        if (result && typeof result.then === "function") {
-                            void Promise.resolve(result).then(() => settleAction(restoreFocus), (error) => { settleAction(restoreFocus); throw error; });
-                        }
-                        else
-                            settleAction(restoreFocus);
-                    }
-                    catch (error) {
-                        settleAction(restoreFocus);
-                        throw error;
-                    }
-                }, { signal: controller.signal });
-                const dispose = () => {
-                    if (disposed)
-                        return;
-                    disposed = true;
-                    controller.abort();
-                    signal.removeEventListener("abort", dispose);
-                };
-                if (signal.aborted)
-                    dispose();
-                else
-                    signal.addEventListener("abort", dispose, { once: true });
-                return Object.freeze({
-                    element,
-                    busy: () => state.busy || pendingActions > 0,
-                    setState: (patch) => { if (!disposed)
-                        updateState(patch); },
-                    dispose,
-                });
+                return createExtensionUiAction(signal, options);
             },
             slider(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object")
@@ -21990,6 +22120,264 @@ var Amaterasu;
         return Object.freeze(ui);
     }
     Amaterasu.createExtensionUiV1 = createExtensionUiV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    const extensionUiBadgeTones = ["neutral", "success", "warning", "error", "info"];
+    const extensionUiTooltipTriggers = new WeakSet();
+    let nextExtensionUiTooltipId = 0;
+    function ensureExtensionUiElementsActive(signal) {
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+    }
+    Amaterasu.ensureExtensionUiElementsActive = ensureExtensionUiElementsActive;
+    function disposableExtensionUiElement(element, signal, release) {
+        let disposed = false;
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            signal.removeEventListener("abort", dispose);
+            release?.();
+            element.remove();
+        };
+        signal.addEventListener("abort", dispose, { once: true });
+        return Object.freeze({ element, dispose });
+    }
+    Amaterasu.disposableExtensionUiElement = disposableExtensionUiElement;
+    function extensionUiTooltipButton(trigger) {
+        if (trigger instanceof HTMLButtonElement)
+            return trigger;
+        if (trigger instanceof HTMLElement) {
+            const buttons = trigger.querySelectorAll("button");
+            if (buttons.length === 1 && buttons[0] instanceof HTMLButtonElement)
+                return buttons[0];
+        }
+        throw new Error("A plugin tooltip trigger must be a button or contain exactly one button.");
+    }
+    function extensionUiDescriptionIds(button) {
+        return (button.getAttribute("aria-describedby") ?? "").trim().split(/\s+/).filter(Boolean);
+    }
+    function positionExtensionUiTooltip(anchor, tooltip) {
+        const viewport = anchor.ownerDocument.documentElement;
+        const rect = anchor.getBoundingClientRect();
+        const padding = 8;
+        const rightmost = viewport.clientWidth - tooltip.offsetWidth - padding;
+        const left = Math.max(padding, Math.min(rect.left, rightmost));
+        tooltip.style.setProperty("--plugin-tooltip-offset", `${left - rect.left}px`);
+        const height = tooltip.offsetHeight;
+        tooltip.dataset.placement = rect.bottom + height > viewport.clientHeight - padding && rect.top >= height + padding
+            ? "above" : "below";
+    }
+    function createExtensionUiTooltip(signal, options) {
+        const { trigger } = options;
+        const button = extensionUiTooltipButton(trigger);
+        if (extensionUiTooltipTriggers.has(button))
+            throw new Error("The plugin tooltip trigger already has a tooltip.");
+        const tooltip = Amaterasu.el("span", "plugin-tooltip", Amaterasu.extensionUiTextNode(options.message));
+        tooltip.id = `amaterasu-plugin-tooltip-${++nextExtensionUiTooltipId}`;
+        tooltip.hidden = true;
+        tooltip.setAttribute("role", "tooltip");
+        const anchor = Amaterasu.el("div", "plugin-tooltip-anchor", trigger, tooltip);
+        const document = button.ownerDocument;
+        const listeners = new AbortController();
+        extensionUiTooltipTriggers.add(button);
+        const describeTrigger = () => {
+            const ids = extensionUiDescriptionIds(button);
+            if (!ids.includes(tooltip.id))
+                button.setAttribute("aria-describedby", [...ids, tooltip.id].join(" "));
+        };
+        describeTrigger();
+        const descriptions = new MutationObserver(describeTrigger);
+        descriptions.observe(button, { attributes: true, attributeFilter: ["aria-describedby"] });
+        let hovered = false;
+        let focused = false;
+        let dismissed = false;
+        const position = () => positionExtensionUiTooltip(anchor, tooltip);
+        const updateVisibility = () => {
+            const visible = !dismissed && (hovered || focused);
+            if (visible === !tooltip.hidden)
+                return;
+            tooltip.hidden = !visible;
+            if (visible) {
+                position();
+                document.addEventListener("keydown", dismiss, { capture: true, signal: listeners.signal });
+                document.addEventListener("scroll", position, { capture: true, passive: true, signal: listeners.signal });
+                document.defaultView?.addEventListener("resize", position, { signal: listeners.signal });
+            }
+            else {
+                document.removeEventListener("keydown", dismiss, true);
+                document.removeEventListener("scroll", position, true);
+                document.defaultView?.removeEventListener("resize", position);
+            }
+        };
+        const dismiss = (event) => {
+            if (event.key !== "Escape")
+                return;
+            event.preventDefault();
+            event.stopPropagation();
+            dismissed = true;
+            updateVisibility();
+        };
+        const listenerOptions = { signal: listeners.signal };
+        anchor.addEventListener("pointerenter", (event) => {
+            if (event.pointerType === "touch")
+                return;
+            hovered = true;
+            dismissed = false;
+            updateVisibility();
+        }, listenerOptions);
+        anchor.addEventListener("pointerleave", () => {
+            hovered = false;
+            updateVisibility();
+        }, listenerOptions);
+        button.addEventListener("focus", () => {
+            focused = true;
+            dismissed = false;
+            updateVisibility();
+        }, listenerOptions);
+        button.addEventListener("blur", () => {
+            focused = false;
+            updateVisibility();
+        }, listenerOptions);
+        return disposableExtensionUiElement(anchor, signal, () => {
+            listeners.abort();
+            descriptions.disconnect();
+            const ids = extensionUiDescriptionIds(button).filter((id) => id !== tooltip.id);
+            if (ids.length)
+                button.setAttribute("aria-describedby", ids.join(" "));
+            else
+                button.removeAttribute("aria-describedby");
+            extensionUiTooltipTriggers.delete(button);
+            tooltip.hidden = true;
+            anchor.replaceChildren();
+        });
+    }
+    function createExtensionUiElementsV1(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin UI requires a lifecycle signal.");
+        ensureExtensionUiElementsActive(signal);
+        const elements = {
+            version: 1,
+            badge(options) {
+                ensureExtensionUiElementsActive(signal);
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin badge.");
+                const tone = options.tone === undefined ? "neutral" : options.tone;
+                if (!extensionUiBadgeTones.includes(tone))
+                    throw new Error("Invalid plugin badge tone.");
+                const element = Amaterasu.el("span", "badge plugin-badge", Amaterasu.extensionUiTextNode(options.label));
+                element.dataset.tone = tone;
+                return disposableExtensionUiElement(element, signal);
+            },
+            tooltip(options) {
+                ensureExtensionUiElementsActive(signal);
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin tooltip.");
+                return createExtensionUiTooltip(signal, options);
+            },
+        };
+        return Object.freeze(elements);
+    }
+    Amaterasu.createExtensionUiElementsV1 = createExtensionUiElementsV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    const infoIconPaths = {
+        gpu: "M5 2h14v2h3v2h-3v2h3v2h-3v2h3v2h-3v2h3v2h-3v3H5v-3H2v-2h3v-2H2v-2h3v-2H2V8h3V6H2V4h3z M7 5v13h10V5z M8 6h8v11H8z M13.8 9l-3.3 3H9l3.1-3z M15 11v1.8l-2.5 2.4H11z",
+        capture: "M2 3h20v14H2z M4 5v10h16V5z M5 14l10-7-2.5 4.6 5.2.4-3 2z M10 17h4l.7 2.6 4.3.5V22H5v-1.9l4.3-.5z",
+        encoder: "M2 4.3 20.8.8l.8 4.6L2.7 9z M4.5 4.5l2 2.5 2.6-.5-2-2.5z M11.8 3.1l2 2.5 2.5-.5-2-2.4z M3 9.7h18V21H3z M10 12v6l5.6-3.1z",
+        catalog: "M2 5a2 2 0 0 1 2-2h6l2.2 2H20a2 2 0 0 1 2 2v2H2z M2 10h20l-2 11H4z M7 13v2h9v-2z",
+        sessions: "M2 5h13V2l6 5-6 5V9H2z M22 15H9v-3l-6 5 6 5v-3h13z",
+        processes: "M2 3h20v15H2z M4 5v11h16V5z M5 11h3l2-4 3 5 1-2h5v2h-4l-2 3-3-5-1 3H5z M10 18h4v2h4v2H6v-2h4z",
+        discoveries: "M12 1.5a10.5 10.5 0 1 1 0 21 10.5 10.5 0 1 1 0-21z M12 4a8 8 0 1 0 0 16 8 8 0 0 0 0-16z M17.4 6.6l-3.8 7-7 3.8 3.8-7z M12 11a1 1 0 1 0 0 2 1 1 0 0 0 0-2z",
+    };
+    const statusGlyphPaths = {
+        success: "M3.5 12.8 6 10.1l4.1 3.7 8.8-9.4 2.2 2.5-10.8 13z",
+        warning: "M10 4.2h4L13.2 14h-2.4z M10.4 16h3.2v3.6h-3.2z",
+        error: "M5.2 7.4l2.2-2.2 4.6 4.6 4.6-4.6 2.2 2.2-4.6 4.6 4.6 4.6-2.2 2.2-4.6-4.6-4.6 4.6-2.2-2.2L9.8 12z",
+        info: "M10.1 4h3.8v3.8h-3.8z M10.4 10h3.2v9.9h-3.2z",
+        neutral: "M5 10.4h14v3.2H5z",
+    };
+    let nextSummaryHeading = 0;
+    function summaryPictogram(data) {
+        const ns = "http://www.w3.org/2000/svg";
+        const svg = document.createElementNS(ns, "svg");
+        svg.setAttribute("viewBox", "0 0 24 24");
+        svg.setAttribute("aria-hidden", "true");
+        svg.setAttribute("focusable", "false");
+        const path = document.createElementNS(ns, "path");
+        path.setAttribute("fill", "currentColor");
+        path.setAttribute("fill-rule", "evenodd");
+        path.setAttribute("d", data);
+        svg.append(path);
+        return svg;
+    }
+    function summaryStatusCard(options) {
+        const tone = options.tone ?? "neutral";
+        if (typeof tone !== "string" || !Object.hasOwn(statusGlyphPaths, tone))
+            throw new Error("Invalid status card tone.");
+        const title = Amaterasu.el("h2", "ink-status-title", options.title);
+        title.id = `amaterasu-summary-heading-${++nextSummaryHeading}`;
+        const copy = Amaterasu.el("div", "ink-summary-copy", title);
+        if (options.description !== undefined)
+            copy.append(Amaterasu.el("p", "ink-summary-description", options.description));
+        const seal = Amaterasu.el("span", "ink-seal ink-status-seal", summaryPictogram(statusGlyphPaths[tone]));
+        seal.setAttribute("aria-hidden", "true");
+        const card = Amaterasu.el("section", "ink-status-card");
+        card.setAttribute("aria-labelledby", title.id);
+        card.setAttribute("data-summary-tone", tone);
+        if (options.label !== undefined)
+            card.append(Amaterasu.el("p", "ink-summary-label", options.label));
+        card.append(Amaterasu.el("div", "ink-status-body", seal, copy));
+        return card;
+    }
+    Amaterasu.summaryStatusCard = summaryStatusCard;
+    function summaryInfoCard(options) {
+        const card = Amaterasu.el("div", "ink-info-card");
+        if (options.icon !== undefined) {
+            if (typeof options.icon !== "string" || !Object.hasOwn(infoIconPaths, options.icon))
+                throw new Error("Invalid info card icon.");
+            card.append(Amaterasu.el("span", "ink-info-icon", summaryPictogram(infoIconPaths[options.icon])));
+        }
+        const copy = Amaterasu.el("div", "ink-summary-copy", Amaterasu.el("span", "ink-summary-label", options.label), Amaterasu.el("strong", "ink-info-value", options.value));
+        if (options.description !== undefined)
+            copy.append(Amaterasu.el("small", "ink-summary-description", options.description));
+        card.append(copy);
+        return card;
+    }
+    Amaterasu.summaryInfoCard = summaryInfoCard;
+    function createExtensionUiSummaryV1(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin UI requires a lifecycle signal.");
+        Amaterasu.ensureExtensionUiElementsActive(signal);
+        const optionalText = (value) => value === undefined ? undefined : Amaterasu.extensionUiTextNode(value);
+        const api = {
+            version: 1,
+            statusCard(options) {
+                Amaterasu.ensureExtensionUiElementsActive(signal);
+                const card = summaryStatusCard({
+                    title: Amaterasu.extensionUiTextNode(options.title),
+                    label: optionalText(options.label),
+                    description: optionalText(options.description),
+                    tone: options.tone,
+                });
+                return Amaterasu.disposableExtensionUiElement(card, signal);
+            },
+            infoCard(options) {
+                Amaterasu.ensureExtensionUiElementsActive(signal);
+                const card = summaryInfoCard({
+                    label: Amaterasu.extensionUiTextNode(options.label),
+                    value: typeof options.value === "string" ? document.createTextNode(options.value) : Amaterasu.extensionUiTextNode(options.value),
+                    description: optionalText(options.description),
+                    icon: options.icon,
+                });
+                return Amaterasu.disposableExtensionUiElement(card, signal);
+            },
+        };
+        return Object.freeze(api);
+    }
+    Amaterasu.createExtensionUiSummaryV1 = createExtensionUiSummaryV1;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -22044,12 +22432,17 @@ var Amaterasu;
         if (!options || typeof options !== "object" || Array.isArray(options))
             throw new Error("Invalid plugin UI card.");
         extensionUiLayoutRequiredText(options.label, "card label");
+        const appearance = options.appearance === undefined ? "plain" : options.appearance;
+        if (appearance !== "plain" && appearance !== "brush" && appearance !== "illustrated")
+            throw new Error("Invalid plugin UI card appearance.");
         const id = `amaterasu-plugin-card-${++nextExtensionUiLayoutId}`;
         const heading = Amaterasu.el("h2", "", extensionUiLayoutTextNode(options.label));
         heading.id = `${id}-heading`;
         const content = Amaterasu.el("div", "plugin-ui-card-content");
         const element = Amaterasu.el("section", "panel plugin-ui-card", heading, content);
         element.setAttribute("aria-labelledby", heading.id);
+        if (appearance !== "plain")
+            element.setAttribute("data-appearance", appearance);
         let disposed = false;
         const dispose = () => {
             if (disposed)
@@ -22533,18 +22926,33 @@ var Amaterasu;
                 const severity = options.severity === undefined ? "info" : options.severity;
                 if (!["info", "success", "warning", "error"].includes(severity))
                     throw new Error("Invalid plugin alert severity.");
+                if (options.dismissible !== undefined && typeof options.dismissible !== "boolean")
+                    throw new Error("Invalid plugin alert dismissible state.");
                 const element = makeElement("plugin-feedback-alert");
-                element.setAttribute("role", "alert");
-                element.setAttribute("aria-live", "assertive");
-                element.setAttribute("aria-atomic", "true");
+                const messageElement = options.dismissible ? Amaterasu.el("span", "plugin-feedback-message") : element;
+                messageElement.setAttribute("role", "alert");
+                messageElement.setAttribute("aria-live", "assertive");
+                messageElement.setAttribute("aria-atomic", "true");
                 element.setAttribute("data-severity", severity);
-                feedbackSetMessage(element, options.message);
+                feedbackSetMessage(messageElement, options.message);
+                const dismiss = options.dismissible ? Amaterasu.el("button", "button ghost plugin-alert-dismiss") : null;
+                const hide = () => { element.hidden = true; };
+                if (dismiss) {
+                    dismiss.type = "button";
+                    Amaterasu.setLocalizedAttribute(dismiss, "aria-label", "Dismiss alert");
+                    const glyph = Amaterasu.el("span", "", "×");
+                    glyph.setAttribute("aria-hidden", "true");
+                    dismiss.append(glyph);
+                    dismiss.addEventListener("click", hide, { signal });
+                    element.setAttribute("data-dismissible", "");
+                    element.append(messageElement, dismiss);
+                }
                 let disposed = false;
                 const handle = feedbackHandle(element, signal, {
                     setMessage(message) {
                         if (disposed || signal.aborted)
                             return;
-                        feedbackSetMessage(element, message);
+                        feedbackSetMessage(messageElement, message);
                     },
                     setSeverity(nextSeverity) {
                         if (disposed || signal.aborted)
@@ -22555,7 +22963,14 @@ var Amaterasu;
                     },
                 });
                 const originalDispose = handle.dispose;
-                return Object.freeze({ ...handle, dispose() { disposed = true; originalDispose(); } });
+                return Object.freeze({
+                    ...handle,
+                    dispose() {
+                        disposed = true;
+                        dismiss?.removeEventListener("click", hide);
+                        originalDispose();
+                    },
+                });
             },
             progress(options) {
                 feedbackLifecycle(signal);
@@ -22665,6 +23080,12 @@ var Amaterasu;
             throw new Error("Invalid plugin dialog translations.");
         return Amaterasu.localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source));
     }
+    function extensionUiDialogOwnsNode(value, allowedTypes) {
+        if (!value || typeof value !== "object")
+            return false;
+        const node = value;
+        return node.ownerDocument === document && allowedTypes.includes(node.nodeType);
+    }
     function extensionUiDialogContent(content) {
         if (content === undefined)
             return [];
@@ -22672,11 +23093,20 @@ var Amaterasu;
         return values.map((value) => {
             if (typeof value === "string")
                 return document.createTextNode(value);
-            if (!value || typeof value !== "object" || value.ownerDocument !== document ||
-                ![1, 3, 11].includes(value.nodeType))
+            if (!extensionUiDialogOwnsNode(value, [1, 3, 11]))
                 throw new Error("Dialog content must be text or a node owned by this document.");
             return value;
         });
+    }
+    function extensionUiDialogActions(actions, content) {
+        if (actions === undefined)
+            return [];
+        if (!Array.isArray(actions) || actions.some(action => !(action instanceof HTMLElement) || !extensionUiDialogOwnsNode(action, [1])))
+            throw new Error("Dialog actions must be elements owned by this document.");
+        if (new Set(actions).size !== actions.length || actions.some(action => content.some(node => node.contains(action) || action.contains(node)) ||
+            actions.some(other => other !== action && action.contains(other))))
+            throw new Error("Dialog actions must be separate from the dialog content and from each other.");
+        return [...actions];
     }
     function createExtensionUiDialogsV1(signal) {
         if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
@@ -22696,11 +23126,11 @@ var Amaterasu;
                     ? null : extensionUiDialogTextNode(options.description);
                 const cancelLabel = extensionUiDialogTextNode(options.cancelLabel ?? "Cancel");
                 const contentNodes = extensionUiDialogContent(options.content);
+                const actionNodes = extensionUiDialogActions(options.actions, contentNodes);
                 const initialFocus = options.initialFocus;
                 if (initialFocus !== undefined && (!initialFocus || typeof initialFocus.focus !== "function" ||
-                    initialFocus.ownerDocument !== document || !contentNodes.some((node) => node === initialFocus ||
-                    ((node.nodeType === 1 || node.nodeType === 11) && node.contains(initialFocus)))))
-                    throw new Error("Dialog initial focus must be inside its content.");
+                    initialFocus.ownerDocument !== document || ![...contentNodes, ...actionNodes].some(node => node.contains(initialFocus))))
+                    throw new Error("Dialog initial focus must be inside its content or actions.");
                 const instanceId = ++nextExtensionUiDialogId;
                 const titleId = `amaterasu-plugin-dialog-title-${instanceId}`;
                 const descriptionId = `amaterasu-plugin-dialog-description-${instanceId}`;
@@ -22728,9 +23158,9 @@ var Amaterasu;
                 actions.className = "actions plugin-dialog-actions";
                 const cancelButton = document.createElement("button");
                 cancelButton.type = "button";
-                cancelButton.className = "button secondary";
+                cancelButton.className = actionNodes.length ? "button outline" : "button secondary";
                 cancelButton.append(cancelLabel);
-                actions.append(cancelButton);
+                actions.append(cancelButton, ...actionNodes);
                 element.append(actions);
                 const controller = new AbortController();
                 const nativeClose = element.close.bind(element);
@@ -22983,12 +23413,29 @@ var Amaterasu;
                     (options.maximum !== undefined && !Number.isFinite(options.maximum)) ||
                     (options.minimum !== undefined && options.maximum !== undefined && options.minimum >= options.maximum))
                     throw new Error("Invalid chart scale.");
-                const svg = chartSvg("svg", { viewBox: "0 0 640 180", role: "img", class: "plugin-metric-plot", tabindex: "0", "aria-label": options.label });
+                if (options.appearance !== undefined && options.appearance !== "full" && options.appearance !== "sparkline")
+                    throw new Error("Invalid chart appearance.");
+                const sparkline = options.appearance === "sparkline";
+                const width = 640;
+                const plot = sparkline
+                    ? { left: 4, top: 4, right: 636, bottom: 48 }
+                    : { left: 40, top: 10, right: 630, bottom: 150 };
+                const plotWidth = plot.right - plot.left;
+                const plotHeight = plot.bottom - plot.top;
+                const svg = chartSvg("svg", {
+                    viewBox: `0 0 ${width} ${sparkline ? 52 : 180}`,
+                    role: "img", class: "plugin-metric-plot", tabindex: "0", "aria-label": options.label,
+                    ...(sparkline ? { preserveAspectRatio: "none" } : {}),
+                });
                 const legend = Amaterasu.el("div", "plugin-chart-legend");
-                const readout = Amaterasu.el("p", "plugin-chart-readout muted", "Hover or use arrow keys to inspect values.");
+                const readout = Amaterasu.el("p", "plugin-chart-readout muted", sparkline ? null : "Hover or use arrow keys to inspect values.");
                 readout.setAttribute("aria-live", "polite");
                 const controls = Amaterasu.el("div", "plugin-chart-controls");
-                const element = Amaterasu.el("section", "plugin-metric-chart", Amaterasu.el("h3", "", options.label), legend, svg, controls, readout);
+                const heading = Amaterasu.el("h3", "", options.label);
+                const latest = sparkline ? Amaterasu.el("p", "plugin-chart-latest") : null;
+                const element = sparkline
+                    ? Amaterasu.el("section", "plugin-metric-chart plugin-metric-chart-sparkline", heading, latest, svg, readout)
+                    : Amaterasu.el("section", "plugin-metric-chart", heading, legend, svg, controls, readout);
                 let series = options.series;
                 let disposed = signal.aborted;
                 let zoom = 1;
@@ -22996,17 +23443,36 @@ var Amaterasu;
                 let timestamps = [];
                 let domainStart = 0, domainEnd = 1;
                 const hidden = new Set();
+                const formatter = sparkline ? new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }) : null;
+                const formatValue = (value) => {
+                    if (value == null)
+                        return "Unavailable";
+                    if (!formatter)
+                        return `${value.toFixed(2)} ${options.unit}`;
+                    const number = formatter.format(value);
+                    if (!options.unit)
+                        return number;
+                    return options.unit === "%" ? `${number}%` : `${number} ${options.unit}`;
+                };
                 const showPoint = (time) => {
                     if (disposed)
                         return;
                     const values = series.filter((s) => !hidden.has(s.id)).map((s) => {
                         const point = s.points.reduce((best, p) => !best || Math.abs(p.time - time) < Math.abs(best.time - time) ? p : best, undefined);
-                        return `${s.label}: ${point?.value == null ? "Unavailable" : `${point.value.toFixed(2)} ${options.unit}`}`;
+                        return `${s.label}: ${formatValue(point?.value)}`;
                     });
                     svg.querySelector(".plugin-chart-cursor")?.remove();
-                    const x = 40 + 590 * Math.max(0, Math.min(1, (time - domainStart) / Math.max(1, domainEnd - domainStart)));
-                    svg.append(chartSvg("path", { class: "plugin-chart-cursor", d: `M ${x} 10 V 150`, stroke: "var(--muted)", "stroke-dasharray": "3 3" }));
+                    const x = plot.left + plotWidth * Math.max(0, Math.min(1, (time - domainStart) / Math.max(1, domainEnd - domainStart)));
+                    svg.append(chartSvg("path", {
+                        class: "plugin-chart-cursor", d: `M ${x} ${plot.top} V ${plot.bottom}`,
+                        stroke: "var(--muted)", "stroke-dasharray": "3 3",
+                        ...(sparkline ? { "vector-effect": "non-scaling-stroke" } : {}),
+                    }));
                     readout.textContent = `${new Date(time).toLocaleTimeString()} · ${values.join(" · ")}`;
+                };
+                const clearReadout = () => {
+                    svg.querySelector(".plugin-chart-cursor")?.remove();
+                    readout.textContent = "";
                 };
                 const draw = () => {
                     if (disposed)
@@ -23023,29 +23489,59 @@ var Amaterasu;
                     const low = options.minimum ?? Math.min(0, ...values);
                     const high = options.maximum ?? Math.max(low + 1, ...values);
                     svg.replaceChildren();
-                    for (const fraction of [0, .5, 1]) {
-                        const y = 150 - 140 * fraction;
-                        svg.append(chartSvg("path", { d: `M 40 ${y} H 630`, stroke: "var(--line)", fill: "none" }));
-                        const label = chartSvg("text", { x: "36", y: String(y + 4), "text-anchor": "end", fill: "currentColor", "font-size": "10" });
-                        label.textContent = (low + (high - low) * fraction).toFixed(1);
-                        svg.append(label);
+                    if (!sparkline) {
+                        for (const fraction of [0, .5, 1]) {
+                            const y = plot.bottom - plotHeight * fraction;
+                            svg.append(chartSvg("path", { d: `M ${plot.left} ${y} H ${plot.right}`, stroke: "var(--line)", fill: "none" }));
+                            const label = chartSvg("text", { x: "36", y: String(y + 4), "text-anchor": "end", fill: "currentColor", "font-size": "10" });
+                            label.textContent = (low + (high - low) * fraction).toFixed(1);
+                            svg.append(label);
+                        }
                     }
+                    const strokes = sparkline
+                        ? ["var(--good)", "var(--accent-text)", "var(--fg)"]
+                        : ["var(--accent)", "var(--strong)", "var(--muted)"];
                     for (const [index, item] of visible.entries()) {
                         let path = "";
-                        let connected = false;
+                        let lastCoordinate = "";
+                        let segmentLength = 0;
+                        const finishSegment = () => {
+                            if (sparkline && segmentLength === 1)
+                                path += `L${lastCoordinate} `;
+                            segmentLength = 0;
+                        };
                         for (const point of item.points) {
                             if (point.time < begin || point.value === null) {
-                                connected = false;
+                                finishSegment();
                                 continue;
                             }
-                            const x = 40 + 590 * (point.time - begin) / Math.max(end - begin, 1);
-                            const y = 150 - 140 * Math.max(0, Math.min(1, (point.value - low) / (high - low)));
-                            path += `${connected ? "L" : "M"}${x.toFixed(2)} ${y.toFixed(2)} `;
-                            connected = true;
+                            const x = plot.left + plotWidth * (point.time - begin) / Math.max(end - begin, 1);
+                            const y = plot.bottom - plotHeight * Math.max(0, Math.min(1, (point.value - low) / (high - low)));
+                            lastCoordinate = `${x.toFixed(2)} ${y.toFixed(2)}`;
+                            path += `${segmentLength ? "L" : "M"}${lastCoordinate} `;
+                            segmentLength++;
                         }
-                        svg.append(chartSvg("path", { d: path, fill: "none", stroke: ["var(--accent)", "var(--strong)", "var(--muted)"][index % 3], "stroke-width": "2", "stroke-dasharray": index > 2 ? "5 3" : "none" }));
+                        finishSegment();
+                        const dash = sparkline ? ["none", "6 2", "3 2"][Math.floor(index / 3)] : index > 2 ? "5 3" : "none";
+                        svg.append(chartSvg("path", {
+                            d: path, fill: "none", stroke: strokes[index % strokes.length], "stroke-width": "2", "stroke-dasharray": dash,
+                            ...(sparkline ? { "stroke-linecap": "round", "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke" } : {}),
+                        }));
                     }
-                    svg.setAttribute("aria-label", `${options.label}. ${points.filter((p) => p.value !== null).length} measured values. ${zoom}× zoom. Missing values are gaps.`);
+                    const measured = points.filter((point) => point.value !== null).length;
+                    if (latest) {
+                        const values = visible.map(item => ({
+                            label: item.label,
+                            value: formatValue(item.points.at(-1)?.value),
+                        }));
+                        const labelled = values.map(item => `${item.label}: ${item.value}`).join(" · ");
+                        latest.textContent = values.length === 1 ? values[0].value : labelled || "Unavailable";
+                        svg.setAttribute("aria-label", `${options.label}. Latest: ${labelled || "Unavailable"}. ${measured} measured values. Missing values are gaps. Use arrow keys to inspect values.`);
+                        clearReadout();
+                    }
+                    else {
+                        svg.setAttribute("aria-label", `${options.label}. ${measured} measured values. ${zoom}× zoom. Missing values are gaps.`);
+                    }
                 };
                 const updateLegend = () => {
                     legend.replaceChildren();
@@ -23058,8 +23554,11 @@ var Amaterasu;
                         legend.append(toggle);
                     }
                 };
-                for (const [label, factor] of [["Zoom in", 2], ["Zoom out", .5], ["Reset zoom", 0]])
-                    controls.append(Amaterasu.button(label, () => { zoom = factor ? Math.max(1, Math.min(64, zoom * factor)) : 1; draw(); }));
+                if (!sparkline) {
+                    for (const [label, factor] of [["Zoom in", 2], ["Zoom out", .5], ["Reset zoom", 0]])
+                        controls.append(Amaterasu.button(label, () => { zoom = factor ? Math.max(1, Math.min(64, zoom * factor)) : 1; draw(); }));
+                    updateLegend();
+                }
                 const onKey = (event) => {
                     if (disposed || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) || !timestamps.length)
                         return;
@@ -23072,19 +23571,38 @@ var Amaterasu;
                     const first = timestamps[0], last = timestamps.at(-1);
                     if (disposed || first === undefined || last === undefined || bounds.width <= 0)
                         return;
-                    showPoint(domainStart + Math.max(0, Math.min(1, ((event.clientX - bounds.left) / bounds.width * 640 - 40) / 590)) * (domainEnd - domainStart));
+                    const fraction = ((event.clientX - bounds.left) / bounds.width * width - plot.left) / plotWidth;
+                    showPoint(domainStart + Math.max(0, Math.min(1, fraction)) * (domainEnd - domainStart));
                 };
                 svg.addEventListener("keydown", onKey);
                 svg.addEventListener("pointermove", onPointer);
-                const dispose = () => { disposed = true; signal.removeEventListener("abort", dispose); svg.removeEventListener("keydown", onKey); svg.removeEventListener("pointermove", onPointer); };
+                if (sparkline) {
+                    svg.addEventListener("pointerleave", clearReadout);
+                    svg.addEventListener("blur", clearReadout);
+                }
+                const dispose = () => {
+                    disposed = true;
+                    signal.removeEventListener("abort", dispose);
+                    svg.removeEventListener("keydown", onKey);
+                    svg.removeEventListener("pointermove", onPointer);
+                    svg.removeEventListener("pointerleave", clearReadout);
+                    svg.removeEventListener("blur", clearReadout);
+                };
                 signal.addEventListener("abort", dispose, { once: true });
-                updateLegend();
                 draw();
-                return { element, setData(next) { validateExtensionChartSeries(next); if (!disposed) {
+                return {
+                    element,
+                    setData(next) {
+                        validateExtensionChartSeries(next);
+                        if (disposed)
+                            return;
                         series = next;
-                        updateLegend();
+                        if (!sparkline)
+                            updateLegend();
                         draw();
-                    } }, dispose };
+                    },
+                    dispose,
+                };
             },
         };
         return Object.freeze(ui);
@@ -23337,11 +23855,20 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
-                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", "ui.charts/1", "ui.assets/1", ...(descriptor.settings_provider && (application || slot === "settings") ? ["ui.settings/1"] : []), ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
+                features: Object.freeze([
+                    "ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1",
+                    "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1", "ui.sparklines/1", "ui.assets/1", "ui.controls/3", "ui.elements/1",
+                    "ui.summary/1",
+                    ...(descriptor.settings_provider && (application || slot === "settings") ? ["ui.settings/1"] : []),
+                    ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : []),
+                ]),
                 ui: Object.freeze({
                     ...Amaterasu.createExtensionUiWithDialogsV1(controller.signal),
                     ...Amaterasu.createExtensionUiTabsV1(controller.signal),
                     ...Amaterasu.createExtensionUiChartsV1(controller.signal),
+                    ...Amaterasu.createExtensionUiControlsV3(controller.signal),
+                    ...Amaterasu.createExtensionUiElementsV1(controller.signal),
+                    ...Amaterasu.createExtensionUiSummaryV1(controller.signal),
                 }),
                 assets: Object.freeze({ stylesheet: (path) => Amaterasu.loadExtensionStylesheet(id, descriptor.digest, path, controller.signal) }),
                 canCall: (method) => !controller.signal.aborted && aliases.has(method),
@@ -24483,31 +25010,30 @@ var Amaterasu;
         tokens: "API tokens",
         maintenance: "Maintenance",
     };
-    const pageIcons = {
-        overview: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
-        host: "M4 5h16v11H4z M8 20h8 M12 16v4",
-        catalog: "M4 4h7v7H4z M13 4h7v7h-7z M4 13h7v7H4z M13 13h7v7h-7z",
-        integrations: "M8 3v5 M16 3v5 M6 8h12v3a6 6 0 0 1-12 0z M12 17v4",
-        settings: "M4 6h16 M4 12h16 M4 18h16 M8 4v4 M16 10v4 M10 16v4",
-        plugins: "M4 4h7v7H4z M4 13h7v7H4z M13 13h7v7h-7z M16.5 4.5v6 M13.5 7.5h6",
-        sessions: "M4 8h14 M15 5l3 3-3 3 M20 16H6 M9 13l-3 3 3 3",
-        diagnostics: "M3 12h4l2-6 4 12 2-6h6",
-        maintenance: "M14 4a5 5 0 0 0-6 6L3 15l3 3 5-5a5 5 0 0 0 6-6l-3 3-3-3z",
-        tokens: "M8 14a4 4 0 1 1 3.5-6H21v4h-3v3h-3v-3h-3.5A4 4 0 0 1 8 14z M7 10h.01",
-        accounts: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M4 20a8 8 0 0 1 16 0",
+    const shellIcons = {
+        overview: "M3 4h8v8H3z M13 4h8v5h-8z M3 14h8v6H3z M13 11h8v9h-8z",
+        host: "M2 5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v11H2z M5 6v7h14V6z M10 17h4v2h4v2H6v-2h4z",
+        catalog: "M3 3h4v16H3z M9 3h5v16H9z M16 4l3-1 4 15-3 1z M2 20h21v2H2z",
+        integrations: "M7 2h3v5h4V2h3v5h3v3h-2v2a6 6 0 0 1-4.5 5.8V22h-3v-4.2A6 6 0 0 1 6 12v-2H4V7h3z",
+        settings: "M2 4h5V2h3v2h12v3H10v2H7V7H2z M2 10.5h12v-2h3v2h5v3h-5v2h-3v-2H2z M2 17h6v-2h3v2h11v3H11v2H8v-2H2z",
+        plugins: "M3 4h8v7H3z M3 13h8v8H3z M13 13h8v8h-8z M17 1l6 6-6 5-5-5z",
+        sessions: "M2 6h13V2l7 6-7 6v-4H2z M22 14v4H9v4l-7-6 7-6v4z",
+        diagnostics: "M2 3h20v18H2z M4 13h4l2-4 3 8 3-6h4V9h-5l-1.6 3L10 5l-3 6H4z",
+        maintenance: "M20.8 2.9l-4.1 4.2-3.1-3.1 4.1-4A7 7 0 0 0 9 8.6l-7.3 7.2a3.7 3.7 0 0 0 5.3 5.3l7.2-7.3a7 7 0 0 0 6.6-10.9z M5.3 17a1.3 1.3 0 1 1 0 2.6 1.3 1.3 0 0 1 0-2.6z",
+        tokens: "M8 3a6 6 0 0 1 5.7 4H22v4h-2v3h-3v-3h-3.3A6 6 0 1 1 8 3z M6 7a2 2 0 1 0 0 4 2 2 0 0 0 0-4z",
+        accounts: "M12 2a5 5 0 1 1 0 10 5 5 0 0 1 0-10z M3 21a9 9 0 0 1 18 0z",
+        menu: "M3 5h18v3H3z M3 11h18v3H3z M3 17h18v3H3z",
     };
-    function navigationIcon(page) {
+    function shellIcon(name) {
         const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
         icon.setAttribute("viewBox", "0 0 24 24");
         icon.setAttribute("class", "nav-icon");
         icon.setAttribute("aria-hidden", "true");
-        icon.setAttribute("fill", "none");
-        icon.setAttribute("stroke", "currentColor");
-        icon.setAttribute("stroke-width", "1.7");
-        icon.setAttribute("stroke-linecap", "round");
-        icon.setAttribute("stroke-linejoin", "round");
+        icon.setAttribute("focusable", "false");
+        icon.setAttribute("fill", "currentColor");
+        icon.setAttribute("fill-rule", "evenodd");
         const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-        path.setAttribute("d", pageIcons[page]);
+        path.setAttribute("d", shellIcons[name]);
         icon.append(path);
         return icon;
     }
@@ -24533,9 +25059,10 @@ var Amaterasu;
         theme;
         signedIn = false;
         content = Amaterasu.el("main");
+        mastheadContext = Amaterasu.el("p", "console-masthead-context");
         navigation = new Map();
         extensions;
-        extensionIds = new Set();
+        extensionPageNames = new Map();
         notification = Amaterasu.el("div");
         notificationTimer = 0;
         restorationGeneration = 0;
@@ -24609,7 +25136,7 @@ var Amaterasu;
             main.id = "main";
             main.tabIndex = -1;
             main.setAttribute("aria-busy", "true");
-            const intro = Amaterasu.el("section", "login-intro", this.brand(), Amaterasu.el("div", "", Amaterasu.badge("LOCAL HOST MANAGEMENT", "accent"), Amaterasu.el("h1", "", "Your host.\nWithin reach."), Amaterasu.el("p", "", "Checking for a remembered session.")));
+            const intro = Amaterasu.el("section", "login-intro", this.brand(), Amaterasu.el("div", "login-intro-copy", Amaterasu.el("h1", "", "Host console"), Amaterasu.el("p", "", "Checking for a remembered session.")));
             const status = Amaterasu.el("section", "login-card", Amaterasu.el("p", "eyebrow", "WELCOME BACK"), Amaterasu.el("h2", "", "Restoring your session"), Amaterasu.el("p", "muted", "Please wait while we check this browser."));
             status.setAttribute("role", "status");
             status.setAttribute("aria-live", "polite");
@@ -24631,7 +25158,7 @@ var Amaterasu;
             const libraryView = Amaterasu.libraryViewFromAddress(value);
             const library = libraryView !== null && Amaterasu.libraryViewAvailable(this.api, libraryView);
             return core || settingsCategory || pluginsView || library ||
-                (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
+                (value.startsWith("extension/") && this.extensionPageNames.has(value.slice(10))) ? value : "overview";
         }
         pageAvailable(page) {
             if (page === "catalog")
@@ -24675,13 +25202,13 @@ var Amaterasu;
             this.displayedPage = null;
             this.signedIn = false;
             this.extensions.reset();
-            this.extensionIds.clear();
+            this.extensionPageNames.clear();
             const main = Amaterasu.el("main", "login-layout");
             main.id = "main";
             main.tabIndex = -1;
             const brand = this.brand();
-            const intro = Amaterasu.el("section", "login-intro", brand, Amaterasu.el("div", "", Amaterasu.badge("LOCAL HOST MANAGEMENT", "accent"), Amaterasu.el("h1", "", "Your host.\nWithin reach."), Amaterasu.el("p", "", "A considered place to organize applications, manage sessions, and keep an eye on your host.")), Amaterasu.el("p", "login-footnote", "Independent components. One clear view."));
-            const card = Amaterasu.el("section", "login-card", Amaterasu.el("p", "eyebrow", "WELCOME BACK"), Amaterasu.el("h2", "", "Connect to your host"), Amaterasu.el("p", "muted", "Sign in with your host account."));
+            const intro = Amaterasu.el("section", "login-intro", brand, Amaterasu.el("div", "login-intro-copy", Amaterasu.el("h1", "", "Host console"), Amaterasu.el("p", "", "Your applications, sessions, and local services in one place.")));
+            const card = Amaterasu.el("section", "login-card", Amaterasu.el("h2", "", "Connect to your host"), Amaterasu.el("p", "muted", "Sign in with your host account."));
             const username = Amaterasu.input("username");
             username.autocomplete = "username";
             username.required = true;
@@ -24770,20 +25297,28 @@ var Amaterasu;
             username.focus();
             Amaterasu.setLocalizedPageTitle("Sign in");
         }
-        brand() {
-            return Amaterasu.el("div", "brand", Amaterasu.el("span", "brand-symbol", Amaterasu.el("span")), Amaterasu.el("span", "", "amaterasu"));
+        brand(context) {
+            const wordmark = Amaterasu.el("span", "", "Amaterasu");
+            return Amaterasu.el("div", "brand", Amaterasu.el("span", "brand-symbol"), context ? Amaterasu.el("div", "console-brand-copy", wordmark, context) : wordmark);
         }
         shell() {
             this.signedIn = true;
             this.extensions.reset();
-            this.extensionIds.clear();
+            this.extensionPageNames.clear();
             this.navigation.clear();
-            const shell = Amaterasu.el("div", "shell");
+            const shell = Amaterasu.el("div", "shell console-shell");
             const sidebar = Amaterasu.el("aside", "sidebar");
             const navigationContainer = Amaterasu.el("div", "navigation-container");
             const closeMenu = () => {
                 shell.classList.remove("menu-open");
                 menu.setAttribute("aria-expanded", "false");
+            };
+            const choosePage = (page) => {
+                if (page === this.displayedPage && shell.classList.contains("menu-open")) {
+                    closeMenu();
+                    menu.focus();
+                }
+                this.navigate(page);
             };
             for (const group of navigationGroups) {
                 const pages = group.pages.filter((page) => this.pageAvailable(page));
@@ -24792,11 +25327,8 @@ var Amaterasu;
                 const nav = Amaterasu.el("nav", "navigation");
                 Amaterasu.setLocalizedAttribute(nav, "aria-label", group.label);
                 for (const page of pages) {
-                    const item = Amaterasu.button(pageNames[page], () => {
-                        closeMenu();
-                        this.navigate(page);
-                    }, "nav-item");
-                    item.prepend(navigationIcon(page));
+                    const item = Amaterasu.button(pageNames[page], () => choosePage(page), "nav-item");
+                    item.prepend(shellIcon(page));
                     nav.append(item);
                     this.navigation.set(page, item);
                 }
@@ -24812,13 +25344,10 @@ var Amaterasu;
                 for (const entry of entries) {
                     if (!(entry.placements ?? ["page"]).includes("page"))
                         continue;
-                    this.extensionIds.add(entry.id);
+                    this.extensionPageNames.set(entry.id, entry.name);
                     const page = `extension/${entry.id}`;
-                    const item = Amaterasu.button(appTextLiteral(entry.name), () => {
-                        shell.classList.remove("menu-open");
-                        menu.setAttribute("aria-expanded", "false");
-                        this.navigate(page);
-                    }, "nav-item");
+                    const item = Amaterasu.button(appTextLiteral(entry.name), () => choosePage(page), "nav-item");
+                    item.prepend(shellIcon("plugins"));
                     extensionsNav.append(item);
                     this.navigation.set(page, item);
                 }
@@ -24831,25 +25360,27 @@ var Amaterasu;
                     extensionsHeading.hidden = false;
                 }
             });
-            sidebar.append(this.brand(), Amaterasu.el("div", "sidebar-navigation", navigationContainer, extensionsHeading, extensionsNav, Amaterasu.mountLocaleSelector(this.api)), Amaterasu.el("div", "sidebar-bottom", this.theme.mount(), Amaterasu.el("strong", "", "Host console"), Amaterasu.el("p", "muted", "Manage this host and its devices")));
-            const menu = Amaterasu.button("☰", () => {
+            const menu = Amaterasu.button("", () => {
                 const open = shell.classList.toggle("menu-open");
                 menu.setAttribute("aria-expanded", String(open));
                 if (open)
                     sidebar.querySelector(".nav-item")?.focus();
             }, "menu-toggle");
+            menu.append(shellIcon("menu"));
             Amaterasu.setLocalizedAttribute(menu, "aria-label", "Toggle navigation");
             menu.setAttribute("aria-expanded", "false");
             sidebar.id = "main-navigation";
             menu.setAttribute("aria-controls", sidebar.id);
             const scrim = Amaterasu.button("Close navigation", () => { closeMenu(); menu.focus(); }, "nav-scrim");
+            scrim.tabIndex = -1;
             shell.addEventListener("keydown", (event) => {
                 if (event.key === "Escape" && shell.classList.contains("menu-open")) {
                     closeMenu();
                     menu.focus();
                 }
                 else if (event.key === "Tab" && shell.classList.contains("menu-open")) {
-                    const controls = Array.from(sidebar.querySelectorAll("button:not(:disabled), select:not(:disabled), a[href]")).filter((control) => control.getClientRects().length > 0);
+                    const controls = Array.from(sidebar.querySelectorAll("button:not(:disabled), select:not(:disabled), summary, a[href]")).filter((control) => control.getClientRects().length > 0 &&
+                        !control.matches("details:not([open]) :not(summary)"));
                     const first = controls[0];
                     const last = controls.at(-1);
                     if (event.shiftKey && document.activeElement === first) {
@@ -24888,14 +25419,19 @@ var Amaterasu;
                     this.root.querySelector(".login-card")?.prepend(warning);
                 });
             }, "quiet");
-            const top = Amaterasu.el("header", "topbar", Amaterasu.el("div", "actions", menu, Amaterasu.el("span", "topbar-label", "Host workspace")), Amaterasu.el("div", "account", Amaterasu.el("span", "account-avatar", this.api.subject.slice(0, 1).toUpperCase()), Amaterasu.el("span", "account-name", appTextLiteral(this.api.subject)), logout));
+            const avatar = Amaterasu.el("span", "account-avatar", appTextLiteral(this.api.subject.slice(0, 1).toUpperCase()));
+            avatar.setAttribute("aria-hidden", "true");
+            const account = Amaterasu.el("details", "console-account", Amaterasu.el("summary", "account", avatar, Amaterasu.el("span", "account-name", appTextLiteral(this.api.subject))), Amaterasu.el("div", "console-account-utilities", Amaterasu.mountLocaleSelector(this.api), this.theme.mount(), logout));
+            sidebar.append(Amaterasu.el("div", "sidebar-navigation", navigationContainer, extensionsHeading, extensionsNav, account), Amaterasu.el("div", "sidebar-bottom"));
+            this.mastheadContext.id = "console-route-title";
+            const masthead = Amaterasu.el("header", "console-masthead", menu, this.brand(this.mastheadContext));
             this.notification = Amaterasu.el("div", "toast");
             this.notification.setAttribute("role", "status");
             this.notification.hidden = true;
             this.content = Amaterasu.el("main", "content");
             this.content.id = "main";
             this.content.tabIndex = -1;
-            shell.append(sidebar, scrim, Amaterasu.el("div", "workspace", top, this.content), this.notification);
+            shell.append(masthead, Amaterasu.el("div", "console-columns", sidebar, scrim, Amaterasu.el("div", "workspace", this.content)), this.notification);
             this.root.replaceChildren(shell);
             this.renderPage(this.currentPage());
         }
@@ -24960,9 +25496,14 @@ var Amaterasu;
                 },
             };
             if (page.startsWith("extension/")) {
-                fresh.append(Amaterasu.el("p", "muted", "Loading extension…"));
+                const id = page.slice(10);
+                const name = this.extensionPageNames.get(id);
+                this.mastheadContext.replaceChildren(Amaterasu.textValueNode(name === undefined ? "Extension" : appTextLiteral(name)));
+                fresh.setAttribute("aria-labelledby", this.mastheadContext.id);
+                const loading = Amaterasu.el("p", "muted", "Loading extension…");
+                fresh.append(loading);
                 this.draftGuards.register(() => this.extensions.isDirty(), () => this.extensions.dispose());
-                void this.extensions.mount(page.slice(10), fresh).catch((error) => {
+                void this.extensions.mount(id, fresh).then(() => loading.remove()).catch((error) => {
                     if (fresh.isConnected)
                         fresh.replaceChildren(Amaterasu.errorPanel(error));
                 });
@@ -24973,6 +25514,7 @@ var Amaterasu;
                 const renderer = corePages.get(corePage);
                 if (!renderer)
                     return;
+                Amaterasu.setLocalizedTextContent(this.mastheadContext, pageNames[corePage]);
                 renderer(context);
                 Amaterasu.setLocalizedPageTitle(pageNames[corePage]);
             }

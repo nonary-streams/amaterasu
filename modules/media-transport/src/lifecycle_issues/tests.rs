@@ -95,6 +95,14 @@ fn a_delivery_failure_is_reported_once_at_the_line_that_raised_it() {
     assert_eq!(issue.operation, "session-2-media");
     assert_eq!(issue.phase, "deliver");
     assert_eq!(issue.code, "udp_discovery_timeout");
+    assert_eq!(issue.reason, "awaiting_video_and_audio_ping_timeout_ms");
+    assert_eq!(
+        issue.requested,
+        Some(amaterasu_module_sdk::stream_warnings::WarningValue::Integer(0))
+    );
+    let record = serde_json::to_string(&issue).unwrap();
+    assert!(!record.contains("video_token-1234"));
+    assert!(!record.contains("audio_token-1234"));
     assert!(
         issue.site.contains("media-transport/src/datagrams.rs:"),
         "{}",

@@ -16,32 +16,31 @@ namespace Amaterasu {
     tokens: "API tokens",
     maintenance: "Maintenance",
   };
-  const pageIcons: Record<Page, string> = {
-    overview: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
-    host: "M4 5h16v11H4z M8 20h8 M12 16v4",
-    catalog: "M4 4h7v7H4z M13 4h7v7h-7z M4 13h7v7H4z M13 13h7v7h-7z",
-    integrations: "M8 3v5 M16 3v5 M6 8h12v3a6 6 0 0 1-12 0z M12 17v4",
-    settings: "M4 6h16 M4 12h16 M4 18h16 M8 4v4 M16 10v4 M10 16v4",
-    plugins: "M4 4h7v7H4z M4 13h7v7H4z M13 13h7v7h-7z M16.5 4.5v6 M13.5 7.5h6",
-    sessions: "M4 8h14 M15 5l3 3-3 3 M20 16H6 M9 13l-3 3 3 3",
-    diagnostics: "M3 12h4l2-6 4 12 2-6h6",
-    maintenance: "M14 4a5 5 0 0 0-6 6L3 15l3 3 5-5a5 5 0 0 0 6-6l-3 3-3-3z",
-    tokens: "M8 14a4 4 0 1 1 3.5-6H21v4h-3v3h-3v-3h-3.5A4 4 0 0 1 8 14z M7 10h.01",
-    accounts: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M4 20a8 8 0 0 1 16 0",
+  const shellIcons: Record<Page | "menu", string> = {
+    overview: "M3 4h8v8H3z M13 4h8v5h-8z M3 14h8v6H3z M13 11h8v9h-8z",
+    host: "M2 5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v11H2z M5 6v7h14V6z M10 17h4v2h4v2H6v-2h4z",
+    catalog: "M3 3h4v16H3z M9 3h5v16H9z M16 4l3-1 4 15-3 1z M2 20h21v2H2z",
+    integrations: "M7 2h3v5h4V2h3v5h3v3h-2v2a6 6 0 0 1-4.5 5.8V22h-3v-4.2A6 6 0 0 1 6 12v-2H4V7h3z",
+    settings: "M2 4h5V2h3v2h12v3H10v2H7V7H2z M2 10.5h12v-2h3v2h5v3h-5v2h-3v-2H2z M2 17h6v-2h3v2h11v3H11v2H8v-2H2z",
+    plugins: "M3 4h8v7H3z M3 13h8v8H3z M13 13h8v8h-8z M17 1l6 6-6 5-5-5z",
+    sessions: "M2 6h13V2l7 6-7 6v-4H2z M22 14v4H9v4l-7-6 7-6v4z",
+    diagnostics: "M2 3h20v18H2z M4 13h4l2-4 3 8 3-6h4V9h-5l-1.6 3L10 5l-3 6H4z",
+    maintenance: "M20.8 2.9l-4.1 4.2-3.1-3.1 4.1-4A7 7 0 0 0 9 8.6l-7.3 7.2a3.7 3.7 0 0 0 5.3 5.3l7.2-7.3a7 7 0 0 0 6.6-10.9z M5.3 17a1.3 1.3 0 1 1 0 2.6 1.3 1.3 0 0 1 0-2.6z",
+    tokens: "M8 3a6 6 0 0 1 5.7 4H22v4h-2v3h-3v-3h-3.3A6 6 0 1 1 8 3z M6 7a2 2 0 1 0 0 4 2 2 0 0 0 0-4z",
+    accounts: "M12 2a5 5 0 1 1 0 10 5 5 0 0 1 0-10z M3 21a9 9 0 0 1 18 0z",
+    menu: "M3 5h18v3H3z M3 11h18v3H3z M3 17h18v3H3z",
   };
 
-  function navigationIcon(page: Page): SVGSVGElement {
+  function shellIcon(name: Page | "menu"): SVGSVGElement {
     const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     icon.setAttribute("viewBox", "0 0 24 24");
     icon.setAttribute("class", "nav-icon");
     icon.setAttribute("aria-hidden", "true");
-    icon.setAttribute("fill", "none");
-    icon.setAttribute("stroke", "currentColor");
-    icon.setAttribute("stroke-width", "1.7");
-    icon.setAttribute("stroke-linecap", "round");
-    icon.setAttribute("stroke-linejoin", "round");
+    icon.setAttribute("focusable", "false");
+    icon.setAttribute("fill", "currentColor");
+    icon.setAttribute("fill-rule", "evenodd");
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", pageIcons[page]);
+    path.setAttribute("d", shellIcons[name]);
     icon.append(path);
     return icon;
   }
@@ -71,9 +70,10 @@ namespace Amaterasu {
     private readonly theme: ThemeController;
     private signedIn = false;
     private content = el("main");
+    private readonly mastheadContext = el("p", "console-masthead-context");
     private navigation = new Map<string, HTMLButtonElement>();
     private extensions: ExtensionPages;
-    private extensionIds = new Set<string>();
+    private extensionPageNames = new Map<string, string>();
     private notification = el("div");
     private notificationTimer = 0;
     private restorationGeneration = 0;
@@ -156,9 +156,8 @@ namespace Amaterasu {
         this.brand(),
         el(
           "div",
-          "",
-          badge("LOCAL HOST MANAGEMENT", "accent"),
-          el("h1", "", "Your host.\nWithin reach."),
+          "login-intro-copy",
+          el("h1", "", "Host console"),
           el("p", "", "Checking for a remembered session."),
         ),
       );
@@ -192,7 +191,7 @@ namespace Amaterasu {
       const libraryView = libraryViewFromAddress(value);
       const library = libraryView !== null && libraryViewAvailable(this.api, libraryView);
       return core || settingsCategory || pluginsView || library ||
-        (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
+        (value.startsWith("extension/") && this.extensionPageNames.has(value.slice(10))) ? value : "overview";
     }
 
     private pageAvailable(page: Page): boolean {
@@ -237,7 +236,7 @@ namespace Amaterasu {
       this.displayedPage = null;
       this.signedIn = false;
       this.extensions.reset();
-      this.extensionIds.clear();
+      this.extensionPageNames.clear();
       const main = el("main", "login-layout");
       main.id = "main";
       main.tabIndex = -1;
@@ -248,21 +247,18 @@ namespace Amaterasu {
         brand,
         el(
           "div",
-          "",
-          badge("LOCAL HOST MANAGEMENT", "accent"),
-          el("h1", "", "Your host.\nWithin reach."),
+          "login-intro-copy",
+          el("h1", "", "Host console"),
           el(
             "p",
             "",
-            "A considered place to organize applications, manage sessions, and keep an eye on your host.",
+            "Your applications, sessions, and local services in one place.",
           ),
         ),
-        el("p", "login-footnote", "Independent components. One clear view."),
       );
       const card = el(
         "section",
         "login-card",
-        el("p", "eyebrow", "WELCOME BACK"),
         el("h2", "", "Connect to your host"),
         el(
           "p",
@@ -389,26 +385,30 @@ namespace Amaterasu {
       setLocalizedPageTitle("Sign in");
     }
 
-    private brand(): HTMLElement {
-      return el(
-        "div",
-        "brand",
-        el("span", "brand-symbol", el("span")),
-        el("span", "", "amaterasu"),
-      );
+    private brand(context?: HTMLElement): HTMLElement {
+      const wordmark = el("span", "", "Amaterasu");
+      return el("div", "brand", el("span", "brand-symbol"),
+        context ? el("div", "console-brand-copy", wordmark, context) : wordmark);
     }
 
     private shell(): void {
       this.signedIn = true;
       this.extensions.reset();
-      this.extensionIds.clear();
+      this.extensionPageNames.clear();
       this.navigation.clear();
-      const shell = el("div", "shell");
+      const shell = el("div", "shell console-shell");
       const sidebar = el("aside", "sidebar");
       const navigationContainer = el("div", "navigation-container");
       const closeMenu = () => {
         shell.classList.remove("menu-open");
         menu.setAttribute("aria-expanded", "false");
+      };
+      const choosePage = (page: string) => {
+        if (page === this.displayedPage && shell.classList.contains("menu-open")) {
+          closeMenu();
+          menu.focus();
+        }
+        this.navigate(page);
       };
       for (const group of navigationGroups) {
         const pages = group.pages.filter((page) => this.pageAvailable(page));
@@ -416,11 +416,8 @@ namespace Amaterasu {
         const nav = el("nav", "navigation");
         setLocalizedAttribute(nav, "aria-label", group.label);
         for (const page of pages) {
-          const item = button(pageNames[page], () => {
-            closeMenu();
-            this.navigate(page);
-          }, "nav-item");
-          item.prepend(navigationIcon(page));
+          const item = button(pageNames[page], () => choosePage(page), "nav-item");
+          item.prepend(shellIcon(page));
           nav.append(item);
           this.navigation.set(page, item);
         }
@@ -434,13 +431,10 @@ namespace Amaterasu {
         if (!this.signedIn || !shell.isConnected) return;
         for (const entry of entries) {
           if (!(entry.placements ?? ["page"]).includes("page")) continue;
-          this.extensionIds.add(entry.id);
+          this.extensionPageNames.set(entry.id, entry.name);
           const page = `extension/${entry.id}`;
-          const item = button(appTextLiteral(entry.name), () => {
-            shell.classList.remove("menu-open");
-            menu.setAttribute("aria-expanded", "false");
-            this.navigate(page);
-          }, "nav-item");
+          const item = button(appTextLiteral(entry.name), () => choosePage(page), "nav-item");
+          item.prepend(shellIcon("plugins"));
           extensionsNav.append(item);
           this.navigation.set(page, item);
         }
@@ -452,15 +446,8 @@ namespace Amaterasu {
           extensionsHeading.hidden = false;
         }
       });
-      sidebar.append(
-        this.brand(),
-        el("div", "sidebar-navigation", navigationContainer, extensionsHeading, extensionsNav,
-          mountLocaleSelector(this.api)),
-        el("div", "sidebar-bottom", this.theme.mount(), el("strong", "", "Host console"),
-          el("p", "muted", "Manage this host and its devices")),
-      );
       const menu = button(
-        "☰",
+        "",
         () => {
           const open = shell.classList.toggle("menu-open");
           menu.setAttribute("aria-expanded", String(open));
@@ -468,19 +455,22 @@ namespace Amaterasu {
         },
         "menu-toggle",
       );
+      menu.append(shellIcon("menu"));
       setLocalizedAttribute(menu, "aria-label", "Toggle navigation");
       menu.setAttribute("aria-expanded", "false");
       sidebar.id = "main-navigation";
       menu.setAttribute("aria-controls", sidebar.id);
       const scrim = button("Close navigation", () => { closeMenu(); menu.focus(); }, "nav-scrim");
+      scrim.tabIndex = -1;
       shell.addEventListener("keydown", (event) => {
         if (event.key === "Escape" && shell.classList.contains("menu-open")) {
           closeMenu();
           menu.focus();
         } else if (event.key === "Tab" && shell.classList.contains("menu-open")) {
           const controls = Array.from(sidebar.querySelectorAll<HTMLElement>(
-            "button:not(:disabled), select:not(:disabled), a[href]",
-          )).filter((control) => control.getClientRects().length > 0);
+            "button:not(:disabled), select:not(:disabled), summary, a[href]",
+          )).filter((control) => control.getClientRects().length > 0 &&
+            !control.matches("details:not([open]) :not(summary)"));
           const first = controls[0];
           const last = controls.at(-1);
           if (event.shiftKey && document.activeElement === first) {
@@ -523,27 +513,20 @@ namespace Amaterasu {
         },
         "quiet",
       );
-      const top = el(
-        "header",
-        "topbar",
-        el(
-          "div",
-          "actions",
-          menu,
-          el("span", "topbar-label", "Host workspace"),
-        ),
-        el(
-          "div",
-          "account",
-          el(
-            "span",
-            "account-avatar",
-            this.api.subject.slice(0, 1).toUpperCase(),
-          ),
-          el("span", "account-name", appTextLiteral(this.api.subject)),
-          logout,
-        ),
+      const avatar = el("span", "account-avatar", appTextLiteral(this.api.subject.slice(0, 1).toUpperCase()));
+      avatar.setAttribute("aria-hidden", "true");
+      const account = el(
+        "details",
+        "console-account",
+        el("summary", "account", avatar, el("span", "account-name", appTextLiteral(this.api.subject))),
+        el("div", "console-account-utilities", mountLocaleSelector(this.api), this.theme.mount(), logout),
       );
+      sidebar.append(
+        el("div", "sidebar-navigation", navigationContainer, extensionsHeading, extensionsNav, account),
+        el("div", "sidebar-bottom"),
+      );
+      this.mastheadContext.id = "console-route-title";
+      const masthead = el("header", "console-masthead", menu, this.brand(this.mastheadContext));
       this.notification = el("div", "toast");
       this.notification.setAttribute("role", "status");
       this.notification.hidden = true;
@@ -551,9 +534,8 @@ namespace Amaterasu {
       this.content.id = "main";
       this.content.tabIndex = -1;
       shell.append(
-        sidebar,
-        scrim,
-        el("div", "workspace", top, this.content),
+        masthead,
+        el("div", "console-columns", sidebar, scrim, el("div", "workspace", this.content)),
         this.notification,
       );
       this.root.replaceChildren(shell);
@@ -616,9 +598,14 @@ namespace Amaterasu {
         },
       };
       if (page.startsWith("extension/")) {
-        fresh.append(el("p", "muted", "Loading extension…"));
+        const id = page.slice(10);
+        const name = this.extensionPageNames.get(id);
+        this.mastheadContext.replaceChildren(textValueNode(name === undefined ? "Extension" : appTextLiteral(name)));
+        fresh.setAttribute("aria-labelledby", this.mastheadContext.id);
+        const loading = el("p", "muted", "Loading extension…");
+        fresh.append(loading);
         this.draftGuards.register(() => this.extensions.isDirty(), () => this.extensions.dispose());
-        void this.extensions.mount(page.slice(10), fresh).catch((error) => {
+        void this.extensions.mount(id, fresh).then(() => loading.remove()).catch((error) => {
           if (fresh.isConnected) fresh.replaceChildren(errorPanel(error));
         });
         setLocalizedPageTitle("Extension");
@@ -626,6 +613,7 @@ namespace Amaterasu {
         const corePage = (page.startsWith("settings/") ? "settings" : page.startsWith("plugins/") ? "plugins" : page.startsWith("catalog/") ? "catalog" : page) as Page;
         const renderer = corePages.get(corePage);
         if (!renderer) return;
+        setLocalizedTextContent(this.mastheadContext, pageNames[corePage]);
         renderer(context);
         setLocalizedPageTitle(pageNames[corePage]);
       }
