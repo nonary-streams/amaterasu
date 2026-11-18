@@ -175,12 +175,21 @@ impl Coordinator {
     /// Run one bounded reconciliation pass. Failures are logged and fence only
     /// the receipt or admission concerned.
     pub(super) fn reconcile_uncertain_preparation(&mut self) {
-        if !self.approvals_loaded() {
+        if !self.shared.borrow().reconciliation_scan_pending || !self.approvals_loaded() {
             return;
         }
+        // A save re-arms the scan. Keep it armed while a provider status read
+        // defers re-arming a release, or when a newly fenced candidate makes
+        // another receipt eligible on the next turn.
+        self.shared.borrow_mut().reconciliation_scan_pending =
+            self.failed_prepare_recovery.is_some();
+        let fenced_before = self.unreconcilable.len();
         self.release_answered_locks();
         self.revalidate_one_finished_release();
         self.rearm_one_failed_release();
+        if self.unreconcilable.len() != fenced_before {
+            self.shared.borrow_mut().reconciliation_scan_pending = true;
+        }
     }
 
     /// Every participant's lifecycle methods have been approved this epoch.

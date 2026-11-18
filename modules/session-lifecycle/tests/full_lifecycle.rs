@@ -1,19 +1,20 @@
 //! Cross-module tests run the production lifecycle ABI against the actual broker.
 use amaterasu_module_sdk::{Command, Response, abi};
+mod support;
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use support::TestBroker;
 
 const SERVICE: &str = "amaterasu.session-lifecycle/1";
 const COORDINATOR: &str = "amaterasu.session-lifecycle";
 static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct Endpoint {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     principal: &'static str,
 }
 
@@ -23,7 +24,7 @@ unsafe extern "C" fn invoke(
     reply: abi::ReplySink,
 ) -> abi::Status {
     // SAFETY: Harness retains its boxed Endpoint until the module is destroyed;
-    // module calls and broker pumping are serialized on this test thread.
+    // the broker serializes commands from the worker and the test thread.
     let endpoint = unsafe { &*context.cast::<Endpoint>() };
     // SAFETY: the SDK lends valid input bytes for the synchronous ABI call.
     let Ok(input) = (unsafe { input.read() }) else {
@@ -32,10 +33,7 @@ unsafe extern "C" fn invoke(
     let Ok(command) = serde_json::from_slice(input) else {
         return abi::STATUS_INVALID_ARGUMENT;
     };
-    let response = endpoint
-        .broker
-        .borrow_mut()
-        .dispatch(endpoint.principal, command);
+    let response = endpoint.broker.dispatch(endpoint.principal, command);
     let Ok(bytes) = serde_json::to_vec(&response) else {
         return abi::STATUS_INTERNAL_ERROR;
     };
@@ -45,7 +43,7 @@ unsafe extern "C" fn invoke(
 }
 
 struct Harness {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     endpoint: Box<Endpoint>,
     api: abi::ModuleApi,
     instance: *mut c_void,
@@ -144,9 +142,9 @@ impl Harness {
                 json!("amaterasu.extension-registry/1");
         }
         let configuration = serde_json::from_value(configuration).unwrap();
-        let broker = Rc::new(RefCell::new(Broker::new(configuration).unwrap()));
+        let broker = TestBroker::new(Broker::new(configuration).unwrap());
         for method in methods {
-            let response = broker.borrow_mut().dispatch(
+            let response = broker.dispatch(
                 "display",
                 Command::RegisterApi {
                     method: serde_json::from_value(method).unwrap(),
@@ -159,7 +157,7 @@ impl Harness {
             ("launch", "amaterasu.launch/1"),
         ] {
             assert!(matches!(
-                broker.borrow_mut().dispatch(
+                broker.dispatch(
                     principal,
                     Command::Register {
                         service: service.into()
@@ -170,7 +168,7 @@ impl Harness {
         }
         if registry_settings.is_some() {
             assert!(matches!(
-                broker.borrow_mut().dispatch(
+                broker.dispatch(
                     "registry",
                     Command::Register {
                         service: "amaterasu.extension-registry/1".into()
@@ -219,12 +217,11 @@ impl Harness {
 
     fn tick(&mut self) {
         // SAFETY: instance is a live module created by this exact table.
-        assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        self.endpoint.broker.tick(self.endpoint.principal, || {
+            assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        });
         if self.provider {
-            let request = self
-                .broker
-                .borrow_mut()
-                .dispatch("display", Command::Poll {});
+            let request = self.broker.dispatch("display", Command::Poll {});
             if let Response::Request {
                 id,
                 caller,
@@ -261,7 +258,7 @@ impl Harness {
                     };
                     let plan = json!({"plan_id":"plan","revision":1,"resources":resources,"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":constraint,"allowed_degradation":[]});
                     assert!(matches!(
-                        self.broker.borrow_mut().dispatch(
+                        self.broker.dispatch(
                             "display",
                             Command::Complete {
                                 request: id,
@@ -276,7 +273,7 @@ impl Harness {
                     assert_eq!(args["binding"]["resource"]["incarnation"], "native");
                     let result = json!({"status":"succeeded","target":args["target"],"binding":args["binding"],"observation":args["observation"],"plan_revision":args["plan_revision"]});
                     assert!(matches!(
-                        self.broker.borrow_mut().dispatch(
+                        self.broker.dispatch(
                             "display",
                             Command::Complete {
                                 request: id,
@@ -296,7 +293,7 @@ impl Harness {
                         json!({"status":"prepared","candidate":null,"obligations":[]})
                     };
                     assert!(matches!(
-                        self.broker.borrow_mut().dispatch(
+                        self.broker.dispatch(
                             "display",
                             Command::Complete {
                                 request: id,
@@ -311,10 +308,7 @@ impl Harness {
             }
         }
         if let Some((revision, settings)) = &self.registry_settings {
-            let request = self
-                .broker
-                .borrow_mut()
-                .dispatch("registry", Command::Poll {});
+            let request = self.broker.dispatch("registry", Command::Poll {});
             if let Response::Request {
                 id,
                 caller,
@@ -334,14 +328,11 @@ impl Harness {
                         (key.clone(), json!({"value":value,"source":{"kind":"host"}}))
                     })
                     .collect();
-                assert!(matches!(self.broker.borrow_mut().dispatch("registry", Command::Complete { request: id, payload: json!({"ok":true,"status":"ok","revision":revision,"effective":effective}) }), Response::Ok));
+                assert!(matches!(self.broker.dispatch("registry", Command::Complete { request: id, payload: json!({"ok":true,"status":"ok","revision":revision,"effective":effective}) }), Response::Ok));
             }
         }
         for principal in [self.input_principal, "launch"] {
-            let request = self
-                .broker
-                .borrow_mut()
-                .dispatch(principal, Command::Poll {});
+            let request = self.broker.dispatch(principal, Command::Poll {});
             if let Response::Request { id, payload, .. } = request {
                 let response = match payload["action"].as_str() {
                     Some("binding_status") => {
@@ -356,7 +347,7 @@ impl Harness {
                     _ => panic!("unexpected {principal} request: {payload}"),
                 };
                 assert!(matches!(
-                    self.broker.borrow_mut().dispatch(
+                    self.broker.dispatch(
                         principal,
                         Command::Complete {
                             request: id,
@@ -371,7 +362,7 @@ impl Harness {
 
     fn call(&mut self, caller: &str, payload: Value) -> Value {
         self.request_sequence += 1;
-        let response = self.broker.borrow_mut().dispatch(
+        let response = self.broker.dispatch(
             caller,
             Command::Request {
                 service: SERVICE.into(),
@@ -388,14 +379,12 @@ impl Harness {
             self.tick();
             let response = self
                 .broker
-                .borrow_mut()
                 .dispatch(caller, Command::TakeResult { request: id });
             match response {
                 Response::Pending => continue,
                 Response::Result { payload } => {
                     assert!(matches!(
                         self.broker
-                            .borrow_mut()
                             .dispatch(caller, Command::ReleaseResult { request: id }),
                         Response::Ok
                     ));

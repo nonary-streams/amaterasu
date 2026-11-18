@@ -34,6 +34,24 @@ fn idle_retirement_rechecks_after_a_durable_change() {
 }
 
 #[test]
+fn idle_reconciliation_rechecks_newly_persisted_work() {
+    let directory = TestDirectory::new();
+    let mut coordinator = Coordinator::open(&directory.journal()).unwrap();
+    coordinator.reconcile_uncertain_preparation();
+    assert!(!coordinator.shared.borrow().reconciliation_scan_pending);
+
+    let prepared = coordinator.handle(
+        "transport",
+        "client",
+        json!({"operation":"prepare", "operation_id":"prepare"}),
+    );
+    assert_eq!(prepared["status"], "pending");
+    assert!(coordinator.shared.borrow().reconciliation_scan_pending);
+    coordinator.reconcile_uncertain_preparation();
+    assert!(!coordinator.shared.borrow().reconciliation_scan_pending);
+}
+
+#[test]
 #[ignore = "opt-in benchmark; AMATERASU_BENCH_JOURNAL selects a read-only journal snapshot"]
 fn benchmark_idle_scheduler_from_journal_snapshot() {
     let snapshot = std::env::var("AMATERASU_BENCH_JOURNAL").expect("set AMATERASU_BENCH_JOURNAL");

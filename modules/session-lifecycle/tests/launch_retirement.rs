@@ -4,22 +4,23 @@
 //! run this test with `cargo test -p amaterasu-session-lifecycle --test
 //! launch_retirement -- --ignored`. The plugin must be trusted native code.
 use amaterasu_module_sdk::{Command, Response, abi};
+mod support;
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
     ffi::c_void,
     path::PathBuf,
-    rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
+use support::TestBroker;
 
 const LIFECYCLE: &str = "amaterasu.session-lifecycle";
 const LIFECYCLE_SERVICE: &str = "amaterasu.session-lifecycle/1";
 const LAUNCH: &str = "amaterasu.launch";
 const LAUNCH_SERVICE: &str = "amaterasu.launch/1";
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-type Trace = Rc<RefCell<Vec<(String, Command, Response)>>>;
+type Trace = Arc<Mutex<Vec<(String, Command, Response)>>>;
 
 struct TemporaryDirectory(PathBuf);
 
@@ -30,7 +31,7 @@ impl Drop for TemporaryDirectory {
 }
 
 struct Endpoint {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     principal: &'static str,
     trace: Trace,
 }
@@ -51,11 +52,11 @@ unsafe extern "C" fn invoke(
     };
     let response = endpoint
         .broker
-        .borrow_mut()
         .dispatch(endpoint.principal, command.clone());
     endpoint
         .trace
-        .borrow_mut()
+        .lock()
+        .unwrap()
         .push((endpoint.principal.to_owned(), command, response.clone()));
     let Ok(bytes) = serde_json::to_vec(&response) else {
         return abi::STATUS_INTERNAL_ERROR;
@@ -74,7 +75,7 @@ struct Module {
 impl Module {
     fn start(
         api: abi::ModuleApi,
-        broker: Rc<RefCell<Broker>>,
+        broker: Arc<TestBroker>,
         principal: &'static str,
         trace: Trace,
     ) -> Self {
@@ -104,7 +105,9 @@ impl Module {
 
     fn tick(&self) {
         // SAFETY: The live instance belongs to this table and calls are serialized.
-        assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        self._endpoint.broker.tick(self._endpoint.principal, || {
+            assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        });
     }
 }
 
@@ -116,7 +119,7 @@ impl Drop for Module {
 }
 
 struct Harness {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     lifecycle: Module,
     launch: Module,
     _launch_library: libloading::Library,
@@ -155,8 +158,8 @@ impl Harness {
                 LAUNCH: {"retirement_observers":[LIFECYCLE]}
             }
         })).unwrap();
-        let broker = Rc::new(RefCell::new(Broker::new(configuration).unwrap()));
-        let trace = Rc::new(RefCell::new(Vec::new()));
+        let broker = TestBroker::new(Broker::new(configuration).unwrap());
+        let trace = Arc::new(Mutex::new(Vec::new()));
         let path = std::env::var_os("AMATERASU_LAUNCH_PLUGIN").expect("Launch plugin path");
         // SAFETY: The test operator supplies a trusted matching plugin; the
         // library is retained until after its module instance is destroyed.
@@ -191,7 +194,7 @@ impl Harness {
 
     fn call(&mut self, service: &str, payload: Value) -> Value {
         self.sequence += 1;
-        let accepted = self.broker.borrow_mut().dispatch(
+        let accepted = self.broker.dispatch(
             "transport",
             Command::Request {
                 service: service.into(),
@@ -208,14 +211,12 @@ impl Harness {
             self.tick();
             let result = self
                 .broker
-                .borrow_mut()
                 .dispatch("transport", Command::TakeResult { request: id });
             match result {
                 Response::Pending => {}
                 Response::Result { payload } => {
                     assert!(matches!(
                         self.broker
-                            .borrow_mut()
                             .dispatch("transport", Command::ReleaseResult { request: id }),
                         Response::Ok
                     ));
@@ -277,7 +278,7 @@ fn never_admitted_application_is_fenced_before_session_end_completes() {
     assert_eq!(application["status"], "succeeded", "{application}");
     let ended = h.settled("end");
     assert_eq!(ended["status"], "succeeded", "{ended}");
-    let trace = h.trace.borrow();
+    let trace = h.trace.lock().unwrap().clone();
     let request = trace.iter().find_map(|(principal, command, response)| {
         if principal == LIFECYCLE && matches!(command, Command::Request { service, payload, .. } if service == LAUNCH_SERVICE && payload == &json!({"action":"verify_retirement","owner":"transport","launch_id":null,"operation_id":application_operation}))
             && let Response::Accepted { id } = response {

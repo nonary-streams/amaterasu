@@ -5,16 +5,17 @@
 //! `AMATERASU_DISPLAY_TARGET_SCHEMA`. Native display and state are simulated.
 #![cfg(target_os = "linux")]
 use amaterasu_module_sdk::{Command, Response, abi};
+mod support;
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     ffi::{CString, c_char, c_void},
     path::PathBuf,
-    rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
+use support::TestBroker;
 
 #[link(name = "dl")]
 unsafe extern "C" {
@@ -27,9 +28,9 @@ const LIFECYCLE: &str = "amaterasu.session-lifecycle/1";
 const SCREEN: &str = "nonary.virtual-screen";
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Endpoint {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     principal: &'static str,
-    trace: Rc<RefCell<Vec<Value>>>,
+    trace: Arc<Mutex<Vec<Value>>>,
 }
 unsafe extern "C" fn invoke(
     context: *mut c_void,
@@ -54,17 +55,16 @@ unsafe extern "C" fn invoke(
     ) {
         endpoint
             .trace
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(json!({"principal": endpoint.principal, "command": command}));
     }
-    let response = endpoint
-        .broker
-        .borrow_mut()
-        .dispatch(endpoint.principal, command);
+    let response = endpoint.broker.dispatch(endpoint.principal, command);
     if matches!(&response, Response::Error { .. }) {
         endpoint
             .trace
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(json!({"principal":endpoint.principal,"broker_error":response}));
     }
     let Ok(bytes) = serde_json::to_vec(&response) else {
@@ -82,9 +82,9 @@ struct RunningModule {
 impl RunningModule {
     fn new(
         api: abi::ModuleApi,
-        broker: Rc<RefCell<Broker>>,
+        broker: Arc<TestBroker>,
         principal: &'static str,
-        trace: Rc<RefCell<Vec<Value>>>,
+        trace: Arc<Mutex<Vec<Value>>>,
     ) -> Self {
         let mut endpoint = Box::new(Endpoint {
             broker,
@@ -112,7 +112,9 @@ impl RunningModule {
     }
     fn tick(&self) {
         let _keep_alive = &self.endpoint;
-        assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        self.endpoint.broker.tick(self.endpoint.principal, || {
+            assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        });
     }
 }
 impl Drop for RunningModule {
@@ -206,11 +208,11 @@ struct Store {
     values: BTreeMap<String, Value>,
 }
 struct Fixture {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     lifecycle: RunningModule,
     screen: RunningModule,
     screen_library: *mut c_void,
-    trace: Rc<RefCell<Vec<Value>>>,
+    trace: Arc<Mutex<Vec<Value>>>,
     lifecycle_library: *mut c_void,
     root: PathBuf,
     next: u64,
@@ -240,13 +242,13 @@ impl Fixture {
         configuration["settings"][COORDINATOR]["journal_path"] = json!(root.join("journal.json"));
         configuration["host_context"] = json!({"schema":1,"state_root":root});
         let config = serde_json::from_value(configuration).unwrap();
-        let broker = Rc::new(RefCell::new(Broker::new(config).unwrap()));
+        let broker = TestBroker::new(Broker::new(config).unwrap());
         for (caller, service) in [
             ("virtual", "amaterasu.virtual-display/1"),
             ("state", "amaterasu.state/1"),
         ] {
             assert!(matches!(
-                broker.borrow_mut().dispatch(
+                broker.dispatch(
                     caller,
                     Command::Register {
                         service: service.into()
@@ -255,7 +257,7 @@ impl Fixture {
                 Response::Ok
             ));
         }
-        let trace = Rc::new(RefCell::new(Vec::new()));
+        let trace = Arc::new(Mutex::new(Vec::new()));
         let (screen_library, screen_api) = load_plugin("AMATERASU_SCREEN_PLUGIN");
         let (lifecycle_library, lifecycle_api) = load_plugin("AMATERASU_LIFECYCLE_PLUGIN");
         let screen = RunningModule::new(screen_api, broker.clone(), SCREEN, trace.clone());
@@ -287,10 +289,7 @@ impl Fixture {
         self.lifecycle.tick();
         self.screen.tick();
         for principal in ["virtual", "state"] {
-            let response = self
-                .broker
-                .borrow_mut()
-                .dispatch(principal, Command::Poll {});
+            let response = self.broker.dispatch(principal, Command::Poll {});
             if let Response::Request {
                 id,
                 caller,
@@ -304,7 +303,7 @@ impl Fixture {
                     self.native(&payload)
                 };
                 assert!(matches!(
-                    self.broker.borrow_mut().dispatch(
+                    self.broker.dispatch(
                         principal,
                         Command::Complete {
                             request: id,
@@ -399,7 +398,7 @@ impl Fixture {
     }
     fn native(&mut self, p: &Value) -> Value {
         self.native_calls.push(p.clone());
-        self.trace.borrow_mut().push(json!({"native":p}));
+        self.trace.lock().unwrap().push(json!({"native":p}));
         match p["action"].as_str().unwrap() {
             "status" => {
                 let identity = p["identity"].as_str();
@@ -495,7 +494,7 @@ impl Fixture {
     }
     fn begin_as(&mut self, caller: &str, service: &str, payload: Value) -> u64 {
         self.next += 1;
-        let response = self.broker.borrow_mut().dispatch(
+        let response = self.broker.dispatch(
             caller,
             Command::Request {
                 service: service.into(),
@@ -516,14 +515,12 @@ impl Fixture {
             self.tick();
             let response = self
                 .broker
-                .borrow_mut()
                 .dispatch(caller, Command::TakeResult { request: id });
             match response {
                 Response::Pending => {}
                 Response::Result { payload } => {
                     assert!(matches!(
                         self.broker
-                            .borrow_mut()
                             .dispatch(caller, Command::ReleaseResult { request: id }),
                         Response::Ok
                     ));
@@ -552,7 +549,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let evidence = json!({"stores":self.stores,"collections":self.collections,"native_calls":self.native_calls,"trace":*self.trace.borrow()});
+        let evidence = json!({"stores":self.stores,"collections":self.collections,"native_calls":self.native_calls,"trace":*self.trace.lock().unwrap()});
         std::fs::write(
             self.root.join("simulated-backend.json"),
             serde_json::to_vec_pretty(&evidence).unwrap(),
@@ -588,12 +585,12 @@ fn real_owner_prepares_session_with_simulated_native_and_state() {
         result["status"],
         "succeeded",
         "{result}; trace={:?}; native={:?}",
-        f.trace.borrow(),
+        *f.trace.lock().unwrap(),
         f.native_calls
     );
     assert!(f.native_calls.iter().any(|call| call["action"] == "create"));
     assert!(f.native_calls.iter().any(|call| call["action"] == "borrow"));
-    assert!(f.trace.borrow().iter().any(|event| {
+    assert!(f.trace.lock().unwrap().iter().any(|event| {
         event["principal"] == SCREEN
             && event["command"]["op"] == "complete"
             && event["command"]["payload"]["status"] == "prepared"
@@ -620,13 +617,13 @@ fn real_owner_finalizes_stream_and_validates_capture_binding() {
         "succeeded",
         "{stream}; native={:?}; trace={:?}",
         f.native_calls,
-        f.trace.borrow()
+        f.trace.lock().unwrap()
     );
     let target = stream["target"].clone();
     let candidate = stream["candidate"].clone();
     assert_eq!(candidate["resource"]["provider"], SCREEN);
     assert_eq!(candidate["mode"], video);
-    let trace = f.trace.borrow();
+    let trace = f.trace.lock().unwrap().clone();
     assert!(
         trace.iter().any(|event| event["principal"] == COORDINATOR
             && event["command"]["method"] == "resource_finalize"),
@@ -650,11 +647,12 @@ fn real_owner_finalizes_stream_and_validates_capture_binding() {
         outcome["status"],
         "succeeded",
         "{outcome}; trace={:?}",
-        f.trace.borrow()
+        f.trace.lock().unwrap()
     );
     assert!(
         f.trace
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .any(|event| event["principal"] == COORDINATOR
                 && event["command"]["method"] == "binding_validate"),
@@ -699,13 +697,13 @@ fn run_owner_release_and_relaunch(park_final: bool, capture_started: bool) {
         "succeeded",
         "{stream}; native={:?}; trace={:?}",
         f.native_calls,
-        f.trace.borrow()
+        f.trace.lock().unwrap()
     );
     let target = stream["target"].clone();
     let candidate = stream["candidate"].clone();
     assert_eq!(candidate["resource"]["provider"], SCREEN);
     assert_eq!(candidate["mode"], video);
-    let trace = f.trace.borrow();
+    let trace = f.trace.lock().unwrap().clone();
     assert!(
         trace.iter().any(|event| event["principal"] == COORDINATOR
             && event["command"]["method"] == "resource_finalize"),
@@ -730,11 +728,12 @@ fn run_owner_release_and_relaunch(park_final: bool, capture_started: bool) {
             outcome["status"],
             "succeeded",
             "{outcome}; trace={:?}",
-            f.trace.borrow()
+            f.trace.lock().unwrap()
         );
         assert!(
             f.trace
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
                 .any(|event| event["principal"] == COORDINATOR
                     && event["command"]["method"] == "binding_validate"),
@@ -756,7 +755,7 @@ fn run_owner_release_and_relaunch(park_final: bool, capture_started: bool) {
         ended["status"],
         "succeeded",
         "{ended}; trace={:?}; native={:?}",
-        f.trace.borrow(),
+        *f.trace.lock().unwrap(),
         f.native_calls
     );
     assert!(
@@ -769,7 +768,7 @@ fn run_owner_release_and_relaunch(park_final: bool, capture_started: bool) {
         "native borrows remain: {:?}",
         f.borrows
     );
-    let trace = f.trace.borrow();
+    let trace = f.trace.lock().unwrap().clone();
     let release = |event: &&Value, phase: &str| {
         event["principal"] == COORDINATOR
             && event["command"]["method"] == "lifecycle_callback"

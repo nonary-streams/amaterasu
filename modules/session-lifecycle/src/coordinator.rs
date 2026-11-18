@@ -609,6 +609,7 @@ struct SharedJournal {
     // Closure eligibility depends on durable state. Recheck after a successful
     // replacement, rather than cloning and validating history on every tick.
     retirement_scan_pending: bool,
+    reconciliation_scan_pending: bool,
 }
 type Shared = Rc<RefCell<SharedJournal>>;
 
@@ -636,6 +637,7 @@ fn save(shared: &Shared, mut next: Journal) -> ModuleResult<()> {
     })?;
     shared.value = next;
     shared.retirement_scan_pending = true;
+    shared.reconciliation_scan_pending = true;
     Ok(())
 }
 fn validate_journal(journal: &Journal) -> io::Result<()> {
@@ -1273,6 +1275,7 @@ impl Coordinator {
                 store,
                 value: journal,
                 retirement_scan_pending: true,
+                reconciliation_scan_pending: true,
             })),
             settings: LifecycleSettings::default(),
             configured: false,

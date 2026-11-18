@@ -13,16 +13,17 @@
 //! real_composition_cycles -- --ignored --nocapture` with matching artifacts.
 #![cfg(target_os = "linux")]
 use amaterasu_module_sdk::{Command, Response, abi};
+mod support;
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     ffi::{CString, c_char, c_void},
     path::PathBuf,
-    rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
+use support::TestBroker;
 
 #[link(name = "dl")]
 unsafe extern "C" {
@@ -38,9 +39,9 @@ const SCREEN: &str = "nonary.virtual-screen";
 const SCREEN_SERVICE: &str = "nonary.virtual-screen/2";
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Endpoint {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     principal: &'static str,
-    trace: Rc<RefCell<Vec<Value>>>,
+    trace: Arc<Mutex<Vec<Value>>>,
 }
 unsafe extern "C" fn invoke(
     context: *mut c_void,
@@ -65,17 +66,16 @@ unsafe extern "C" fn invoke(
     ) {
         endpoint
             .trace
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(json!({"principal": endpoint.principal, "command": command}));
     }
-    let response = endpoint
-        .broker
-        .borrow_mut()
-        .dispatch(endpoint.principal, command);
+    let response = endpoint.broker.dispatch(endpoint.principal, command);
     if matches!(&response, Response::Error { .. }) {
         endpoint
             .trace
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(json!({"principal":endpoint.principal,"broker_error":response}));
     }
     let Ok(bytes) = serde_json::to_vec(&response) else {
@@ -93,9 +93,9 @@ struct RunningModule {
 impl RunningModule {
     fn new(
         api: abi::ModuleApi,
-        broker: Rc<RefCell<Broker>>,
+        broker: Arc<TestBroker>,
         principal: &'static str,
-        trace: Rc<RefCell<Vec<Value>>>,
+        trace: Arc<Mutex<Vec<Value>>>,
     ) -> Self {
         let mut endpoint = Box::new(Endpoint {
             broker,
@@ -123,7 +123,9 @@ impl RunningModule {
     }
     fn tick(&self) {
         let _keep_alive = &self.endpoint;
-        assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        self.endpoint.broker.tick(self.endpoint.principal, || {
+            assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        });
     }
 }
 impl Drop for RunningModule {
@@ -171,13 +173,13 @@ impl Drop for AdditionalModule {
     }
 }
 struct Fixture {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     lifecycle: RunningModule,
     display: Option<RunningModule>,
     screen: RunningModule,
     display_library: *mut c_void,
     screen_library: *mut c_void,
-    trace: Rc<RefCell<Vec<Value>>>,
+    trace: Arc<Mutex<Vec<Value>>>,
     additional: Vec<AdditionalModule>,
     lifecycle_library: *mut c_void,
     root: PathBuf,
@@ -229,11 +231,11 @@ impl Fixture {
             );
         }
         let config = serde_json::from_value(configuration).unwrap();
-        let broker = Rc::new(RefCell::new(Broker::new(config).unwrap()));
+        let broker = TestBroker::new(Broker::new(config).unwrap());
         {
             let (caller, service) = ("virtual", "amaterasu.virtual-display/1");
             assert!(matches!(
-                broker.borrow_mut().dispatch(
+                broker.dispatch(
                     caller,
                     Command::Register {
                         service: service.into()
@@ -242,7 +244,7 @@ impl Fixture {
                 Response::Ok
             ));
         }
-        let trace = Rc::new(RefCell::new(Vec::new()));
+        let trace = Arc::new(Mutex::new(Vec::new()));
         let (display_library, display_api) = load_plugin("AMATERASU_DISPLAY_PLUGIN");
         let display = Some(RunningModule::new(
             display_api,
@@ -292,10 +294,7 @@ impl Fixture {
         }
         {
             let principal = "virtual";
-            let response = self
-                .broker
-                .borrow_mut()
-                .dispatch(principal, Command::Poll {});
+            let response = self.broker.dispatch(principal, Command::Poll {});
             if let Response::Request {
                 id,
                 caller,
@@ -306,7 +305,7 @@ impl Fixture {
                 let _ = caller;
                 let answer = self.native(&payload);
                 assert!(matches!(
-                    self.broker.borrow_mut().dispatch(
+                    self.broker.dispatch(
                         principal,
                         Command::Complete {
                             request: id,
@@ -320,7 +319,7 @@ impl Fixture {
     }
     fn native(&mut self, p: &Value) -> Value {
         self.native_calls.push(p.clone());
-        self.trace.borrow_mut().push(json!({"native":p}));
+        self.trace.lock().unwrap().push(json!({"native":p}));
         match p["action"].as_str().unwrap() {
             "status" => {
                 let identity = p["identity"].as_str();
@@ -343,7 +342,8 @@ impl Fixture {
             "create" => {
                 assert!(
                     self.trace
-                        .borrow()
+                        .lock()
+                        .unwrap()
                         .iter()
                         .any(|event| event["principal"] == SCREEN
                             && event["command"]["payload"]["action"] == "collection_commit"),
@@ -438,7 +438,7 @@ impl Fixture {
     }
     fn begin_as(&mut self, caller: &str, service: &str, payload: Value) -> u64 {
         self.next += 1;
-        let response = self.broker.borrow_mut().dispatch(
+        let response = self.broker.dispatch(
             caller,
             Command::Request {
                 service: service.into(),
@@ -459,14 +459,12 @@ impl Fixture {
             self.tick();
             let response = self
                 .broker
-                .borrow_mut()
                 .dispatch(caller, Command::TakeResult { request: id });
             match response {
                 Response::Pending => {}
                 Response::Result { payload } => {
                     assert!(matches!(
                         self.broker
-                            .borrow_mut()
                             .dispatch(caller, Command::ReleaseResult { request: id }),
                         Response::Ok
                     ));
@@ -495,7 +493,8 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let evidence = json!({"native_calls":self.native_calls,"trace":*self.trace.borrow()});
+        let evidence =
+            json!({"native_calls":self.native_calls,"trace":*self.trace.lock().unwrap()});
         std::fs::write(
             self.root.join("simulated-backend.json"),
             serde_json::to_vec_pretty(&evidence).unwrap(),
@@ -729,7 +728,7 @@ fn run_composition(paused_end: bool) {
         assert!(f.references.is_empty(), "second session leaked references");
         assert!(f.borrows.is_empty(), "second session leaked borrows");
     }
-    let trace = f.trace.borrow();
+    let trace = f.trace.lock().unwrap().clone();
     let calls: Vec<_> = trace
         .iter()
         .filter_map(|e| e.get("command"))

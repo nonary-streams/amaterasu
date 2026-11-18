@@ -1,21 +1,23 @@
 //! Cross-module tests run the production lifecycle ABI against the actual broker.
 use amaterasu_module_sdk::{Command, Response, abi};
+mod support;
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use support::TestBroker;
 
 const SERVICE: &str = "amaterasu.session-lifecycle/1";
 const COORDINATOR: &str = "amaterasu.session-lifecycle";
 static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct Endpoint {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     principal: &'static str,
+    polling_thread: std::sync::OnceLock<std::thread::ThreadId>,
 }
 
 unsafe extern "C" fn invoke(
@@ -24,7 +26,7 @@ unsafe extern "C" fn invoke(
     reply: abi::ReplySink,
 ) -> abi::Status {
     // SAFETY: Harness retains its boxed Endpoint until the module is destroyed;
-    // module calls and broker pumping are serialized on this test thread.
+    // the broker serializes commands from the worker and the test thread.
     let endpoint = unsafe { &*context.cast::<Endpoint>() };
     // SAFETY: the SDK lends valid input bytes for the synchronous ABI call.
     let Ok(input) = (unsafe { input.read() }) else {
@@ -33,10 +35,10 @@ unsafe extern "C" fn invoke(
     let Ok(command) = serde_json::from_slice(input) else {
         return abi::STATUS_INVALID_ARGUMENT;
     };
-    let response = endpoint
-        .broker
-        .borrow_mut()
-        .dispatch(endpoint.principal, command);
+    if matches!(command, Command::Poll {}) {
+        let _ = endpoint.polling_thread.set(std::thread::current().id());
+    }
+    let response = endpoint.broker.dispatch(endpoint.principal, command);
     let Ok(bytes) = serde_json::to_vec(&response) else {
         return abi::STATUS_INTERNAL_ERROR;
     };
@@ -46,7 +48,7 @@ unsafe extern "C" fn invoke(
 }
 
 struct Harness {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     endpoint: Box<Endpoint>,
     api: abi::ModuleApi,
     instance: *mut c_void,
@@ -113,9 +115,9 @@ impl Harness {
             configuration["api_methods"]=json!(methods.iter().map(|method|json!({"provider":"display","callers":[COORDINATOR],"method":method})).collect::<Vec<_>>());
         }
         let configuration = serde_json::from_value(configuration).unwrap();
-        let broker = Rc::new(RefCell::new(Broker::new(configuration).unwrap()));
+        let broker = TestBroker::new(Broker::new(configuration).unwrap());
         for method in methods {
-            let response = broker.borrow_mut().dispatch(
+            let response = broker.dispatch(
                 "display",
                 Command::RegisterApi {
                     method: serde_json::from_value(method).unwrap(),
@@ -126,6 +128,7 @@ impl Harness {
         let endpoint = Box::new(Endpoint {
             broker: broker.clone(),
             principal: COORDINATOR,
+            polling_thread: Default::default(),
         });
         // SAFETY: the exported table is static and has the ABI version checked below.
         let api = unsafe { *amaterasu_session_lifecycle::amaterasu_module_v1() };
@@ -163,12 +166,11 @@ impl Harness {
 
     fn tick(&mut self) {
         // SAFETY: instance is a live module created by this exact table.
-        assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        self.endpoint.broker.tick(self.endpoint.principal, || {
+            assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        });
         if self.provider {
-            let request = self
-                .broker
-                .borrow_mut()
-                .dispatch("display", Command::Poll {});
+            let request = self.broker.dispatch("display", Command::Poll {});
             if let Response::Request {
                 id,
                 caller,
@@ -181,7 +183,7 @@ impl Harness {
                 if payload["method"] == "resource_plan" {
                     let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":self.plan_constraints,"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
                     assert!(matches!(
-                        self.broker.borrow_mut().dispatch(
+                        self.broker.dispatch(
                             "display",
                             Command::Complete {
                                 request: id,
@@ -199,7 +201,7 @@ impl Harness {
 
     fn call(&mut self, caller: &str, payload: Value) -> Value {
         self.request_sequence += 1;
-        let response = self.broker.borrow_mut().dispatch(
+        let response = self.broker.dispatch(
             caller,
             Command::Request {
                 service: SERVICE.into(),
@@ -216,14 +218,12 @@ impl Harness {
             self.tick();
             let response = self
                 .broker
-                .borrow_mut()
                 .dispatch(caller, Command::TakeResult { request: id });
             match response {
                 Response::Pending => continue,
                 Response::Result { payload } => {
                     assert!(matches!(
                         self.broker
-                            .borrow_mut()
                             .dispatch(caller, Command::ReleaseResult { request: id }),
                         Response::Ok
                     ));
@@ -245,6 +245,16 @@ impl Drop for Harness {
         }
         std::fs::remove_dir_all(&self.root).unwrap();
     }
+}
+
+#[test]
+fn lifecycle_requests_are_served_off_the_streaming_host_thread() {
+    let mut harness = Harness::new();
+    harness.tick();
+    assert_ne!(
+        *harness.endpoint.polling_thread.get().unwrap(),
+        std::thread::current().id()
+    );
 }
 
 #[test]
@@ -373,7 +383,7 @@ fn preparation_waits_for_provider_and_verifies_its_exact_durable_callback() {
     forged["fingerprint"] = json!("0".repeat(64));
     assert_eq!(harness.call("display", forged)["status"], "rejected");
     assert!(matches!(
-        harness.broker.borrow_mut().dispatch(
+        harness.broker.dispatch(
             "display",
             Command::Complete {
                 request,
@@ -429,7 +439,7 @@ fn prepared_context_requires_a_prepared_callback_not_only_settled_rights() {
             json!({"status":"cleanup","outcomes":[]})
         };
         assert!(matches!(
-            harness.broker.borrow_mut().dispatch(
+            harness.broker.dispatch(
                 "display",
                 Command::Complete {
                     request,

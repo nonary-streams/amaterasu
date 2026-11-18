@@ -2,15 +2,16 @@
 //!
 #![cfg(target_os = "linux")]
 use amaterasu_module_sdk::{Command, abi};
+mod support;
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
     ffi::{CString, c_char, c_void},
     path::PathBuf,
-    rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
+use support::TestBroker;
 
 #[link(name = "dl")]
 unsafe extern "C" {
@@ -23,9 +24,9 @@ const LIFECYCLE: &str = "amaterasu.session-lifecycle/1";
 const SCREEN: &str = "nonary.virtual-screen";
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Endpoint {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     principal: &'static str,
-    trace: Rc<RefCell<Vec<Value>>>,
+    trace: Arc<Mutex<Vec<Value>>>,
 }
 unsafe extern "C" fn invoke(
     context: *mut c_void,
@@ -50,13 +51,11 @@ unsafe extern "C" fn invoke(
     ) {
         endpoint
             .trace
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(json!({"principal": endpoint.principal, "command": command}));
     }
-    let response = endpoint
-        .broker
-        .borrow_mut()
-        .dispatch(endpoint.principal, command);
+    let response = endpoint.broker.dispatch(endpoint.principal, command);
     let Ok(bytes) = serde_json::to_vec(&response) else {
         return abi::STATUS_INTERNAL_ERROR;
     };
@@ -72,9 +71,9 @@ struct RunningModule {
 impl RunningModule {
     fn new(
         api: abi::ModuleApi,
-        broker: Rc<RefCell<Broker>>,
+        broker: Arc<TestBroker>,
         principal: &'static str,
-        trace: Rc<RefCell<Vec<Value>>>,
+        trace: Arc<Mutex<Vec<Value>>>,
     ) -> Self {
         let mut endpoint = Box::new(Endpoint {
             broker,
@@ -181,10 +180,9 @@ fn partial_owner_profile_is_rejected_without_registered_finalize() {
             .get("finalize_policies")
             .is_none()
     );
-    let broker = Rc::new(RefCell::new(
-        Broker::new(serde_json::from_value(configuration).unwrap()).unwrap(),
-    ));
-    let trace = Rc::new(RefCell::new(Vec::new()));
+    let broker =
+        TestBroker::new(Broker::new(serde_json::from_value(configuration).unwrap()).unwrap());
+    let trace = Arc::new(Mutex::new(Vec::new()));
     let (owner_library, owner_api) = load_plugin("AMATERASU_SCREEN_PLUGIN");
     let owner = RunningModule::new(owner_api, broker.clone(), SCREEN, trace.clone());
     let mut endpoint = Box::new(Endpoint {
@@ -213,7 +211,8 @@ fn partial_owner_profile_is_rejected_without_registered_finalize() {
     assert_ne!(status, abi::STATUS_OK, "incomplete v2 profile was accepted");
     assert!(
         !trace
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .any(|e| e["command"]["op"] == "call_api" || e["command"]["op"] == "request"),
         "provider effect was dispatched"

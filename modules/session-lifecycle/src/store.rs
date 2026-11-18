@@ -80,8 +80,7 @@ impl LifecycleStore {
                 "journal requires reopening after failed replacement",
             ));
         }
-        let value = serde_json::to_value(value).map_err(io::Error::other)?;
-        let bytes = serde_json::to_vec(&value).map_err(io::Error::other)?;
+        let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
         if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

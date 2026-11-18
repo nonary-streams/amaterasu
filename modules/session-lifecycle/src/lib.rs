@@ -42,7 +42,11 @@ impl LifecycleHandler for Coordinator {
 }
 
 type SessionLifecycleModule = LifecycleAdapter<Coordinator>;
-amaterasu_module_sdk::export_module!(SessionLifecycleModule);
+// Journal replacement and provider coordination share one ordered worker.
+// A durable commit can wait on storage without holding the streaming host thread.
+amaterasu_module_sdk::export_module!(
+    amaterasu_module_sdk::service_worker::ServiceWorker<SessionLifecycleModule>
+);
 
 #[cfg(test)]
 mod coordinator_regression_tests;

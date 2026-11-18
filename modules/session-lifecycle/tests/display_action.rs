@@ -5,16 +5,17 @@
 //! and approvals SHA-256 8ce545418800c32cf335ae5e51b83a5b227571ebe58c4bbf737c7b87e7f8e6fc.
 #![cfg(target_os = "linux")]
 use amaterasu_module_sdk::{Command, Response, abi};
+mod support;
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     ffi::{CString, c_char, c_void},
     path::PathBuf,
-    rc::Rc,
+    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
 };
+use support::TestBroker;
 
 #[link(name = "dl")]
 unsafe extern "C" {
@@ -28,7 +29,7 @@ const LIFECYCLE: &str = "amaterasu.session-lifecycle/1";
 const DISPLAY_SERVICE: &str = "nonary.display-settings/1";
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Endpoint {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     principal: &'static str,
 }
 unsafe extern "C" fn invoke(
@@ -45,10 +46,7 @@ unsafe extern "C" fn invoke(
     let Ok(command) = serde_json::from_slice::<Command>(bytes) else {
         return abi::STATUS_INVALID_ARGUMENT;
     };
-    let response = endpoint
-        .broker
-        .borrow_mut()
-        .dispatch(endpoint.principal, command);
+    let response = endpoint.broker.dispatch(endpoint.principal, command);
     if endpoint.principal == DISPLAY
         && (matches!(&response, Response::Error { .. })
             || matches!(&response, Response::Result { payload } if payload["status"] == "rejected"))
@@ -68,7 +66,7 @@ struct RunningModule {
     endpoint: Box<Endpoint>,
 }
 impl RunningModule {
-    fn new(api: abi::ModuleApi, broker: Rc<RefCell<Broker>>, principal: &'static str) -> Self {
+    fn new(api: abi::ModuleApi, broker: Arc<TestBroker>, principal: &'static str) -> Self {
         let mut endpoint = Box::new(Endpoint { broker, principal });
         let host = abi::HostApi {
             header: abi::AbiHeader::of::<abi::HostApi>(),
@@ -91,7 +89,9 @@ impl RunningModule {
     }
     fn tick(&self) {
         let _keep_alive = &self.endpoint;
-        assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        self.endpoint.broker.tick(self.endpoint.principal, || {
+            assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        });
     }
 }
 impl Drop for RunningModule {
@@ -105,7 +105,7 @@ fn domain(revision: u64, borrowers: usize) -> Value {
     json!({"id":"provider_session:abc","revision":revision,"borrowers":borrowers,"pending_mutations":0,"scope":"provider_session"})
 }
 struct Fixture {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     lifecycle: RunningModule,
     display: RunningModule,
     library: *mut c_void,
@@ -180,13 +180,13 @@ impl Fixture {
             "participants":[{"provider":DISPLAY,"plan_method":method("resource_plan"),"callback_method":method("lifecycle_callback"),"status_method":method("lifecycle_status"),"binding_validate_method":method("binding_validate"),"settings_revision":"one","settings":settings,"capabilities":[],"cleanup_methods":[method("lifecycle_callback")]}]
         }}});
         let config = serde_json::from_value(configuration).unwrap();
-        let broker = Rc::new(RefCell::new(Broker::new(config).unwrap()));
+        let broker = TestBroker::new(Broker::new(config).unwrap());
         for (caller, service) in [
             ("virtual", "amaterasu.virtual-display/1"),
             ("state", "amaterasu.state/1"),
         ] {
             assert!(matches!(
-                broker.borrow_mut().dispatch(
+                broker.dispatch(
                     caller,
                     Command::Register {
                         service: service.into()
@@ -238,10 +238,7 @@ impl Fixture {
         self.lifecycle.tick();
         self.display.tick();
         for principal in ["virtual", "state"] {
-            let response = self
-                .broker
-                .borrow_mut()
-                .dispatch(principal, Command::Poll {});
+            let response = self.broker.dispatch(principal, Command::Poll {});
             if let Response::Request { id, payload, .. } = response {
                 let answer = if principal == "state" {
                     self.state(&payload)
@@ -249,7 +246,7 @@ impl Fixture {
                     self.native(&payload)
                 };
                 assert!(matches!(
-                    self.broker.borrow_mut().dispatch(
+                    self.broker.dispatch(
                         principal,
                         Command::Complete {
                             request: id,
@@ -414,7 +411,7 @@ impl Fixture {
     }
     fn call_as(&mut self, caller: &str, payload: Value) -> Value {
         self.next += 1;
-        let response = self.broker.borrow_mut().dispatch(
+        let response = self.broker.dispatch(
             caller,
             Command::Request {
                 service: LIFECYCLE.into(),
@@ -431,7 +428,6 @@ impl Fixture {
             self.tick();
             match self
                 .broker
-                .borrow_mut()
                 .dispatch(caller, Command::TakeResult { request: id })
             {
                 Response::Pending => {}
@@ -443,7 +439,7 @@ impl Fixture {
     }
     fn call_api(&mut self, method: &str, payload: Value) -> Value {
         self.next += 1;
-        let result = self.broker.borrow_mut().dispatch(
+        let result = self.broker.dispatch(
             "amaterasu.extension-actions",
             Command::CallApi {
                 service: DISPLAY_SERVICE.into(),
@@ -461,7 +457,7 @@ impl Fixture {
         };
         for _ in 0..1000 {
             self.tick();
-            let result = self.broker.borrow_mut().dispatch(
+            let result = self.broker.dispatch(
                 "amaterasu.extension-actions",
                 Command::TakeResult { request: id },
             );

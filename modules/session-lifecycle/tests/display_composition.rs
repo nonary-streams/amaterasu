@@ -6,16 +6,17 @@
 //! temporary path; native display and state services are deterministic fakes.
 #![cfg(target_os = "linux")]
 use amaterasu_module_sdk::{Command, Response, abi};
+mod support;
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     ffi::{CString, c_char, c_void},
     path::PathBuf,
-    rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
+use support::TestBroker;
 
 #[link(name = "dl")]
 unsafe extern "C" {
@@ -31,10 +32,10 @@ const SCREEN: &str = "nonary.virtual-screen";
 const SCREEN_SERVICE: &str = "nonary.virtual-screen/2";
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Endpoint {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     principal: &'static str,
-    trace: Rc<RefCell<Vec<Value>>>,
-    fault: Rc<RefCell<OutputFault>>,
+    trace: Arc<Mutex<Vec<Value>>>,
+    fault: Arc<Mutex<OutputFault>>,
 }
 #[derive(Default)]
 struct OutputFault {
@@ -65,7 +66,7 @@ unsafe extern "C" fn invoke(
             .and_then(Value::as_array_mut)
             .and_then(|outputs| outputs.first_mut())
     {
-        let mut fault = endpoint.fault.borrow_mut();
+        let mut fault = endpoint.fault.lock().unwrap();
         match fault.kind {
             Some("foreign") => {
                 output["resource"]["provider"] = json!("foreign.provider");
@@ -91,7 +92,8 @@ unsafe extern "C" fn invoke(
     ) {
         endpoint
             .trace
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(json!({"principal": endpoint.principal, "command": command}));
     }
     let completing = endpoint.principal == "amaterasu.extension-actions"
@@ -103,12 +105,9 @@ unsafe extern "C" fn invoke(
         }
         _ => None,
     };
-    let mut response = endpoint
-        .broker
-        .borrow_mut()
-        .dispatch(endpoint.principal, command);
+    let mut response = endpoint.broker.dispatch(endpoint.principal, command);
     {
-        let mut fault = endpoint.fault.borrow_mut();
+        let mut fault = endpoint.fault.lock().unwrap();
         if completing && let Response::Accepted { id } = &response {
             fault.completion_request = Some(*id);
         }
@@ -125,7 +124,8 @@ unsafe extern "C" fn invoke(
     if matches!(&response, Response::Error { .. }) {
         endpoint
             .trace
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(json!({"principal":endpoint.principal,"broker_error":response}));
     }
     let Ok(bytes) = serde_json::to_vec(&response) else {
@@ -143,10 +143,10 @@ struct RunningModule {
 impl RunningModule {
     fn new(
         api: abi::ModuleApi,
-        broker: Rc<RefCell<Broker>>,
+        broker: Arc<TestBroker>,
         principal: &'static str,
-        trace: Rc<RefCell<Vec<Value>>>,
-        fault: Rc<RefCell<OutputFault>>,
+        trace: Arc<Mutex<Vec<Value>>>,
+        fault: Arc<Mutex<OutputFault>>,
     ) -> Self {
         let mut endpoint = Box::new(Endpoint {
             broker,
@@ -175,7 +175,9 @@ impl RunningModule {
     }
     fn tick(&self) {
         let _keep_alive = &self.endpoint;
-        assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        self.endpoint.broker.tick(self.endpoint.principal, || {
+            assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        });
     }
 }
 impl Drop for RunningModule {
@@ -234,14 +236,14 @@ struct Store {
     values: BTreeMap<String, Value>,
 }
 struct Fixture {
-    broker: Rc<RefCell<Broker>>,
+    broker: Arc<TestBroker>,
     lifecycle: RunningModule,
     display: Option<RunningModule>,
     screen: RunningModule,
     display_library: *mut c_void,
     screen_library: *mut c_void,
-    trace: Rc<RefCell<Vec<Value>>>,
-    fault: Rc<RefCell<OutputFault>>,
+    trace: Arc<Mutex<Vec<Value>>>,
+    fault: Arc<Mutex<OutputFault>>,
     additional: Vec<AdditionalModule>,
     lifecycle_library: *mut c_void,
     root: PathBuf,
@@ -315,13 +317,13 @@ impl Fixture {
             );
         }
         let config = serde_json::from_value(configuration).unwrap();
-        let broker = Rc::new(RefCell::new(Broker::new(config).unwrap()));
+        let broker = TestBroker::new(Broker::new(config).unwrap());
         for (caller, service) in [
             ("virtual", "amaterasu.virtual-display/1"),
             ("state", "amaterasu.state/1"),
         ] {
             assert!(matches!(
-                broker.borrow_mut().dispatch(
+                broker.dispatch(
                     caller,
                     Command::Register {
                         service: service.into()
@@ -332,7 +334,7 @@ impl Fixture {
         }
         if keyboard {
             assert!(matches!(
-                broker.borrow_mut().dispatch(
+                broker.dispatch(
                     "configuration",
                     Command::Register {
                         service: "amaterasu.configuration/1".into()
@@ -341,8 +343,8 @@ impl Fixture {
                 Response::Ok
             ));
         }
-        let trace = Rc::new(RefCell::new(Vec::new()));
-        let fault = Rc::new(RefCell::new(OutputFault::default()));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let fault = Arc::new(Mutex::new(OutputFault::default()));
         let (display_library, display) = if owner_only {
             (std::ptr::null_mut(), None)
         } else {
@@ -429,10 +431,7 @@ impl Fixture {
             module.module.tick();
         }
         for principal in ["virtual", "state", "configuration"] {
-            let response = self
-                .broker
-                .borrow_mut()
-                .dispatch(principal, Command::Poll {});
+            let response = self.broker.dispatch(principal, Command::Poll {});
             if let Response::Request {
                 id,
                 caller,
@@ -449,7 +448,7 @@ impl Fixture {
                     self.native(&payload)
                 };
                 assert!(matches!(
-                    self.broker.borrow_mut().dispatch(
+                    self.broker.dispatch(
                         principal,
                         Command::Complete {
                             request: id,
@@ -566,7 +565,7 @@ impl Fixture {
     }
     fn native(&mut self, p: &Value) -> Value {
         self.native_calls.push(p.clone());
-        self.trace.borrow_mut().push(json!({"native":p}));
+        self.trace.lock().unwrap().push(json!({"native":p}));
         match p["action"].as_str().unwrap() {
             "status" => {
                 let identity = p["identity"].as_str();
@@ -692,7 +691,7 @@ impl Fixture {
     }
     fn begin_as(&mut self, caller: &str, service: &str, payload: Value) -> u64 {
         self.next += 1;
-        let response = self.broker.borrow_mut().dispatch(
+        let response = self.broker.dispatch(
             caller,
             Command::Request {
                 service: service.into(),
@@ -713,14 +712,12 @@ impl Fixture {
             self.tick();
             let response = self
                 .broker
-                .borrow_mut()
                 .dispatch(caller, Command::TakeResult { request: id });
             match response {
                 Response::Pending => {}
                 Response::Result { payload } => {
                     assert!(matches!(
                         self.broker
-                            .borrow_mut()
                             .dispatch(caller, Command::ReleaseResult { request: id }),
                         Response::Ok
                     ));
@@ -750,7 +747,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let evidence = json!({"stores":self.stores,"collections":self.collections,"native_calls":self.native_calls,"trace":*self.trace.borrow()});
+        let evidence = json!({"stores":self.stores,"collections":self.collections,"native_calls":self.native_calls,"trace":*self.trace.lock().unwrap()});
         std::fs::write(
             self.root.join("simulated-backend.json"),
             serde_json::to_vec_pretty(&evidence).unwrap(),
@@ -857,7 +854,7 @@ fn real_participants_prepare_resume_and_release_in_dependency_order() {
     assert_eq!(ended["status"], "succeeded", "{ended}");
     assert!(f.references.is_empty());
     assert!(f.borrows.is_empty());
-    let trace = f.trace.borrow();
+    let trace = f.trace.lock().unwrap().clone();
     let calls: Vec<_> = trace
         .iter()
         .filter_map(|e| e.get("command"))
@@ -971,14 +968,13 @@ fn lifecycle_rejects_missing_and_cyclic_participant_dependencies() {
         } else if graph == "missing" {
             participants[dependent]["depends_on"] = json!(["missing.provider"]);
         }
-        let broker = Rc::new(RefCell::new(
-            Broker::new(serde_json::from_value(configuration).unwrap()).unwrap(),
-        ));
+        let broker =
+            TestBroker::new(Broker::new(serde_json::from_value(configuration).unwrap()).unwrap());
         let mut endpoint = Box::new(Endpoint {
             broker,
             principal: COORDINATOR,
-            trace: Rc::new(RefCell::new(Vec::new())),
-            fault: Rc::new(RefCell::new(OutputFault::default())),
+            trace: Arc::new(Mutex::new(Vec::new())),
+            fault: Arc::new(Mutex::new(OutputFault::default())),
         });
         let host = abi::HostApi {
             header: abi::AbiHeader::of::<abi::HostApi>(),
@@ -1001,7 +997,7 @@ fn lifecycle_rejects_missing_and_cyclic_participant_dependencies() {
             assert_ne!(status, abi::STATUS_OK, "invalid graph accepted: {graph}");
         }
         assert!(
-            endpoint.trace.borrow().is_empty(),
+            endpoint.trace.lock().unwrap().is_empty(),
             "invalid graph dispatched provider effects"
         );
     }
@@ -1074,12 +1070,12 @@ fn active_stream_keyboard_remove_retires_dependents_before_owner_effect() {
     let started =
         f.call(json!({"operation":"start_stream","operation_id":"start","target":target}));
     assert_eq!(started["status"], "succeeded", "{started}");
-    f.fault.borrow_mut().drop_completion_result = true;
+    f.fault.lock().unwrap().drop_completion_result = true;
     let batch = f.begin_as("amaterasu.stream-session", "amaterasu.input/1", json!({"action":"batch","lease":acquired["lease"],"input_binding":binding["token"],"operation_id":format!("{}:1", acquired["batch_epoch"].as_str().unwrap()),"events":[{"kind":"key","key":{"platform":"linux_evdev","code":30},"state":"down"}]}));
     let mut began_transition = false;
     for _ in 0..5000 {
         f.tick();
-        began_transition = f.trace.borrow().iter().any(|e| {
+        began_transition = f.trace.lock().unwrap().iter().any(|e| {
             e["principal"] == "amaterasu.extension-actions"
                 && e["command"]["payload"]["operation"] == "begin_action_transition"
         });
@@ -1087,7 +1083,7 @@ fn active_stream_keyboard_remove_retires_dependents_before_owner_effect() {
             break;
         }
         if matches!(
-            f.broker.borrow_mut().dispatch(
+            f.broker.dispatch(
                 "amaterasu.stream-session",
                 Command::TakeResult { request: batch }
             ),
@@ -1109,7 +1105,7 @@ fn active_stream_keyboard_remove_retires_dependents_before_owner_effect() {
     let mut completed = false;
     for _ in 0..5000 {
         f.tick();
-        match f.broker.borrow_mut().dispatch(
+        match f.broker.dispatch(
             "amaterasu.stream-session",
             Command::TakeResult { request: batch },
         ) {
@@ -1124,10 +1120,10 @@ fn active_stream_keyboard_remove_retires_dependents_before_owner_effect() {
     }
     assert!(completed, "keyboard batch did not settle");
     assert!(
-        f.fault.borrow().completion_result_dropped,
+        f.fault.lock().unwrap().completion_result_dropped,
         "completion reply was not dropped"
     );
-    let trace = f.trace.borrow();
+    let trace = f.trace.lock().unwrap().clone();
     let settings_release = trace
         .iter()
         .position(|e| {
@@ -1242,7 +1238,8 @@ fn active_stream_keyboard_remove_retires_dependents_before_owner_effect() {
     let batch = f.begin_as("amaterasu.stream-session", "amaterasu.input/1", json!({"action":"batch","lease":acquired["lease"],"input_binding":binding["token"],"operation_id":format!("{}:1", acquired["batch_epoch"].as_str().unwrap()),"events":[{"kind":"key","key":{"platform":"linux_evdev","code":30},"state":"down"}]}));
     let prior_transitions = f
         .trace
-        .borrow()
+        .lock()
+        .unwrap()
         .iter()
         .filter(|e| {
             e["principal"] == "amaterasu.extension-actions"
@@ -1253,7 +1250,8 @@ fn active_stream_keyboard_remove_retires_dependents_before_owner_effect() {
     for _ in 0..5000 {
         f.tick();
         if f.trace
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .filter(|e| {
                 e["principal"] == "amaterasu.extension-actions"
@@ -1272,7 +1270,7 @@ fn active_stream_keyboard_remove_retires_dependents_before_owner_effect() {
     let mut second_completed = false;
     for _ in 0..5000 {
         f.tick();
-        match f.broker.borrow_mut().dispatch(
+        match f.broker.dispatch(
             "amaterasu.stream-session",
             Command::TakeResult { request: batch },
         ) {
@@ -1365,20 +1363,21 @@ fn active_stream_keyboard_remove_retires_dependents_before_owner_effect() {
 fn foreign_and_stale_owner_outputs_never_reach_dependent_configuration() {
     for kind in ["foreign", "stale"] {
         let mut f = Fixture::new();
-        f.fault.borrow_mut().kind = Some(kind);
+        f.fault.lock().unwrap().kind = Some(kind);
         let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
         let pending = f.call(json!({"operation":"prepare","operation_id":"session","requested_video":video,"application_ref":{"kind":"desktop"}}));
         assert_eq!(pending["status"], "pending", "{pending}");
         let outcome = f.settled("session");
         assert!(
-            f.fault.borrow().injected,
+            f.fault.lock().unwrap().injected,
             "owner did not emit an output to tamper with"
         );
         assert_ne!(outcome["status"], "succeeded", "{kind}: {outcome}");
         assert!(outcome.get("candidate").is_none_or(Value::is_null));
         assert!(
             !f.trace
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
                 .any(|e| e["command"]["service"] == SCREEN_SERVICE
                     && e["command"]["method"] == "resource_control"),
@@ -1405,11 +1404,10 @@ fn partial_owner_profile_is_rejected_without_registered_finalize() {
             .get("finalize_policies")
             .is_none()
     );
-    let broker = Rc::new(RefCell::new(
-        Broker::new(serde_json::from_value(configuration).unwrap()).unwrap(),
-    ));
-    let trace = Rc::new(RefCell::new(Vec::new()));
-    let fault = Rc::new(RefCell::new(OutputFault::default()));
+    let broker =
+        TestBroker::new(Broker::new(serde_json::from_value(configuration).unwrap()).unwrap());
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let fault = Arc::new(Mutex::new(OutputFault::default()));
     let (owner_library, owner_api) = load_plugin("AMATERASU_SCREEN_PLUGIN");
     let owner = RunningModule::new(
         owner_api,
@@ -1445,7 +1443,8 @@ fn partial_owner_profile_is_rejected_without_registered_finalize() {
     assert_ne!(status, abi::STATUS_OK, "incomplete v2 profile was accepted");
     assert!(
         !trace
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .any(|e| e["command"]["op"] == "call_api" || e["command"]["op"] == "request"),
         "provider effect was dispatched"
@@ -1464,12 +1463,12 @@ fn real_owner_prepares_session_with_simulated_native_and_state() {
         result["status"],
         "succeeded",
         "{result}; trace={:?}; native={:?}",
-        f.trace.borrow(),
+        *f.trace.lock().unwrap(),
         f.native_calls
     );
     assert!(f.native_calls.iter().any(|call| call["action"] == "create"));
     assert!(f.native_calls.iter().any(|call| call["action"] == "borrow"));
-    assert!(f.trace.borrow().iter().any(|event| {
+    assert!(f.trace.lock().unwrap().iter().any(|event| {
         event["principal"] == SCREEN
             && event["command"]["op"] == "complete"
             && event["command"]["payload"]["status"] == "prepared"
