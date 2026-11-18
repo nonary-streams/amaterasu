@@ -280,7 +280,7 @@ def ready_status(console: Console) -> dict:
                     lambda value: value.get("tls_ready"))
 
 
-def pair_and_list(harness: LinuxSessionHarness, base_port: int) -> tuple[str, dict]:
+def pair_and_list(harness: LinuxSessionHarness, base_port: int) -> tuple[str, dict, bool]:
     console = harness.console()
     try:
         imported = import_host_identity(console)
@@ -302,6 +302,8 @@ def pair_and_list(harness: LinuxSessionHarness, base_port: int) -> tuple[str, di
         applications = {
             str(int(created["id"][4:], 16)): CATALOG_NAME,
             "2147483647": "Desktop",
+            "2147483506": "Remote Input",
+            "2147483505": "Remote Monitor",
         }
         require_private_library(http, https)
         require_untrusted(https, tls_context())
@@ -310,7 +312,11 @@ def pair_and_list(harness: LinuxSessionHarness, base_port: int) -> tuple[str, di
         context = tls_context()
         paired = successful(get(https, "/serverinfo", {"uniqueid": CLIENT_ID}, context))
         assert paired.findtext("PairStatus") == "1"
-        check_library(https, applications, context)
+        # HEVC Main10 and AV1 Main10 are advertised only after a successful
+        # encoder probe for HDR. The optimized build can expose them.
+        main10_codecs = 0x0000_0200 | 0x0002_0000
+        hdr_supported = bool(int(paired.findtext("ServerCodecModeSupport")) & main10_codecs)
+        check_library(https, applications, context, hdr_supported=hdr_supported)
 
         # Every socket the host and its workers own is loopback-only, and the
         # whole Moonlight port set is really listening.
@@ -320,13 +326,13 @@ def pair_and_list(harness: LinuxSessionHarness, base_port: int) -> tuple[str, di
         outside = {item for item in listeners if not item[1].is_loopback}
         assert not outside, f"listeners beyond loopback: {outside}"
         console.eof()
-        return certificate_id, applications
+        return certificate_id, applications, hdr_supported
     finally:
         console.close()
 
 
 def confirm_restart_keeps_trust(harness: LinuxSessionHarness, certificate_id: str,
-                                applications: dict) -> None:
+                                applications: dict, hdr_supported: bool) -> None:
     console = harness.console()
     try:
         status = ready_status(console)
@@ -334,7 +340,9 @@ def confirm_restart_keeps_trust(harness: LinuxSessionHarness, certificate_id: st
         restored = successful(get(https, "/serverinfo", {"uniqueid": CLIENT_ID}, tls_context()))
         assert restored.findtext("PairStatus") == "1", "pairing did not survive the restart"
         # Also proves the library persisted and that revocation still takes effect.
-        check_persisted_trust(console, certificate_id, applications, revoke=True)
+        check_persisted_trust(
+            console, certificate_id, applications, revoke=True, hdr_supported=hdr_supported
+        )
         console.eof()
     finally:
         console.close()
@@ -349,8 +357,8 @@ def test_loopback_pairing_catalog_and_restart() -> None:
         check_default_policy(harness.root)
         check_rejected_network_options(harness.publisher, directory)
         harness.pack_and_stage()
-        certificate_id, applications = pair_and_list(harness, base_port)
-        confirm_restart_keeps_trust(harness, certificate_id, applications)
+        certificate_id, applications, hdr_supported = pair_and_list(harness, base_port)
+        confirm_restart_keeps_trust(harness, certificate_id, applications, hdr_supported)
     print("Passed: signed pack-linux-session package, loopback NVHTTP/RTSP listeners, PIN pairing, "
           "console-authored application list, restart keeps PairStatus=1, and validated LAN "
           "option refusals. No capture, display, audio or input effect was started.")

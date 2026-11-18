@@ -186,7 +186,7 @@ def create_library(console):
     return applications
 
 
-def check_library(https, applications, context, *, client_id=CLIENT_ID, expected_server_pem=None):
+def check_library(https, applications, context, *, client_id=CLIENT_ID, expected_server_pem=None, hdr_supported=False):
     root = successful(get(
         https, "/applist", {"uniqueid": client_id}, context,
         expected_server_pem=expected_server_pem,
@@ -194,8 +194,7 @@ def check_library(https, applications, context, *, client_id=CLIENT_ID, expected
     rows = root.findall("App")
     assert len(rows) == len(applications), ET.tostring(root)
     assert {row.findtext("ID"): row.findtext("AppTitle") for row in rows} == applications
-    assert all(row.findtext("IsHdrSupported") == "0" for row in rows)
-    assert "<IsHdrSupported>1</IsHdrSupported>" not in ET.tostring(root, encoding="unicode")
+    assert all(row.findtext("IsHdrSupported") == str(int(hdr_supported)) for row in rows), ET.tostring(root)
     assert b"/private/example-game" not in ET.tostring(root), "launch metadata leaked"
 
 
@@ -350,14 +349,14 @@ def check_unpair_persisted_then_repair(console, applications, expected_certifica
     return certificate_id
 
 
-def check_persisted_trust(console, certificate_id, applications, *, revoke):
+def check_persisted_trust(console, certificate_id, applications, *, revoke, hdr_supported=False):
     status = wait_for(console, "amaterasu.nvhttp/1", {"action": "status"}, lambda value: value.get("tls_ready"))
     https = "https://" + status["https_address"]
     context = tls_context()
     if revoke:
         restored = successful(get(https, "/serverinfo", {"uniqueid": CLIENT_ID}, context))
         assert restored.findtext("PairStatus") == "1", "committed trust did not survive restart"
-        check_library(https, applications, context)
+        check_library(https, applications, context, hdr_supported=hdr_supported)
         result = console.request("amaterasu.pairing/1", {"action": "unpair", "certificate_id": certificate_id})
         assert result["ok"], result
     status, rejected = get(https, "/serverinfo", {"uniqueid": CLIENT_ID}, context)
