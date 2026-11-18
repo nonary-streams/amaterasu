@@ -1107,6 +1107,8 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos();
             let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
                 .join(format!("amaterasu-logging-{}-{unique}", std::process::id()));
             fs::create_dir(&path).unwrap();
             Self(path)
@@ -1121,7 +1123,7 @@ mod tests {
 
     #[test]
     fn source_levels_and_product_default_match_pinned_policy() {
-        let root = std::env::temp_dir();
+        let root = std::env::temp_dir().canonicalize().unwrap();
         let default = LoggingPolicy::from_global(0, None, &root).unwrap();
         assert!(default.minimum_level.allows(Level::Info));
         assert!(!default.minimum_level.allows(Level::Debug));

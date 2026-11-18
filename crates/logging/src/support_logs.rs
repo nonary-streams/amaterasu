@@ -407,7 +407,7 @@ mod tests {
     struct Directory(PathBuf);
     impl Directory {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
+            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
                 "amaterasu-support-{}",
                 crate::host_logs::random_id().unwrap()
             ));
