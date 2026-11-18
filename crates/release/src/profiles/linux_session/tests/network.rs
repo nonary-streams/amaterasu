@@ -49,10 +49,14 @@ fn every_listener_binds_loopback_by_default() {
 
 fn network_for(arguments_: &[&str]) -> (NetworkOption, BTreeMap<String, Value>) {
     let options = LinuxSessionOptions::from_arguments(&arguments(arguments_)).unwrap();
-    let root = TemporaryRoot::new("network");
-    let settings = linux_session_policy(root.path(), &options)
-        .unwrap()
-        .settings;
+    let state = std::env::temp_dir().join("amaterasu-network-profile-fixture");
+    let directories = PrivateStateDirectories {
+        session_history_database: state.join("session-history/history.db"),
+        lifecycle: state.join("session-lifecycle"),
+        rtx_hdr_runtime_parent: state.join("rtx-hdr"),
+        state,
+    };
+    let settings = settings(&options, &directories);
     (options.network, settings)
 }
 

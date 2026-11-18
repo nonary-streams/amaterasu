@@ -27,7 +27,7 @@ fn owner_launch_and_retry_preserve_512000_audio_bitrate_on_rtsp_open() {
     let mut streaming = config();
     streaming.profile.audio_bitrate = 512_000;
     streaming.profile.packet_ms = 5;
-    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
     let mut broker = Broker::default();
 
     assert!(controller.launch(10, request(31), peer(31), now).is_none());
@@ -63,7 +63,7 @@ fn owner_launch_exports_signed_video_ceilings_and_effective_bitrate_bound() {
     streaming.profile.max_height = 1440;
     streaming.profile.max_fps = 120;
     streaming.profile.bitrate_kbps = 20_000;
-    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
     controller.set_encoder_snapshot(hardware_h264());
     controller.set_global_max_bitrate_kbps(Some(8_000));
     let mut broker = Broker::default();

@@ -1,5 +1,5 @@
 fn retirement_cleanup_fixture(now: Instant) -> (Controller, Value, String) {
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let target =
         json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});

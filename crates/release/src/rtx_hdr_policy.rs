@@ -82,7 +82,7 @@ pub fn prepare(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use amaterasu_package::{random_identifier, write_json_atomically};

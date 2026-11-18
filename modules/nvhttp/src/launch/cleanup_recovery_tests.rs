@@ -131,7 +131,7 @@ fn reply_text(reply: &Reply) -> String {
 #[test]
 fn a_launch_during_cleanup_waits_and_starts_when_the_application_has_closed() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     assert!(controller.cancel(20, &peer(1), now).is_none());
@@ -159,7 +159,7 @@ fn a_launch_during_cleanup_waits_and_starts_when_the_application_has_closed() {
 #[test]
 fn a_launch_starts_after_the_grace_while_the_previous_application_never_finishes_closing() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut hosts = Generations::new();
     launch_delivered(&mut controller, &mut hosts, 10, 1, now);
     // The application accepts the stop and never finishes closing.
@@ -201,7 +201,7 @@ fn a_launch_starts_after_the_grace_while_the_previous_application_never_finishes
 #[test]
 fn quit_and_management_act_on_the_running_application_not_the_one_left_closing() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut hosts = Generations::new();
     launch_delivered(&mut controller, &mut hosts, 10, 1, now);
     hosts.host(1).application_stop_pending = true;
@@ -234,7 +234,7 @@ fn quit_and_management_act_on_the_running_application_not_the_one_left_closing()
 #[test]
 fn a_launch_does_not_wait_for_an_application_that_ended_long_ago() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.application_stop_pending = true;
@@ -255,7 +255,7 @@ fn a_launch_does_not_wait_for_an_application_that_ended_long_ago() {
 #[test]
 fn a_retained_application_settling_its_transport_still_holds_the_slot() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let record = controller.records.get_mut(&1).unwrap();
@@ -296,7 +296,7 @@ fn a_retained_application_settling_its_transport_still_holds_the_slot() {
 #[test]
 fn unfinished_cleanups_never_use_up_launch_capacity() {
     let mut now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut hosts = Generations::new();
     // Every application accepts its stop and never finishes closing.
     hosts.stop_pending = true;
@@ -329,7 +329,7 @@ fn unfinished_cleanups_never_use_up_launch_capacity() {
 #[test]
 fn a_waiting_launch_is_dropped_when_the_host_is_asked_to_quit_or_the_client_leaves() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.application_stop_pending = true;
@@ -354,7 +354,7 @@ fn a_waiting_launch_is_dropped_when_the_host_is_asked_to_quit_or_the_client_leav
 #[test]
 fn an_active_application_still_refuses_a_different_launch() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let mut other = request(2);
@@ -368,7 +368,7 @@ fn an_active_application_still_refuses_a_different_launch() {
 #[test]
 fn failed_application_cleanup_is_read_back_then_abandoned_without_replaying_stop() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.application_terminal_stop_state = Some("cleanup_failed");
@@ -410,7 +410,7 @@ fn failed_application_cleanup_is_read_back_then_abandoned_without_replaying_stop
 #[test]
 fn an_automatic_retry_completes_cleanup_that_only_needed_more_time() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.application_terminal_stop_state = Some("cleanup_failed");
@@ -437,7 +437,7 @@ fn an_automatic_retry_completes_cleanup_that_only_needed_more_time() {
 #[test]
 fn quitting_during_a_status_poll_does_not_fail_cleanup() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     // Leave a monitor read in flight, then lose its reply while quitting.
@@ -489,7 +489,7 @@ fn quitting_during_a_status_poll_does_not_fail_cleanup() {
 #[test]
 fn finished_launches_do_not_use_up_launch_capacity() {
     let mut now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     for cycle in 0..(MAX_RECORDS as u8 * 2) {
         let mut broker = Broker::default();
         let connection = 100 + u64::from(cycle) * 2;
@@ -517,7 +517,7 @@ fn finished_launches_do_not_use_up_launch_capacity() {
 #[test]
 fn a_failed_transport_cleanup_keeps_the_retained_application_resumable() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let record = controller.records.get_mut(&1).unwrap();

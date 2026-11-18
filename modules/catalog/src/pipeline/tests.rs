@@ -3185,7 +3185,7 @@ fn exported_launch_preflight_preserves_sparse_rtss_limit_types() {
             id.into(),
             json!({
                 "name":"RTSS game",
-                "launch":{"kind":"executable","program":"C:/games/rtss.exe"},
+                "launch":{"kind":"desktop"},
                 "config_overrides":override_value
             }),
         );
@@ -3196,7 +3196,7 @@ fn exported_launch_preflight_preserves_sparse_rtss_limit_types() {
             "nvhttp",
             "management",
         );
-        assert_eq!(result["ok"], true);
+        assert_eq!(result["ok"], true, "{result}");
         assert_eq!(
             result["entry"]["config_overrides"]["rtss_frame_limit_type"],
             override_value["rtss_frame_limit_type"]

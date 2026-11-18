@@ -21,7 +21,7 @@ fn auxiliary_plan(key: u8, capture: CaptureSource) -> AuxiliaryStreamPlan {
 }
 
 fn auxiliary_controller() -> Controller {
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_borrowed_capture_verification(true);
     controller.set_auxiliary_capture_routes(
         Some(CaptureProvider::External("black".into())),
@@ -97,7 +97,7 @@ fn auxiliary_open(broker: &Broker) -> &Value {
 #[test]
 fn auxiliary_sources_require_explicit_provider_selection() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let plan = auxiliary_plan(1, CaptureSource::SyntheticBlack);
     assert_eq!(
         controller
@@ -122,7 +122,7 @@ fn auxiliary_input_uses_black_source_without_application_display_or_audio_policy
     let now = Instant::now();
     let mut controller = auxiliary_controller();
     controller
-        .set_global_display_policy(9, json!({"dd_configuration_option":"ensure_only_display"}));
+        .set_physical_fixture_display_policy(9, json!({"dd_configuration_option":"ensure_only_display"}));
     controller.set_virtual_sink_settings(Some("virtual-managed-sink"));
     let mut broker = Broker::default();
     assert!(
@@ -522,7 +522,7 @@ fn auxiliary_borrowed_application_verifies_and_binds_source_before_required_life
         amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
     );
     controller
-        .set_global_display_policy(7, json!({"dd_configuration_option":"ensure_only_display"}));
+        .set_physical_fixture_display_policy(7, json!({"dd_configuration_option":"ensure_only_display"}));
     let source = borrowed_source("original-application-source");
     let mut broker = SharedSessionBroker::default();
     assert!(
@@ -611,7 +611,7 @@ fn resumed_source_keeps_disconnect_witness_with_its_exact_transport() {
     controller.set_session_lifecycle_capture_mode(
         amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
     );
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = SharedSessionBroker::default();
     assert!(
         controller
@@ -960,7 +960,7 @@ fn normal_join_response_uses_route_independently_of_lifecycle_resume() {
 #[test]
 fn normal_launch_response_can_follow_a_policy_selected_resume_route() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(
         controller
@@ -1334,7 +1334,7 @@ fn cached_application_source_retry_keeps_original_application_lifetime_hold() {
     controller.set_session_lifecycle_capture_mode(
         amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
     );
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let source = borrowed_source("original-application-source");
     let mut broker = SharedSessionBroker::default();
     controller.launch_application_with_source(10, request(1), peer(1), source.clone(), now);
@@ -1483,7 +1483,7 @@ fn application_source_binding_waits_for_durable_ack_before_lifecycle_or_launch()
     controller.set_session_lifecycle_capture_mode(
         amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
     );
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = SharedSessionBroker::default();
     controller.launch_application_with_source(
         10,
@@ -1653,7 +1653,7 @@ fn pending_application_binding_expires_without_lifecycle_or_application_effects(
     controller.set_session_lifecycle_capture_mode(
         amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
     );
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = SharedSessionBroker::default();
     controller.launch_application_with_source(
         10,
@@ -1836,7 +1836,7 @@ fn application_launch_join_binds_the_fresh_borrowed_reservation_before_rtsp() {
     controller.set_session_lifecycle_capture_mode(
         amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
     );
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let original = borrowed_source("application-source");
     let mut broker = SharedSessionBroker::default();
     assert!(
@@ -1912,7 +1912,7 @@ fn application_launch_join_rejects_a_changed_borrowed_source_before_effects() {
     controller.set_session_lifecycle_capture_mode(
         amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
     );
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = SharedSessionBroker::default();
     assert!(
         controller

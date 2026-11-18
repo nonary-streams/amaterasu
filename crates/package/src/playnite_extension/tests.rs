@@ -114,52 +114,197 @@ fn restore_fixture_write_access(active: &Path, sid: &str) {
 }
 
 #[cfg(windows)]
+fn with_fixture_token<T>(disable_admin: bool, operation: impl FnOnce() -> T) -> T {
+    use std::ffi::c_void;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut c_void,
+        attributes: u32,
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+        fn CreateRestrictedToken(
+            token: *mut c_void,
+            flags: u32,
+            disabled_count: u32,
+            disabled: *const SidAndAttributes,
+            privilege_count: u32,
+            privileges: *const c_void,
+            restricted_count: u32,
+            restricted: *const SidAndAttributes,
+            result: *mut *mut c_void,
+        ) -> i32;
+        fn ConvertStringSidToSidW(text: *const u16, sid: *mut *mut c_void) -> i32;
+        fn GetTokenInformation(
+            token: *mut c_void,
+            class: i32,
+            data: *mut c_void,
+            size: u32,
+            needed: *mut u32,
+        ) -> i32;
+        fn SetTokenInformation(
+            token: *mut c_void,
+            class: i32,
+            data: *const c_void,
+            size: u32,
+        ) -> i32;
+        fn ImpersonateLoggedOnUser(token: *mut c_void) -> i32;
+        fn RevertToSelf() -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    struct Impersonation;
+    impl Drop for Impersonation {
+        fn drop(&mut self) {
+            // SAFETY: this guard is confined to the impersonating test thread.
+            if unsafe { RevertToSelf() } == 0 {
+                std::process::abort();
+            }
+        }
+    }
+
+    let check = |success| {
+        assert_ne!(
+            success,
+            0,
+            "Playnite test token: {}",
+            std::io::Error::last_os_error()
+        )
+    };
+    let mut original = ptr::null_mut();
+    // SAFETY: the pseudo-handle and the token output pointer are valid.
+    check(unsafe { OpenProcessToken(GetCurrentProcess(), 0x008a, &mut original) });
+    // SAFETY: OpenProcessToken returned one owned handle.
+    let original = unsafe { OwnedHandle::from_raw_handle(original) };
+    let administrators: Vec<u16> = "S-1-5-32-544".encode_utf16().chain(Some(0)).collect();
+    let mut disabled = SidAndAttributes {
+        sid: ptr::null_mut(),
+        attributes: 0,
+    };
+    // SAFETY: administrators is NUL-terminated and the output pointer is live.
+    check(unsafe { ConvertStringSidToSidW(administrators.as_ptr(), &mut disabled.sid) });
+    let mut token = ptr::null_mut();
+    // SAFETY: each SID and token remains live for the call and the output is owned.
+    let copied = unsafe {
+        CreateRestrictedToken(
+            original.as_raw_handle(),
+            u32::from(disable_admin),
+            u32::from(disable_admin),
+            &disabled,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            &mut token,
+        )
+    };
+    // SAFETY: Windows owns this SID allocation until it is released here.
+    unsafe { LocalFree(disabled.sid) };
+    check(copied);
+    // SAFETY: CreateRestrictedToken returned one owned handle.
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+
+    let mut user = [0usize; 64];
+    let mut needed = 0;
+    // SAFETY: user is an aligned, writable buffer large enough for TOKEN_USER.
+    check(unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            1,
+            user.as_mut_ptr().cast(),
+            std::mem::size_of_val(&user) as u32,
+            &mut needed,
+        )
+    });
+    // SAFETY: TOKEN_USER begins with a SID pointer into the live buffer.
+    let user_sid = unsafe { (*user.as_ptr().cast::<SidAndAttributes>()).sid };
+    // SAFETY: TOKEN_OWNER is one live SID pointer, valid until the call returns.
+    check(unsafe {
+        SetTokenInformation(
+            token.as_raw_handle(),
+            4,
+            (&user_sid as *const *mut c_void).cast(),
+            std::mem::size_of::<*mut c_void>() as u32,
+        )
+    });
+    // SAFETY: the duplicate token is valid and scoped to this test thread.
+    check(unsafe { ImpersonateLoggedOnUser(token.as_raw_handle()) });
+    let _impersonation = Impersonation;
+    operation()
+}
+
+#[cfg(windows)]
 #[test]
 fn installs_exact_pair_and_restores_previous_version_after_restart() {
-    let (root, profile, source, sid, expected) = fixture();
-    let extensions = profile.join("AppData/Roaming/Playnite/Extensions");
-    let active = extensions.join(ACTIVE_DIRECTORY);
-    fs::create_dir(&active).unwrap();
-    fs::write(active.join("extension.yaml"), b"previous manifest").unwrap();
-    fs::write(active.join("AmaterasuPlaynite.psm1"), b"previous module").unwrap();
-    let expected_refs = [
-        (expected[0].0, expected[0].1.as_str(), expected[0].2),
-        (expected[1].0, expected[1].1.as_str(), expected[1].2),
-    ];
-    let PlayniteExtensionInstall::Installed(receipt) =
-        install_with_hashes(&source, &extensions, &profile, &sid, &expected_refs).unwrap()
-    else {
-        panic!("upgrade returned AlreadyCurrent");
-    };
-    assert!(receipt.had_previous);
-    assert_eq!(
-        fs::read(active.join("extension.yaml")).unwrap(),
-        b"Id: test\r\n"
-    );
-    let recovered =
-        read_playnite_extension_receipt(&extensions, &receipt.transaction, &profile, &sid).unwrap();
-    assert_eq!(receipt, recovered);
-    assert!(
-        OpenOptions::new()
-            .write(true)
-            .open(active.join("extension.yaml"))
-            .is_err()
-    );
-    assert!(
-        install_with_hashes(&source, &extensions, &profile, &sid, &expected_refs).is_err(),
-        "pending upgrade was replaced"
-    );
-    restore_fixture_write_access(&active, &sid);
-    rollback_with_hashes(&recovered, &profile, &sid, &expected_refs).unwrap();
-    assert_eq!(
-        fs::read(active.join("extension.yaml")).unwrap(),
-        b"previous manifest"
-    );
-    assert_eq!(
-        fs::read(active.join("AmaterasuPlaynite.psm1")).unwrap(),
-        b"previous module"
-    );
-    fs::remove_dir_all(root).unwrap();
+    let (root, profile, active, sid, expected, recovered) = with_fixture_token(false, || {
+        let (root, profile, source, sid, expected) = fixture();
+        let extensions = profile.join("AppData/Roaming/Playnite/Extensions");
+        let active = extensions.join(ACTIVE_DIRECTORY);
+        fs::create_dir(&active).unwrap();
+        fs::write(active.join("extension.yaml"), b"previous manifest").unwrap();
+        fs::write(active.join("AmaterasuPlaynite.psm1"), b"previous module").unwrap();
+        let expected_refs = [
+            (expected[0].0, expected[0].1.as_str(), expected[0].2),
+            (expected[1].0, expected[1].1.as_str(), expected[1].2),
+        ];
+        let PlayniteExtensionInstall::Installed(receipt) =
+            install_with_hashes(&source, &extensions, &profile, &sid, &expected_refs).unwrap()
+        else {
+            panic!("upgrade returned AlreadyCurrent");
+        };
+        assert!(receipt.had_previous);
+        let recovered =
+            read_playnite_extension_receipt(&extensions, &receipt.transaction, &profile, &sid)
+                .unwrap();
+        assert_eq!(receipt, recovered);
+        assert!(
+            install_with_hashes(&source, &extensions, &profile, &sid, &expected_refs).is_err(),
+            "pending upgrade was replaced"
+        );
+        (root, profile, active, sid, expected, recovered)
+    });
+
+    // The installer retains administrator recovery access. Verify the target
+    // user's actual rights without the elevated Administrators group.
+    with_fixture_token(true, || {
+        let manifest = active.join("extension.yaml");
+        assert_eq!(fs::read(&manifest).unwrap(), b"Id: test\r\n");
+        assert_eq!(
+            OpenOptions::new()
+                .write(true)
+                .open(manifest)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    });
+
+    with_fixture_token(false, || {
+        let expected_refs = [
+            (expected[0].0, expected[0].1.as_str(), expected[0].2),
+            (expected[1].0, expected[1].1.as_str(), expected[1].2),
+        ];
+        restore_fixture_write_access(&active, &sid);
+        rollback_with_hashes(&recovered, &profile, &sid, &expected_refs).unwrap();
+        assert_eq!(
+            fs::read(active.join("extension.yaml")).unwrap(),
+            b"previous manifest"
+        );
+        assert_eq!(
+            fs::read(active.join("AmaterasuPlaynite.psm1")).unwrap(),
+            b"previous module"
+        );
+        fs::remove_dir_all(root).unwrap();
+    });
 }
 
 #[cfg(windows)]

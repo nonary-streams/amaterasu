@@ -136,8 +136,8 @@ fn one_client_application_with_lifetime(
     stop_on_stream_end: bool,
 ) -> (Controller, SharedSessionBroker, Instant) {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    controller.set_global_display_policy(7, json!({}));
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
+    controller.set_physical_fixture_display_policy(7, json!({}));
     controller.set_session_lifecycle_required(true);
     let mut broker = SharedSessionBroker::default();
     broker.broker.application_stop_on_stream_end = stop_on_stream_end;

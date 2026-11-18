@@ -205,7 +205,7 @@ impl Broker {
 }
 
 fn router() -> Router {
-    let mut launches = Controller::new(Some(StreamingConfig {
+    let mut launches = Controller::new_physical_fixture(Some(StreamingConfig {
         capture: CaptureConfig {
             capture_provider: CaptureProvider::Dxgi,
             output: "display-one".into(),

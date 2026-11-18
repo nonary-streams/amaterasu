@@ -8,6 +8,30 @@ use amaterasu_module_sdk::{Command, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+impl Controller {
+    /// Most broker fixtures provide only a physical display. Keep the
+    /// platform's default virtual-display policy in tests that exercise it.
+    pub(crate) fn new_physical_fixture(
+        config: Option<StreamingConfig>,
+    ) -> Result<Self, &'static str> {
+        let mut controller = Self::new(config)?;
+        if cfg!(windows) {
+            controller.global_display_policy = json!({"virtual_display_mode": "disabled"});
+        }
+        Ok(controller)
+    }
+
+    fn set_physical_fixture_display_policy(&mut self, revision: u64, mut policy: Value) {
+        if cfg!(windows)
+            && policy.get("virtual_display_mode").is_none()
+            && policy.get("virtual_display_outputs").is_none()
+        {
+            policy["virtual_display_mode"] = json!("disabled");
+        }
+        self.set_global_display_policy(revision, policy);
+    }
+}
+
 pub(super) fn config() -> StreamingConfig {
     StreamingConfig {
         capture: CaptureConfig {
@@ -379,7 +403,7 @@ fn paired_physical_mode_freezes_independently_of_stream_cadence_and_retry() {
     let now = Instant::now();
     let mut streaming = config();
     streaming.profile.max_fps = 120;
-    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
     controller.set_encoder_snapshot(hardware_h264());
     let paired = peer_with_display_mode(19, "1920x1080x59.94").unwrap();
     let mut stream = request(19);
@@ -419,8 +443,8 @@ fn virtual_display_intent_is_frozen_and_admission_bound_before_rtsp_open() {
         "virtual_display_mode": "shared",
         "virtual_display_layout": "extended"
     });
-    let mut controller = Controller::new(Some(config())).unwrap();
-    controller.set_global_display_policy(
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
+    controller.set_physical_fixture_display_policy(
         7,
         json!({
             "virtual_display_mode":"disabled",
@@ -507,7 +531,7 @@ fn malformed_paired_physical_mode_rejects_before_launch_and_absent_inherits_stre
         );
     }
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(21), peer(21), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
@@ -581,7 +605,7 @@ fn disabled_streaming_fails_and_paired_foreign_client_can_cancel() {
         503
     );
 
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(1, request(1), peer(1), now).is_none());
     assert!(controller.cancel(2, &peer(2), now).is_none());
     assert_eq!(controller.records[&1].state, super::record::State::Stopping);
@@ -590,7 +614,7 @@ fn disabled_streaming_fails_and_paired_foreign_client_can_cancel() {
 #[test]
 fn secret_key_reuse_is_global_but_key_id_reuse_is_allowed_for_fresh_sessions() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(1, request(1), peer(1), now).is_none());
 
     let mut changed = request(1);
@@ -604,7 +628,7 @@ fn secret_key_reuse_is_global_but_key_id_reuse_is_allowed_for_fresh_sessions() {
 #[test]
 fn stream_start_waits_for_persisted_output_settings() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_output_name_settings(false, None);
 
     let reply = controller
@@ -621,7 +645,7 @@ fn selected_or_default_output_is_snapshotted_into_rtsp_open() {
         (None, "display-one"),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_output_name_settings(true, configured);
         assert!(controller.launch(10, request(1), peer(1), now).is_none());
         // A later settings write affects later sessions, not this launch transaction.
@@ -651,7 +675,7 @@ fn configured_device_name_and_moonlight_override_are_snapshotted_separately_from
         (Some("Moonlight Desk"), "Studio PC", "Moonlight Desk"),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_device_name(configured);
         let mut launch_request = request(1);
         launch_request.device_name = override_name.map(str::to_owned);
@@ -688,7 +712,7 @@ fn selected_or_bootstrap_audio_sink_is_snapshotted_into_rtsp_capture_open() {
         (None, "default"),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_audio_sink_settings(configured);
         assert!(controller.launch(10, request(1), peer(1), now).is_none());
         controller.set_audio_sink_settings(Some("endpoint.changed"));
@@ -713,7 +737,7 @@ fn selected_or_bootstrap_audio_sink_is_snapshotted_into_rtsp_capture_open() {
 fn unavailable_selected_audio_sink_fails_without_opening_bootstrap_sink() {
     let now = Instant::now();
     let selected = "endpoint.unavailable";
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_audio_sink_settings(Some(selected));
     let mut broker = Broker {
         unavailable_audio_endpoint: Some(selected.into()),
@@ -753,7 +777,7 @@ fn audio_sink_overrides_preserve_empty_values_and_apply_client_app_global_preced
         (Some("endpoint.app"), Some(""), "default"),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_audio_sink_settings(Some("endpoint.global"));
         let mut broker = Broker {
             application_audio_sink: app.map(str::to_owned),
@@ -852,7 +876,7 @@ fn audio_sink_capture_only_requires_an_explicit_resolved_sink_and_uses_client_ap
     ) in cases.into_iter().enumerate()
     {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_audio_sink_settings(global_sink);
         controller.set_audio_sink_capture_only(global_enabled);
         let peer = peer_with_capture_options(index as u8 + 20, client_sink, client_enabled);
@@ -889,7 +913,7 @@ fn scoped_back_button_timeout_uses_client_then_application_and_preserves_disable
         (None, None, None),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let peer = peer_with_back_button_timeout(33, client);
         let mut broker = Broker {
             application_back_button_timeout: application,
@@ -931,7 +955,7 @@ fn scoped_input_overrides_use_client_then_application_precedence_and_preserve_fa
         })),
         ..Broker::default()
     };
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(
         controller
             .launch(10, request(1), client_peer, now)
@@ -957,7 +981,7 @@ fn scoped_input_overrides_use_client_then_application_precedence_and_preserve_fa
             })),
             ..Broker::default()
         };
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         assert!(controller.launch(11, request(2), peer, now).is_none());
         let _ = poll_until_reply(&mut controller, &mut broker, now);
         opened_rtsp_payload(&broker)
@@ -981,7 +1005,7 @@ fn scoped_controller_compatibility_overrides_preserve_false_and_client_precedenc
         })),
         ..Broker::default()
     };
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(
         controller
             .launch(10, request(1), client_peer, now)
@@ -1003,7 +1027,7 @@ fn scoped_controller_compatibility_overrides_preserve_false_and_client_precedenc
         })),
         ..Broker::default()
     };
-    let mut application_controller = Controller::new(Some(config())).unwrap();
+    let mut application_controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(
         application_controller
             .launch(11, request(2), peer(89), now)
@@ -1035,7 +1059,7 @@ fn selected_supported_gamepad_profile() -> &'static str {
 fn unavailable_scoped_audio_sink_fails_without_falling_back_to_global() {
     let now = Instant::now();
     let selected = "endpoint.unavailable";
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_audio_sink_settings(Some("endpoint.global"));
     let mut broker = Broker {
         application_audio_sink: Some(selected.into()),
@@ -1053,7 +1077,7 @@ fn unavailable_scoped_audio_sink_fails_without_falling_back_to_global() {
 #[test]
 fn invalid_application_audio_sink_is_rejected_before_rtsp_open() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_audio_sink: Some("invalid\nendpoint".into()),
         ..Broker::default()
@@ -1069,7 +1093,7 @@ fn invalid_application_audio_sink_is_rejected_before_rtsp_open() {
 #[test]
 fn client_audio_sink_override_does_not_leak_to_another_client() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_audio_sink_settings(Some("endpoint.global"));
     let first_peer = peer_with_audio_sink(1, Some("endpoint.client-one"));
     let second_peer = peer_with_audio_sink(2, None);
@@ -1115,7 +1139,7 @@ fn virtual_sink_overrides_follow_client_app_global_precedence_and_empty_clears_i
         expected_capture_only: bool,
     ) -> Value {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_audio_sink_settings(Some("endpoint.global"));
         controller.set_audio_sink_capture_only(true);
         controller.set_virtual_sink_settings(Some("virtual.global"));
@@ -1180,7 +1204,7 @@ fn authenticated_surround_request_reaches_rtsp_and_binds_retry_identity() {
         let now = Instant::now();
         let mut settings = config();
         settings.profile.audio_bitrate = bitrate;
-        let mut controller = Controller::new(Some(settings)).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
         let mut broker = Broker::default();
         let mut stream = request(channels as u8);
         stream.audio_channels = channels;
@@ -1218,7 +1242,7 @@ fn surround_without_virtual_sink_or_supported_bitrate_stops_before_launch() {
         let now = Instant::now();
         let mut settings = config();
         settings.profile.audio_bitrate = bitrate;
-        let mut controller = Controller::new(Some(settings)).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
         let mut broker = Broker::default();
         let mut stream = request(6);
         stream.audio_channels = 6;
@@ -1248,7 +1272,7 @@ fn surround_uses_frozen_application_sink_and_stream_audio_before_launch() {
         let now = Instant::now();
         let mut settings = config();
         settings.profile.audio_bitrate = 256_000;
-        let mut controller = Controller::new(Some(settings)).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
         let mut broker = Broker {
             application_virtual_sink: Some("virtual.application".into()),
             application_stream_audio,
@@ -1280,7 +1304,7 @@ fn surround_uses_frozen_application_sink_and_stream_audio_before_launch() {
 fn unavailable_selected_output_fails_without_opening_bootstrap_output() {
     let now = Instant::now();
     let selected = "unavailable-display-id";
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_output_name_settings(true, Some(selected));
     let mut broker = Broker {
         unavailable_output: Some(selected.into()),
@@ -2126,7 +2150,7 @@ fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) 
 #[test]
 fn management_stop_confirms_the_exact_launch_and_reports_owned_cleanup() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let snapshot = controller.management_status(None);
@@ -2154,7 +2178,7 @@ fn management_stop_fences_a_pending_resume_and_does_not_restart_it() {
     let now = Instant::now();
     let mut settings = config();
     settings.desktop.enabled = true;
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     let mut broker = Broker::default();
     let client = peer(95);
     let mut first = request(95);
@@ -2182,7 +2206,7 @@ fn management_stop_fences_a_pending_resume_and_does_not_restart_it() {
 #[test]
 fn management_stop_reports_cleanup_failure_and_allows_an_explicit_retry() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.fail_rtsp_cleanup = true;
@@ -2207,7 +2231,7 @@ fn desktop_launch_and_cancel_only_manage_rtsp_and_history() {
     let now = Instant::now();
     let mut settings = config();
     settings.desktop.enabled = true;
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     let mut broker = Broker::default();
     let mut desktop_request = request(91);
     desktop_request.app_id = DESKTOP_APP_ID;
@@ -2254,7 +2278,7 @@ fn pipewire_launch_carries_the_owned_display_request_to_rtsp() {
     settings.desktop.enabled = true;
     settings.capture.capture_provider = CaptureProvider::PipeWire;
     settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     let mut broker = Broker::default();
     let mut desktop_request = request(96);
     desktop_request.app_id = DESKTOP_APP_ID;
@@ -2308,7 +2332,7 @@ fn application_physical_output_overrides_owned_capture_in_auto_mode() {
     let mut settings = config();
     settings.capture.capture_provider = CaptureProvider::External("vkms".into());
     settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     let mut broker = Broker {
         application_display_settings: Some(json!({"display_output":"DP-1"})),
         ..Broker::default()
@@ -2326,7 +2350,7 @@ fn application_explicit_capture_mode_remains_authoritative_for_physical_output()
     let mut settings = config();
     settings.capture.capture_provider = CaptureProvider::External("vkms".into());
     settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     let mut broker = Broker {
         application_display_settings: Some(json!({"display_output":"DP-1"})),
         application_input_overrides: Some(json!({"capture":"pipewire"})),
@@ -2345,7 +2369,7 @@ fn application_virtual_output_overrides_configured_physical_output_in_auto_mode(
     let mut settings = config();
     settings.capture.capture_provider = CaptureProvider::External("vkms".into());
     settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     controller.set_output_name_settings(true, Some("DP-1"));
     let mut broker = Broker {
         application_display_settings: Some(json!({"virtual_screen":true})),
@@ -2366,8 +2390,8 @@ fn disabled_virtual_display_without_physical_output_fails_before_rtsp() {
         settings.desktop.enabled = true;
         settings.capture.capture_provider = CaptureProvider::External("vkms".into());
         settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
-        let mut controller = Controller::new(Some(settings)).unwrap();
-        controller.set_global_display_policy(1, json!({"virtual_display_mode":"disabled"}));
+        let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
+        controller.set_physical_fixture_display_policy(1, json!({"virtual_display_mode":"disabled"}));
         let mut broker = Broker::default();
         let mut launch_request = request(1);
         if desktop { launch_request.app_id = DESKTOP_APP_ID; }
@@ -2385,9 +2409,9 @@ fn desktop_explicit_virtual_policy_fails_before_rtsp() {
     settings.desktop.enabled = true;
     settings.capture.capture_provider = CaptureProvider::External("vkms".into());
     settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     controller.set_output_name_settings(true, Some("DP-1"));
-    controller.set_global_display_policy(1, json!({"virtual_display_mode":"per_client"}));
+    controller.set_physical_fixture_display_policy(1, json!({"virtual_display_mode":"per_client"}));
     let mut broker = Broker::default();
     let mut launch_request = request(1);
     launch_request.app_id = DESKTOP_APP_ID;
@@ -2404,8 +2428,8 @@ fn desktop_default_linux_virtual_profile_allows_owned_capture() {
     settings.desktop.enabled = true;
     settings.capture.capture_provider = CaptureProvider::External("vkms".into());
     settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
-    let mut controller = Controller::new(Some(settings)).unwrap();
-    controller.set_global_display_policy(1, json!({
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
+    controller.set_physical_fixture_display_policy(1, json!({
         "virtual_display_outputs":["Virtual-1"],
         "virtual_display_layout":"exclusive", "dd_virtual_display_scale":-1
     }));
@@ -2426,8 +2450,8 @@ fn desktop_nonvirtual_provider_is_not_rejected_for_display_policy() {
         let mut settings = config();
         settings.desktop.enabled = true;
         settings.capture.capture_provider = provider;
-        let mut controller = Controller::new(Some(settings)).unwrap();
-        controller.set_global_display_policy(1, json!({"virtual_display_mode":"per_client", "dd_virtual_display_scale":125}));
+        let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
+        controller.set_physical_fixture_display_policy(1, json!({"virtual_display_mode":"per_client", "dd_virtual_display_scale":125}));
         let mut broker = Broker::default();
         let mut launch_request = request(1);
         launch_request.app_id = DESKTOP_APP_ID;
@@ -2447,7 +2471,7 @@ fn saved_physical_output_overrides_implicit_virtual_mode() {
         settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
         let mut controller = Controller::new(Some(settings)).unwrap();
         controller.set_output_name_settings(true, Some("DP-1"));
-        controller.set_global_display_policy(1, json!({"virtual_display_outputs":["Virtual-1"]}));
+        controller.set_physical_fixture_display_policy(1, json!({"virtual_display_outputs":["Virtual-1"]}));
         let mut broker = Broker::default();
         let mut launch_request = request(1);
         if desktop { launch_request.app_id = DESKTOP_APP_ID; }
@@ -2467,8 +2491,8 @@ fn app_disabling_virtual_screen_does_not_create_owned_output() {
     let mut settings = config();
     settings.capture.capture_provider = CaptureProvider::External("vkms".into());
     settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
-    let mut controller = Controller::new(Some(settings)).unwrap();
-    controller.set_global_display_policy(1, json!({"virtual_display_mode":"per_client"}));
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
+    controller.set_physical_fixture_display_policy(1, json!({"virtual_display_mode":"per_client"}));
     let mut broker = Broker { application_display_settings: Some(json!({"virtual_screen":false})), ..Broker::default() };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
@@ -2482,8 +2506,8 @@ fn activate_virtual_display_is_honored_with_disabled_mode() {
     let mut settings = config();
     settings.capture.capture_provider = CaptureProvider::External("vkms".into());
     settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
-    let mut controller = Controller::new(Some(settings)).unwrap();
-    controller.set_global_display_policy(1, json!({
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
+    controller.set_physical_fixture_display_policy(1, json!({
         "virtual_display_mode":"disabled", "dd_activate_virtual_display":true
     }));
     let mut broker = Broker::default();
@@ -2501,7 +2525,7 @@ fn desktop_launch_carries_portal_pipewire_source_to_rtsp_without_display_preflig
     settings.desktop.enabled = true;
     settings.capture.capture_provider = CaptureProvider::PipeWire;
     settings.capture.output = "profile-output-must-not-be-used".into();
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     controller.set_output_name_settings(true, Some("configured-physical-display"));
     let mut broker = Broker::default();
     let mut desktop_request = request(95);
@@ -2545,7 +2569,7 @@ fn desktop_resume_retires_rtsp_then_opens_a_fresh_ticket_without_app_calls() {
     let now = Instant::now();
     let mut settings = config();
     settings.desktop.enabled = true;
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     let mut broker = Broker::default();
     let client = peer(93);
     let mut first = request(93);
@@ -2594,7 +2618,7 @@ fn revoked_pending_desktop_resume_is_closed_before_stopped_without_reopening_rts
     let now = Instant::now();
     let mut settings = config();
     settings.desktop.enabled = true;
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     let mut broker = Broker::default();
     let client = peer(95);
     let mut first = request(95);
@@ -2630,7 +2654,7 @@ fn deferred_desktop_resume_revalidates_current_certificate_trust() {
     let now = Instant::now();
     let mut settings = config();
     settings.desktop.enabled = true;
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     let mut broker = Broker::default();
     let client = peer(97);
     let mut first = request(97);
@@ -2662,7 +2686,7 @@ fn duplicate_resume_cancel_and_repeated_revocation_are_idempotent() {
     let now = Instant::now();
     let mut settings = config();
     settings.desktop.enabled = true;
-    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(settings)).unwrap();
     let mut broker = Broker::default();
     let client = peer(99);
     let mut first = request(99);
@@ -2707,7 +2731,7 @@ fn duplicate_resume_cancel_and_repeated_revocation_are_idempotent() {
 #[test]
 fn desktop_app_id_is_rejected_when_opt_in_is_disabled() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut desktop_request = request(92);
     desktop_request.app_id = DESKTOP_APP_ID;
     let reply = controller
@@ -2720,7 +2744,7 @@ fn desktop_app_id_is_rejected_when_opt_in_is_disabled() {
 #[test]
 fn history_reservation_precedes_preflight_and_releases_after_stream_cleanup() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let actions = broker.actions();
@@ -2762,7 +2786,7 @@ fn history_reservation_precedes_preflight_and_releases_after_stream_cleanup() {
 #[test]
 fn missing_history_reservation_is_visible_and_does_not_tag_rtsp() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         history_reserve_unavailable: true,
         ..Broker::default()
@@ -2796,7 +2820,7 @@ fn missing_history_reservation_is_visible_and_does_not_tag_rtsp() {
 #[test]
 fn mismatched_history_reservation_does_not_tag_rtsp_and_is_released() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         history_reserve_wrong_identity: true,
         ..Broker::default()
@@ -2830,7 +2854,7 @@ fn mismatched_history_reservation_does_not_tag_rtsp_and_is_released() {
 #[test]
 fn lost_history_reservation_admission_looks_up_without_replaying_and_releases_on_cancel() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         lose_history_reserve_once: true,
         ..Broker::default()
@@ -2867,7 +2891,7 @@ fn lost_history_reservation_admission_looks_up_without_replaying_and_releases_on
 #[test]
 fn failed_history_release_retries_in_background_without_blocking_later_launches() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.history_release_unavailable = true;
@@ -2889,7 +2913,7 @@ fn failed_history_release_retries_in_background_without_blocking_later_launches(
 #[test]
 fn history_in_use_release_retries_in_background_without_blocking_cancel() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.history_release_in_use_once = true;
@@ -2920,7 +2944,7 @@ fn history_in_use_release_retries_in_background_without_blocking_cancel() {
 #[test]
 fn lost_history_release_result_is_retried_without_replaying_mutation() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.lose_history_release_result_once = true;
@@ -2986,7 +3010,7 @@ fn global_app_and_verified_client_fec_values_apply_in_precedence_order() {
         (Some(31), Some(37), Some(49), 49),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_global_fec_percentage(global_fec);
         let mut broker = Broker {
             application_fec_percentage: app_fec,
@@ -3023,7 +3047,7 @@ fn global_app_and_verified_client_audio_values_apply_in_precedence_order() {
         (false, Some(true), Some(false), false),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_global_stream_audio(global);
         let mut broker = Broker {
             application_stream_audio: app,
@@ -3063,7 +3087,7 @@ fn continuous_audio_is_requested_per_launch_and_requires_effective_stream_audio(
         (true, false, Some(true), Some(false), false),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_global_stream_audio(global);
         let mut broker = Broker {
             application_stream_audio: app,
@@ -3096,7 +3120,7 @@ fn continuous_audio_is_requested_per_launch_and_requires_effective_stream_audio(
 fn global_video_batch_size_reaches_rtsp_open_and_is_snapshotted_at_admission() {
     for (configured, later_value) in [(16, 32), (32, 64), (64, 16)] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_global_video_max_batch_size_kb(configured);
         let mut broker = Broker::default();
 
@@ -3122,7 +3146,7 @@ fn global_video_batch_size_reaches_rtsp_open_and_is_snapshotted_at_admission() {
 fn global_ping_timeout_reaches_rtsp_open_and_is_snapshotted_at_admission() {
     for (configured, later_value) in [(0, 250), (250, 10_000), (i32::MAX as u32, 0)] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_global_ping_timeout_ms(configured);
         let mut broker = Broker::default();
 
@@ -3157,7 +3181,7 @@ fn native_pen_touch_resolves_client_before_application_and_preserves_inheritance
             application_input_overrides: Some(json!({"native_pen_touch":application})),
             ..Broker::default()
         };
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         assert!(
             controller
                 .launch(
@@ -3192,7 +3216,7 @@ fn paired_client_ds4_touchpad_override_precedes_application_and_preserves_false(
             application_input_overrides: Some(application_overrides),
             ..Broker::default()
         };
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         assert!(
             controller
                 .launch(
@@ -3223,7 +3247,7 @@ fn encryption_modes_and_authenticated_peer_ip_are_snapshotted_into_rtsp_open() {
             ClientConfigOverrides::default(),
         )
         .unwrap();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_video_encryption_modes(2, 0);
     let mut broker = Broker::default();
 
@@ -3247,7 +3271,7 @@ fn global_max_bitrate_is_sent_as_encoder_cap_and_snapshotted_at_admission() {
         (None, Some(5_000), None),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_global_max_bitrate_kbps(configured);
         let mut broker = Broker::default();
 
@@ -3283,7 +3307,7 @@ fn global_max_bitrate_is_sent_as_encoder_cap_and_snapshotted_at_admission() {
 #[test]
 fn stream_overrides_resolve_client_before_application_before_global() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(9_000));
     controller.set_global_minimum_fps_target(20.0);
     controller.set_global_video_max_batch_size_kb(64);
@@ -3311,7 +3335,7 @@ fn stream_overrides_resolve_client_before_application_before_global() {
 #[test]
 fn stream_overrides_preserve_explicit_zero_and_fall_back_to_application_or_global() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(8_000));
     controller.set_global_minimum_fps_target(20.0);
     controller.set_global_video_max_batch_size_kb(16);
@@ -3330,7 +3354,7 @@ fn stream_overrides_preserve_explicit_zero_and_fall_back_to_application_or_globa
     assert_eq!(rtsp_open["minimum_fps_target"], 30.0);
     assert_eq!(rtsp_open["profile"]["video_max_batch_size_kb"], 32);
 
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(8_000));
     controller.set_global_minimum_fps_target(20.0);
     controller.set_global_video_max_batch_size_kb(16);
@@ -3354,7 +3378,7 @@ fn stream_overrides_preserve_explicit_zero_and_fall_back_to_application_or_globa
 #[test]
 fn global_minimum_fps_target_reaches_rtsp_open_and_is_snapshotted_at_admission() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_minimum_fps_target(23.5);
     let mut broker = Broker::default();
 
@@ -3378,7 +3402,7 @@ fn global_minimum_fps_target_reaches_rtsp_open_and_is_snapshotted_at_admission()
 #[test]
 fn global_wgc_pacing_smoothing_reaches_rtsp_open_and_is_snapshotted_at_admission() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_wgc_pacing_smoothing(false);
     let mut broker = Broker::default();
 
@@ -3402,7 +3426,7 @@ fn global_wgc_pacing_smoothing_reaches_rtsp_open_and_is_snapshotted_at_admission
 #[test]
 fn global_bitrate_below_encoder_minimum_can_be_overridden_by_client_cap() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(99));
     let client = peer_with_stream_overrides(1, Some(5_000), None, None);
     let mut broker = Broker::default();
@@ -3417,7 +3441,7 @@ fn global_bitrate_below_encoder_minimum_can_be_overridden_by_client_cap() {
 #[test]
 fn global_bitrate_below_encoder_minimum_can_be_overridden_by_application_cap() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(99));
     let mut broker = Broker {
         application_max_bitrate: Some(6_000),
@@ -3434,7 +3458,7 @@ fn global_bitrate_below_encoder_minimum_can_be_overridden_by_application_cap() {
 #[test]
 fn global_bitrate_below_encoder_minimum_can_be_cleared_by_client_override() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(99));
     let client = peer_with_stream_overrides(1, Some(0), None, None);
     let mut broker = Broker {
@@ -3455,7 +3479,7 @@ fn global_bitrate_below_encoder_minimum_can_be_cleared_by_client_override() {
 #[test]
 fn effective_client_bitrate_below_encoder_minimum_fails_before_rtsp_open() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(5_000));
     let client = peer_with_stream_overrides(1, Some(99), None, None);
     let mut broker = Broker::default();
@@ -3470,7 +3494,7 @@ fn effective_client_bitrate_below_encoder_minimum_fails_before_rtsp_open() {
 #[test]
 fn effective_application_bitrate_below_encoder_minimum_fails_before_rtsp_open() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(5_000));
     let mut broker = Broker {
         application_max_bitrate: Some(99),
@@ -3495,7 +3519,7 @@ fn effective_application_bitrate_below_encoder_minimum_fails_before_rtsp_open() 
 #[test]
 fn global_bitrate_below_encoder_minimum_without_override_fails_before_rtsp_open() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(99));
     let mut broker = Broker::default();
 
@@ -3567,7 +3591,7 @@ fn global_capture_modes_reach_rtsp_open_and_are_snapshotted_at_admission() {
         let now = Instant::now();
         let mut stream_config = config();
         stream_config.capture.capture_provider = bootstrap_provider;
-        let mut controller = Controller::new(Some(stream_config)).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(stream_config)).unwrap();
         controller.set_capture_mode(mode);
         let mut broker = Broker::default();
 
@@ -3625,7 +3649,7 @@ fn scoped_capture_selection_prefers_client_then_application_then_global() {
 
     for (global, application, client, expected_provider, expected_constant_rate) in cases {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_capture_mode(global);
         let peer = client.map_or_else(
             || peer(91),
@@ -3672,7 +3696,7 @@ fn scoped_capture_selection_prefers_client_then_application_then_global() {
 #[test]
 fn success_requires_active_application_and_ready_rtsp_then_retries_same_url() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
 
@@ -3705,7 +3729,7 @@ fn proton_compatibility_freezes_client_application_global_precedence() {
 
     for (index, (global, application, client, expected)) in cases.into_iter().enumerate() {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker {
             input_policy_response: json!({
                 "ok":true,
@@ -3764,7 +3788,7 @@ fn unavailable_proton_policy_uses_a_disabled_default_and_keeps_launching() {
 
     for response in malformed {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker {
             input_policy_response: response,
             ..Broker::default()
@@ -3807,7 +3831,7 @@ fn unavailable_proton_policy_uses_a_disabled_default_and_keeps_launching() {
 fn unavailable_optional_history_warning_delivery_never_blocks_launch() {
     for (history_absent, rejected, lost) in [(true, false, false), (false, true, false), (false, false, true)] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker {
             input_policy_response: json!({"ok":false}),
             history_reserve_unavailable: history_absent,
@@ -3829,7 +3853,7 @@ fn unavailable_optional_history_warning_delivery_never_blocks_launch() {
 #[test]
 fn application_warnings_are_forwarded_to_the_exact_stream_history() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_warnings: vec![json!({"code":"proton_hook_unavailable",
             "source":"amaterasu.application/1","reason":"proton_hook_unconfirmed",
@@ -3852,7 +3876,7 @@ fn application_warnings_are_forwarded_to_the_exact_stream_history() {
 #[test]
 fn invalid_client_hint_is_forwarded_to_exact_stream_history() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     let mut launch = request(1);
     launch.advisory_warnings.0.push(serde_json::from_value(json!({
@@ -3876,7 +3900,7 @@ fn invalid_client_hint_is_forwarded_to_exact_stream_history() {
 #[test]
 fn an_ignored_hint_on_an_idempotent_retry_is_reported_without_conflict() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     let launch = request(1);
     assert!(controller.launch(10, launch.clone(), peer(1), now).is_none());
@@ -3900,7 +3924,7 @@ fn an_ignored_hint_on_an_idempotent_retry_is_reported_without_conflict() {
 #[test]
 fn pending_history_warning_does_not_block_stream_monitoring() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         input_policy_response: json!({"ok":false}),
         history_warning_pending: true,
@@ -3931,7 +3955,7 @@ fn pending_history_warning_does_not_block_stream_monitoring() {
 fn rejected_or_lost_proton_policy_read_does_not_block_launch() {
     for lost in [false, true] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker {
             input_policy_rejected: !lost,
             input_policy_result_lost: lost,
@@ -3952,7 +3976,7 @@ fn rejected_or_lost_proton_policy_read_does_not_block_launch() {
 #[test]
 fn pending_optional_policy_read_has_its_own_bounded_budget() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker { input_policy_pending: true, ..Broker::default() };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     controller.records.get_mut(&1).unwrap().deadline = now + Duration::from_millis(200);
@@ -3974,7 +3998,7 @@ fn pending_optional_policy_read_has_its_own_bounded_budget() {
 fn unavailable_global_proton_policy_still_honors_explicit_overrides() {
     for (application, client, expected) in [(Some(true), None, true), (Some(true), Some(false), false)] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker {
             input_policy_response: json!({"ok":false}),
             application_input_overrides: application.map(|value| json!({"proton_dualsense_compatibility":value})),
@@ -3989,7 +4013,7 @@ fn unavailable_global_proton_policy_still_honors_explicit_overrides() {
 #[test]
 fn launch_export_uses_the_preparation_snapshot_captured_at_admission() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let original: PreparationStep = serde_json::from_value(json!({
         "run":{"executable":std::env::current_exe().unwrap(),"args":["original"]}
     }))
@@ -4036,7 +4060,7 @@ fn launch_export_uses_the_preparation_snapshot_captured_at_admission() {
 #[test]
 fn malformed_preflight_override_fails_before_application_launch() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_input_overrides: Some(json!({"stream_audio":"false"})),
         ..Broker::default()
@@ -4065,7 +4089,7 @@ fn malformed_preflight_override_fails_before_application_launch() {
 #[test]
 fn whitespace_executable_path_fails_preflight_before_launch_or_rtsp_open() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_executable_path: Some(" \t ".into()),
         ..Broker::default()
@@ -4091,7 +4115,7 @@ fn whitespace_executable_path_fails_preflight_before_launch_or_rtsp_open() {
 #[test]
 fn changed_application_policy_after_preflight_never_opens_rtsp() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_fec_percentage: Some(31),
         ..Broker::default()
@@ -4122,7 +4146,7 @@ fn changed_application_policy_after_preflight_never_opens_rtsp() {
 #[test]
 fn changed_catalog_revision_after_preflight_stops_application_before_rtsp() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     for _ in 0..8 {
@@ -4152,7 +4176,7 @@ fn changed_catalog_revision_after_preflight_stops_application_before_rtsp() {
 #[test]
 fn sparse_application_display_fields_are_frozen_before_launch_and_checked_on_readback() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_input_overrides: Some(json!({
             "dd_refresh_rate_option":"prefer_highest",
@@ -4228,7 +4252,7 @@ fn paired_client_display_policy_overrides_application_fields_without_global_defa
         .unwrap();
     let mut streaming = config();
     streaming.capture.output = "00000000:00000001/\\\\.\\DISPLAY1".into();
-    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
     let mut broker = Broker {
         display_snapshot_ids: vec!["monitor.one".into()],
         display_entries: vec![json!({
@@ -4288,8 +4312,8 @@ fn pipewire_display_topology_mapping_stays_explicitly_unsupported() {
     let mut streaming = config();
     streaming.capture.capture_provider = CaptureProvider::PipeWire;
     streaming.capture.output = "portal-session-source".into();
-    let mut controller = Controller::new(Some(streaming)).unwrap();
-    controller.set_global_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
+    controller.set_physical_fixture_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
@@ -4308,8 +4332,8 @@ fn verify_only_freezes_active_monitor_and_projects_mode_policy_on_exact_retries(
     let mut streaming = config();
     streaming.capture.capture_provider = CaptureProvider::Wgc;
     streaming.capture.output = "\\\\.\\DISPLAY2".into();
-    let mut controller = Controller::new(Some(streaming)).unwrap();
-    controller.set_global_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
+    controller.set_physical_fixture_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
     let mut broker = Broker {
         display_snapshot_ids: vec!["monitor.one".into(), "Monitor.Two".into()],
         display_entries: vec![
@@ -4325,7 +4349,7 @@ fn verify_only_freezes_active_monitor_and_projects_mode_policy_on_exact_retries(
             .launch(10, stream.clone(), paired.clone(), now)
             .is_none()
     );
-    controller.set_global_display_policy(10, json!({"dd_configuration_option":"disabled"}));
+    controller.set_physical_fixture_display_policy(10, json!({"dd_configuration_option":"disabled"}));
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
     let body = String::from_utf8(reply.body).unwrap();
@@ -4365,8 +4389,8 @@ fn display_open_preserves_frozen_application_identity() {
     let mut streaming = config();
     streaming.capture.capture_provider = CaptureProvider::Wgc;
     streaming.capture.output = "\\\\.\\DISPLAY2".into();
-    let mut controller = Controller::new(Some(streaming)).unwrap();
-    controller.set_global_display_policy(9, json!({"dd_configuration_option":"ensure_active"}));
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
+    controller.set_physical_fixture_display_policy(9, json!({"dd_configuration_option":"ensure_active"}));
     let mut broker = Broker {
         display_snapshot_ids: vec!["monitor.one".into(), "monitor.two".into()],
         display_entries: vec![
@@ -4434,8 +4458,8 @@ fn verify_only_fails_before_application_for_missing_ambiguous_inactive_or_change
         let mut streaming = config();
         streaming.capture.capture_provider = CaptureProvider::Wgc;
         streaming.capture.output = "\\\\.\\DISPLAY2".into();
-        let mut controller = Controller::new(Some(streaming)).unwrap();
-        controller.set_global_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
+        let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
+        controller.set_physical_fixture_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
         let mut broker = Broker {
             display_entries: entries,
             display_snapshot_ids: ids.into_iter().map(str::to_owned).collect(),
@@ -4460,7 +4484,7 @@ fn verify_only_fails_before_application_for_missing_ambiguous_inactive_or_change
 #[test]
 fn disabled_display_policy_skips_provider_and_mutating_policy_fails_before_launch() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(24), peer(24), now).is_none());
     assert_eq!(
@@ -4474,8 +4498,8 @@ fn disabled_display_policy_skips_provider_and_mutating_policy_fails_before_launc
             .any(|(service, _)| *service == "amaterasu.display/1")
     );
 
-    let mut controller = Controller::new(Some(config())).unwrap();
-    controller.set_global_display_policy(9, json!({"dd_configuration_option":"ensure_active"}));
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
+    controller.set_physical_fixture_display_policy(9, json!({"dd_configuration_option":"ensure_active"}));
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(25), peer(25), now).is_none());
     assert_ne!(
@@ -4494,8 +4518,8 @@ fn disabled_display_policy_skips_provider_and_mutating_policy_fails_before_launc
 #[test]
 fn global_display_policy_is_frozen_and_resolves_below_application_and_client() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    controller.set_global_display_policy(
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
+    controller.set_physical_fixture_display_policy(
         17,
         json!({
             "dd_refresh_rate_option":"auto",
@@ -4519,7 +4543,7 @@ fn global_display_policy_is_frozen_and_resolves_below_application_and_client() {
         )
         .unwrap();
     assert!(controller.launch(10, request(16), paired, now).is_none());
-    controller.set_global_display_policy(18, json!({"dd_refresh_rate_option":"disabled"}));
+    controller.set_physical_fixture_display_policy(18, json!({"dd_refresh_rate_option":"disabled"}));
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
     let snapshot = &opened_rtsp_payload(&broker)["display_policy_snapshot"];
@@ -4571,7 +4595,7 @@ fn certificate_matched_peer_preserves_all_eight_sparse_display_fields() {
 #[test]
 fn forged_display_readback_stops_before_rtsp_open() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_input_overrides: Some(json!({"dd_refresh_rate_option":"manual"})),
         wrong_application_display_overrides: true,
@@ -4586,7 +4610,7 @@ fn forged_display_readback_stops_before_rtsp_open() {
 #[test]
 fn forged_rtsp_display_snapshot_never_completes_launch() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         wrong_rtsp_display_policy_snapshot: true,
         ..Broker::default()
@@ -4614,7 +4638,7 @@ fn explicit_null_client_display_field_inherits_application_choice() {
         )
         .unwrap();
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_input_overrides: Some(json!({"dd_refresh_rate_option":"manual"})),
         ..Broker::default()
@@ -4639,7 +4663,7 @@ fn explicit_null_client_display_field_inherits_application_choice() {
 #[test]
 fn expired_preflight_settles_without_scheduling_application_cleanup() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     for _ in 0..8 {
@@ -4681,7 +4705,7 @@ fn expired_preflight_settles_without_scheduling_application_cleanup() {
 #[test]
 fn successful_launch_result_after_deadline_is_cleaned_up_not_published() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker { hold_launch_export_result: true, ..Broker::default() };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     for _ in 0..32 {
@@ -4702,7 +4726,7 @@ fn successful_launch_result_after_deadline_is_cleaned_up_not_published() {
 #[test]
 fn successful_rtsp_result_after_deadline_is_cleaned_up_not_published() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     for _ in 0..64 {
@@ -4722,9 +4746,9 @@ fn successful_rtsp_result_after_deadline_is_cleaned_up_not_published() {
 #[test]
 fn late_pending_lifecycle_result_fences_and_replies_to_caller() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = Broker::default();
     broker.lifecycle_replies.push_back(json!({"status":"pending"}));
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
@@ -4750,7 +4774,7 @@ fn late_pending_lifecycle_result_fences_and_replies_to_caller() {
 #[test]
 fn response_loss_before_first_flush_stops_rtsp_and_application() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
@@ -4768,7 +4792,7 @@ fn response_loss_before_first_flush_stops_rtsp_and_application() {
 #[test]
 fn rtsp_cleanup_failure_still_stops_application_and_retains_failure() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.fail_rtsp_cleanup = true;
@@ -4783,7 +4807,7 @@ fn rtsp_cleanup_failure_still_stops_application_and_retains_failure() {
 #[test]
 fn wrong_provider_identity_cannot_extend_the_live_observation_deadline() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.wrong_application_id = true;
@@ -4804,7 +4828,7 @@ fn wrong_provider_identity_cannot_extend_the_live_observation_deadline() {
 #[test]
 fn unhealthy_application_response_adopts_the_owned_id_then_cleans_it() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_unhealthy: true,
         ..Broker::default()
@@ -4819,7 +4843,7 @@ fn unhealthy_application_response_adopts_the_owned_id_then_cleans_it() {
 #[test]
 fn lost_rtsp_admission_is_settled_before_owned_lookup_without_reopening() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         lose_rtsp_open_once: true,
         application_executable_path: Some("C:\\Games\\Example.exe".into()),
@@ -4874,7 +4898,7 @@ fn missing_owner_lookup_never_retires_an_uncertain_open() {
         (Phase::OpenRtsp, Phase::LookupRtsp, "ticket_not_found"),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker::default();
         launch_ready(&mut controller, &mut broker, now);
         let id = *controller.records.keys().next().unwrap();
@@ -4903,7 +4927,7 @@ fn missing_owner_lookup_never_retires_an_uncertain_open() {
 #[test]
 fn uncertain_startup_mutation_reports_critical_before_cleanup() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let id = *controller.records.keys().next().unwrap();
@@ -4944,7 +4968,7 @@ fn uncertain_startup_mutation_reports_critical_before_cleanup() {
 #[test]
 fn missing_application_during_startup_replies_once_after_cleanup() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let id = *controller.records.keys().next().unwrap();
@@ -4996,7 +5020,7 @@ fn terminal_provider_during_startup_replies_once_after_cleanup() {
         ),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         assert!(controller.launch(10, request(1), peer(1), now).is_none());
         let mut replies = Vec::new();
         for _ in 0..64 {
@@ -5028,7 +5052,7 @@ fn assert_failed_startup_reply(
 #[test]
 fn natural_application_exit_closes_the_stream_and_releases_the_application() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.application_state = "stopped";
@@ -5044,7 +5068,7 @@ fn natural_application_exit_closes_the_stream_and_releases_the_application() {
 #[test]
 fn verified_application_stop_returns_to_lifecycle_cleanup() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let record = controller.records.values_mut().next().unwrap();
@@ -5071,7 +5095,7 @@ fn verified_application_stop_returns_to_lifecycle_cleanup() {
 fn long_cleanup_keeps_expired_stop_fenced_after_terminal_status() {
     for disconnect_cancel in [false, true] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker {
             // Provider 321s plus eight sequential 300s raw undos with 3s tails.
             application_cleanup_budget: json!(2_745_000),
@@ -5168,7 +5192,7 @@ fn long_cleanup_keeps_expired_stop_fenced_after_terminal_status() {
 #[test]
 fn cleanup_deadline_expiry_retains_application_until_explicit_retry() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_stop_pending: true,
         application_stop_expired: true,
@@ -5227,7 +5251,7 @@ fn cleanup_budget_contract_rejects_missing_malformed_and_out_of_range_preflight(
         Some(json!(u64::MAX)),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker::default();
         assert!(controller.launch(10, request(1), peer(1), now).is_none());
         let mut reply = None;
@@ -5270,7 +5294,7 @@ fn cleanup_budget_contract_rejects_missing_malformed_and_out_of_range_preflight(
 #[test]
 fn explicit_cancel_retries_a_genuine_application_cleanup_failure() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.application_terminal_stop_state = Some("cleanup_failed");
@@ -5312,7 +5336,7 @@ fn explicit_cancel_retries_a_genuine_application_cleanup_failure() {
 fn changed_cleanup_budget_and_unhealthy_stopping_readback_retain_owned_failure() {
     for changed_budget in [false, true] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker::default();
         launch_ready(&mut controller, &mut broker, now);
         if changed_budget {
@@ -5336,7 +5360,7 @@ fn changed_cleanup_budget_and_unhealthy_stopping_readback_retain_owned_failure()
 #[test]
 fn repeated_cancel_and_revocation_do_not_extend_cleanup_deadlines() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_cleanup_budget: json!(2_745_000),
         ..Broker::default()
@@ -5367,7 +5391,7 @@ fn repeated_cancel_and_revocation_do_not_extend_cleanup_deadlines() {
 #[test]
 fn dual_uncertain_cleanup_calls_are_both_retained_and_reconciled_before_success() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.fail_rtsp_settlement = true;
@@ -5407,7 +5431,7 @@ fn software_scopes_freeze_and_qp_resolves_client_before_application_before_globa
         (Some(""), Some(-7), Some(31), Some(30), 31),
         (None, None, None, Some(30), 30),
     ] {
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_global_qp(28);
         controller.set_software_encoder_options(SoftwareEncoderOptions {
             sw_preset: Some("fast".into()),
@@ -5475,7 +5499,7 @@ fn software_scopes_freeze_and_qp_resolves_client_before_application_before_globa
 #[test]
 fn nvenc_scopes_freeze_client_over_application_over_global_and_verify_readback() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let global = amaterasu_module_sdk::NvencSettings {
         nvenc_preset: 2,
         nvenc_vbv_increase: 10,
@@ -5535,7 +5559,7 @@ fn malformed_software_application_options_fail_before_rtsp_and_launch() {
         json!({"qp":1.5}),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker {
             application_input_overrides: Some(overrides),
             ..Default::default()
@@ -5593,7 +5617,7 @@ fn admitted_keybindings_select_the_client_whole_list_then_application_then_globa
                 .map(|selected| json!({"keybindings":selected})),
             ..Broker::default()
         };
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         assert!(
             controller
                 .launch(
@@ -5632,7 +5656,7 @@ fn invalid_keybindings_fail_before_launch_export_and_rtsp_open() {
                 .is_err()
         );
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker {
             application_input_overrides: Some(json!({"keybindings":invalid})),
             ..Broker::default()
@@ -5664,7 +5688,7 @@ fn keybindings_do_not_make_a_mismatched_certificate_an_authorized_client() {
 #[test]
 fn changed_application_keybindings_after_preflight_cannot_open_rtsp() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_input_overrides: Some(json!({"keybindings":[65,66]})),
         ..Broker::default()
@@ -5726,7 +5750,7 @@ const AUTO_ENCODER: EncoderSelection =
 #[test]
 fn hardware_encoders_offer_every_codec_to_rtsp_up_to_the_profile_maximum() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(uhd_profile(AUTO_ENCODER))).unwrap();
     controller.set_encoder_snapshot(nvenc_and_x264());
     let mut broker = Broker::default();
 
@@ -5760,7 +5784,7 @@ fn software_only_launches_above_full_hd_sixty_are_refused_before_any_effect() {
         (None, "encoder capabilities are not known yet"),
         (Some(encoders(vec![])), "no video encoder is available"),
     ] {
-        let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(uhd_profile(AUTO_ENCODER))).unwrap();
         if let Some(snapshot) = snapshot {
             controller.set_encoder_snapshot(snapshot);
         }
@@ -5783,7 +5807,7 @@ fn software_only_launches_above_full_hd_sixty_are_refused_before_any_effect() {
 #[test]
 fn software_codecs_keep_negotiation_within_the_software_limit() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(uhd_profile(AUTO_ENCODER))).unwrap();
     controller.set_encoder_snapshot(encoders(vec![
         encoder_entry("amaterasu.hardware.nvenc-cuda.hevc", "hevc", true),
         encoder_entry("amaterasu.software.x264", "h264", false),
@@ -5813,7 +5837,7 @@ fn software_codecs_keep_negotiation_within_the_software_limit() {
 #[test]
 fn a_numeric_encoder_selection_offers_only_that_encoder_codec() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(uhd_profile(EncoderSelection::Index(1)))).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(uhd_profile(EncoderSelection::Index(1)))).unwrap();
     controller.set_encoder_snapshot(nvenc_and_x264());
     let mut broker = Broker::default();
     assert!(
@@ -5831,7 +5855,7 @@ fn a_numeric_encoder_selection_offers_only_that_encoder_codec() {
 #[test]
 fn an_h264_only_offer_keeps_the_legacy_rtsp_profile_shape() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_encoder_snapshot(hardware_h264());
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(65), peer(65), now).is_none());
@@ -5846,7 +5870,7 @@ fn codec_advertisement_tracks_configuration_and_the_latest_snapshot() {
         Controller::new(None).unwrap().codec_advertisement(),
         CodecAdvertisement::NONE
     );
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert_eq!(controller.codec_advertisement().codec_mode_support, 0x1);
     controller.set_encoder_snapshot(nvenc_and_x264());
     assert_eq!(
@@ -5861,7 +5885,7 @@ fn codec_advertisement_tracks_configuration_and_the_latest_snapshot() {
 #[test]
 fn scoped_software_selection_uses_the_frozen_snapshot_to_constrain_codec_negotiation() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(uhd_profile(AUTO_ENCODER))).unwrap();
     controller.set_encoder_snapshot(nvenc_and_x264());
     let mut broker = Broker {
         application_input_overrides: Some(json!({"encoder":"software"})),
@@ -5885,7 +5909,7 @@ fn external_capture_alias_flows_from_startup_to_rtsp() {
     let streaming: StreamingConfig = serde_json::from_value(value).unwrap();
     assert!(streaming.validate().is_ok());
     let now = Instant::now();
-    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let _ = poll_until_reply(&mut controller, &mut broker, now);
@@ -5913,7 +5937,7 @@ fn external_capture_alias_rejects_invalid_names_and_builtin_override_works() {
 fn steam_lifetime_policy_closes_the_application_on_authenticated_disconnect() {
     for close_application in [false, true] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         let mut broker = Broker::default();
         assert!(controller.launch(10, request(1), peer(1), now).is_none());
         poll_until_reply(&mut controller, &mut broker, now);
@@ -5962,7 +5986,7 @@ fn steam_lifetime_policy_closes_the_application_on_authenticated_disconnect() {
 #[test]
 fn retired_stream_failure_preserves_the_application_until_pause_is_verified() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     poll_until_reply(&mut controller, &mut broker, now);
@@ -6017,7 +6041,7 @@ fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
     let runtime = unsafe { amaterasu_module_sdk::RuntimeClient::from_endpoint(endpoint) };
     let (emitter, mut queue) = runtime.log_emitter();
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     controller.launch(10, request(1), peer(1), now);
     poll_until_reply(&mut controller, &mut broker, now);
@@ -6041,7 +6065,7 @@ fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
 #[test]
 fn cooperative_shutdown_runs_owned_application_cleanup_before_reporting_ready() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     controller.launch(10, request(1), peer(1), now);
     poll_until_reply(&mut controller, &mut broker, now);
@@ -6057,7 +6081,7 @@ fn cooperative_shutdown_runs_owned_application_cleanup_before_reporting_ready() 
 #[test]
 fn cooperative_shutdown_does_not_wait_on_unconfirmed_history_release() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.history_release_unavailable = true;
@@ -6091,7 +6115,7 @@ fn cooperative_shutdown_does_not_wait_on_unconfirmed_history_release() {
 #[test]
 fn paused_app_survives_failed_history_release_and_records_lifecycle_warning() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.history_release_unavailable = true;
@@ -6125,7 +6149,7 @@ fn paused_app_survives_failed_history_release_and_records_lifecycle_warning() {
 #[test]
 fn cooperative_shutdown_abandons_a_genuine_application_cleanup_failure_without_replaying_stop() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     broker.application_terminal_stop_state = Some("cleanup_failed");
@@ -6160,9 +6184,9 @@ fn virtual_display_allocation_uses_paired_physical_mode_without_changing_stream_
     let now = Instant::now();
     let mut streaming = config();
     streaming.profile.max_fps = 120;
-    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
     controller.set_encoder_snapshot(hardware_h264());
-    controller.set_global_display_policy(7, json!({"virtual_display_mode":"per_client"}));
+    controller.set_physical_fixture_display_policy(7, json!({"virtual_display_mode":"per_client"}));
     let mut broker = Broker::default();
     let paired = peer_with_display_mode(73, "2560x1440x59.94").unwrap();
     let mut stream = request(73);
@@ -6194,7 +6218,7 @@ fn lifecycle_of(
 fn a_rejected_rtsp_open_is_the_root_cause_with_its_provider_code_and_line() {
     let now = Instant::now();
     let selected = "missing-display";
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_output_name_settings(true, Some(selected));
     let mut broker = Broker {
         unavailable_output: Some(selected.into()),
@@ -6228,7 +6252,7 @@ fn a_rejected_rtsp_open_is_the_root_cause_with_its_provider_code_and_line() {
 #[test]
 fn a_refused_launch_is_recorded_with_the_line_that_refused_it() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_output_name_settings(false, None);
     let reply = controller.launch(1, request(1), peer(1), now).unwrap();
     assert_eq!(reply.status, 503);
@@ -6249,7 +6273,7 @@ fn a_refused_launch_is_recorded_with_the_line_that_refused_it() {
 
 #[test]
 fn malformed_stream_request_is_recorded_before_launch_admission() {
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let reply = controller.refuse_stream_request(400, "missing query field", "request_parsing");
     assert_eq!(reply.status, 400);
     let issue = &controller.stream_lifecycle.stream("refused.1").unwrap().root_cause().unwrap().issue;
@@ -6260,7 +6284,7 @@ fn malformed_stream_request_is_recorded_before_launch_admission() {
 
 #[test]
 fn recent_refusals_are_visible_and_bounded_when_no_launch_exists() {
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     for _ in 0..20 {
         controller.refuse_stream_request(400, "missing query field", "request_parsing");
     }
@@ -6275,7 +6299,7 @@ fn recent_refusals_are_visible_and_bounded_when_no_launch_exists() {
 #[test]
 fn a_demoted_input_policy_failure_is_a_warning_not_a_failure() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         input_policy_rejected: true,
         ..Broker::default()
@@ -6331,7 +6355,7 @@ impl IssueReports {
 #[test]
 fn the_failing_provider_is_the_root_cause_through_each_callers_binding() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.enable_stream_issue_feed();
     let mut broker = Broker::default();
     let mut reports = IssueReports {
@@ -6420,7 +6444,7 @@ fn the_failing_provider_is_the_root_cause_through_each_callers_binding() {
 fn warning_reports_cannot_stop_a_launch_or_change_cleanup_ownership() {
     use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let record = controller.records.get_mut(&1).unwrap();
@@ -6463,7 +6487,7 @@ fn warning_reports_cannot_stop_a_launch_or_change_cleanup_ownership() {
 fn raw_error_fields_cannot_authorize_a_launch_503_but_a_critical_report_can() {
     use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let record = controller.records.get_mut(&1).unwrap();

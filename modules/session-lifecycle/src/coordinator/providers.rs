@@ -4098,11 +4098,29 @@ mod output_finish_tests {
             selections: [("screen".into(), selected)].into(),
         };
         if mode == 1 {
-            let before = std::fs::read(dir.join("journal.json")).unwrap();
-            let moved = dir.with_extension("moved");
-            std::fs::rename(&dir, &moved).unwrap();
-            assert!(writer.persist(&resulting_authority).is_err());
-            assert_eq!(std::fs::read(moved.join("journal.json")).unwrap(), before);
+            let journal = dir.join("journal.json");
+            let before = std::fs::read(&journal).unwrap();
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // The directory itself has an open private root lock on
+                // Windows. Deny journal replacement at the file instead.
+                let read_only = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0x0000_0001) // FILE_SHARE_READ
+                    .open(&journal)
+                    .unwrap();
+                assert!(writer.persist(&resulting_authority).is_err());
+                drop(read_only);
+            }
+            #[cfg(not(windows))]
+            {
+                let moved = dir.with_extension("moved");
+                std::fs::rename(&dir, &moved).unwrap();
+                assert!(writer.persist(&resulting_authority).is_err());
+                std::fs::rename(&moved, &dir).unwrap();
+            }
+            assert_eq!(std::fs::read(&journal).unwrap(), before);
             assert_eq!(
                 coordinator.shared.borrow().value.receipts[&key]
                     .work
@@ -4111,7 +4129,6 @@ mod output_finish_tests {
                     .index,
                 0
             );
-            std::fs::rename(&moved, &dir).unwrap();
         } else if mode == 2 || mode == 3 {
             let before = std::fs::read(dir.join("journal.json")).unwrap();
             assert!(writer.persist(&resulting_authority).is_err());

@@ -3,9 +3,9 @@ fn mutating_display_fixture(option: &str, two_displays: bool) -> (Controller, Br
     streaming.profile.max_fps = 120;
     streaming.capture.capture_provider = CaptureProvider::Wgc;
     streaming.capture.output = "\\\\.\\DISPLAY2".into();
-    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(streaming)).unwrap();
     controller.set_encoder_snapshot(hardware_h264());
-    controller.set_global_display_policy(
+    controller.set_physical_fixture_display_policy(
         9,
         json!({
             "dd_configuration_option":option,
@@ -117,7 +117,7 @@ fn inactive_ensure_active_attests_appended_target_without_changing_active_displa
 fn inactive_stream_mode_fallback_requires_static_refresh_policy() {
     let now = Instant::now();
     let (mut controller, mut broker) = inactive_display_fixture("ensure_active");
-    controller.set_global_display_policy(
+    controller.set_physical_fixture_display_policy(
         9,
         json!({
             "dd_configuration_option":"ensure_active",
@@ -238,7 +238,7 @@ fn selected_two_monitor_mutation_attests_full_topology_and_physical_5994_mode() 
             .launch(10, stream.clone(), paired.clone(), now)
             .is_none()
     );
-    controller.set_global_display_policy(10, json!({"dd_configuration_option":"disabled"}));
+    controller.set_physical_fixture_display_policy(10, json!({"dd_configuration_option":"disabled"}));
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
     let open = opened_rtsp_payload(&broker);
@@ -416,7 +416,7 @@ fn signed_display_option_precedence_is_frozen_through_launch_and_rtsp() {
                 .is_none(),
             "{case}"
         );
-        controller.set_global_display_policy(10, json!({"dd_configuration_option":"disabled"}));
+        controller.set_physical_fixture_display_policy(10, json!({"dd_configuration_option":"disabled"}));
         let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
         assert_eq!(reply.status, 200, "{case}");
 
@@ -739,7 +739,7 @@ fn display_modes_project_without_optimize_game_settings_fact() {
             "dd_hdr_option":"disabled",
         });
         global.as_object_mut().unwrap().extend(overrides.as_object().unwrap().clone());
-        controller.set_global_display_policy(9, global);
+        controller.set_physical_fixture_display_policy(9, global);
         assert!(controller.launch(10, request(71), peer(71), now).is_none());
         let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
         assert_eq!(reply.status, 200, "{overrides}");
@@ -759,7 +759,7 @@ fn display_modes_project_without_optimize_game_settings_fact() {
 fn disabled_display_mode_options_preserve_observed_desktop_mode() {
     let now = Instant::now();
     let (mut controller, mut broker) = mutating_display_fixture("ensure_active", true);
-    controller.set_global_display_policy(9, json!({
+    controller.set_physical_fixture_display_policy(9, json!({
         "dd_configuration_option":"ensure_active",
         "dd_resolution_option":"disabled",
         "dd_refresh_rate_option":"disabled",
@@ -794,7 +794,7 @@ fn frozen_hdr_override_drives_display_and_negotiation_without_rewriting_client_r
         controller.config.as_mut().unwrap().capture.encoder = EncoderSelection::Backend(
             amaterasu_module_sdk::EncoderBackend::Auto,
         );
-        controller.set_global_display_policy(9, json!({
+        controller.set_physical_fixture_display_policy(9, json!({
             "dd_configuration_option":"verify_only",
             "dd_hdr_option":"auto",
             "dd_hdr_request_override":global,
@@ -838,8 +838,8 @@ fn private_resolution_catalog_requires_an_owned_bundled_per_client_display() {
         ("per_client", true, true),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
-        controller.set_global_display_policy(9, json!({
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
+        controller.set_physical_fixture_display_policy(9, json!({
             "virtual_display_mode":mode,
             "dd_use_sunshine_virtual_display_driver":bundled,
         }));
@@ -865,7 +865,7 @@ fn inactive_activation_modes_and_automatic_refresh_reach_attested_provider_trans
         for refresh in ["auto", "prefer_highest"] {
             let now = Instant::now();
             let (mut controller, mut broker) = inactive_display_fixture(option);
-            controller.set_global_display_policy(9, json!({
+            controller.set_physical_fixture_display_policy(9, json!({
                 "dd_configuration_option":option,
                 "dd_resolution_option":"auto",
                 "dd_refresh_rate_option":refresh,

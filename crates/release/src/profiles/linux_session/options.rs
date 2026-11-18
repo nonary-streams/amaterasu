@@ -629,7 +629,7 @@ fn label(value: String, option: &'static str, maximum: usize) -> Result<String, 
     Ok(value)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod rtx_hdr_tests {
     use super::*;
 

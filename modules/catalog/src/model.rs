@@ -2592,6 +2592,11 @@ mod tests {
 
     #[test]
     fn desktop_target_is_process_less_normalized_and_bounded() {
+        let (working_dir, configure) = if cfg!(windows) {
+            ("C:/player", "C:/tools/configure.exe")
+        } else {
+            ("/home/player", "/usr/bin/configure")
+        };
         let bare: Entry = serde_json::from_value(json!({
             "name":"Desktop",
             "launch":{"kind":"desktop"}
@@ -2617,10 +2622,10 @@ mod tests {
             "launch":{
                 "kind":"desktop",
                 "exit_timeout_seconds":30,
-                "working-dir":"/home/player",
+                "working-dir":working_dir,
                 "preparation":[{
-                    "run":{"executable":"/usr/bin/configure","args":["enable"]},
-                    "undo":{"executable":"/usr/bin/configure","args":["disable"]}
+                    "run":{"executable":configure,"args":["enable"]},
+                    "undo":{"executable":configure,"args":["disable"]}
                 }]
             }
         }))
@@ -2628,7 +2633,7 @@ mod tests {
         configured.validate().unwrap();
         let normalized = serde_json::to_value(&configured).unwrap();
         assert_eq!(normalized["launch"]["exit_timeout_seconds"], 30);
-        assert_eq!(normalized["launch"]["working_directory"], "/home/player");
+        assert_eq!(normalized["launch"]["working_directory"], working_dir);
         assert_eq!(
             normalized["launch"]["preparation"][0]["run"]["timeout_ms"],
             10_000

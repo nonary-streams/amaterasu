@@ -646,6 +646,7 @@ mod tests {
         fingerprint
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn review_reports_exact_proposed_grant_without_modifying_host() {
         let base = std::env::temp_dir().join(format!(

@@ -276,7 +276,7 @@ fn streaming_router() -> Router {
             http_port: 47989,
             https_port: 47984,
         },
-        LaunchController::new(Some(StreamingConfig {
+        LaunchController::new_physical_fixture(Some(StreamingConfig {
             capture: CaptureConfig {
                 capture_provider: CaptureProvider::Dxgi,
                 output: "display-one".into(),

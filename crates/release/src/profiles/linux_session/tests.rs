@@ -466,6 +466,7 @@ fn vkms_capture_stays_disabled_until_a_frame_helper_is_named() {
     assert_eq!(vkms_capture_settings(&capture_disabled)["enabled"], false);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn frame_helper_option_requires_one_absolute_normal_path() {
     let parse = |values: &[&str]| {
@@ -549,6 +550,7 @@ fn portal_selection_authorizes_direct_management_and_video_ensure_routes() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn opt_in_virtual_screen_alias_matches_bootstrap_and_retains_provider_grants() {
     let parse = |arguments: &[&str]| {
@@ -661,6 +663,7 @@ fn opt_in_virtual_screen_alias_matches_bootstrap_and_retains_provider_grants() {
     assert!(linux_session_policy(root.path(), &invalid).is_err());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn package_capture_authority_requires_scoped_owned_display_options() {
     let parse = |values: &[&str]| LinuxSessionOptions::from_arguments(&arguments(values));
@@ -757,6 +760,7 @@ fn package_capture_authority_requires_scoped_owned_display_options() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn package_capture_authority_rejects_invalid_paths_and_card_scope() {
     let parse = |values: &[&str]| LinuxSessionOptions::from_arguments(&arguments(values));
@@ -805,6 +809,7 @@ fn package_capture_authority_rejects_invalid_paths_and_card_scope() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn programmatic_capture_authority_options_preserve_validation() {
     let valid = LinuxSessionOptions {
@@ -867,6 +872,7 @@ fn programmatic_capture_authority_options_preserve_validation() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn package_authority_profile_uses_only_the_inherited_channel() {
     let options = LinuxSessionOptions {
@@ -899,6 +905,7 @@ fn package_authority_profile_uses_only_the_inherited_channel() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn precheck_is_an_explicit_false_placeholder_and_old_profile_schema_stays_unchanged() {
     let parse = |args: &[&str]| {
@@ -978,6 +985,7 @@ fn session_extensions_profile_adds_actions_to_default_extension_services() {
     }));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
     let root = TemporaryRoot::new("rtx-hdr-composition");
@@ -1203,6 +1211,7 @@ fn rtx_hdr_policy_conflicts_leave_existing_policy_unchanged() {
     assert_eq!(serde_json::to_value(&policy).unwrap(), before);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn rtx_hdr_does_not_require_vkms_or_other_optional_extensions() {
     let root = TemporaryRoot::new("rtx-hdr-independent");
@@ -1271,6 +1280,7 @@ fn rtx_hdr_does_not_require_vkms_or_other_optional_extensions() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn external_extension_composition_can_start_with_only_rtx_hdr_selected() {
     let root = TemporaryRoot::new("rtx-hdr-external-composition");
@@ -1304,6 +1314,7 @@ fn external_extension_composition_can_start_with_only_rtx_hdr_selected() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn rtx_hdr_composes_selected_sdk_providers_and_preserves_other_hooks() {
     let root = TemporaryRoot::new("rtx-hdr-replacement-providers");
@@ -1481,6 +1492,7 @@ fn rtx_hdr_policy_rejects_conflicting_foreground_provider_without_mutation() {
     assert_eq!(serde_json::to_value(&policy).unwrap(), before);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn rtx_hdr_preserves_existing_default_capability_consumers() {
     let root = TemporaryRoot::new("rtx-hdr-shared-capabilities");
@@ -1532,6 +1544,7 @@ fn display_settings_selection_conflicts_do_not_overwrite_policy() {
     assert_eq!(serde_json::to_value(&policy).unwrap(), before);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn rtsp_warmup_retains_authority_through_source_preparation() {
     use amaterasu_contracts::{Command, Response};

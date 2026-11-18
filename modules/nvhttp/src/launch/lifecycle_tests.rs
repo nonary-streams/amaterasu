@@ -1,7 +1,7 @@
 #[test]
 fn application_preparation_can_exceed_startup_deadline_before_rtsp_admission() {
     let started = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_state: "starting",
         ..Broker::default()
@@ -94,7 +94,7 @@ fn application_preparation_can_exceed_startup_deadline_before_rtsp_admission() {
 #[test]
 fn explicit_cancel_stops_application_while_preparation_is_still_running() {
     let started = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_state: "starting",
         ..Broker::default()
@@ -140,7 +140,7 @@ fn explicit_cancel_stops_application_while_preparation_is_still_running() {
 #[test]
 fn application_readiness_reuses_an_existing_rtsp_ticket() {
     let started = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut broker = Broker {
         application_state: "starting",
         ..Broker::default()
@@ -186,9 +186,9 @@ fn application_readiness_reuses_an_existing_rtsp_ticket() {
 #[test]
 fn required_extension_lifecycle_polls_pending_before_application_launch() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = Broker {
         application_executable_path: Some("/games/example".into()),
         application_input_overrides: Some(json!({"vendor_option":{"quality":"high"}})),
@@ -230,9 +230,9 @@ fn required_extension_lifecycle_polls_pending_before_application_launch() {
 #[test]
 fn unavailable_extension_lifecycle_refuses_before_application_or_rtsp() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = Broker { lifecycle_unavailable: true, ..Default::default() };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
@@ -244,9 +244,9 @@ fn unavailable_extension_lifecycle_refuses_before_application_or_rtsp() {
 #[test]
 fn failed_lifecycle_with_confirmed_cleanup_allows_another_launch() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = Broker::default();
     broker.lifecycle_replies.push_back(json!({"status":"pending"}));
     broker.lifecycle_replies.push_back(json!({"status":"failed", "cleanup_completed":true,
@@ -273,9 +273,9 @@ fn failed_lifecycle_with_confirmed_cleanup_allows_another_launch() {
 #[test]
 fn pending_extension_lifecycle_deadline_does_not_block_the_next_launch() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     for _ in 0..32 {
@@ -312,9 +312,9 @@ fn pending_extension_lifecycle_deadline_does_not_block_the_next_launch() {
 #[test]
 fn extension_lifecycle_result_release_uncertainty_remains_fenced() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = Broker { lifecycle_release_failure: true, ..Default::default() };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
@@ -343,7 +343,7 @@ fn lifecycle_target_requires_a_bounded_tagged_session_identity() {
 #[test]
 fn paused_snapshot_requires_exact_epoch_session_and_generation() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.values_mut().next().unwrap();
     record.lifecycle_session_target = serde_json::from_value(json!({"kind":"session","host_epoch":"e","session_id":"s","generation":2})).ok();
@@ -359,7 +359,7 @@ fn paused_snapshot_requires_exact_epoch_session_and_generation() {
 #[test]
 fn lifecycle_end_fences_before_retirement_and_waits_for_release() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let target = json!({"kind":"session","host_epoch":"e","session_id":"s","generation":1});
     let record = controller.records.values_mut().next().unwrap();
@@ -387,7 +387,7 @@ fn lifecycle_end_fences_before_retirement_and_waits_for_release() {
 #[test]
 fn retained_resume_uses_fresh_rtsp_operation_and_rechecks_paused_session() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.values_mut().next().unwrap();
     record.lifecycle_required = true;
@@ -409,7 +409,7 @@ fn retained_resume_uses_fresh_rtsp_operation_and_rechecks_paused_session() {
 #[test]
 fn failed_retained_resume_cannot_authorize_the_next_resume_reply() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.get_mut(&1).unwrap();
     record.lifecycle_required = true;
@@ -450,8 +450,8 @@ fn failed_retained_resume_cannot_authorize_the_next_resume_reply() {
 #[test]
 fn retained_application_resumes_on_another_paired_client_without_relaunch() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    controller.set_global_display_policy(7, json!({}));
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     assert_eq!(poll_until_reply(&mut controller, &mut broker, now).1.status, 200);
@@ -505,8 +505,8 @@ fn retained_application_resumes_on_another_paired_client_without_relaunch() {
 #[test]
 fn resume_keeps_last_proton_policy_when_optional_refresh_is_unavailable() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    controller.set_global_display_policy(7, json!({}));
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
+    controller.set_physical_fixture_display_policy(7, json!({}));
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     assert_eq!(poll_until_reply(&mut controller, &mut broker, now).1.status, 200);
@@ -542,7 +542,7 @@ fn resume_keeps_last_proton_policy_when_optional_refresh_is_unavailable() {
 #[test]
 fn unauthenticated_client_cannot_resume_a_retained_application() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.values_mut().next().unwrap();
     record.lifecycle_required = true;
@@ -560,7 +560,7 @@ fn unauthenticated_client_cannot_resume_a_retained_application() {
 #[test]
 fn lifecycle_application_cleanup_failure_remains_fenced() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.values_mut().next().unwrap();
     let id = record.id;
@@ -578,7 +578,7 @@ fn lifecycle_application_cleanup_failure_remains_fenced() {
 #[test]
 fn lifecycle_binds_known_application_before_reply_or_cleanup() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.values_mut().next().unwrap();
     record.lifecycle_required = true;
@@ -596,7 +596,7 @@ fn lifecycle_binds_known_application_before_reply_or_cleanup() {
 #[test]
 fn rejected_resume_retains_application_and_releases_new_history() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.values_mut().next().unwrap();
     record.application_launch = Some(42);
@@ -614,7 +614,7 @@ fn rejected_resume_retains_application_and_releases_new_history() {
 #[test]
 fn lost_resume_reply_before_stream_admission_retains_application() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.values_mut().next().unwrap();
     record.lifecycle_session_target = serde_json::from_value(json!({"kind":"session","host_epoch":"e","session_id":"s","generation":1})).ok();
@@ -634,7 +634,7 @@ fn lost_resume_reply_before_stream_admission_retains_application() {
 #[test]
 fn uncertain_history_does_not_fence_a_caller_abandoned_resume() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.values_mut().next().unwrap();
     let id = record.id;
@@ -661,7 +661,7 @@ fn uncertain_history_does_not_fence_a_caller_abandoned_resume() {
 fn history_settlement_uncertainty_preserves_initial_and_resumed_launches() {
     for (resumed, fail_release) in [(false, false), (true, false), (true, true)] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         assert!(controller.launch(10, request(1), peer(1), now).is_none());
         let record = controller.records.values_mut().next().unwrap();
         let id = record.id;
@@ -746,7 +746,7 @@ fn history_settlement_uncertainty_preserves_initial_and_resumed_launches() {
 #[test]
 fn terminal_lifecycle_end_reply_without_pending_fence_allows_cleanup() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let target = json!({
         "kind":"session", "host_epoch":"epoch", "session_id":"session", "generation":1
@@ -792,7 +792,7 @@ fn lifecycle_end_never_accepts_unfenced_pending_or_another_generation() {
         json!({"status":"recovery_required", "target":target, "fenced":true}),
     ] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         assert!(controller.launch(10, request(1), peer(1), now).is_none());
         let record = controller.records.values_mut().next().unwrap();
         record.lifecycle_session_target = serde_json::from_value(target.clone()).ok();
@@ -825,7 +825,7 @@ fn lifecycle_end_never_accepts_unfenced_pending_or_another_generation() {
 fn long_stream_monitoring_retires_results_before_real_broker_capacity_is_exhausted() {
     use amaterasu_contracts::{Grants, RuntimeConfig};
     let started = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     let mut responses = Broker::default();
     assert!(
         controller
@@ -1015,7 +1015,7 @@ fn stranded_snapshot() -> Value {
 #[test]
 fn restart_sweep_abandons_stranded_sessions_without_reporting_retirement() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
     controller.enable_restart_abandonment_sweep();
     let mut broker = RestartSweepBroker {
@@ -1058,7 +1058,7 @@ fn restart_sweep_abandons_stranded_sessions_without_reporting_retirement() {
 fn truncated_stranded_listing_continues_only_after_progress() {
     for (refuse, expected_snapshots) in [(false, 8), (true, 1)] {
         let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
         controller.set_session_lifecycle_required(true);
         controller.enable_restart_abandonment_sweep();
         let mut snapshot = stranded_snapshot();
@@ -1080,9 +1080,9 @@ fn truncated_stranded_listing_continues_only_after_progress() {
 #[test]
 fn launches_proceed_during_the_sweep_and_capacity_refusal_sweeps_again() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     controller.enable_restart_abandonment_sweep();
     let mut broker = RestartSweepBroker {
         hold_snapshots: true,
@@ -1102,9 +1102,9 @@ fn launches_proceed_during_the_sweep_and_capacity_refusal_sweeps_again() {
     assert_eq!(broker.operations(), ["snapshot", "prepare"], "sweep is still pending");
 
     let later = now + Duration::from_secs(60);
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
-    controller.set_global_display_policy(7, json!({}));
+    controller.set_physical_fixture_display_policy(7, json!({}));
     controller.enable_restart_abandonment_sweep();
     let mut broker = RestartSweepBroker {
         snapshot_reply: json!({"status":"ok","host_epoch":"current","sessions":[]}),
@@ -1129,7 +1129,7 @@ fn launches_proceed_during_the_sweep_and_capacity_refusal_sweeps_again() {
 #[test]
 fn history_reservation_settlement_capacity_skips_metadata_before_admission() {
     let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut controller = Controller::new_physical_fixture(Some(config())).unwrap();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let record = controller.records.values_mut().next().unwrap();
     let id = record.id;

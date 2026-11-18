@@ -375,6 +375,11 @@ fn ordinary_requests_wait_for_the_seed_and_see_its_entry() {
 
 #[test]
 fn manual_desktop_entry_is_normalized_stored_exported_and_strictly_validated() {
+    let configure = if cfg!(windows) {
+        "C:/tools/configure.exe"
+    } else {
+        "/usr/bin/configure"
+    };
     let mut backend = Backend::default();
     let mut pipeline = unseeded_pipeline();
     let created = management(
@@ -383,8 +388,8 @@ fn manual_desktop_entry_is_normalized_stored_exported_and_strictly_validated() {
         json!({"action":"create","expected_revision":0,"entry":{
             "name":"Streaming desktop",
             "launch":{"kind":"desktop","preparation":[{
-                "run":{"executable":"/usr/bin/configure","args":["on"]},
-                "undo":{"executable":"/usr/bin/configure","args":["off"]},
+                "run":{"executable":configure,"args":["on"]},
+                "undo":{"executable":configure,"args":["off"]},
             }]},
         }}),
     );

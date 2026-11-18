@@ -146,7 +146,7 @@ fn remove_provider_entries(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use amaterasu_package::random_identifier;
