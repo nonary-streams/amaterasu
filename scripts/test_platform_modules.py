@@ -130,15 +130,17 @@ def test_operation_errors_do_not_roll_back_activation(harness: PlatformHarness) 
 
 
 def wait_for_diagnostics(console) -> None:
-    deadline = time.monotonic() + 15
+    # Startup discards the first ready document before accepting a fresh GET.
+    # Allow two 30-second provider requests and the five-second retry delay.
+    deadline = time.monotonic() + 70
     while True:
         status = console.request("amaterasu.diagnostics/1", {"action": "status"})
         assert status["ok"], status
         if status["ready"]:
             assert status["logging_configuration_revision"] == 1, status
             return
-        assert time.monotonic() < deadline, status
-        time.sleep(0.02)
+        assert time.monotonic() < deadline, (status, "".join(console.errors[-12:]))
+        time.sleep(0.05)
 
 
 def test_diagnostics(harness: PlatformHarness) -> None:
@@ -203,6 +205,12 @@ def test_diagnostics(harness: PlatformHarness) -> None:
     # Diagnostics explicitly has in-memory retention, unlike the durable catalog.
     restarted_console = Console(harness)
     try:
+        restarted_api = Api(restarted_console)
+        status, persisted, _ = restarted_api.post(
+            "/v1/host-configuration/get", token=token["bearer"],
+        )
+        assert status == 200 and persisted["ok"] and persisted["ready"], persisted
+        assert persisted["revision"] == 1, persisted
         wait_for_diagnostics(restarted_console)
         restarted = restarted_console.request(service, {"action": "query"})
         assert restarted["ok"] and restarted["records"] == [], restarted
