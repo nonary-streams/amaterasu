@@ -25,6 +25,7 @@ TOKEN_QUERY = 0x0008
 TOKEN_ADJUST_DEFAULT = 0x0080
 TOKEN_USER = 1
 TOKEN_OWNER = 4
+TOKEN_DEFAULT_DACL = 6
 TOKEN_ELEVATION = 20
 TOKEN_INTEGRITY_LEVEL = 25
 DISABLE_MAX_PRIVILEGE = 0x1
@@ -65,6 +66,10 @@ def windows_api():
         ),
         (security.SetTokenInformation, wt.BOOL, wt.HANDLE, wt.DWORD, wt.LPVOID, wt.DWORD),
         (security.ConvertStringSidToSidW, wt.BOOL, wt.LPCWSTR, ct.POINTER(wt.LPVOID)),
+        (security.ConvertStringSecurityDescriptorToSecurityDescriptorW,
+         wt.BOOL, wt.LPCWSTR, wt.DWORD, ct.POINTER(wt.LPVOID), ct.POINTER(wt.DWORD)),
+        (security.GetSecurityDescriptorDacl,
+         wt.BOOL, wt.LPVOID, ct.POINTER(wt.BOOL), ct.POINTER(wt.LPVOID), ct.POINTER(wt.BOOL)),
         (security.GetLengthSid, wt.DWORD, wt.LPVOID),
         (security.CreateRestrictedToken,
             wt.BOOL, wt.HANDLE, wt.DWORD, wt.DWORD, ct.POINTER(SidAndAttributes),
@@ -104,6 +109,30 @@ def elevated(security, token):
     return bool(value.value)
 
 
+def set_fixture_default_dacl(security, kernel, token):
+    descriptor = wt.LPVOID()
+    # The elevated runner can default new handles to Administrators. The
+    # restricted process must be able to open its own pipes and objects.
+    sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;{runner_sid()})"
+    require(security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ct.byref(descriptor), None,
+    ))
+    try:
+        present = wt.BOOL()
+        dacl = wt.LPVOID()
+        defaulted = wt.BOOL()
+        require(security.GetSecurityDescriptorDacl(
+            descriptor, ct.byref(present), ct.byref(dacl), ct.byref(defaulted),
+        ))
+        if not present.value or not dacl:
+            raise RuntimeError("the Windows fixture's default ACL is missing")
+        require(security.SetTokenInformation(
+            token, TOKEN_DEFAULT_DACL, ct.byref(dacl), ct.sizeof(dacl),
+        ))
+    finally:
+        kernel.LocalFree(descriptor)
+
+
 def restrict_token(security, kernel, source):
     administrators = wt.LPVOID()
     medium_integrity = wt.LPVOID()
@@ -135,6 +164,7 @@ def restrict_token(security, kernel, source):
         require(security.SetTokenInformation(
             result, TOKEN_OWNER, ct.byref(user_sid), ct.sizeof(user_sid),
         ))
+        set_fixture_default_dacl(security, kernel, result)
         if elevated(security, result):
             raise RuntimeError("the Windows integration token is still elevated")
         return result
@@ -149,7 +179,7 @@ def restrict_token(security, kernel, source):
             kernel.LocalFree(administrators)
 
 
-def grant_fixture_write(path):
+def runner_sid():
     system = Path(os.environ["SystemRoot"]) / "System32"
     output = subprocess.check_output(
         [str(system / "whoami.exe"), "/user", "/fo", "csv", "/nh"], text=True,
@@ -157,8 +187,13 @@ def grant_fixture_write(path):
     _, sid = next(csv.reader(output.splitlines()))
     if not sid.startswith("S-1-"):
         raise RuntimeError("could not identify the Windows runner user")
+    return sid
+
+
+def grant_fixture_write(path):
+    tool = Path(os.environ["SystemRoot"]) / "System32" / "icacls.exe"
     subprocess.run(
-        [str(system / "icacls.exe"), str(path), "/grant", f"*{sid}:(OI)(CI)M", "/Q"],
+        [str(tool), str(path), "/grant", f"*{runner_sid()}:(OI)(CI)M", "/Q"],
         check=True,
     )
 
@@ -201,7 +236,13 @@ def run_restricted(security, kernel, token, task):
 
 def run_fixture(task, output=None):
     if task == VERIFY:
-        print("Windows integration token is unelevated", file=output, flush=True)
+        proof = subprocess.run(
+            [sys.executable, "-c", "print('Windows fixture pipes work')"],
+            capture_output=True, text=True, check=True,
+        )
+        if proof.stdout.strip() != "Windows fixture pipes work":
+            raise RuntimeError("could not receive output through Windows fixture pipes")
+        print("Windows integration token is unelevated and pipes work", file=output, flush=True)
         return 0
     script = Path(__file__).with_name(task)
     return subprocess.run([sys.executable, str(script)], stdout=output, stderr=output).returncode
