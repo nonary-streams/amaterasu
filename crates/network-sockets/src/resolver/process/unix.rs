@@ -3,10 +3,7 @@ use super::*;
 use std::{
     fs::File,
     io::{Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::process::CommandExt,
-    },
+    os::{fd::AsRawFd, unix::process::CommandExt},
     process::{Child, Command, Stdio},
 };
 
@@ -172,6 +169,7 @@ fn only_unreaped_leader(group: libc::pid_t) -> bool {
 
 #[cfg(target_os = "linux")]
 fn pipe() -> io::Result<(File, File)> {
+    use std::os::fd::FromRawFd;
     let mut descriptors = [-1; 2];
     let result = unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) };
     if result != 0 {

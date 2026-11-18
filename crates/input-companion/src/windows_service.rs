@@ -287,7 +287,20 @@ pub fn run(state_root: &Path, stop: Arc<AtomicBool>, on_ready: impl FnOnce()) ->
                 let worker_connections = Arc::clone(&connections);
                 let cleanup_failed = Arc::clone(&cleanup_failed);
                 match std::thread::Builder::new().spawn(move || {
-                    let _ = serve_connection(pipe, ledger, stop, cleanup_failed, true);
+                    crate::service_threads::run_guarded_worker(
+                        || {
+                            let _ = serve_connection(
+                                pipe,
+                                ledger,
+                                Arc::clone(&stop),
+                                Arc::clone(&cleanup_failed),
+                                true,
+                            );
+                        },
+                        &stop,
+                        &cleanup_failed,
+                        wake_listener,
+                    );
                     worker_connections.fetch_sub(1, Ordering::AcqRel);
                 }) {
                     Ok(worker) => workers.push(worker),
