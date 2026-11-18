@@ -2,6 +2,7 @@
 """Run the platform fixtures without administrator privileges on hosted Windows."""
 from __future__ import annotations
 
+import csv
 import ctypes as ct
 from ctypes import wintypes as wt
 import os
@@ -148,9 +149,26 @@ def restrict_token(security, kernel, source):
             kernel.LocalFree(administrators)
 
 
+def grant_fixture_write(path):
+    system = Path(os.environ["SystemRoot"]) / "System32"
+    output = subprocess.check_output(
+        [str(system / "whoami.exe"), "/user", "/fo", "csv", "/nh"], text=True,
+    )
+    _, sid = next(csv.reader(output.splitlines()))
+    if not sid.startswith("S-1-"):
+        raise RuntimeError("could not identify the Windows runner user")
+    subprocess.run(
+        [str(system / "icacls.exe"), str(path), "/grant", f"*{sid}:(OI)(CI)M", "/Q"],
+        check=True,
+    )
+
+
 def run_restricted(security, kernel, token, task):
     temp_root = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())).resolve()
     with tempfile.TemporaryDirectory(prefix="amaterasu-native-ci-", dir=temp_root) as directory:
+        # The hosted parent grants write through Administrators by default.
+        # Grant the same identity directly on this task's scratch directory.
+        grant_fixture_write(directory)
         log = Path(directory) / "integration.log"
         command = ct.create_unicode_buffer(subprocess.list2cmdline([
             sys.executable, str(Path(__file__).resolve()), "--child", str(log), task,
@@ -215,10 +233,18 @@ def main():
                     return 1
                 # Avoid the hosted runner's short-name alias and retain a
                 # separate temporary root for this standard-user process.
-                os.environ["TMPDIR"] = str(Path(args[1]).parent)
+                temp = str(Path(args[1]).parent)
+                os.environ.update(TMPDIR=temp, TMP=temp, TEMP=temp)
                 return run_fixture(task, output)
         if not is_elevated:
             return run_fixture(task)
+        if (task == VERIFY and os.environ.get("GITHUB_ACTIONS") == "true"
+                and Path.cwd().resolve() == Path(os.environ["GITHUB_WORKSPACE"]).resolve()):
+            # Do this before Cargo creates output, so subsequent fixture
+            # builds can reuse only this checkout's native build directory.
+            target = Path.cwd() / "target"
+            target.mkdir(exist_ok=True)
+            grant_fixture_write(target)
         token = restrict_token(security, kernel, source)
         try:
             return run_restricted(security, kernel, token, task)
