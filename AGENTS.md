@@ -61,6 +61,73 @@
   checks. Run the tests and checks appropriate to the changed modules and report
   installation separately from real client playback.
 
+## Stream failures: warnings and fallbacks first
+
+- **Keep the stream viable. A compatible fallback with a warning is the
+  default.** Apply this from the first launch, resume, or RTSP request through
+  playback and termination, including paths before a stream record exists.
+  A failure is critical only when a specific required condition still prevents
+  a valid, authorized stream from starting or continuing after safe fallbacks
+  are considered. Name that condition and give the reason at the decision.
+- Route every decision to fail the whole stream through the centralized
+  Amaterasu lifecycle owner. The owner records an explicit critical disposition
+  and concrete reason through the [lifecycle SDK](docs/stream-lifecycle-store.md).
+  Lower layers return what failed and why, distinguishing no effect, confirmed
+  effect, and unknown outcome. They may contain or retire their own resources
+  within their authority. The observing Amaterasu layer reports dependency
+  failures when needed, such as video reporting a capture failure. A provider
+  error, local failure state, or HTTP/RTSP error status alone cannot decide the
+  whole stream's fate. The store records the outcome. Keep diagnostic health
+  and delivery off the decision path.
+- Give optional probes, providers, hints, and diagnostics a bounded budget.
+  On rejection, timeout, missing or invalid replies, use an approved alternate,
+  keep the last valid configuration, or skip the optional feature as compatible
+  with the request. Account for any uncertain effect under its original operation
+  during fallback. Preserve authorization, explicit policy, and agreed media
+  and encryption. For an optional codec such as PyroWave, prove the provider
+  chain before offering it and verify the client can negotiate a compatible
+  standard codec when it is unavailable. Keep HDR or SDR and required bit depth
+  intact. The client and host must agree on the effective format before PLAY.
+- Log every demotion in host diagnostics and report it through the lifecycle
+  SDK to the exact launch or stream attempt. Attach it to stream diagnostics
+  and history when available. Include a bounded code, stage, source, reason,
+  and effective fallback. Include safe requested and effective values when
+  they explain the decision. Report recovery only after the fallback succeeds.
+  Use an advisory warning for an issue that needed no fallback. A trusted
+  refusal before a stream exists belongs with the request. A rejected request
+  against an existing stream leaves its state intact.
+- Treat a requested stop or disconnect and its cleanup as separate from
+  playback failure. For example, unconfirmed RTSP teardown after Quit is a
+  warning, and the Quit response must still report incomplete cleanup. Retain
+  the exact cleanup ownership and receipts. Keep ended generations out of new
+  admission and fence late results to the original operation. If a required
+  resource still cannot be safely acquired, report that specific blocker.
+
+## Mandatory stream architecture review
+
+- Read and apply the [stream failure policy](docs/stream-failure-policy.md),
+  [lifecycle ownership and recovery](docs/stream-lifecycle-behavior.md),
+  [admission and retirement rules](docs/lifecycle-admission-and-retirement.md),
+  and [generation isolation design](docs/lifecycle-generation-isolation-design.md)
+  when working on stream initialization, termination, or RTSP traffic. For RTSP
+  also follow the [module contract](modules/rtsp/README.md) and the
+  [wire negotiation contract](crates/gamestream/src/rtsp/negotiation/README.md).
+- Every change that can affect those paths requires a distinct architecture
+  review, including changes in a dependency, provider, configuration, or package.
+  Trace the affected path from the client request through the responsible owners
+  to media startup, refusal, or verified retirement. Trace every changed error
+  return that could stop or reject the stream. Verify that each decision to fail
+  the stream comes from the central owner and identifies the unmet requirement.
+  For an optional failure, test both the warning and actual startup or
+  continuation via the fallback. Cover retries, timeouts, late results, and
+  cleanup where the change affects them. Verify the negotiated wire contract
+  and exact effect ownership across module boundaries.
+- Record the exact change reviewed, reviewer, affected paths, findings, and
+  supporting evidence before merging, installing, or handing off the change.
+  Apply the same review to the plan for a live repair before changing stream
+  state. Resolve blocking findings and review the affected paths again after
+  changes. Keep test, installed-package, and client-playback evidence distinct.
+
 ## Latency-sensitive paths
 
 - Mark the stages of an input event or frame with `amaterasu_module_sdk::trace`
