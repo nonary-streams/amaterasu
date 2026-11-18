@@ -930,7 +930,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let (accepted, _) = listener.accept().unwrap();
+        let (accepted, _) = accept_loopback(&listener);
         // The server actively closes first, leaving its endpoint in TIME_WAIT.
         accepted.shutdown(Shutdown::Write).unwrap();
         let mut byte = [0];
@@ -949,6 +949,37 @@ mod tests {
 
     static FIXED_PORT_LOCK: Mutex<()> = Mutex::new(());
 
+    fn poll_loopback<T>(mut poll: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(value) = poll() {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "loopback fixture did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn accept_loopback(listener: &NetworkTcpListener) -> (NetworkTcpStream, SocketAddr) {
+        poll_loopback(|| match listener.accept() {
+            Ok(peer) => Some(peer),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+            Err(error) => panic!("could not accept loopback fixture peer: {error}"),
+        })
+    }
+
+    fn loopback_requests(server: &mut Server, expected: usize, accepted: usize) -> Vec<Incoming> {
+        let mut requests = Vec::new();
+        poll_loopback(|| {
+            requests.extend(server.tick().requests);
+            (requests.len() >= expected && server.connections() >= accepted)
+                .then(|| std::mem::take(&mut requests))
+        })
+    }
+
     #[cfg(unix)]
     #[test]
     fn closed_loopback_listener_can_restart_without_sharing_a_live_port() {
@@ -966,7 +997,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let (accepted, _) = listener.accept().unwrap();
+        let (accepted, _) = accept_loopback(&listener);
         // Close the accepted side first. After the client observes EOF and
         // closes, the server-side connection enters TIME_WAIT on this port.
         accepted.shutdown(Shutdown::Write).unwrap();
@@ -1087,24 +1118,18 @@ mod tests {
         };
         let mut server = Server::bind(&settings).unwrap();
         let mut client = TcpStream::connect(server.http_address()).unwrap();
-        client.set_nonblocking(true).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         client
             .write_all(b"GET /applist HTTP/1.1\r\nHost: test\r\n\r\n")
             .unwrap();
-        let mut queued = false;
-        for _ in 0..100 {
-            for request in server.tick().requests {
-                let mut reply = simple_reply(200, "private catalog");
-                reply.requires_paired_tls = true;
-                reply.permission = Some(crate::wire::Permission::List);
-                assert!(server.respond(request.id, reply));
-                queued = true;
-            }
-            if queued {
-                break;
-            }
-        }
-        assert!(queued);
+        let requests = loopback_requests(&mut server, 1, 1);
+        assert_eq!(requests.len(), 1);
+        let mut reply = simple_reply(200, "private catalog");
+        reply.requires_paired_tls = true;
+        reply.permission = Some(crate::wire::Permission::List);
+        assert!(server.respond(requests[0].id, reply));
         let events = server.tick_checked(|_, _| false);
         assert_eq!(events.closed.len(), 1);
         assert!(!events.closed[0].response_delivered);
@@ -1263,7 +1288,7 @@ mod tests {
             tls_clients.push(TcpStream::connect(destination).unwrap());
         }
 
-        let requests = server.tick().requests;
+        let requests = loopback_requests(&mut server, 2, 4);
         assert_eq!(requests.len(), 2);
         assert_eq!(server.connections(), 4, "both HTTPS families were accepted");
         let peers = requests
@@ -1321,7 +1346,7 @@ mod tests {
                 .unwrap();
             clients.push(client);
         }
-        let requests = server.tick().requests;
+        let requests = loopback_requests(&mut server, 2, 2);
         assert_eq!(requests.len(), 2);
         let peers = requests
             .into_iter()
@@ -1354,7 +1379,9 @@ mod tests {
         existing_client
             .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
             .unwrap();
-        let existing_request = server.tick().requests.pop().unwrap();
+        let mut requests = loopback_requests(&mut server, 1, 1);
+        assert_eq!(requests.len(), 1);
+        let existing_request = requests.pop().unwrap();
 
         let base_port = available_port_pair();
         server.rebind_port(base_port).unwrap();
@@ -1370,7 +1397,7 @@ mod tests {
         new_client
             .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
             .unwrap();
-        let requests = server.tick().requests;
+        let requests = loopback_requests(&mut server, 1, 2);
         assert_eq!(requests.len(), 1);
         assert_ne!(requests[0].id, existing_request.id);
         assert_ne!(old_http.port(), base_port);
@@ -1391,7 +1418,9 @@ mod tests {
         accepted_client
             .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
             .unwrap();
-        let accepted_request = server.tick().requests.pop().unwrap();
+        let mut requests = loopback_requests(&mut server, 1, 1);
+        assert_eq!(requests.len(), 1);
+        let accepted_request = requests.pop().unwrap();
 
         let raised_base_port = base_port + crate::settings::HTTPS_PORT_OFFSET;
         server.rebind_port(raised_base_port).unwrap();
@@ -1685,7 +1714,7 @@ mod tests {
             .bind_tcp("127.0.0.1:0".parse().unwrap())
             .unwrap();
         let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (socket, remote) = listener.accept().unwrap();
+        let (socket, remote) = accept_loopback(&listener);
         let configuration =
             ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
