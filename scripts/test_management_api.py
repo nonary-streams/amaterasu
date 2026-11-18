@@ -139,14 +139,18 @@ class Api:
         # Listener availability precedes durable peer-policy readiness. The
         # management server deliberately drops HTTP connections until that
         # policy is loaded; wait through its signed read-only service first.
+        def get_policy():
+            return console.request("amaterasu.management/1", {"action": "product_get"})
+
+        # The first request already waits for the native worker to start.
+        # Give policy loading a separate deadline.
+        policy = get_policy()
         deadline = time.monotonic() + 20
-        while True:
-            policy = console.request("amaterasu.management/1", {"action": "product_get"})
-            assert time.monotonic() < deadline, "management durable peer policy did not load"
-            if policy.get("ok"):
-                break
+        while not policy.get("ok"):
             assert policy.get("code") == "settings_unavailable", policy
+            assert time.monotonic() < deadline, (policy, "".join(console.errors[-12:]))
             time.sleep(0.025)
+            policy = get_policy()
         status = console.request("amaterasu.management/1", {"action": "status"})
         assert status["ok"] and status["enabled"], status
         host, port = status["bound_address"].rsplit(":", 1)
