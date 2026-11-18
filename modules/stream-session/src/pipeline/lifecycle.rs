@@ -338,10 +338,10 @@ impl Pipeline {
                         job.step,
                         Step::ObserveActiveBinding | Step::ValidateActiveBinding
                     ) {
-                        invalidate_active_binding(
+                        fence_active_binding(record);
+                        job.fail(
                             record,
-                            job,
-                            "capture_validation_unavailable",
+                            StreamFailure::requirement_failed("capture_validation_unavailable"),
                             now,
                         );
                         return true;
@@ -822,7 +822,12 @@ impl Pipeline {
                 || payload["stream"] != record.resources[&Resource::Video]
                 || record.lifecycle_observation.as_ref() != Some(&payload["observed_capture"])
             {
-                invalidate_active_binding(record, job, "capture_binding_invalid", now);
+                fence_active_binding(record);
+                job.fail(
+                    record,
+                    StreamFailure::requirement_failed("capture_binding_invalid"),
+                    now,
+                );
             } else {
                 job.step = Step::ValidateActiveBinding;
             }
@@ -841,7 +846,12 @@ impl Pipeline {
                 || payload["binding"] != json!(start.lifecycle_candidate)
                 || payload["observation"] != json!(record.lifecycle_observation)
             {
-                invalidate_active_binding(record, job, "capture_binding_invalid", now);
+                fence_active_binding(record);
+                job.fail(
+                    record,
+                    StreamFailure::requirement_failed("capture_binding_invalid"),
+                    now,
+                );
             } else {
                 record.lifecycle_delivery_permit = true;
                 record.lifecycle_control_permit = true;
@@ -2326,13 +2336,12 @@ fn video_open_next_step(record: &Record) -> Step {
     }
 }
 
-fn invalidate_active_binding(record: &mut Record, job: &mut Job, code: &'static str, now: u64) {
+fn fence_active_binding(record: &mut Record) {
     record.plane = None;
     record.input_events.clear();
     record.input_timing.clear_queue();
     record.lifecycle_delivery_permit = false;
     record.lifecycle_control_permit = false;
-    job.fail(record, StreamFailure::requirement_failed(code), now);
 }
 
 #[cfg(test)]
