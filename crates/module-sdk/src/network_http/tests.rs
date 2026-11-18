@@ -35,6 +35,7 @@ fn loopback_http_peer(
                 Err(error) => return Err(error),
             }
         };
+        peer.set_nonblocking(false)?;
         peer.set_read_timeout(Some(Duration::from_secs(1)))?;
         peer.set_write_timeout(Some(Duration::from_secs(1)))?;
         let mut request = Vec::new();

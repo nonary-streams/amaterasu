@@ -718,6 +718,10 @@ fn udp_bind_impl(
         .map_err(io_status)?;
         if shared {
             socket.set_reuse_address(true).map_err(io_status)?;
+            // Darwin requires explicit port sharing on every participating
+            // socket when binding the same unicast address.
+            #[cfg(target_os = "macos")]
+            socket.set_reuse_port(true).map_err(io_status)?;
         }
         if address.is_ipv6() {
             socket.set_only_v6(true).map_err(io_status)?
@@ -811,7 +815,20 @@ unsafe extern "C" fn read(
                 let mut borrowed = s;
                 borrowed.read(buffer)
             }
-            SocketResource::Udp(s) => s.recv(buffer),
+            SocketResource::Udp(s) => {
+                let result = s.recv(buffer);
+                // Winsock consumes the truncated datagram but reports a
+                // truncation error. A zero-byte buffer explicitly discards
+                // the payload, as it does on Unix.
+                #[cfg(windows)]
+                if buffer.is_empty()
+                    && result.as_ref().err().and_then(io::Error::raw_os_error)
+                        == Some(windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE)
+                {
+                    return unsafe { output(count, 0) };
+                }
+                result
+            }
             _ => return Err(net::UNSUPPORTED),
         }
         .map_err(io_status)?;

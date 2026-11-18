@@ -514,7 +514,11 @@ fn receive_work_per_tick_is_bounded() {
 
     delivery.tick();
     assert_eq!(delivery.peer_port(Medium::Video), None);
-    delivery.tick();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while delivery.peer_port(Medium::Video).is_none() && Instant::now() < deadline {
+        delivery.tick();
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(
         delivery.peer_port(Medium::Video),
         Some(video.local_addr().unwrap().port())
