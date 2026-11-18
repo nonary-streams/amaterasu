@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "network-test-support")]
 fn loopback_http_peer(
     response_delay: Option<Duration>,
+    headers_received: Option<std::sync::mpsc::Sender<()>>,
 ) -> (
     std::net::SocketAddr,
     std::sync::mpsc::SyncSender<()>,
@@ -47,11 +48,14 @@ fn loopback_http_peer(
             }
             request.extend_from_slice(&buffer[..count]);
         }
+        if let Some(notice) = headers_received {
+            notice.send(()).unwrap();
+        }
         if let Some(delay) = response_delay {
             std::thread::sleep(delay);
             peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")?;
         } else {
-            let _ = released.recv_timeout(Duration::from_millis(500));
+            let _ = released.recv_timeout(Duration::from_secs(2));
         }
         Ok(())
     });
@@ -61,7 +65,7 @@ fn loopback_http_peer(
 #[cfg(feature = "network-test-support")]
 #[test]
 fn native_http_waits_for_a_delayed_response_within_its_deadline() {
-    let (address, _release, peer) = loopback_http_peer(Some(Duration::from_millis(50)));
+    let (address, _release, peer) = loopback_http_peer(Some(Duration::from_millis(50)), None);
     let client = agent(
         Config::builder()
             .proxy(None)
@@ -80,8 +84,31 @@ fn native_http_waits_for_a_delayed_response_within_its_deadline() {
 
 #[cfg(feature = "network-test-support")]
 #[test]
+fn cancellable_http_waits_for_a_delayed_response_within_its_deadline() {
+    let (address, _release, peer) = loopback_http_peer(Some(Duration::from_millis(150)), None);
+    let client = agent_cancellable(
+        Config::builder()
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(3)))
+            .build(),
+        Network::test_provider(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let value = client
+        .get(format!("http://{address}/"))
+        .call()
+        .unwrap()
+        .body_mut()
+        .read_to_string()
+        .unwrap();
+    assert_eq!(value, "ok");
+    peer.join().unwrap().unwrap();
+}
+
+#[cfg(feature = "network-test-support")]
+#[test]
 fn native_http_idle_peer_expires_at_the_configured_deadline() {
-    let (address, release, peer) = loopback_http_peer(None);
+    let (address, release, peer) = loopback_http_peer(None, None);
     let client = agent(
         Config::builder()
             .proxy(None)
@@ -444,7 +471,8 @@ fn partial_writes_share_one_absolute_timeout_instead_of_resetting_the_budget() {
 #[cfg(feature = "network-test-support")]
 #[test]
 fn cancellation_retires_a_connection_waiting_for_response_headers() {
-    let (address, release, peer) = loopback_http_peer(None);
+    let (notice, received_headers) = std::sync::mpsc::channel();
+    let (address, release, peer) = loopback_http_peer(None, Some(notice));
     let cancelled = Arc::new(AtomicBool::new(false));
     let client = agent_cancellable(
         Config::builder()
@@ -460,7 +488,9 @@ fn cancellation_retires_a_connection_waiting_for_response_headers() {
             .call()
             .is_err()
     });
-    std::thread::sleep(Duration::from_millis(30));
+    received_headers
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
     let started = Instant::now();
     cancelled.store(true, Ordering::Release);
     assert!(request.join().unwrap());

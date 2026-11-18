@@ -20,6 +20,9 @@ use ureq::unversioned::transport::{
 };
 use ureq::{Agent, Error, ProxyProtocol};
 
+const CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+const CANCELLABLE_IO_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Create an HTTP/HTTPS client with provider-backed DNS, TCP and TLS byte I/O.
 /// The network binding is retained by every pooled connection and worker clone.
 pub fn agent(config: Config, network: Network) -> Agent {
@@ -100,6 +103,7 @@ impl<Incoming: Transport> Connector<Incoming> for ProviderConnector {
         details: &ConnectionDetails,
         chained: Option<Incoming>,
     ) -> Result<Option<Self::Out>, Error> {
+        ensure_not_cancelled(self.1.as_deref())?;
         if let Some(transport) = chained {
             return Ok(Some(Either::A(transport)));
         }
@@ -117,6 +121,7 @@ impl<Incoming: Transport> Connector<Incoming> for ProviderConnector {
         let budget = bounded_duration(details.timeout)?;
         let mut last_error = None;
         for (index, address) in details.addrs.iter().enumerate() {
+            ensure_not_cancelled(self.1.as_deref())?;
             let remaining = budget
                 .checked_sub(started.elapsed())
                 .filter(|duration| !duration.is_zero())
@@ -134,8 +139,13 @@ impl<Incoming: Transport> Connector<Incoming> for ProviderConnector {
                     if details.config.no_delay() {
                         stream.set_nodelay(true)?;
                     }
+                    if self.1.is_some() {
+                        // Repeated blocking I/O timeouts can invalidate a Winsock
+                        // connection. Check readiness with nonblocking I/O instead.
+                        stream.set_nonblocking(true)?;
+                    }
                     return Ok(Some(Either::B(ProviderTransport {
-                        _cancellation: self
+                        cancellation: self
                             .1
                             .as_ref()
                             .map(|cancelled| CancellationGuard::new(&stream, cancelled.clone()))
@@ -163,9 +173,10 @@ impl<Incoming: Transport> Connector<Incoming> for ProviderConnector {
 struct ProviderTransport {
     stream: TcpStream,
     buffers: LazyBuffers,
-    _cancellation: Option<CancellationGuard>,
+    cancellation: Option<CancellationGuard>,
 }
 struct CancellationGuard {
+    cancelled: Arc<AtomicBool>,
     stop: mpsc::SyncSender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -173,21 +184,23 @@ impl CancellationGuard {
     fn new(stream: &TcpStream, cancelled: Arc<AtomicBool>) -> io::Result<Self> {
         let stream = stream.try_clone()?;
         let (stop, stopped) = mpsc::sync_channel(1);
+        let worker_cancelled = cancelled.clone();
         let worker = std::thread::Builder::new()
             .name("network-http-cancellation".into())
             .spawn(move || {
                 loop {
-                    if cancelled.load(Ordering::Acquire) {
+                    if worker_cancelled.load(Ordering::Acquire) {
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         break;
                     }
-                    match stopped.recv_timeout(Duration::from_millis(50)) {
+                    match stopped.recv_timeout(CANCELLATION_CHECK_INTERVAL) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
                 }
             })?;
         Ok(Self {
+            cancelled,
             stop,
             worker: Some(worker),
         })
@@ -199,6 +212,29 @@ impl Drop for CancellationGuard {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+impl ProviderTransport {
+    fn check_cancellation(&self) -> Result<(), Error> {
+        ensure_not_cancelled(
+            self.cancellation
+                .as_ref()
+                .map(|guard| guard.cancelled.as_ref()),
+        )
+    }
+
+    fn wait_for_cancellable_io(
+        &self,
+        budget: Option<Duration>,
+        started: Instant,
+        timeout: NextTimeout,
+    ) -> Result<(), Error> {
+        self.check_cancellation()?;
+        let sleep_for = remaining_io_budget(budget, started, timeout)?
+            .unwrap_or(CANCELLABLE_IO_RETRY_INTERVAL)
+            .min(CANCELLABLE_IO_RETRY_INTERVAL);
+        std::thread::sleep(sleep_for);
+        Ok(())
     }
 }
 impl fmt::Debug for ProviderTransport {
@@ -215,36 +251,60 @@ impl Transport for ProviderTransport {
         let budget = optional_duration(timeout)?;
         let mut sent = 0;
         while sent < amount {
-            let remaining = budget.map(|budget| budget.saturating_sub(started.elapsed()));
-            if remaining.is_some_and(|remaining| remaining.is_zero()) {
-                return Err(Error::Timeout(timeout.reason));
+            self.check_cancellation()?;
+            let remaining = remaining_io_budget(budget, started, timeout)?;
+            if self.cancellation.is_none() {
+                self.stream.set_write_timeout(remaining)?;
             }
-            self.stream.set_write_timeout(remaining)?;
             match self.stream.write(&self.buffers.output()[sent..amount]) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
                 Ok(count) => sent += count,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if self.cancellation.is_some() && error.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    self.wait_for_cancellable_io(budget, started, timeout)?;
+                }
                 Err(error) => return Err(timeout_error(error, timeout)),
             }
         }
-        Ok(())
+        self.check_cancellation()
     }
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
-        self.stream.set_read_timeout(optional_duration(timeout)?)?;
-        let bytes = self
-            .stream
-            .read(self.buffers.input_append_buf())
-            .map_err(|error| timeout_error(error, timeout))?;
-        self.buffers.input_appended(bytes);
-        Ok(bytes != 0)
+        let started = Instant::now();
+        let budget = optional_duration(timeout)?;
+        if self.cancellation.is_none() {
+            self.stream.set_read_timeout(budget)?;
+        }
+        loop {
+            self.check_cancellation()?;
+            remaining_io_budget(budget, started, timeout)?;
+            match self.stream.read(self.buffers.input_append_buf()) {
+                Ok(bytes) => {
+                    self.check_cancellation()?;
+                    self.buffers.input_appended(bytes);
+                    return Ok(bytes != 0);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if self.cancellation.is_some() && error.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    self.wait_for_cancellable_io(budget, started, timeout)?;
+                }
+                Err(error) => return Err(timeout_error(error, timeout)),
+            }
+        }
     }
     fn is_open(&mut self) -> bool {
-        if self.stream.set_nonblocking(true).is_err() {
+        let blocking = self.cancellation.is_none();
+        if self.check_cancellation().is_err()
+            || (blocking && self.stream.set_nonblocking(true).is_err())
+        {
             return false;
         }
         let mut byte = [0];
         let pending = self.stream.read(&mut byte);
-        let restored = self.stream.set_nonblocking(false).is_ok();
+        let restored = !blocking || self.stream.set_nonblocking(false).is_ok();
         restored && matches!(pending, Err(error) if error.kind() == io::ErrorKind::WouldBlock)
     }
 }
@@ -261,6 +321,29 @@ fn optional_duration(timeout: NextTimeout) -> Result<Option<Duration>, Error> {
 fn bounded_duration(timeout: NextTimeout) -> Result<Duration, Error> {
     Ok(optional_duration(timeout)?.unwrap_or(Duration::from_secs(60)))
 }
+fn remaining_io_budget(
+    budget: Option<Duration>,
+    started: Instant,
+    timeout: NextTimeout,
+) -> Result<Option<Duration>, Error> {
+    let remaining = budget.map(|budget| budget.saturating_sub(started.elapsed()));
+    if remaining.is_some_and(|duration| duration.is_zero()) {
+        return Err(Error::Timeout(timeout.reason));
+    }
+    Ok(remaining)
+}
+
+fn ensure_not_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), Error> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "network HTTP request cancelled",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn timeout_error(error: io::Error, timeout: NextTimeout) -> Error {
     if matches!(
         error.kind(),
