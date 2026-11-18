@@ -3158,7 +3158,6 @@ fn exported_display_overrides_are_sparse_revisioned_and_strict() {
     );
 }
 
-#[cfg(windows)]
 #[test]
 fn exported_launch_preflight_preserves_sparse_rtss_limit_types() {
     let mut pipeline = Pipeline::new_with_steam_id_export_principals(
@@ -3197,15 +3196,12 @@ fn exported_launch_preflight_preserves_sparse_rtss_limit_types() {
             "management",
         );
         assert_eq!(result["ok"], true, "{result}");
+        // This provider-owned field is opaque to the catalog. Preserve the
+        // distinction between a stored null and an omitted key.
         assert_eq!(
-            result["entry"]["config_overrides"]["rtss_frame_limit_type"],
-            override_value["rtss_frame_limit_type"]
-        );
-        assert_eq!(
-            result["entry"]["config_overrides"]
-                .get("rtss_frame_limit_type")
-                .is_none(),
-            override_value["rtss_frame_limit_type"].is_null()
+            result["entry"]["config_overrides"].get("rtss_frame_limit_type"),
+            override_value.get("rtss_frame_limit_type"),
+            "{result}"
         );
     }
 }
