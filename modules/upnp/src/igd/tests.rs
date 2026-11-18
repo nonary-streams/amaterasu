@@ -214,6 +214,7 @@ fn shutdown_budget_restricted_during_soap_stops_later_scan_and_delete_effects() 
                     Err(error) => panic!("loopback SOAP peer failed: {error}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();

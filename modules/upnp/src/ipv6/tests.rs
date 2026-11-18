@@ -261,6 +261,7 @@ fn http_total_deadline_stops_a_gateway_that_keeps_trickling_body_bytes() {
                 Err(error) => panic!("test peer accept failed: {error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
