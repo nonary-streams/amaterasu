@@ -1,8 +1,10 @@
 //! Verified staging of the NVIDIA TrueHDR runtime. Networking is supplied by
 //! an injected HTTP agent, which production must construct with the Network SDK.
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
@@ -12,18 +14,21 @@ use std::{
 };
 
 pub mod remote;
+#[cfg(target_os = "linux")]
 mod zip_guard;
 pub use remote::RemoteWheel;
 pub const WHEEL_URL: &str = "https://pypi.nvidia.com/nvidia-vfx/nvidia_vfx-0.2.0.0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl";
 pub const WHEEL_SHA256: &str = "0252866a7b798a6f92c8543443d88f716e8c5bbc6a7ddd77a2754728dada9fa8";
 pub const DIRECTORY: &str = "runtime";
 
+#[cfg(target_os = "linux")]
 struct Entry {
     name: &'static str,
     sha256: &'static str,
     size: u64,
 }
 // Digests are independently pinned from the SHA-256-verified NVIDIA VFX 0.2.0.0 wheel.
+#[cfg(target_os = "linux")]
 const ENTRIES: &[Entry] = &[
     Entry {
         name: "nvidia_vfx-0.2.0.0.dist-info/licenses/packaging/NVIDIA-Open-Model-License-Agreements-24-10-2025.pdf",
@@ -116,9 +121,11 @@ const ENTRIES: &[Entry] = &[
         size: 79776,
     },
 ];
+#[cfg(target_os = "linux")]
 fn bad(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+#[cfg(target_os = "linux")]
 fn cancelled(flag: &AtomicBool) -> io::Result<()> {
     if flag.load(Ordering::Acquire) {
         Err(io::Error::new(

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 const MAX_HELD: usize = 128;
 const MAX_EVENTS_PER_SECOND: usize = 2048;
+#[cfg(any(target_os = "linux", windows, test))]
 const HOST_AUTHORIZED_SESSION_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// A companion-owned device handle. `release_all` must neutralize the state
@@ -317,6 +318,7 @@ impl<S: DeviceSink> InputSession<S> {
 
     /// Called only while the separate host permit is current. This keeps a
     /// long-running authorized worker from hitting its original one-hour cap.
+    #[cfg(any(target_os = "linux", windows, test))]
     pub(crate) fn refresh_host_authorized_expiry(&mut self, now: Instant) -> InputResult<()> {
         if self.closed {
             return Err(InputError::Closed);
