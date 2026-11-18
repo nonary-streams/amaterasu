@@ -64,6 +64,7 @@ struct Readiness {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HookReadiness {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Pending,
     Ready,
     Failed,

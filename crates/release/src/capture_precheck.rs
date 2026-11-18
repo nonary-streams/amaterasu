@@ -1,8 +1,12 @@
 //! Artifact evidence only for the reserved settings-field request. This does
 //! not perform native admission or establish actual capture readiness.
-use amaterasu_package::{ComponentManifest, PackageResult, read_bounded};
+use amaterasu_package::PackageResult;
+#[cfg(target_os = "linux")]
+use amaterasu_package::{ComponentManifest, read_bounded};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 pub(crate) const MARKER: &[u8] = b"AMATERASU_CAPTURE_AUTHORITY_PRECHECK=1\0";
 pub(crate) const COMPONENT: &str = "amaterasu.capture-vkms";
 pub(crate) fn requested(settings: &BTreeMap<String, Value>) -> PackageResult<bool> {
@@ -36,6 +40,7 @@ pub(crate) fn validate_artifact(artifact: &[u8]) -> PackageResult<()> {
     }
     Ok(())
 }
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_package(
     package: &Path,
     components: &[ComponentManifest],

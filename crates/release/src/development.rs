@@ -11,6 +11,7 @@ use amaterasu_storage::write_atomically;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
 use std::ffi::c_void;
 
 use crate::profiles::linux_session::{

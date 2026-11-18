@@ -1,19 +1,23 @@
 //! Separately provisioned machine service. Only pinned host processes may submit
 //! finite, signed installation reviews; browser values never select executable paths.
-use amaterasu_module_sdk::drivers::{Action, HelperReply, HelperRequest};
-use amaterasu_package::{
-    PackageResult,
-    plugins::{installed, operation::Operation},
-};
+use amaterasu_module_sdk::drivers::HelperRequest;
+#[cfg(any(windows, target_os = "linux"))]
+use amaterasu_module_sdk::drivers::{Action, HelperReply};
+#[cfg(any(windows, target_os = "linux"))]
+use amaterasu_package::plugins::installed;
+use amaterasu_package::{PackageResult, plugins::operation::Operation};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(any(windows, target_os = "linux"))]
+use serde_json::json;
+#[cfg(any(windows, target_os = "linux"))]
 use std::{
     collections::BTreeMap,
+    sync::{Mutex, atomic::Ordering},
+};
+use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
 };
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,16 +45,20 @@ pub enum Request {
         operation: Operation,
     },
 }
+#[cfg(any(windows, target_os = "linux"))]
 struct Job {
     result: Option<PackageResult<HelperReply>>,
 }
+#[cfg(any(windows, target_os = "linux"))]
 type Jobs = Arc<Mutex<BTreeMap<String, Job>>>;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(any(windows, target_os = "linux"))]
 struct Receipt {
     request: HelperRequest,
     result: Option<PackageResult<HelperReply>>,
 }
+#[cfg(any(windows, target_os = "linux"))]
 fn receipt_path(policy: &Policy, request: &HelperRequest) -> PackageResult<PathBuf> {
     let approval = approval_path(policy, &request.operation)?;
     Ok(approval.with_file_name(format!(
@@ -59,6 +67,7 @@ fn receipt_path(policy: &Policy, request: &HelperRequest) -> PackageResult<PathB
         amaterasu_package::sha256(request.requirement.id.as_bytes())
     )))
 }
+#[cfg(any(windows, target_os = "linux"))]
 fn current_revision(policy: &Policy, operation: &Operation) -> PackageResult<()> {
     let selection: amaterasu_package::ActivationState =
         amaterasu_package::read_json(&policy.root.join("selection.json"))?;
@@ -71,6 +80,7 @@ fn current_revision(policy: &Policy, operation: &Operation) -> PackageResult<()>
     }
     Ok(())
 }
+#[cfg(any(windows, target_os = "linux"))]
 fn verify(policy: &Policy, operation: &Operation, elevated: bool) -> PackageResult<()> {
     import_sources(policy, operation)?;
     operation.validate()?;
@@ -121,6 +131,7 @@ fn verify(policy: &Policy, operation: &Operation, elevated: bool) -> PackageResu
         Ok(())
     })
 }
+#[cfg(any(windows, target_os = "linux", test))]
 fn approval_path(policy: &Policy, id: &str) -> PackageResult<PathBuf> {
     if id.is_empty()
         || id.len() > 128
@@ -132,6 +143,7 @@ fn approval_path(policy: &Policy, id: &str) -> PackageResult<PathBuf> {
     }
     Ok(policy.approvals.join(format!("{id}.json")))
 }
+#[cfg(any(windows, target_os = "linux"))]
 fn prune_receipts(policy: &Policy, current: &str) -> PackageResult<()> {
     let mut records = Vec::new();
     for entry in std::fs::read_dir(&policy.approvals).map_err(|e| e.to_string())? {
@@ -176,6 +188,7 @@ fn prune_receipts(policy: &Policy, current: &str) -> PackageResult<()> {
     }
     Ok(())
 }
+#[cfg(any(windows, target_os = "linux"))]
 fn handle(policy: &Policy, request: Request, jobs: &Jobs) -> PackageResult<Value> {
     match request {
         Request::Approve { operation } => {
@@ -342,7 +355,7 @@ fn handle(policy: &Policy, request: Request, jobs: &Jobs) -> PackageResult<Value
         }
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn stage_plugin(_policy: &Policy, _operation: Operation) -> PackageResult<Value> {
     Err("plugin_stage_requires_runtime_account".into())
 }
@@ -689,6 +702,7 @@ pub fn read_policy(path: &Path) -> PackageResult<Policy> {
     Ok(policy)
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn import_sources(policy: &Policy, operation: &Operation) -> PackageResult<()> {
     let Some(directory) = &policy.repository_directory else {
         return Ok(());

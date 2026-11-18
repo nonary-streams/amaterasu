@@ -1,7 +1,9 @@
 //! Offline, non-authoritative review of the proposed activation policy.
 // Proposed capability only; no host request route is registered by this report.
 const HOST_PACKAGE_ACTIVATION_SERVICE: &str = "amaterasu.host-package-activation/1";
+#[cfg(target_os = "linux")]
 const RTX_REPOSITORY_ID: &str = "amaterasu-rtx-hdr";
+#[cfg(target_os = "linux")]
 const RTX_REPOSITORY_URL: &str =
     "https://raw.githubusercontent.com/nonary-streams/amaterasu-rtx-hdr/catalog";
 use amaterasu_package::policy_approval::{PolicyCandidateContext, propose_policy_approval};

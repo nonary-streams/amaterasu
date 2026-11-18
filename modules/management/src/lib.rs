@@ -423,7 +423,7 @@ impl ManagedModule for ManagementModule {
                             action == "rtx_hdr_cancel" && installer.waiting_for_stream();
                         #[cfg(not(target_os = "linux"))]
                         let cancel_waiting = false;
-                        let mut result = if cancel_waiting {
+                        let result = if cancel_waiting {
                             match self.runtime.send(Command::HostPackageActivationCancel {}) {
                                 Ok(Response::Ok) => {
                                     installer.cancel_pending_activation();
@@ -434,6 +434,8 @@ impl ManagedModule for ManagementModule {
                         } else {
                             installer.request(action)
                         };
+                        #[cfg(target_os = "linux")]
+                        let mut result = result;
                         #[cfg(target_os = "linux")]
                         if action == "rtx_hdr_status" {
                             if let Ok(Response::HostPackageActivationState { pending, started }) =

@@ -80,6 +80,7 @@ fn output_fixture() {
     std::io::stderr().write_all(b"stderr-marker\n").unwrap();
 }
 
+#[cfg(unix)]
 fn output_command() -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args([

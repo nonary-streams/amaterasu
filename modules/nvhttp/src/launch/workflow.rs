@@ -5588,25 +5588,16 @@ fn resolve_virtual_display_mode(
 }
 
 fn implicit_virtual_display_mode(record: &Record) -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        let private_outputs_are_configured = record
-            .global_display_policy
-            .get("virtual_display_outputs")
-            .and_then(Value::as_array)
-            .is_some_and(|outputs| !outputs.is_empty());
-        if private_outputs_are_configured {
-            "per_client"
-        } else {
-            "disabled"
-        }
-    }
-    #[cfg(target_os = "windows")]
+    if cfg!(windows)
+        || (cfg!(target_os = "linux")
+            && record
+                .global_display_policy
+                .get("virtual_display_outputs")
+                .and_then(Value::as_array)
+                .is_some_and(|outputs| !outputs.is_empty()))
     {
         "per_client"
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
+    } else {
         "disabled"
     }
 }

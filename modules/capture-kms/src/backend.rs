@@ -1,8 +1,13 @@
 use crate::model::{
-    CaptureError, CaptureResult, DesktopGeometry, Frame, MAX_OUTPUTS, NativeAvailability, Output,
-    frame_layout, validate_output_id,
+    CaptureError, CaptureResult, DesktopGeometry, Frame, NativeAvailability, Output,
+    validate_output_id,
 };
-use amaterasu_media::{CaptureGeometry, DesktopRect};
+#[cfg(amaterasu_kms)]
+use crate::model::{MAX_OUTPUTS, frame_layout};
+#[cfg(amaterasu_kms)]
+use amaterasu_media::CaptureGeometry;
+use amaterasu_media::DesktopRect;
+#[cfg(amaterasu_kms)]
 use std::{ffi::CString, time::Instant};
 
 #[cfg(amaterasu_kms)]
@@ -273,6 +278,7 @@ impl Drop for KmsSession {
     }
 }
 
+#[cfg(any(amaterasu_kms, test))]
 fn bounding_rectangle(rectangles: &[DesktopRect]) -> CaptureResult<DesktopRect> {
     let first = rectangles
         .first()
@@ -387,6 +393,7 @@ fn fixed_string<const N: usize>(bytes: &[c_char; N]) -> CaptureResult<String> {
     Ok(value)
 }
 
+#[cfg(any(amaterasu_kms, test))]
 fn error_reason(error: u32) -> &'static str {
     match error {
         1 => "drm_device_unavailable",
@@ -402,6 +409,7 @@ fn error_reason(error: u32) -> &'static str {
     }
 }
 
+#[cfg(amaterasu_kms)]
 pub(crate) fn native_error(error: u32) -> CaptureError {
     let code = match error {
         1 => "device_lost",

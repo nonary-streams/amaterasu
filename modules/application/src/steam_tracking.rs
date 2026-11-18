@@ -21,17 +21,19 @@ const GAME_ASSOCIATION_WINDOW: Duration = Duration::from_secs(15);
 /// Retirement requires a successful snapshot proving no attributed game remains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SteamStopProgress {
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Pending,
     Complete,
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Failed(&'static str),
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(windows, target_os = "linux")))]
 std::thread_local! {
     static FAIL_NEXT_PROCESS_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(windows, target_os = "linux")))]
 pub(crate) fn fail_next_process_scan() {
     FAIL_NEXT_PROCESS_SCAN.set(true);
 }

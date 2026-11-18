@@ -1,5 +1,8 @@
+#[cfg(any(amaterasu_pipewire, test))]
 use crate::model::CaptureResult;
-use amaterasu_media::{MAX_FRAME_BYTES, MEDIA_BUSY};
+#[cfg(any(amaterasu_pipewire, test))]
+use amaterasu_media::MAX_FRAME_BYTES;
+use amaterasu_media::MEDIA_BUSY;
 use amaterasu_module_sdk::abi::{STATUS_OK, Status};
 use std::sync::{
     Arc, Mutex,
@@ -9,6 +12,7 @@ use std::sync::{
 /// Private adapter descriptor. `data` already points to the beginning of the
 /// mapped data region; map_offset describes its FD mapping, not a pixel offset.
 #[repr(C)]
+#[cfg(any(amaterasu_pipewire, test))]
 pub struct Plane {
     pub data: *const u8,
     pub memory_type: u32,
@@ -43,6 +47,7 @@ impl AsRef<[u8]> for OwnedFrame {
 /// `plane.data` must address `plane.max_size` bytes mapped readably for this
 /// synchronous call. Only validated initialized pixel rows are read; padding
 /// is never borrowed. The PipeWire worker retains its dequeued buffer until return.
+#[cfg(any(amaterasu_pipewire, test))]
 pub unsafe fn copy_plane(
     plane: &Plane,
     width: u32,
@@ -106,7 +111,9 @@ pub unsafe fn copy_plane(
 struct Frames {
     latest: Option<Arc<OwnedFrame>>,
     pending: Option<Arc<OwnedFrame>>,
+    #[cfg(any(amaterasu_pipewire, test))]
     epoch_us: Option<u64>,
+    #[cfg(any(amaterasu_pipewire, test))]
     next_sequence: u64,
 }
 
@@ -117,12 +124,14 @@ pub struct Mailbox {
     pub delivered: AtomicU64,
     pub rejected: AtomicU64,
     pub copied: AtomicU64,
+    #[cfg(any(amaterasu_pipewire, test))]
     published: AtomicBool,
 }
 
 impl Mailbox {
     /// # Safety
     /// The adapter owns plane memory for this synchronous callback only.
+    #[cfg(any(amaterasu_pipewire, test))]
     pub unsafe fn publish(
         &self,
         plane: &Plane,
@@ -158,6 +167,7 @@ impl Mailbox {
         1
     }
 
+    #[cfg(any(amaterasu_pipewire, test))]
     pub fn has_frame(&self) -> bool {
         self.published.load(Ordering::SeqCst)
     }

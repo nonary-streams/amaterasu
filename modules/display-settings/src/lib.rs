@@ -1,18 +1,21 @@
 //! Default independently replaceable Display Settings SDK provider.
+#[cfg(any(target_os = "linux", test))]
 mod engine;
 #[cfg(target_os = "linux")]
 mod native;
 mod stream_issues;
+#[cfg(target_os = "linux")]
+use amaterasu_module_sdk::operation_api;
 use amaterasu_module_sdk::{
-    Command, ManagedModule, ModuleResult, Response, RuntimeClient,
-    display_settings::{self, Operation},
-    operation_api,
+    Command, ManagedModule, ModuleResult, Response, RuntimeClient, display_settings,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
 use std::{
     collections::BTreeSet,
-    sync::mpsc::{self, Receiver, SyncSender},
+    sync::mpsc::{Receiver, SyncSender},
     thread::JoinHandle,
 };
 
@@ -23,10 +26,12 @@ struct Settings {
     registrars: BTreeSet<String>,
     consumers: BTreeSet<String>,
 }
+#[cfg(target_os = "linux")]
 struct FileStore {
     path: std::path::PathBuf,
     _lock: amaterasu_storage::RootLock,
 }
+#[cfg(target_os = "linux")]
 impl engine::Store for FileStore {
     fn save(&mut self, state: &engine::State) -> engine::Result<()> {
         amaterasu_storage::write_json_atomically(&self.path, state)
@@ -35,7 +40,8 @@ impl engine::Store for FileStore {
 struct Work {
     request: u64,
     caller: String,
-    operation: Operation,
+    #[cfg(target_os = "linux")]
+    operation: display_settings::Operation,
 }
 struct Provider {
     runtime: RuntimeClient,
@@ -170,6 +176,7 @@ impl ManagedModule for Provider {
                         .send(Work {
                             request: id,
                             caller,
+                            #[cfg(target_os = "linux")]
                             operation,
                         })
                         .map_err(|_| "display_worker_closed")?;

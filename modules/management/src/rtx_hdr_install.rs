@@ -190,11 +190,13 @@ impl Installer {
         })
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub fn mark_activation_requested(&mut self) {
         self.phase = "waiting_stream";
         self.error = None;
     }
 
+    #[cfg(target_os = "linux")]
     pub fn waiting_for_stream(&self) -> bool {
         self.phase == "waiting_stream"
     }
@@ -202,6 +204,7 @@ impl Installer {
         self.phase = "ready";
         self.error = None;
     }
+    #[cfg(target_os = "linux")]
     pub fn update_activation_state(&mut self, pending: bool, started: bool) {
         if !matches!(self.phase, "waiting_stream" | "activating") {
             return;

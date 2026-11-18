@@ -3,8 +3,10 @@
 use amaterasu_module_sdk::drivers::{Action, DriverState, HelperReply, HelperRequest};
 use amaterasu_package::PackageResult;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+#[cfg(any(windows, target_os = "linux"))]
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
 };
 #[cfg(target_os = "linux")]
@@ -42,6 +44,7 @@ pub struct Descriptor {
     #[serde(default)]
     pub prerequisites: Vec<String>,
 }
+#[cfg(any(windows, target_os = "linux"))]
 fn payload(request: &HelperRequest, name: &Option<String>) -> PackageResult<PathBuf> {
     let name = name.as_ref().ok_or("driver_payload_missing")?;
     if !request
@@ -56,6 +59,7 @@ fn payload(request: &HelperRequest, name: &Option<String>) -> PackageResult<Path
         .map_err(|e| e.to_string())?
         .join(name))
 }
+#[cfg(any(windows, target_os = "linux"))]
 fn run(program: &Path, args: &[&std::ffi::OsStr]) -> PackageResult<i32> {
     let status = Command::new(program)
         .args(args)

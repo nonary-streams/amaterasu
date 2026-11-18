@@ -1,11 +1,19 @@
 //! Optional owned-display and direct KWin capture artifact/registration checks.
-use amaterasu_package::{ComponentManifest, PackageResult, read_bounded};
+use amaterasu_package::PackageResult;
+#[cfg(target_os = "linux")]
+use amaterasu_package::{ComponentManifest, read_bounded};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use std::path::Path;
+#[cfg(target_os = "linux")]
 pub(crate) const DESKTOP_FILE: &str = "org.amaterasu.StreamingHost.desktop";
+#[cfg(target_os = "linux")]
 const DRIVER_MARKER: &[u8] = b"AMATERASU_LINUX_VDD=b2946d02a09bc453d9e6d287623390ca1dedf964\0";
+#[cfg(target_os = "linux")]
 const CAPTURE_MARKER: &[u8] = b"AMATERASU_KWIN_CAPTURE=1\0";
 const DESKTOP_CAPTURE_MARKER: &[u8] = b"AMATERASU_KWIN_DESKTOP_CAPTURE=1\0";
+#[cfg(target_os = "linux")]
 pub(crate) fn enabled(settings: &BTreeMap<String, Value>) -> bool {
     settings
         .get("amaterasu.capture-pipewire")
@@ -23,6 +31,7 @@ pub(crate) fn validate_desktop_capture_artifact(artifact: &[u8]) -> PackageResul
         "desktop output capture requires the linked KWin desktop-capture feature".into()
     })
 }
+#[cfg(target_os = "linux")]
 pub(crate) fn validate(
     package: &Path,
     components: &[ComponentManifest],
@@ -77,6 +86,7 @@ fn validate_marker(artifact: &[u8], marker: &[u8]) -> PackageResult<()> {
     }
     Ok(())
 }
+#[cfg(any(target_os = "linux", all(test, unix)))]
 pub(crate) fn desktop_entry(host: &Path) -> PackageResult<String> {
     let host = host
         .to_str()
@@ -93,6 +103,7 @@ pub(crate) fn desktop_entry(host: &Path) -> PackageResult<String> {
         "[Desktop Entry]\nType=Application\nName=Amaterasu Streaming Host\nNoDisplay=true\nExec=\"{host}\"\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1\n"
     ))
 }
+#[cfg(any(target_os = "linux", all(test, unix)))]
 pub(crate) fn install_script() -> &'static str {
     r#"#!/bin/sh
 set -eu
@@ -130,7 +141,7 @@ fi
 kbuildsycoca6 --noincremental
 "#
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[test]

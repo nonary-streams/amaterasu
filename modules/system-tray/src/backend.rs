@@ -1,4 +1,6 @@
-use crate::settings::{ActivityState, ActivityUpdate, TraySettings, UpdateNotice};
+#[cfg(any(windows, target_os = "linux", test))]
+use crate::settings::ActivityState;
+use crate::settings::{ActivityUpdate, TraySettings, UpdateNotice};
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::thread;
@@ -13,9 +15,13 @@ use std::{
     },
 };
 
+#[cfg(any(windows, target_os = "linux"))]
 const MAX_QUEUED_TRAY_EVENTS: usize = 32;
+#[cfg(any(windows, target_os = "linux"))]
 const OPEN_RELEASE_ACTION: u32 = 103;
+#[cfg(any(windows, target_os = "linux"))]
 const OPEN_CLIENTS_ACTION: u32 = 101;
+#[cfg(any(windows, target_os = "linux"))]
 const OPEN_DASHBOARD_ACTION: u32 = 102;
 
 const START_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -37,7 +43,9 @@ pub enum Delivery {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartState {
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Ready,
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Pending,
     Failed,
 }
@@ -583,6 +591,7 @@ fn tray_icon_with_mark(mark: [u8; 4]) -> ldtray::Icon {
         .expect("the fixed tray icon has a complete RGBA buffer")
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn activity_notice(update: &ActivityUpdate) -> (String, &'static str, String) {
     match update.state {
         ActivityState::Playing => {

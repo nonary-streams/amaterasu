@@ -43,6 +43,7 @@ pub(crate) struct StreamIssues {
 }
 
 impl StreamIssues {
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn enable(&mut self) {
         self.enabled = true;
     }

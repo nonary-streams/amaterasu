@@ -222,6 +222,7 @@ impl Tracker {
         )
     }
 
+    #[cfg(test)]
     fn advance_stop_with(
         &mut self,
         now: Instant,

@@ -388,6 +388,7 @@ struct Broker {
 }
 
 impl Broker {
+    #[cfg(not(windows))]
     fn open(&mut self, request: u64, caller: &str, operation_id: &str) {
         self.active.insert(request);
         self.requests.push_back(crate::Response::Request {
@@ -400,6 +401,7 @@ impl Broker {
         });
     }
 
+    #[cfg(not(windows))]
     fn lookup(&mut self, request: u64, caller: &str, operation_id: &str) {
         self.active.insert(request);
         self.requests.push_back(crate::Response::Request {

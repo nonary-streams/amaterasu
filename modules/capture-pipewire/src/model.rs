@@ -131,6 +131,9 @@ impl Availability {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// The fallback controller still consumes the native state model even on builds
+// without a PipeWire source capable of producing these states.
+#[cfg_attr(not(any(amaterasu_pipewire, test)), allow(dead_code))]
 pub enum SourceState {
     Selecting,
     Ready { node: u32, width: u32, height: u32 },
@@ -171,6 +174,7 @@ pub enum SourceStage {
 }
 
 impl SourceStage {
+    #[cfg(any(amaterasu_pipewire, test))]
     pub fn from_native(value: u32) -> Option<Self> {
         Some(match value {
             1 => Self::ConnectingSessionBus,
@@ -197,6 +201,7 @@ pub enum PipeWireState {
 }
 
 impl PipeWireState {
+    #[cfg(any(amaterasu_pipewire, test))]
     pub fn from_native(value: i32) -> Option<Self> {
         Some(match value {
             0 => Self::Unconnected,
