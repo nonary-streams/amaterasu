@@ -47,6 +47,12 @@ codec before ANNOUNCE. When the client asks for HDR, the fallback needs a
 compatible 10-bit codec. Once both sides agree on a format, startup requires
 a keyframe in that format.
 
+PyroWave applies the color range from the client's ANNOUNCE during pixel
+conversion. SDR uses the negotiated BT.601 or BT.709 matrix, and HDR uses
+BT.2020/PQ at either range. The sequence header carries the actual range.
+BT.601 is signaled by GameStream's color negotiation because the PyroWave
+sequence header has no BT.601 matrix identifier.
+
 The VKMS snapshotter tries renderable scanout layouts if it cannot allocate a
 renderable linear buffer. This preserves RGB precision and provides a shared
 DMA-BUF layout on GPUs whose render-only buffers cannot be imported by

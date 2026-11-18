@@ -263,6 +263,7 @@ impl Record {
             payload["configuration"]["configuration"]["bitrate"] =
                 json!(announce.video.bitrate_kbps.checked_mul(1_000)?);
             payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
+            payload["configuration"]["configuration"]["color_mode"] = json!(announce.video.color);
             return Some(payload);
         }
         let encryption = self.negotiated_encryption?;
@@ -288,12 +289,7 @@ impl Record {
         if !video.codec.is_default() {
             payload["configuration"]["configuration"]["codec"] = serde_json::json!(video.codec);
         }
-        payload["configuration"]["configuration"]["color_mode"] = serde_json::json!(match color {
-            amaterasu_gamestream::sdp::ColorMode::Bt601Limited => "bt601_limited",
-            amaterasu_gamestream::sdp::ColorMode::Bt601Full => "bt601_full",
-            amaterasu_gamestream::sdp::ColorMode::Bt709Limited => "bt709_limited",
-            amaterasu_gamestream::sdp::ColorMode::Bt709Full => "bt709_full",
-        });
+        payload["configuration"]["configuration"]["color_mode"] = json!(color);
         if !self.adjustments.is_empty() {
             payload["configuration"]["stream_adjustments"] = json!(self.adjustments);
         }

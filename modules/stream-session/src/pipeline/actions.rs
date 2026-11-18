@@ -449,6 +449,9 @@ impl Pipeline {
                 .clone()
                 .expect("offered profile has probe configuration");
             expected.extension_profile = Some(profile);
+            // The client selects its color mode in ANNOUNCE, after the offer
+            // probe. Video checks the selected encoder with the final config.
+            expected.color_mode = configuration.configuration.color_mode;
             // The authenticated ANNOUNCE may lower the rate from the probed
             // ceiling. Preserve every other field of the preflight agreement.
             let bitrate = configuration.configuration.bitrate;

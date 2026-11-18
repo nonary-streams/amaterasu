@@ -141,6 +141,7 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
         let mut request = start(session);
         request["configuration"]["client_feature_flags"] = json!(0);
         request["configuration"]["configuration"]["extension_profile"] = profile.clone();
+        request["configuration"]["configuration"]["color_mode"] = json!("bt601_limited");
         let result = host.response_from(2, "amaterasu.rtsp", request);
         if expected_offer {
             assert_eq!(result["state"], "active");
@@ -155,6 +156,10 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
                 .unwrap();
             assert_eq!(video.payload["source_id"], 42);
             assert_eq!(video.payload["configuration"]["extension_profile"], profile);
+            assert_eq!(
+                video.payload["configuration"]["color_mode"],
+                "bt601_limited"
+            );
             assert!(
                 !host
                     .broker
