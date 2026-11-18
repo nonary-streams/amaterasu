@@ -1897,7 +1897,16 @@ mod tests {
         assert!(first.revision.is_some());
         assert!(first.needs_remote_upgrade);
 
+        let modified = fs::metadata(&portrait).unwrap().modified().unwrap();
         fs::write(&portrait, synthetic_png(301, 451)).unwrap();
+        // Equal-length rewrites can share a filesystem timestamp. Set a
+        // distinct timestamp explicitly to exercise the metadata revision.
+        fs::File::options()
+            .write(true)
+            .open(&portrait)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified - Duration::from_secs(10)))
+            .unwrap();
         let second = discover(42, &root.0, &[]);
         assert_eq!(second.source_path.as_deref(), portrait.to_str());
         assert_ne!(second.revision, first.revision);
