@@ -967,7 +967,7 @@ namespace Amaterasu {
 
   export function renderDiagnostics(context: PageContext): void {
     const alertsArea = el("div");
-    const alertObserver = renderDiagnosticAlerts(context, alertsArea);
+    const refreshAlerts = renderDiagnosticAlerts(context, alertsArea);
     const area = el("div");
     const performanceArea = el("div");
     const hostLogArea = el("div");
@@ -1071,6 +1071,7 @@ namespace Amaterasu {
         "Diagnostics",
         "Stream performance, host logs, caller-scoped records, and separately recorded stream outcomes.",
         button("Refresh", () => {
+          void refreshAlerts();
           void refreshPerformance?.();
           void refreshHostLogs?.();
           void loadRecentSessions();
@@ -1111,18 +1112,18 @@ namespace Amaterasu {
             const detail = parseHistoryDetailReply(await context.api.post<unknown>(
               "history/session_detail", { session_id: session.session_id },
             ), session.session_id).detail;
-            return { session, outcome: diagnosticSessionOutcome(detail) };
+            return { session, outcome: diagnosticSessionOutcome(detail), warnings: retainedStreamWarnings(detail) };
           } catch {
-            return { session, outcome: "Outcome unavailable · refresh to retry" };
+            return { session, outcome: "Outcome unavailable · refresh to retry", warnings: "Warning history unavailable." };
           }
         }));
         if (!context.content.isConnected || request !== sessionRequest) return;
         sessionsArea.replaceChildren(table(
-          ["Started", "State", "Recorded outcome"],
-          details.map(({ session, outcome }) => [
+          ["Started", "State", "Recorded outcome", "Recorded warnings"],
+          details.map(({ session, outcome, warnings }) => [
             new Date(session.started_at_unix * 1000).toLocaleString(),
             session.ended_at_unix == null ? badge("Active", "good") : "Ended",
-            outcome,
+            outcome, warnings,
           ]),
         ), el("p", "muted", `Showing at most ${DIAGNOSTIC_SESSION_LIMIT} recent sessions. Client and device identity are not displayed.`));
       } catch (error) {
@@ -1189,7 +1190,8 @@ namespace Amaterasu {
       }
     }
     if (context.api.allows("diagnostics.read")) refreshPerformance = renderPerformance(context, performanceArea);
-    if (context.api.allows("host-logs.read")) refreshHostLogs = renderHostLogs(context, hostLogArea, alertObserver);
+    if (context.api.allows("host-logs.read")) refreshHostLogs = renderHostLogs(context, hostLogArea);
+    void refreshAlerts();
     void load();
     void loadRecentSessions();
   }

@@ -322,6 +322,34 @@ impl StreamLifecycleStore {
         self.streams.get(key).map(StreamLifecycle::snapshot)
     }
 
+    /// Recent warnings and current root causes across all retained operations.
+    /// Each commit appears once even when it is also the pinned warning or root.
+    pub fn recent_issues(&self) -> (Vec<&LifecycleEntry>, bool) {
+        const LIMIT: usize = 32;
+        let mut by_sequence = BTreeMap::new();
+        let mut incomplete = self.gaps > 0;
+        for stream in self.streams.values() {
+            incomplete |= stream.audit_gap || stream.committed > stream.entries.len() as u64;
+            for entry in stream
+                .entries
+                .iter()
+                .filter(|entry| entry.issue.disposition != IssueDisposition::CriticalFailure)
+                .chain(stream.warnings.iter())
+                .chain(stream.root_cause.iter())
+            {
+                by_sequence.insert(entry.seq, entry);
+            }
+        }
+        for entry in &self.unattributed {
+            by_sequence.insert(entry.seq, entry);
+        }
+        incomplete |= by_sequence.len() > LIMIT;
+        (
+            by_sequence.into_values().rev().take(LIMIT).collect(),
+            incomplete,
+        )
+    }
+
     pub fn unattributed(&self) -> impl Iterator<Item = &LifecycleEntry> {
         self.unattributed.iter()
     }

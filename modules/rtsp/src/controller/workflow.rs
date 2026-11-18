@@ -510,6 +510,13 @@ impl Controller {
         };
         if valid && replied {
             record.state = State::Playing;
+            if let Some(logger) = &self.logger {
+                let _ = logger.emit(
+                    amaterasu_module_sdk::LogLevel::Info,
+                    "stream",
+                    &record.playback_description(),
+                );
+            }
             record.expires = u64::MAX;
             record.observation_stale_at = now.saturating_add(OBSERVATION_STALE_MS);
             record.next_status = now.saturating_add(STATUS_INTERVAL_MS);

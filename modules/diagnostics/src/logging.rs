@@ -321,16 +321,18 @@ impl SessionLog {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let mut line = serde_json::to_vec(&json!({
-            "timestamp_unix_ms": timestamp,
-            "level": record.level.as_str(),
-            "caller": caller,
-            "target": record.target,
-            "message": record.message,
-            "fields": record.fields,
-        }))
-        .map_err(io::Error::other)?;
-        line.push(b'\n');
+        let mut message = record.message.clone();
+        for (name, value) in &record.fields {
+            use std::fmt::Write;
+            let _ = write!(message, " {}: {value}.", name.replace('_', " "));
+        }
+        let line = amaterasu_logging::LogRecord::new(
+            record.level.numeric(),
+            caller,
+            &format!("{}: {message}", record.target).replace('\0', " "),
+        )
+        .map_err(io::Error::other)?
+        .line(timestamp);
         self.write_line(&line)
     }
 

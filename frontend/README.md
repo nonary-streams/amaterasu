@@ -173,6 +173,9 @@ browser API calls.
   acceptance does not establish client delivery.
 - Process inventory and termination with confirmation, plus explicit status refresh.
 - Steam provider refresh, discovery pages, partial-scan warnings, and scan status.
+- Diagnostics shows lifecycle warnings and failures with `session.read`, including the
+  affected operation, requested and effective values, and recorded refusals. A feed
+  gap is visible. The recent sessions table shows the warnings retained in session history.
 - Diagnostics provides search, match navigation and export for the current
   host log when `host-logs.read` is granted. A level filter and search narrow
   the preview; search and the plain-text download use the full retained current-session snapshot.

@@ -6,62 +6,28 @@ import argparse
 from collections import deque
 import json
 from pathlib import Path
-import re
+from datetime import datetime, timezone
 import sys
-
-TARGET = re.compile(
-    r"(?:^|: |::)(module\.timing|input\.timing|control\.timing|stream\.timing|"
-    r"video\.pipeline|encoder\.timing|media\.processing_latency|capture\.presentation|service\.worker|broker\.timing|runtime\.invocation|audio\.timing|host\.timing|trace\.window|trace\.slow_flow|trace\.slow_span|rtx-hdr): (.*)$"
-)
-FIELD = re.compile(r"([a-zA-Z_][a-zA-Z_0-9]*)=")
-DECODER = json.JSONDecoder()
-
-
-def parse_fields(message: str) -> dict:
-    """Accept the existing key=value records, including embedded JSON objects."""
-    result = {}
-    cursor = 0
-    while cursor < len(message):
-        match = FIELD.match(message, cursor)
-        if not match:
-            break
-        cursor = match.end()
-        if cursor < len(message) and message[cursor] in "{[":
-            value, length = DECODER.raw_decode(message[cursor:])
-            cursor += length
-        else:
-            end = message.find(" ", cursor)
-            if end == -1:
-                end = len(message)
-            raw = message[cursor:end]
-            try:
-                value = int(raw)
-            except ValueError:
-                value = raw
-            cursor = end
-        result[match[1]] = value
-        while cursor < len(message) and message[cursor].isspace():
-            cursor += 1
-    return result
 
 
 def parse_line(line: str) -> dict | None:
-    match = TARGET.search(line.rstrip())
-    if not match:
-        return None
-    target, message = match.groups()
-    if target == "rtx-hdr" and not message.startswith("{"):
-        return None
-    payload = json.loads(message) if message.startswith("{") else parse_fields(message)
-    if not isinstance(payload, dict) or not payload:
-        raise ValueError("invalid diagnostic record")
+    """Read one complete record from the host's timing capture."""
+    record = json.loads(line)
+    if not isinstance(record, dict):
+        raise ValueError("invalid timing record")
+    target = record["target"]
+    payload = record["payload"]
+    if (not isinstance(target, str) or not isinstance(record.get("source"), str)
+            or not isinstance(payload, dict) or type(record["timestamp"]) is not int
+            or not 0 <= record["timestamp"] <= 253402300799999):
+        raise ValueError("invalid timing record")
     if target == "rtx-hdr":
         if payload.get("event") != "rtx_hdr_gpu_timing":
             return None
         for stage in ("gl_queue", "gl_sample", "cuda_pipeline"):
             payload[stage + "_timing_us"] = {"calls": payload["samples"],
                 "total_us": payload[stage + "_us"], "max_us": payload[stage + "_max_us"]}
-    # Older capture records have flat stage counters. These are interval totals.
+    # Capture reports each stage with flat counters. These are interval totals.
     for name, count in list(payload.items()):
         if name.endswith("_calls"):
             stage = name.removesuffix("_calls")
@@ -75,7 +41,7 @@ def parse_line(line: str) -> dict | None:
                 "calls": known, "total_us": payload["total_tenths_ms"] * 100,
                 "max_us": payload["max_tenths_ms"] * 100,
             }
-    return {"target": target, "timestamp": line[:match.start()].strip(), "payload": payload}
+    return record
 
 
 def metrics(value: dict, path: str = ""):
@@ -105,7 +71,7 @@ def summarize(records: list[dict]) -> list[dict]:
     for record in records:
         if record["target"] == "broker.timing":
             for service in record["payload"].get("services", []):
-                expanded.append({"target":record["target"], "payload":service})
+                expanded.append({**record, "payload": service})
         else:
             expanded.append(record)
     for record in expanded:
@@ -115,8 +81,8 @@ def summarize(records: list[dict]) -> list[dict]:
         if record["target"] == "broker.timing":
             identity = f"caller={payload.get('caller')},service={payload.get('service')}"
         for path, count, metric in metrics(payload):
-            key = record["target"], identity, path
-            row = rows.setdefault(key, {"target": key[0], "identity": identity, "stage": path,
+            key = record["target"], record["source"], identity, path
+            row = rows.setdefault(key, {"target": record["target"], "source": record["source"], "identity": identity, "stage": path,
                                         "calls": 0, "total_us": 0, "max_us": 0,
                                         "max_observed_monotonic_us": None,
                                         "worst_window_p95_upper_us": None})
@@ -139,9 +105,7 @@ def slow_moments(records: list[dict], limit: int = 10) -> list[str]:
     lines = []
     for record in records:
         payload = record["payload"]
-        # The prefix also carries the level and the reporting component.
-        stamp = re.match(r"\[([^\]]+)\]", record["timestamp"])
-        when = stamp[1] if stamp else record["timestamp"]
+        when = datetime.fromtimestamp(record["timestamp"] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         if record["target"] == "trace.slow_flow":
             line = (f"{when} {payload.get('track')} flow took "
                     f"{payload.get('total_us', 0) / 1000:.1f} ms (budget {payload.get('budget_us', 0) / 1000:.1f} ms)")
@@ -187,7 +151,7 @@ def coverage(records: list[dict]) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("logs", type=Path, nargs="+", help="log files in chronological order")
+    parser.add_argument("logs", type=Path, nargs="+", help="timing capture segments in chronological order")
     parser.add_argument("--windows", type=int, default=300, help="retain the last N diagnostic records (1..1000)")
     parser.add_argument("--limit", type=int, default=30, help="maximum timing rows to print")
     parser.add_argument("--json", action="store_true", help="include timing rows and original diagnostic windows")
@@ -210,7 +174,7 @@ def main() -> int:
     except OSError as error:
         parser.exit(2, f"{error}\n")
     if not records:
-        parser.exit(1, "No supported diagnostic windows found. Use logs from a build with streaming diagnostics enabled.\n")
+        parser.exit(1, "No supported diagnostic windows found. Supply the timing capture files produced at Debug level.\n")
     rows = summarize(list(records))
     if args.json:
         json.dump({"schema_version": 1, "malformed_records": malformed,
@@ -221,12 +185,12 @@ def main() -> int:
         print(f"Host diagnostics: {len(records)} records; {malformed} malformed records skipped.")
         print("Timings below overlap. Interval metrics describe cadence, not processing latency.")
         print("p95 is the worst window's histogram upper bound; it is not a combined percentile.")
-        print("mean ms | p95 upper ms | max ms | calls | source / identity / stage")
+        print("mean ms | p95 upper ms | max ms | calls | source / target / identity / stage")
         for row in rows[:args.limit]:
             p95 = row["worst_window_p95_upper_us"]
             tail = f"{p95 / 1000:.3f}" if p95 is not None else "unknown"
             print(f"{row['mean_us'] / 1000:7.3f} | {tail:>12} | {row['max_us'] / 1000:7.3f} | "
-                  f"{row['calls']:5} | {row['target']} / {row['identity']} / {row['stage']}")
+                  f"{row['calls']:5} | {row['source']} / {row['target']} / {row['identity']} / {row['stage']}")
         moments = slow_moments(list(records))
         if moments:
             print("Recent slow flows and spans (flow tracing):")

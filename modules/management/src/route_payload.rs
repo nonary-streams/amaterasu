@@ -2672,7 +2672,13 @@ fn management_launch_identifier(value: &Value) -> bool {
 fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "management_launch_status" => {
-            fields(object, &[], &["reference"])?;
+            fields(object, &[], &["reference", "issues_only"])?;
+            if object.contains_key("issues_only")
+                && (object.get("issues_only") != Some(&Value::Bool(true))
+                    || object.contains_key("reference"))
+            {
+                return Err(INVALID);
+            }
             if object
                 .get("reference")
                 .is_some_and(|value| !management_launch_identifier(value))

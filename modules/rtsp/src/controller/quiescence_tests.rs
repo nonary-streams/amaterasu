@@ -105,6 +105,7 @@ fn client(endpoint: &mut Endpoint) -> RuntimeClient {
 
 fn module(endpoint: &mut Endpoint, controller: Controller) -> crate::RtspModule {
     crate::RtspModule {
+        logs: client(endpoint).log_emitter().1,
         runtime: client(endpoint),
         controller,
         started: Instant::now(),

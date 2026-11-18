@@ -192,6 +192,7 @@ impl Record {
             warning.code.clone(),
         ));
         issue.reason.clone_from(&warning.reason);
+        issue.os_error = warning.os_error;
         let issue = issue.with_values(warning.requested.clone(), warning.effective.clone());
         self.issues.push(issue);
     }

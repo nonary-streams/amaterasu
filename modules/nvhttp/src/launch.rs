@@ -884,11 +884,12 @@ impl Controller {
         self.logger = Some(logger);
     }
 
-    fn log_phase(&self, level: LogLevel, phase: workflow::Phase, event: &str) {
+    fn log_phase(&self, phase: workflow::Phase, event: &str) {
         if let Some(logger) = &self.logger {
             // The phase and event are internal enums and fixed strings; request
             // contents and client identities are deliberately excluded.
-            let _ = logger.emit(level, "launch", &format!("phase={phase:?} event={event}"));
+            let phase = lifecycle_issues::label(phase).replace('_', " ");
+            let _ = logger.emit(LogLevel::Debug, "launch", &format!("{event} ({phase})."));
         }
     }
 
@@ -1083,6 +1084,15 @@ impl Controller {
     pub fn busy(&self) -> bool {
         self.deferred_launch.is_some()
             || self.records.values().any(|record| !record.state.terminal())
+    }
+
+    pub fn management_issues(&self) -> Value {
+        let (issues, partial) = self.stream_lifecycle.recent_issues();
+        let subscribed = self
+            .stream_issue_feed
+            .as_ref()
+            .is_some_and(|feed| feed.subscribed() && feed.malformed() == 0);
+        json!({"ok":true, "issues":issues, "incomplete":partial || !subscribed})
     }
 
     /// Management sees only opaque launch identities and cleanup state. This is
@@ -1396,7 +1406,6 @@ impl Controller {
             ),
         };
 
-        let warning_logger = self.logger.clone();
         if let Some(record) = self
             .records
             .values_mut()
@@ -1414,7 +1423,7 @@ impl Controller {
                 )
             {
                 for warning in request.advisory_warnings.0.clone() {
-                    workflow::add_stream_warning(record, warning_logger.as_ref(), warning);
+                    workflow::add_stream_warning(record, warning);
                 }
                 if matches!(record.state, State::Ready) {
                     record.launch_connection = Some(connection);
@@ -1551,7 +1560,7 @@ impl Controller {
             record.global_configured_virtual_sink = None;
             record.global_display_policy = json!({});
         }
-        workflow::add_request_warnings(&mut record, self.logger.as_ref());
+        workflow::add_request_warnings(&mut record);
         self.records.insert(id, record);
         None
     }
@@ -1631,10 +1640,13 @@ impl Controller {
         {
             return Some(private_error(409, "stream cleanup is already in progress"));
         }
-        eprintln!(
-            "amaterasu launch cancel requested state={:?} stage={:?}",
-            record.state, record.stage
-        );
+        if let Some(logger) = &self.logger {
+            let _ = logger.emit(
+                LogLevel::Info,
+                "launch",
+                "The client requested a stop. Starting cleanup.",
+            );
+        }
         record.cancel_connection = Some(connection);
         // A client disconnect can start transport retirement before its Quit
         // request arrives. Escalate that same cleanup to end the application;

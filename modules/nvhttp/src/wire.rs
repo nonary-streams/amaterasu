@@ -291,6 +291,10 @@ impl Router {
         self.launches.management_status(reference)
     }
 
+    pub fn management_stream_issues(&self) -> Value {
+        self.launches.management_issues()
+    }
+
     pub fn management_stop_launch(
         &mut self,
         reference: &str,

@@ -113,8 +113,7 @@ impl Record {
         let Some(operation) = self.config.rtsp_operation_id.clone() else {
             return;
         };
-        self.issues.push_logged(
-            None,
+        self.issues.push(
             StreamIssue::demoted(
                 operation,
                 LifecycleLayer::StreamSession,

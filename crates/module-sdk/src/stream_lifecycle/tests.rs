@@ -20,6 +20,9 @@ fn scripted(
     let log = sent.clone();
     let mut replies: VecDeque<_> = replies.into();
     let send = move |command: Command| {
+        if matches!(command, Command::Log { .. }) {
+            return Ok(Response::Ok);
+        }
         log.borrow_mut()
             .push(serde_json::to_value(&command).unwrap());
         replies.pop_front().unwrap_or(Ok(Response::Pending))
@@ -113,6 +116,96 @@ fn an_outbox_keeps_what_it_could_not_publish_and_counts_what_it_dropped() {
     );
     assert!(outbox.is_empty());
     assert_eq!(sent.borrow()[0]["payload"]["code"], "code_3");
+}
+
+#[test]
+fn recent_issues_include_ended_and_concurrent_attempts_once_in_commit_order() {
+    let mut store = StreamLifecycleStore::new();
+    for key in ["ended", "active", "other"] {
+        store.open(key);
+        store.commit(
+            "rtsp",
+            StreamIssue::advisory(
+                key,
+                LifecycleLayer::Rtsp,
+                "announce",
+                "optional_client_features",
+            ),
+        );
+    }
+    store.end("ended");
+    store.commit(
+        "nvhttp",
+        StreamIssue::critical("unbound", LifecycleLayer::Nvhttp, "launch", "refused"),
+    );
+    let (issues, incomplete) = store.recent_issues();
+    assert!(!incomplete);
+    assert_eq!(
+        issues
+            .iter()
+            .map(|entry| entry.issue.operation.as_str())
+            .collect::<Vec<_>>(),
+        ["unbound", "other", "active", "ended"]
+    );
+    for _ in 0..40 {
+        store.commit(
+            "rtsp",
+            StreamIssue::advisory(
+                "active",
+                LifecycleLayer::Rtsp,
+                "announce",
+                "optional_client_features",
+            ),
+        );
+    }
+    let (issues, incomplete) = store.recent_issues();
+    assert!(incomplete);
+    assert_eq!(issues.len(), 32);
+    assert_eq!(issues[0].seq, 44);
+}
+
+#[test]
+fn publication_retry_after_retirement_keeps_the_issue_and_logs_once() {
+    let mut active = StreamIssueOutbox::default();
+    active.push(
+        StreamIssue::advisory(
+            "attempt-1",
+            LifecycleLayer::Rtsp,
+            "announce",
+            "bandwidth_adjusted",
+        )
+        .with_values(
+            Some(WarningValue::Integer(10000)),
+            Some(WarningValue::Integer(7500)),
+        ),
+    );
+    let mut lines = Vec::new();
+    let mut publications = 0;
+    let mut send = |command| match command {
+        Command::Log { level, message, .. } => {
+            assert_eq!(level, LogLevel::Warning as u8);
+            lines.push(message);
+            Ok(Response::error("queue_full", "busy"))
+        }
+        Command::Publish { .. } => {
+            publications += 1;
+            if publications == 1 {
+                Ok(Response::error("busy", "retry"))
+            } else {
+                Ok(Response::Ok)
+            }
+        }
+        _ => panic!("unexpected command"),
+    };
+    assert!(active.flush_with(&mut send).is_err());
+    let mut retired = StreamIssueOutbox::default();
+    active.transfer_to(&mut retired);
+    assert_eq!(retired.flush_with(&mut send).unwrap(), 1);
+    assert!(active.is_empty() && retired.is_empty());
+    assert_eq!(publications, 2);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("10000 kbps") && lines[0].contains("7500 kbps"));
+    assert!(lines[0].contains("attempt-1"));
 }
 
 #[test]

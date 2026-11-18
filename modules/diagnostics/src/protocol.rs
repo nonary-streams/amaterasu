@@ -45,16 +45,6 @@ impl Level {
             Self::Error => 4,
         }
     }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Trace => "trace",
-            Self::Debug => "debug",
-            Self::Info => "info",
-            Self::Warn => "warning",
-            Self::Error => "error",
-        }
-    }
 }
 
 #[derive(Clone, Serialize)]

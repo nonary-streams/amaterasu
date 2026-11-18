@@ -24,7 +24,7 @@
 //!   to management.
 //!
 //! An event is a notification, not a delivery guarantee. Each issue is also
-//! written to the reporter's log when it is queued, and a subscriber that
+//! offered to the reporter's log on its first publication attempt, and a subscriber that
 //! falls behind marks the affected streams `audit_gap` rather than presenting
 //! an incomplete record as complete.
 mod feed;
@@ -41,6 +41,7 @@ use crate::events::{Topic, publish_with};
 use crate::stream_warnings::{StreamWarning, WarningValue};
 use crate::{Command, LogEmitter, LogLevel, ModuleResult, Response, RuntimeClient};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::json;
 use std::collections::VecDeque;
 use std::panic::Location;
@@ -73,6 +74,9 @@ impl StreamReport {
     ) -> ControlResult<()> {
         if !self.valid() {
             return Err(ControlError::Payload("invalid stream report".to_owned()));
+        }
+        if let Self::Issue(issue) = self {
+            issue.write_log_with(send);
         }
         publish_with(send, &STREAM_REPORTS, self)
     }
@@ -392,24 +396,89 @@ impl StreamIssue {
         &self,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> ControlResult<()> {
-        if !self.valid() {
-            return Err(ControlError::Payload("invalid stream issue".to_owned()));
-        }
-        publish_with(send, &STREAM_REPORTS, &StreamReport::Issue(self.clone()))
+        StreamReport::Issue(self.clone()).report_with(send)
     }
 
-    /// Write this issue to the reporter's own log. This is the durable record
-    /// when the event cannot be delivered.
-    pub fn log(&self, logger: Option<&LogEmitter>) {
+    /// Describe the observed operation. A provider failure alone does not establish
+    /// the outcome of the whole stream.
+    pub fn description(&self) -> String {
+        use std::fmt::Write;
+        let words = |value: &str| value.replace('_', " ");
+        let summary = match self.code.as_str() {
+            "optional_client_features" => "Ignored unsupported optional client features".into(),
+            "refresh_hint_ignored" => "Ignored the inconsistent display refresh hint".into(),
+            "intra_refresh_unavailable" => "Intra-refresh is unavailable".into(),
+            "bandwidth_adjusted" => {
+                "Reduced the video bitrate to allow for audio and network overhead".into()
+            }
+            "compatibility_defaults" => {
+                "Used defaults for optional settings omitted by the client".into()
+            }
+            "invalid_optional_hints" => "Ignored invalid optional client hints".into(),
+            "audio_quality_default" => "Used the configured audio quality".into(),
+            "hevc_capability_hint_ignored" => "Ignored an unrecognized HEVC capability hint".into(),
+            _ => words(&self.code),
+        };
+        let mut message = format!("During {}: {summary}.", words(&self.phase));
+        if !self.reason.is_empty() && self.reason != self.code {
+            let _ = write!(message, " Reason: {}.", words(&self.reason));
+        }
+        if let Some(fallback) = &self.fallback {
+            let _ = write!(message, " Used {}.", words(fallback));
+        }
+        for (label, value) in [
+            ("Requested", &self.requested),
+            ("Effective", &self.effective),
+        ] {
+            if let Some(value) = value {
+                let value = match value {
+                    WarningValue::Boolean(value) => value.to_string(),
+                    WarningValue::Integer(value) => match self.code.as_str() {
+                        "bandwidth_adjusted" => format!("{value} kbps"),
+                        "refresh_hint_ignored" => format!("{} Hz", *value as f64 / 100.0),
+                        "optional_client_features" | "invalid_optional_hints" => {
+                            format!("0x{value:X}")
+                        }
+                        _ => value.to_string(),
+                    },
+                    WarningValue::Label(value) => words(value),
+                };
+                let _ = write!(message, " {label}: {value}.");
+            }
+        }
+        if let Some(error) = self.os_error {
+            let _ = write!(message, " OS error {error}.");
+        }
+        let _ = write!(message, " (Operation {})", self.operation);
+        message
+    }
+
+    fn write_log_with(&self, send: &mut impl FnMut(Command) -> ModuleResult<Response>) {
+        let (level, target) = self.log_target();
+        let _ = send(Command::Log {
+            level: level as u8,
+            target: target.into(),
+            message: self.description(),
+        });
+    }
+
+    /// Render the owner's own commit through its bounded log emitter.
+    fn log(&self, logger: Option<&LogEmitter>) {
         let Some(logger) = logger else {
             return;
         };
-        let (level, target) = match self.disposition {
+        if self.valid() {
+            let (level, target) = self.log_target();
+            let _ = logger.emit(level, target, &self.description());
+        }
+    }
+
+    fn log_target(&self) -> (LogLevel, &'static str) {
+        match self.disposition {
             IssueDisposition::CriticalFailure => (LogLevel::Error, "stream.lifecycle.failure"),
             IssueDisposition::DemotedWarning => (LogLevel::Warning, "stream.lifecycle.demoted"),
             IssueDisposition::AdvisoryWarning => (LogLevel::Warning, "stream.lifecycle.warning"),
-        };
-        let _ = logger.emit(level, target, &json!(self).to_string());
+        }
     }
 }
 
@@ -417,13 +486,19 @@ impl StreamIssue {
 /// record method with no runtime access. The layer flushes it from its tick.
 #[derive(Debug, Default)]
 pub struct StreamIssueOutbox {
-    issues: VecDeque<StreamReport>,
+    issues: VecDeque<PendingReport>,
     dropped: u64,
+}
+
+#[derive(Debug)]
+struct PendingReport {
+    report: StreamReport,
+    log_attempted: bool,
 }
 
 impl StreamIssueOutbox {
     /// Queue `issue`. When the outbox is full the oldest report is dropped
-    /// and counted; its log line, written by [`Self::push_logged`], remains.
+    /// and counted.
     pub fn push(&mut self, issue: StreamIssue) {
         self.push_report(StreamReport::Issue(issue));
     }
@@ -434,17 +509,18 @@ impl StreamIssueOutbox {
     }
 
     fn push_report(&mut self, report: StreamReport) {
+        self.push_pending(PendingReport {
+            report,
+            log_attempted: false,
+        });
+    }
+
+    fn push_pending(&mut self, pending: PendingReport) {
         if self.issues.len() >= MAX_OUTBOX_ISSUES {
             self.issues.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
-        self.issues.push_back(report);
-    }
-
-    /// Log `issue` now and queue it for publication.
-    pub fn push_logged(&mut self, logger: Option<&LogEmitter>, issue: StreamIssue) {
-        issue.log(logger);
-        self.push(issue);
+        self.issues.push_back(pending);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -462,7 +538,14 @@ impl StreamIssueOutbox {
 
     /// Hand every queued report to an owner that keeps the store itself.
     pub fn drain(&mut self) -> impl Iterator<Item = StreamReport> + '_ {
-        self.issues.drain(..)
+        self.issues.drain(..).map(|pending| pending.report)
+    }
+
+    /// Preserve delivery and logging progress when a record is retired.
+    pub fn transfer_to(&mut self, destination: &mut Self) {
+        for pending in self.issues.drain(..) {
+            destination.push_pending(pending);
+        }
     }
 
     /// Publish queued issues in order. An invalid issue is discarded and
@@ -473,13 +556,19 @@ impl StreamIssueOutbox {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> ControlResult<usize> {
         let mut published = 0;
-        while let Some(report) = self.issues.front() {
-            if !report.valid() {
+        while let Some(pending) = self.issues.front_mut() {
+            if !pending.report.valid() {
                 self.issues.pop_front();
                 self.dropped = self.dropped.saturating_add(1);
                 continue;
             }
-            report.report_with(send)?;
+            if !pending.log_attempted {
+                if let StreamReport::Issue(issue) = &pending.report {
+                    issue.write_log_with(send);
+                }
+                pending.log_attempted = true;
+            }
+            publish_with(send, &STREAM_REPORTS, &pending.report)?;
             self.issues.pop_front();
             published += 1;
         }

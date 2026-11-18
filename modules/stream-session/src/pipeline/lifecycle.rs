@@ -1863,21 +1863,11 @@ impl Pipeline {
                         let mut adjustment =
                             amaterasu_gamestream::sdp::StreamAdjustment::new(code, 1, 0);
                         adjustment.reason = Some(reason.to_owned());
-                        if adjustment.valid() {
-                            let (session, _) = record.history.live_identity();
-                            let message = json!({"event":"stream_adjustment", "stream":session,
-                                "code":adjustment.code,"requested":1,"effective":0,"reason":reason})
-                            .to_string();
-                            let _ = send(Command::Log {
-                                level: amaterasu_module_sdk::LogLevel::Warning as u8,
-                                target: "stream.compatibility".into(),
-                                message,
-                            });
-                            if record.runtime_adjustments.len() < 16
-                                && !record.runtime_adjustments.contains(&adjustment)
-                            {
-                                record.runtime_adjustments.push(adjustment);
-                            }
+                        if adjustment.valid()
+                            && record.runtime_adjustments.len() < 16
+                            && !record.runtime_adjustments.contains(&adjustment)
+                        {
+                            record.runtime_adjustments.push(adjustment);
                         }
                     }
                 }

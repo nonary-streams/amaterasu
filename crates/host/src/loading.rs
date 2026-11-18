@@ -788,6 +788,12 @@ impl LoadedComponents {
         serde_json::from_slice(&output).ok()
     }
 
+    pub fn report_ready(&self) {
+        if let Some(logger) = &self.graph.product_logger {
+            let _ = logger.emit(2, "amaterasu.host", "Host worker ready.");
+        }
+    }
+
     pub fn health(&self) -> PackageResult<()> {
         self.process.require_usable()?;
         let mut call_started = std::time::Instant::now();

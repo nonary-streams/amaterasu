@@ -18,6 +18,7 @@ pub fn run(root: &Path, digest: &str, input: Option<&str>) -> PackageResult<()> 
     components.tick()?;
     components.health()?;
     send_line("READY")?;
+    components.report_ready();
 
     if let Some(input) = input {
         let endpoint = components.console_endpoint()?;
@@ -199,6 +200,7 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
     components.tick()?;
     components.health()?;
     send_line("READY")?;
+    components.report_ready();
     let mut heartbeat = std::time::Instant::now();
     loop {
         let observed_work = components.observe_work()?;
@@ -283,6 +285,7 @@ pub fn serve_interactive(
     components.tick()?;
     components.health()?;
     send_line("READY")?;
+    components.report_ready();
     loop {
         #[cfg(windows)]
         if shutdown.is_requested().map_err(|error| error.to_string())? {

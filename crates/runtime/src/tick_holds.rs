@@ -6,7 +6,6 @@
 use std::{
     cell::RefCell,
     collections::BTreeMap,
-    fmt::Write,
     time::{Duration, Instant},
 };
 
@@ -140,28 +139,14 @@ impl Tracker {
             .filter(|holder| holder.held.count > 0)
             .collect();
         holders.sort_by_key(|holder| std::cmp::Reverse(holder.held.max));
-        let mut report = format!(
-            "window_ms={} passes={} pass_avg_us={} pass_max_us={} broker_calls={} broker_avg_us={} broker_max_us={} slowest_holders=",
-            elapsed.as_millis(),
-            self.passes.count,
-            self.passes.average_us(),
-            self.passes.max.as_micros(),
-            self.broker_calls.count,
-            self.broker_calls.average_us(),
-            self.broker_calls.max.as_micros(),
-        );
-        for holder in holders.into_iter().take(REPORTED_HOLDERS) {
-            let _ = write!(
-                report,
-                "{}[max_us={},total_us={},stalls={}] ",
-                holder.principal,
-                holder.held.max.as_micros(),
-                holder.held.total.as_micros(),
-                holder.stalls,
-            );
-        }
-        report.truncate(report.trim_end().len());
-        report
+        let slowest: Vec<_> = holders.into_iter().take(REPORTED_HOLDERS).map(|holder| {
+            serde_json::json!({"principal": holder.principal, "max_us": holder.held.max.as_micros(),
+                "total_us": holder.held.total.as_micros(), "stalls": holder.stalls})
+        }).collect();
+        serde_json::json!({"window_ms": elapsed.as_millis(), "passes": self.passes.count,
+            "pass_avg_us": self.passes.average_us(), "pass_max_us": self.passes.max.as_micros(),
+            "broker_calls": self.broker_calls.count, "broker_avg_us": self.broker_calls.average_us(),
+            "broker_max_us": self.broker_calls.max.as_micros(), "slowest_holders": slowest}).to_string()
     }
 }
 
@@ -245,13 +230,13 @@ mod tests {
         tracker.begin_wait(at(start, 41));
 
         let report = tracker.report(Duration::from_secs(10));
-        let first = report.find("first[max_us=40000").expect(&report);
-        let second = report.find("second[max_us=1000").expect(&report);
-        assert!(
-            first < second,
-            "the slowest holder is listed first: {report}"
-        );
-        assert!(report.contains("stalls=1"), "{report}");
+        let window: serde_json::Value = serde_json::from_str(&report).unwrap();
+        let holders = &window["slowest_holders"];
+        assert_eq!(holders[0]["principal"], "first");
+        assert_eq!(holders[0]["max_us"], 40000);
+        assert_eq!(holders[0]["stalls"], 1);
+        assert_eq!(holders[1]["principal"], "second");
+        assert_eq!(holders[1]["max_us"], 1000);
     }
 
     #[test]
@@ -303,7 +288,9 @@ mod tests {
             .begin_wait(at(start, 10_005))
             .expect("report is due");
 
-        assert!(report.starts_with("window_ms=10005 passes=2"), "{report}");
+        let window: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(window["window_ms"], 10005);
+        assert_eq!(window["passes"], 2);
         assert!(tracker.holders.is_empty());
         assert_eq!(tracker.passes.count, 0);
     }

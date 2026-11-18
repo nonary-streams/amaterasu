@@ -532,7 +532,7 @@ impl Pipeline {
                 for part in amaterasu_module_sdk::diagnostics::window_parts(&summary) {
                     let _ = send(Command::Log {
                         level: amaterasu_module_sdk::diagnostics::WINDOW_LOG_LEVEL as u8,
-                        target: "stream.timing".into(),
+                        target: "timing/stream.timing".into(),
                         message: part.to_string(),
                     });
                 }

@@ -99,6 +99,8 @@ enum Operation {
     ManagementLaunchStatus {
         #[serde(default)]
         reference: Option<String>,
+        #[serde(default)]
+        issues_only: bool,
     },
     ManagementStopLaunch {
         reference: String,
@@ -809,7 +811,10 @@ impl NvhttpModule {
                     }
                 };
                 match operation {
-                    Operation::ManagementLaunchStatus { reference } => {
+                    Operation::ManagementLaunchStatus {
+                        reference,
+                        issues_only,
+                    } => {
                         if caller != MANAGEMENT_PRINCIPAL {
                             return complete_control(
                                 &self.runtime,
@@ -817,9 +822,10 @@ impl NvhttpModule {
                                 json!({"ok":false,"code":"permission_denied"}),
                             );
                         }
-                        if reference
-                            .as_deref()
-                            .is_some_and(|value| !management_identifier(value))
+                        if (issues_only && reference.is_some())
+                            || reference
+                                .as_deref()
+                                .is_some_and(|value| !management_identifier(value))
                         {
                             return complete_control(
                                 &self.runtime,
@@ -829,7 +835,13 @@ impl NvhttpModule {
                         }
                         let result = self.router.as_ref().map_or_else(
                             || json!({"ok":false,"code":"streaming_unavailable"}),
-                            |router| router.management_launch_status(reference.as_deref()),
+                            |router| {
+                                if issues_only {
+                                    router.management_stream_issues()
+                                } else {
+                                    router.management_launch_status(reference.as_deref())
+                                }
+                            },
                         );
                         complete_control(&self.runtime, id, result)
                     }

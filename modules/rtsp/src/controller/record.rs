@@ -111,6 +111,81 @@ pub(super) struct Record {
 }
 
 impl Record {
+    /// Publish the effective compatibility choices only after an accepted reply.
+    pub(super) fn report_announce_adjustments(&mut self) {
+        use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+        use amaterasu_module_sdk::stream_warnings::WarningValue;
+        for adjustment in &self.adjustments {
+            let mut issue = StreamIssue::advisory(
+                &self.config.operation_id,
+                LifecycleLayer::Rtsp,
+                "announce",
+                &adjustment.code,
+            )
+            .with_values(
+                Some(WarningValue::Integer(adjustment.requested.into())),
+                Some(WarningValue::Integer(adjustment.effective.into())),
+            );
+            if let Some(reason) = &adjustment.reason {
+                issue = issue.because(reason);
+            }
+            self.issues.push(issue);
+        }
+    }
+
+    pub(super) fn playback_description(&self) -> String {
+        use amaterasu_gamestream::sdp::NegotiatedVideoFormat;
+        use amaterasu_media::VideoCodec;
+        use std::fmt::Write;
+        let (mut message, format, channels) = if let Some(announce) = &self.extension_announce
+            && let NegotiatedVideoFormat::Extension(profile) = &announce.video.format
+        {
+            (
+                format!(
+                    "Started streaming {} at {}×{}, {} fps",
+                    profile.encoding_name,
+                    announce.video.width,
+                    announce.video.height,
+                    announce.video.fps
+                ),
+                profile
+                    .media_format
+                    .map(|format| (format.bit_depth, format.dynamic_range)),
+                announce.audio.channels,
+            )
+        } else if let Some(video) = self.negotiated_video {
+            let codec = match video.codec {
+                VideoCodec::H264 => "H.264",
+                VideoCodec::Hevc => "HEVC",
+                VideoCodec::Av1 => "AV1",
+            };
+            let fps = video
+                .fps_milli
+                .map_or(f64::from(video.fps), |rate| f64::from(rate) / 1000.0);
+            (
+                format!(
+                    "Started streaming {codec} at {}×{}, {fps} fps, {} kbps",
+                    video.width, video.height, video.bitrate_kbps
+                ),
+                self.negotiated_video_stream_format
+                    .map(|format| (format.bit_depth, format.dynamic_range)),
+                self.config.channels.unwrap_or(2),
+            )
+        } else {
+            return "Started streaming.".into();
+        };
+        if let Some((depth, range)) = format {
+            let range = if range == amaterasu_module_sdk::DynamicRange::Hdr {
+                "HDR"
+            } else {
+                "SDR"
+            };
+            let _ = write!(message, ", {depth}-bit {range}");
+        }
+        let _ = write!(message, ", {channels}-channel audio.");
+        message
+    }
+
     pub(super) fn accept_extension_announce(
         &mut self,
         announce: &amaterasu_gamestream::sdp::Announce<
@@ -118,6 +193,7 @@ impl Record {
         >,
     ) -> bool {
         self.extension_announce = None;
+        self.adjustments.clear();
         let amaterasu_gamestream::sdp::NegotiatedVideoFormat::Extension(profile) =
             &announce.video.format
         else {
@@ -148,6 +224,7 @@ impl Record {
             );
             return false;
         }
+        self.adjustments.clone_from(&announce.adjustments);
         self.extension_announce = Some(announce.clone());
         true
     }
@@ -252,7 +329,13 @@ impl Record {
             let mut payload = self.config.arm(session);
             payload["configuration"]["encrypt_video"] = json!(announce.encryption.video);
             payload["configuration"]["encrypt_audio"] = json!(announce.encryption.audio);
-            payload["configuration"]["client_feature_flags"] = json!(announce.client_feature_flags);
+            payload["configuration"]["client_feature_flags"] = json!(
+                announce.client_feature_flags
+                    & amaterasu_gamestream::sdp::KNOWN_CLIENT_FEATURE_FLAGS
+            );
+            if !announce.adjustments.is_empty() {
+                payload["configuration"]["stream_adjustments"] = json!(announce.adjustments);
+            }
             payload["configuration"]["configuration"] = self.config.extension_configuration({
                 let format = profile.media_format.unwrap_or_default();
                 (
@@ -388,17 +471,7 @@ impl Record {
             "display_request":self.config.display_request,
             "display_applied":self.display_applied,
             "failure":self.failure,"cleanup_error":self.cleanup_error});
-        let mut warnings = serde_json::to_value(&self.adjustments).unwrap_or_else(|_| json!([]));
-        let ignored = self.client_feature_flags.unwrap_or(0)
-            & !amaterasu_gamestream::sdp::KNOWN_CLIENT_FEATURE_FLAGS;
-        if ignored != 0 {
-            warnings.as_array_mut().expect("warning array").push(json!({
-                "code":"unsupported_optional_client_features",
-                "message":"Some optional client features are unavailable; streaming can continue.",
-                "ignored_feature_flags":ignored
-            }));
-        }
-        response["warnings"] = warnings;
+        response["warnings"] = json!(self.adjustments);
         if let Some(context) = &self.config.source_capture_context {
             response["source_capture_context"] = json!(context);
         }

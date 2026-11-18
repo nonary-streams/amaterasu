@@ -177,7 +177,6 @@ impl Controller {
         if self.retired_stream_key(&request) {
             return Some(private_error(409, "launch key was already used"));
         }
-        let warning_logger = self.logger.clone();
         if let Some(record) = self
             .records
             .values_mut()
@@ -185,7 +184,7 @@ impl Controller {
         {
             if record.peer == peer && record.request == request && record.state == State::Ready {
                 for warning in request.advisory_warnings.0.clone() {
-                    super::workflow::add_stream_warning(record, warning_logger.as_ref(), warning);
+                    super::workflow::add_stream_warning(record, warning);
                 }
                 record.launch_connection = Some(connection);
                 record.response_kind = response;
@@ -279,7 +278,7 @@ impl Controller {
         };
         let operation = operation_id(&self.nonce, id, "rtsp");
         let mut stream = candidate.into_join(retained, id, operation, connection, now);
-        super::workflow::add_request_warnings(&mut stream, self.logger.as_ref());
+        super::workflow::add_request_warnings(&mut stream);
         stream.response_kind = response;
         self.records.insert(id, stream);
         self.pending_resume = Some(PendingResume {

@@ -140,7 +140,7 @@ outside it.
 
 ## Reports
 
-All reports reach the host log under `amaterasu.runtime`:
+The runtime emits the following reports to the timing capture under `amaterasu.runtime`.
 
 | Target | When | Content |
 | --- | --- | --- |
@@ -150,7 +150,7 @@ All reports reach the host log under `amaterasu.runtime`:
 
 All three targets use Debug. The Performance panel keeps recent slow flows,
 slow spans and timing summaries at any log level. See
-[latency diagnostics](streaming-latency-diagnostics.md) for recording a timing log.
+[latency diagnostics](streaming-latency-diagnostics.md) for recording and reading the capture.
 
 Slow reports are limited to twenty per track and twenty spans per window; the
 window states how many were suppressed and the worst one. Percentiles are

@@ -5860,11 +5860,17 @@ fn retired_stream_failure_preserves_the_application_until_pause_is_verified() {
 }
 
 #[test]
-fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
-    use amaterasu_module_sdk::abi::{AbiHeader, BorrowedBytes, HostApi, ReplySink, Status, STATUS_OK};
+fn live_monitor_logs_the_committed_failure_once_and_keeps_healthy_polls_quiet() {
+    use amaterasu_module_sdk::abi::{
+        AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK, Status,
+    };
     use std::ffi::c_void;
 
-    unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, reply: ReplySink) -> Status {
+    unsafe extern "C" fn invoke(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> Status {
         // SAFETY: the test retains the vector and the runtime invokes this synchronously.
         let commands = unsafe { &mut *context.cast::<Vec<Command>>() };
         let bytes = unsafe { input.read() }.unwrap();
@@ -5875,7 +5881,11 @@ fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
     }
 
     let mut commands = Vec::<Command>::new();
-    let endpoint = HostApi { header: AbiHeader::of::<HostApi>(), context: (&mut commands as *mut Vec<Command>).cast(), invoke };
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut commands as *mut Vec<Command>).cast(),
+        invoke,
+    };
     let runtime = unsafe { amaterasu_module_sdk::RuntimeClient::from_endpoint(endpoint) };
     let (emitter, mut queue) = runtime.log_emitter();
     let now = Instant::now();
@@ -5887,17 +5897,36 @@ fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
     let record = controller.records.values().next().unwrap();
     let id = record.id;
     let ticket = record.rtsp_ticket.unwrap();
-    let mut payload = broker.response("amaterasu.rtsp/1", &json!({"action":"status","ticket":ticket}));
-    let job = workflow::Job { record: id, phase: workflow::Phase::MonitorRtsp,
-        call: call::Call::new("unused", json!({}), "unused".into(), 1000), deadline: now + Duration::from_secs(5) };
+    let mut payload = broker.response(
+        "amaterasu.rtsp/1",
+        &json!({"action":"status","ticket":ticket}),
+    );
+    let job = workflow::Job {
+        record: id,
+        phase: workflow::Phase::MonitorRtsp,
+        call: call::Call::new("unused", json!({}), "unused".into(), 1000),
+        deadline: now + Duration::from_secs(5),
+    };
     controller.consume(&job, payload.clone(), now, &mut Vec::new());
     queue.flush(&runtime);
     assert!(commands.is_empty());
     payload["state"] = json!("failed");
     payload["failure"] = json!("stream_failed");
     controller.consume(&job, payload, now, &mut Vec::new());
+    controller.commit_stream_lifecycle(&mut |command| broker.send(command));
     queue.flush(&runtime);
-    assert!(matches!(&commands[..], [Command::Log { level: 3, target, message }] if target == "launch" && message.contains("MonitorRtsp") && message.contains("unhealthy")));
+    let record = &controller.records[&id];
+    let root = controller
+        .stream_lifecycle
+        .stream(&record.rtsp_operation)
+        .unwrap()
+        .root_cause()
+        .unwrap();
+    assert_eq!(root.issue.operation, record.rtsp_operation);
+    assert!(
+        matches!(&commands[..], [Command::Log { level: 4, target, message }]
+        if target == "stream.lifecycle.failure" && message == &root.issue.description())
+    );
 }
 
 #[test]

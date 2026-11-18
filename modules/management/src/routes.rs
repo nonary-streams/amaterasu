@@ -2480,6 +2480,12 @@ mod tests {
         assert_eq!(status.scope, Some("session.read"));
         assert_eq!(stop.scope, Some("application.terminate"));
         assert!(payload(status, br#"{}"#).is_ok());
+        assert_eq!(
+            payload(status, br#"{"issues_only":true}"#).unwrap()["issues_only"],
+            true
+        );
+        assert!(payload(status, br#"{"issues_only":"true"}"#).is_err());
+        assert!(payload(status, br#"{"issues_only":true,"reference":"bad"}"#).is_err());
         let reference = "a".repeat(64);
         let revision = "b".repeat(64);
         let body =

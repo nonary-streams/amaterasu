@@ -195,10 +195,6 @@ struct ProcessRecord {
     /// Optional launch features that could not be confirmed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
-    #[serde(skip)]
-    warnings_reported: usize,
-    #[serde(skip)]
-    lifecycle_warnings_reported: usize,
     #[serde(flatten)]
     lifecycle: Option<ApplicationLifecycle>,
     #[serde(skip)]
@@ -268,8 +264,7 @@ impl ProcessRecord {
             state: ProcessState::Preparing,
             cleanup_error: None,
             warnings: Vec::new(),
-            warnings_reported: 0,
-            lifecycle_warnings_reported: 0,
+
             lifecycle,
             owner: caller.into(),
             spec,
@@ -900,7 +895,6 @@ struct PreparationLease {
     spec: PreparationSpec,
     lifecycle: ApplicationLifecycle,
     stopping: bool,
-    warnings_reported: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -937,7 +931,6 @@ impl PreparationLease {
             spec,
             lifecycle,
             stopping: false,
-            warnings_reported: 0,
         }
     }
 
@@ -1387,46 +1380,6 @@ impl ProcessManager {
             lease.advance();
         }
         failure.map_or(Ok(()), Err)
-    }
-
-    /// Return each process warning once for the module's bounded host log.
-    pub(crate) fn take_warnings(
-        &mut self,
-    ) -> Vec<(
-        Option<u64>,
-        amaterasu_module_sdk::stream_warnings::StreamWarning,
-    )> {
-        let mut warnings = Vec::new();
-        for record in self.records.values_mut() {
-            warnings.extend(
-                record.warnings[record.warnings_reported..]
-                    .iter()
-                    .cloned()
-                    .map(|warning| (Some(record.process_id), warning)),
-            );
-            record.warnings_reported = record.warnings.len();
-            if let Some(lifecycle) = &record.lifecycle {
-                let pending = &lifecycle.preparation.warnings;
-                warnings.extend(
-                    pending[record.lifecycle_warnings_reported..]
-                        .iter()
-                        .cloned()
-                        .map(|warning| (Some(record.process_id), warning)),
-                );
-                record.lifecycle_warnings_reported = pending.len();
-            }
-        }
-        for lease in self.preparations.values_mut() {
-            let pending = &lease.lifecycle.preparation.warnings;
-            warnings.extend(
-                pending[lease.warnings_reported..]
-                    .iter()
-                    .cloned()
-                    .map(|warning| (None, warning)),
-            );
-            lease.warnings_reported = pending.len();
-        }
-        warnings
     }
 
     fn refresh_hook_readiness(&mut self) {

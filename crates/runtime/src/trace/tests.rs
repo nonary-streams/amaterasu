@@ -375,7 +375,7 @@ fn the_collector_thread_retains_history_for_a_management_surface() {
     assert!(events.iter().any(|event| matches!(
         event,
         amaterasu_contracts::HostLogEvent::Record { level: 1, target, .. }
-            if target == "amaterasu.runtime::trace.slow_span"
+            if target == "amaterasu.runtime::timing/trace.slow_span"
     )));
     // Shutdown is idempotent and leaves history readable.
     hub.shutdown();

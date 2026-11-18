@@ -454,8 +454,13 @@ fn report_input_queue_overflow(record: &Record, incoming: &Value) -> &'static st
     for event in &record.input_events {
         *counts.entry(input_event_kind(event)).or_default() += 1;
     }
+    let classes = counts
+        .iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     eprintln!(
-        "amaterasu input queue overflow queued={} inflight={} incoming={} kinds={counts:?}",
+        "Input queue full. {} events queued ({classes}), {} in flight. Incoming event: {}.",
         record.input_events.len(),
         record.input_inflight,
         input_event_kind(incoming),

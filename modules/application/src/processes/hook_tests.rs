@@ -86,11 +86,6 @@ fn pending_optional_hook_warns_and_launches_after_its_own_deadline() {
     assert!(record.pid.is_some());
     assert_eq!(record.warnings[0].reason, "proton_hook_unconfirmed");
     assert!(record.steam_proton_hook_app_id.is_some());
-    let warnings = manager.take_warnings();
-    assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0].0, Some(id));
-    assert_eq!(warnings[0].1.reason, "proton_hook_unconfirmed");
-    assert!(manager.take_warnings().is_empty());
 }
 
 #[test]

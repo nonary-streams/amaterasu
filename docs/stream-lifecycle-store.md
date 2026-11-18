@@ -37,7 +37,10 @@ helper that builds issues for its callers should be `#[track_caller]` too.
 Code that has no runtime at the point of failure, such as a record method,
 pushes into a `StreamIssueOutbox` and flushes it from the module's tick with
 `flush` or `flush_with`. The outbox holds 64 issues; when it is full the oldest
-is dropped and counted.
+is dropped and counted. On the first publication attempt the SDK also writes
+one human-readable line under the reporting component. A queued retry or
+outbox transfer preserves that logging decision. NVHTTP logs its own local
+commits and consumes provider reports without logging them a second time.
 
 `operation` is the operation ID the module was called with for the stream.
 Every module reports its own failures; no module relays another's.
@@ -73,7 +76,7 @@ subscriber.
 
 A module needs the topic's `publish` grant in its component definition
 (`crates/release/src/profiles.rs`, `STREAM_REPORT_TOPIC`). Without it the
-runtime refuses the event; the module's own log line remains.
+runtime refuses the event. Source logging is best-effort and independent of delivery.
 
 ## Who reports what
 
@@ -138,11 +141,46 @@ runtime's, not the payload's.
 
 Events are notifications. If NVHTTP's subscription falls behind, the open
 streams are marked `audit_gap` instead of presenting a partial record as
-complete; the reporters' log lines (`stream.lifecycle.*`) remain the complete
-record. The store keeps the last 32 streams.
+complete. The console requests `{"issues_only":true}` from `launch_status` with `session.read`.
+The getter returns up to 32 recent commits across retained streams, including
+ended attempts, refusals, and reports awaiting attribution.
+It groups repeated commits for the same operation and shows an incomplete
+history when the subscription is unavailable, entries were dropped or the
+feed skipped records. Source logs can help investigate missing events. The
+store keeps the last 32 streams.
 
-Not yet reporting: capture-vkms is a standalone workspace pinned to the
-published `amaterasu-sdk` revision, which predates this module; its failures
-reach the store only as the video service's reaction (`caused_by: capture`).
+The in-tree VKMS capture build uses the host SDK and publishes its own issues.
 Encoder probes carry no operation ID, so a probe rejection appears only as the
 video service's fallback.
+
+## Logging change review, 2026-11-18
+
+Codex reviewed the SDK reporting and retry paths, NVHTTP launch monitoring,
+RTSP ANNOUNCE and PLAY, video provider fallbacks, retained session warnings,
+and the console read path against the stream failure, admission, retirement
+and generation isolation contracts.
+
+- NVHTTP commits its own decisions under the launch operation. A provider
+  publishes its issue through the SDK. A failed log write permits publication,
+  and a failed publication leaves the report queued. Moving a ticket's pending
+  reports to the controller preserves the logging attempt. The SDK regression
+  `publication_retry_after_retirement_keeps_the_issue_and_logs_once` exercises
+  both failures.
+- After a successful ANNOUNCE reply, RTSP reports the accepted adjustments
+  under that ticket's operation. The standard and extension paths pass the
+  supported client feature bits to the stream. Their status and history use
+  the same adjustment values. RTSP writes the playback summary after the
+  stream owner accepts the start and the PLAY reply is sent. The RTSP tests
+  exercise unknown optional flags, distinct tickets and effective bitrates,
+  extension negotiation, and rejection of a mismatched required profile.
+- The video fallback test checks the demoted warning and the encoder's reason.
+  NVHTTP's monitor test verifies one source log line from the committed failure
+  and silence during healthy polling. Quit tests cover application cleanup
+  authority and its deadline. Late lifecycle preparation tests cover a closed
+  ticket.
+- Diagnostics reads the store through the session-read route. The browser
+  tests exercise different operations, dismissal, missing data and access
+  without host-log permission. Logger tests drive sixty ten-second windows at
+  both Info and Debug and check rotation. These are source and fixture results.
+  Installed-package activation and physical client playback require a separate
+  run.

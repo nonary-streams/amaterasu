@@ -199,7 +199,7 @@ namespace Amaterasu {
       if (page === "tokens") return this.api.role === "administrator" && this.api.allows("tokens.manage");
       if (page === "maintenance") return this.api.role === "administrator" && this.api.allows("configuration.write");
       const scope = pageScopes[page];
-      return !scope || this.api.allows(scope) || (page === "diagnostics" && this.api.allows("host-logs.read")) || (page === "accounts" && this.api.allows("configuration.write"));
+      return !scope || this.api.allows(scope) || (page === "diagnostics" && (this.api.allows("host-logs.read") || this.api.allows("session.read"))) || (page === "accounts" && this.api.allows("configuration.write"));
     }
 
     private releaseDraftGuard(): void {

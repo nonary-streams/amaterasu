@@ -18304,180 +18304,161 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
-    function streamCompatibilityAlerts(contents) {
-        const alerts = new Map();
-        const pattern = /^\[([^\]\r\n]{1,64})\]: Warning: amaterasu\.rtsp::rtsp\.negotiation: Optional client features (0x[0-9a-f]{8}) are unsupported and ignored; streaming can continue\.$/;
-        for (const line of contents.split("\n")) {
-            const warningLine = /^\[([^\]\r\n]{1,64})\]: Warning: amaterasu\.nvhttp::stream\.warning: (\{.{1,2048}\})$/.exec(line.replace(/\r$/, ""));
-            if (warningLine) {
-                try {
-                    const value = JSON.parse(warningLine[2]);
-                    const warning = value.warning;
-                    const scalar = (item) => item === undefined || typeof item === "boolean" ||
-                        (typeof item === "number" && Number.isSafeInteger(item)) ||
-                        (typeof item === "string" && /^[a-zA-Z0-9._\/:\-]{1,64}$/.test(item));
-                    if (value.event === "stream_warning" && typeof value.stream === "string" &&
-                        /^(rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16})$/.test(value.stream) &&
-                        warning && typeof warning.code === "string" && /^[a-zA-Z0-9._\/:\-]{1,64}$/.test(warning.code) &&
-                        typeof warning.source === "string" && /^[a-zA-Z0-9._\/:\-]{1,128}$/.test(warning.source) &&
-                        typeof warning.reason === "string" && /^[a-zA-Z0-9._\/:\-]{1,64}$/.test(warning.reason) &&
-                        (warning.os_error === undefined || (Number.isInteger(warning.os_error) && warning.os_error >= -2147483648 && warning.os_error <= 2147483647)) &&
-                        scalar(warning.requested) && scalar(warning.effective)) {
-                        const key = `warning:${value.stream}:${warning.code}:${warning.reason}`;
-                        const existing = alerts.get(key);
-                        if (existing) {
-                            existing.occurrences++;
-                            existing.lastSeen = warningLine[1];
-                        }
-                        else {
-                            if (alerts.size >= 32)
-                                alerts.delete(alerts.keys().next().value);
-                            alerts.set(key, { key, featureFlags: "", occurrences: 1, lastSeen: warningLine[1], warning: { stream: value.stream, ...warning } });
-                        }
-                    }
-                }
-                catch { }
-                continue;
-            }
-            const fallback = /^\[([^\]\r\n]{1,64})\]: Warning: (?:amaterasu\.rtsp::rtsp|amaterasu\.stream-session::stream)\.compatibility: (\{.{1,2048}\})$/.exec(line.replace(/\r$/, ""));
-            if (fallback) {
-                try {
-                    const value = JSON.parse(fallback[2]);
-                    if (value.event === "stream_adjustment" && typeof value.stream === "string" && /^(rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16})$/.test(value.stream) &&
-                        ["refresh_hint_ignored", "intra_refresh_unavailable", "audio_quality_default", "hevc_capability_hint_ignored", "invalid_optional_hints", "optional_client_features", "bandwidth_adjusted", "compatibility_defaults", "capture_fallback", "encoder_fallback"].includes(value.code) &&
-                        (value.reason === undefined || (typeof value.reason === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value.reason))) &&
-                        Number.isSafeInteger(value.requested) && value.requested >= 0 && value.requested <= 4294967295 &&
-                        Number.isSafeInteger(value.effective) && value.effective >= 0 && value.effective <= 4294967295) {
-                        const key = `adjustment:${value.stream}:${value.code}:${value.requested}:${value.effective}`;
-                        const existing = alerts.get(key);
-                        if (existing) {
-                            existing.occurrences++;
-                            existing.lastSeen = fallback[1];
-                        }
-                        else {
-                            if (alerts.size >= 32)
-                                alerts.delete(alerts.keys().next().value);
-                            alerts.set(key, { key, featureFlags: "", occurrences: 1, lastSeen: fallback[1], adjustment: value });
-                        }
-                    }
-                }
-                catch { }
-                continue;
-            }
-            const match = pattern.exec(line.replace(/\r$/, ""));
-            if (!match)
-                continue;
-            const flags = match[2];
-            const numeric = Number.parseInt(flags.slice(2), 16);
-            if (numeric === 0 || (numeric & 15) !== 0)
-                continue;
-            const key = `optional-client-features:${flags}`;
-            const existing = alerts.get(key);
-            if (existing) {
-                existing.occurrences++;
-                existing.lastSeen = match[1];
-            }
-            else {
-                if (alerts.size >= 32)
-                    alerts.delete(alerts.keys().next().value);
-                alerts.set(key, { key, featureFlags: flags, occurrences: 1, lastSeen: match[1] });
-            }
-        }
-        return [...alerts.values()];
+    function fields(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Invalid stream issue record.");
+        return value;
     }
-    Amaterasu.streamCompatibilityAlerts = streamCompatibilityAlerts;
+    const issueMessages = {
+        optional_client_features: "Ignored unsupported optional client features.",
+        intra_refresh_unavailable: "The encoder does not support the requested intra-refresh mode.",
+        bandwidth_adjusted: "Reduced the video bitrate to allow room for audio and network overhead.",
+        refresh_hint_ignored: "Ignored an inconsistent display refresh hint.",
+        hevc_capability_hint_ignored: "Ignored an unrecognized HEVC capability hint.",
+        invalid_optional_hints: "Ignored invalid optional client hints.",
+        compatibility_defaults: "Used defaults for optional settings omitted by the client.",
+        audio_quality_default: "Used the configured audio quality.",
+        proton_policy_unavailable: "The global Proton controller preference was unavailable.",
+        proton_hook_unavailable: "Could not confirm the Proton controller helper.",
+        application_output_unavailable: "Could not use the configured application output.",
+        detached_command_unavailable: "Could not start an optional detached command.",
+        capture_fallback: "Switched to a compatible capture source.",
+        encoder_fallback: "Switched to a compatible encoder.",
+    };
+    function issueText(issue) {
+        if (typeof issue.code !== "string" || !issue.code)
+            throw new Error("Stream issue has no code.");
+        const words = (value) => value.replaceAll("_", " ");
+        const parts = [Object.hasOwn(issueMessages, issue.code) ? issueMessages[issue.code] : words(issue.code) + "."];
+        if (typeof issue.reason === "string" && issue.reason && issue.reason !== issue.code)
+            parts.push("Reason: " + words(issue.reason) + ".");
+        if (typeof issue.fallback === "string")
+            parts.push("Used " + words(issue.fallback) + ".");
+        for (const [name, label] of [["requested", "Requested"], ["effective", "Effective"], ["os_error", "OS error"]]) {
+            const value = issue[name];
+            if (value == null)
+                continue;
+            if (typeof value !== "boolean" && typeof value !== "string" && !Number.isSafeInteger(value))
+                throw new Error("Invalid stream issue value.");
+            let display = typeof value === "string" ? words(value) : String(value);
+            if (typeof value === "number" && name !== "os_error") {
+                if (issue.code === "bandwidth_adjusted")
+                    display = value + " kbps";
+                else if (issue.code === "refresh_hint_ignored")
+                    display = value / 100 + " Hz";
+                else if (issue.code === "optional_client_features" || issue.code === "invalid_optional_hints")
+                    display = "0x" + value.toString(16).toUpperCase();
+            }
+            parts.push(label + ": " + display + ".");
+        }
+        return parts.join(" ");
+    }
+    function retainedStreamWarnings(detail) {
+        if (!detail)
+            return "Warning history unavailable.";
+        const messages = new Set();
+        for (const event of detail.events) {
+            const field = event.event_type === "stream_warnings" ? "warnings" : event.event_type === "stream_adjustments" ? "adjustments" : null;
+            if (!field)
+                continue;
+            const items = fields(event.payload)[field];
+            if (!Array.isArray(items))
+                throw new Error("Invalid stream warning history.");
+            for (const item of items)
+                messages.add(issueText(fields(item)));
+        }
+        if (detail.events_truncated)
+            messages.add("Some earlier events are unavailable.");
+        return [...messages].join(" ") || "No warnings recorded.";
+    }
+    Amaterasu.retainedStreamWarnings = retainedStreamWarnings;
+    function lifecycleAlerts(value) {
+        const reply = fields(value);
+        if (reply.ok !== true || typeof reply.incomplete !== "boolean" || !Array.isArray(reply.issues))
+            throw new Error("Stream issue history is unavailable.");
+        const alerts = new Map();
+        for (const value of reply.issues) {
+            const entry = fields(value), issue = fields(entry.issue);
+            if (typeof issue.operation !== "string" || typeof entry.publisher !== "string" || !Number.isSafeInteger(entry.at_ms) ||
+                !["critical_failure", "advisory_warning", "demoted_warning"].includes(String(issue.disposition)))
+                throw new Error("Invalid stream issue identity.");
+            const key = JSON.stringify([issue.operation, entry.publisher, issue.layer, issue.phase, issue.disposition,
+                issue.code, issue.reason, issue.caused_by, issue.fallback, issue.requested, issue.effective, issue.os_error]);
+            const previous = alerts.get(key);
+            alerts.set(key, { key, occurrences: (previous?.occurrences ?? 0) + 1, message: issueText(issue), source: entry.publisher, operation: issue.operation, title: issue.disposition === "critical_failure" ? "Failure" : "Warning", at: Math.max(previous?.at ?? 0, Number(entry.at_ms)) });
+        }
+        return { alerts: [...alerts.values()].sort((a, b) => b.at - a.at), incomplete: reply.incomplete };
+    }
+    Amaterasu.lifecycleAlerts = lifecycleAlerts;
     function renderDiagnosticAlerts(context, target) {
-        const storageKey = `amaterasu.diagnostic-alert-dismissals.v1.${encodeURIComponent(context.api.hostOrigin)}`;
+        const storageKey = "amaterasu.lifecycle-dismissals." + context.api.hostOrigin;
         const dismissed = new Set();
-        let persistent = true;
-        let alerts = [];
-        let state = "loading";
         try {
-            const stored = JSON.parse(window.localStorage.getItem(storageKey) ?? "[]");
-            if (Array.isArray(stored))
-                for (const key of stored.slice(-64)) {
-                    if (typeof key === "string" && /^(optional-client-features:0x[0-9a-f]{8}|adjustment:(?:rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16}):[a-z_]+:[0-9]+:[0-9]+|warning:(?:rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16}):[a-zA-Z0-9._\/\-]+:[a-zA-Z0-9._\/\-]+)$/.test(key))
+            const saved = JSON.parse(window.localStorage.getItem(storageKey) ?? "[]");
+            if (Array.isArray(saved))
+                for (const key of saved.slice(-64))
+                    if (typeof key === "string")
                         dismissed.add(key);
-                }
         }
-        catch {
-            persistent = false;
-        }
+        catch { }
+        let snapshot;
+        let status = "Reading stream issues…";
+        let generation = 0;
+        let timer;
         function save() {
             while (dismissed.size > 64)
                 dismissed.delete(dismissed.values().next().value);
             try {
                 window.localStorage.setItem(storageKey, JSON.stringify([...dismissed]));
             }
-            catch {
-                persistent = false;
-            }
+            catch { }
+            render();
         }
         function render() {
             const list = Amaterasu.el("div");
             list.setAttribute("aria-live", "polite");
-            const visible = alerts.filter((alert) => !dismissed.has(alert.key));
-            for (const alert of visible) {
-                if (alert.warning) {
-                    const warning = alert.warning;
-                    const message = warning.code === "proton_policy_unavailable"
-                        ? "The global controller compatibility preference was unavailable. The recorded fallback applies where no app or client override is set."
-                        : warning.code === "proton_hook_unavailable"
-                            ? "The optional Proton controller compatibility helper could not be confirmed. The application continued launching."
-                            : warning.code === "application_output_unavailable"
-                                ? "The configured application output could not be used. The application continued without that output."
-                                : warning.code === "detached_command_unavailable"
-                                    ? "An optional detached command could not start. The application continued launching."
-                                    : warning.code === "invalid_client_hint"
-                                        ? "An invalid optional client hint was ignored. The stream settings were preserved."
-                                        : "An optional stream feature was unavailable. Streaming continued.";
-                    list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", "Stream continued with a warning"), Amaterasu.el("p", "", message), Amaterasu.el("p", "muted", `Stream: ${warning.stream}. Source: ${warning.source}. Reason: ${warning.reason}.${warning.os_error === undefined ? "" : ` OS error: ${warning.os_error}.`}${warning.requested === undefined ? "" : ` Requested: ${warning.requested}.`}${warning.effective === undefined ? "" : ` Used: ${warning.effective}.`} Last seen: ${alert.lastSeen}.`), Amaterasu.button("Dismiss", () => { dismissed.add(alert.key); save(); render(); })));
+            for (const item of snapshot?.alerts ?? []) {
+                if (dismissed.has(item.key))
                     continue;
-                }
-                if (alert.adjustment) {
-                    const adjustment = alert.adjustment;
-                    const messages = {
-                        refresh_hint_ignored: "An inconsistent display refresh hint was ignored. The requested stream frame rate is used.",
-                        intra_refresh_unavailable: "Intra refresh is unavailable. Streaming continues with the default refresh behavior.",
-                        audio_quality_default: "The requested audio quality is unavailable. Streaming continues with the configured audio quality.",
-                        hevc_capability_hint_ignored: "An unrecognized HEVC capability hint was ignored. The negotiated video format is unchanged.",
-                        invalid_optional_hints: "Invalid optional client hints were ignored. Required media and security settings are unchanged.",
-                        optional_client_features: "Unsupported optional client features were ignored.",
-                        bandwidth_adjusted: "The video bitrate was reduced to allow room for audio and network overhead.",
-                        capture_fallback: "The capture provider could not initialize. Streaming continues with a compatible capture path.",
-                        encoder_fallback: "The encoder could not initialize. Streaming continues with a compatible encoder.",
-                        compatibility_defaults: "The client omitted optional settings. Compatible defaults were used.",
-                    };
-                    list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", "Stream continued with adjusted settings"), Amaterasu.el("p", "", messages[adjustment.code]), Amaterasu.el("p", "muted", adjustment.code === "invalid_optional_hints"
-                        ? `Stream: ${adjustment.stream}. Ignored hint mask: 0x${adjustment.requested.toString(16)}. Last seen: ${alert.lastSeen}.`
-                        : `Stream: ${adjustment.stream}. Requested: ${adjustment.requested}; used: ${adjustment.effective}.${adjustment.reason ? ` Reason: ${adjustment.reason}.` : ""} Last seen: ${alert.lastSeen}.`), Amaterasu.button("Dismiss", () => { dismissed.add(alert.key); save(); render(); })));
-                    continue;
-                }
-                const dismiss = Amaterasu.button("Dismiss", () => { dismissed.add(alert.key); save(); render(); });
-                dismiss.setAttribute("aria-label", `Dismiss optional client feature alert ${alert.featureFlags}`);
-                list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", "Some optional client features are unavailable"), Amaterasu.el("p", "", "Streaming can continue. Amaterasu ignored optional features advertised by your client that this host does not recognize."), Amaterasu.el("p", "", "If you need these features, check for host and client updates. Otherwise, no action is needed."), Amaterasu.el("p", "muted", `Feature flags: ${alert.featureFlags}. Seen ${alert.occurrences} time(s) in the retained host log. Last seen: ${alert.lastSeen}.`), dismiss));
+                list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", item.title), Amaterasu.el("p", "", item.message), Amaterasu.el("p", "muted", item.source + " · " + item.operation + " · " + new Date(item.at).toLocaleString() + (item.occurrences > 1 ? " · " + item.occurrences + " occurrences" : "")), Amaterasu.button("Dismiss", () => { dismissed.add(item.key); save(); })));
             }
-            if (!visible.length && state === "ready")
-                list.append(Amaterasu.el("p", "muted", "No undismissed stream compatibility alerts in the retained host log."));
-            if (state === "loading")
-                list.append(Amaterasu.el("p", "muted", "Checking the retained host log for stream compatibility alerts…"));
-            if (state === "unavailable")
-                list.append(Amaterasu.el("p", "notice", context.api.allows("host-logs.read")
-                    ? "Alerts could not be refreshed. Previously loaded alerts remain visible. Use Refresh to try again."
-                    : "Host-log read access is required to view stream compatibility alerts."));
-            const restore = Amaterasu.button("Restore dismissed alerts", () => { dismissed.clear(); save(); render(); });
-            restore.disabled = dismissed.size === 0;
-            target.replaceChildren(Amaterasu.panel("Alerts", list, restore, Amaterasu.el("p", "muted", persistent
-                ? "Dismissals are saved for this host in this browser. Dismissing an alert does not change streaming or delete logs. Different feature flags can raise a new alert."
-                : "Browser storage is unavailable. Dismissals last only while this page is open; streaming and logs are unchanged."), Amaterasu.el("p", "muted", "Alerts cover reported stream adjustments and optional-feature warnings in the retained host log. They refresh with the host log; paused log refresh also pauses new alerts.")));
+            if (status)
+                list.append(Amaterasu.el("p", "muted", status));
+            else if (!list.childElementCount)
+                list.append(Amaterasu.el("p", "muted", "No undismissed stream issues."));
+            if (snapshot?.incomplete)
+                list.append(Amaterasu.el("p", "notice", "Some stream issue records are unavailable."));
+            const restore = Amaterasu.button("Restore dismissed alerts", () => { dismissed.clear(); save(); });
+            restore.disabled = !dismissed.size;
+            target.replaceChildren(Amaterasu.panel("Alerts", list, restore));
         }
-        if (!context.api.allows("host-logs.read"))
-            state = "unavailable";
+        async function refresh() {
+            const current = ++generation;
+            window.clearTimeout(timer);
+            if (!context.api.allows("session.read")) {
+                snapshot = undefined;
+                status = "Session read access is required to view stream issues.";
+                render();
+                return;
+            }
+            try {
+                const result = lifecycleAlerts(await context.api.post("nvhttp/launch_status", { issues_only: true }));
+                if (current !== generation || !target.isConnected)
+                    return;
+                snapshot = result;
+                status = "";
+            }
+            catch {
+                if (current !== generation || !target.isConnected)
+                    return;
+                status = "Stream issues could not be refreshed.";
+            }
+            render();
+            timer = window.setTimeout(() => { if (target.isConnected)
+                void refresh(); }, 5000);
+        }
         render();
-        return {
-            snapshot(contents) { alerts = streamCompatibilityAlerts(contents); state = "ready"; render(); },
-            unavailable() { state = "unavailable"; render(); },
-        };
+        return refresh;
     }
     Amaterasu.renderDiagnosticAlerts = renderDiagnosticAlerts;
 })(Amaterasu || (Amaterasu = {}));
@@ -18513,7 +18494,7 @@ var Amaterasu;
             throw new Error("The host returned an invalid log response.");
         return value;
     }
-    function renderHostLogs(context, target, alerts) {
+    function renderHostLogs(context, target) {
         let generation = 0;
         let contents = "";
         let latestContents = "";
@@ -18898,12 +18879,10 @@ var Amaterasu;
                     }
                     updateFollowing();
                 }
-                alerts?.snapshot(latestContents);
                 progress.textContent = discarded ? `${discarded} older log segments were discarded before this snapshot.` : "Snapshot loaded.";
             }
             catch (error) {
                 if (valid()) {
-                    alerts?.unavailable();
                     progress.replaceChildren(Amaterasu.errorPanel(error));
                 }
             }
@@ -20155,7 +20134,7 @@ var Amaterasu;
     Amaterasu.diagnosticSessionOutcome = diagnosticSessionOutcome;
     function renderDiagnostics(context) {
         const alertsArea = Amaterasu.el("div");
-        const alertObserver = Amaterasu.renderDiagnosticAlerts(context, alertsArea);
+        const refreshAlerts = Amaterasu.renderDiagnosticAlerts(context, alertsArea);
         const area = Amaterasu.el("div");
         const performanceArea = Amaterasu.el("div");
         const hostLogArea = Amaterasu.el("div");
@@ -20255,6 +20234,7 @@ var Amaterasu;
         });
         level.addEventListener("change", () => { selectedMatch = 0; renderFilteredRecords(); });
         context.content.append(Amaterasu.sectionHeading("Diagnostics", "Stream performance, host logs, caller-scoped records, and separately recorded stream outcomes.", Amaterasu.button("Refresh", () => {
+            void refreshAlerts();
             void refreshPerformance?.();
             void refreshHostLogs?.();
             void loadRecentSessions();
@@ -20278,18 +20258,18 @@ var Amaterasu;
                 const details = await Promise.all(list.sessions.map(async (session) => {
                     try {
                         const detail = parseHistoryDetailReply(await context.api.post("history/session_detail", { session_id: session.session_id }), session.session_id).detail;
-                        return { session, outcome: diagnosticSessionOutcome(detail) };
+                        return { session, outcome: diagnosticSessionOutcome(detail), warnings: Amaterasu.retainedStreamWarnings(detail) };
                     }
                     catch {
-                        return { session, outcome: "Outcome unavailable · refresh to retry" };
+                        return { session, outcome: "Outcome unavailable · refresh to retry", warnings: "Warning history unavailable." };
                     }
                 }));
                 if (!context.content.isConnected || request !== sessionRequest)
                     return;
-                sessionsArea.replaceChildren(Amaterasu.table(["Started", "State", "Recorded outcome"], details.map(({ session, outcome }) => [
+                sessionsArea.replaceChildren(Amaterasu.table(["Started", "State", "Recorded outcome", "Recorded warnings"], details.map(({ session, outcome, warnings }) => [
                     new Date(session.started_at_unix * 1000).toLocaleString(),
                     session.ended_at_unix == null ? Amaterasu.badge("Active", "good") : "Ended",
-                    outcome,
+                    outcome, warnings,
                 ])), Amaterasu.el("p", "muted", `Showing at most ${DIAGNOSTIC_SESSION_LIMIT} recent sessions. Client and device identity are not displayed.`));
             }
             catch (error) {
@@ -20350,7 +20330,8 @@ var Amaterasu;
         if (context.api.allows("diagnostics.read"))
             refreshPerformance = Amaterasu.renderPerformance(context, performanceArea);
         if (context.api.allows("host-logs.read"))
-            refreshHostLogs = Amaterasu.renderHostLogs(context, hostLogArea, alertObserver);
+            refreshHostLogs = Amaterasu.renderHostLogs(context, hostLogArea);
+        void refreshAlerts();
         void load();
         void loadRecentSessions();
     }
@@ -25168,7 +25149,7 @@ var Amaterasu;
             if (page === "maintenance")
                 return this.api.role === "administrator" && this.api.allows("configuration.write");
             const scope = pageScopes[page];
-            return !scope || this.api.allows(scope) || (page === "diagnostics" && this.api.allows("host-logs.read")) || (page === "accounts" && this.api.allows("configuration.write"));
+            return !scope || this.api.allows(scope) || (page === "diagnostics" && (this.api.allows("host-logs.read") || this.api.allows("session.read"))) || (page === "accounts" && this.api.allows("configuration.write"));
         }
         releaseDraftGuard() {
             this.draftGuards.dispose();

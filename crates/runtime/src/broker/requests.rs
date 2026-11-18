@@ -367,8 +367,19 @@ impl RequestRouter {
                         ))
                         .or_insert(0_u32) += 1;
                 }
+                let mut groups: Vec<_> = counts.into_iter().collect();
+                groups.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                let retained = groups
+                    .iter()
+                    .take(8)
+                    .map(|((owner, service, completed), count)| {
+                        let state = if *completed { "completed" } else { "pending" };
+                        format!("{count} {state} from {owner} to {service}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 eprintln!(
-                    "runtime request capacity reached caller={caller} retained_by_caller_service_completed={counts:?}"
+                    "Request capacity reached while serving {caller}. Largest retained groups: {retained}."
                 );
                 self.last_capacity_report = Some(now);
             }

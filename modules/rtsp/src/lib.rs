@@ -31,6 +31,7 @@ fn decode_startup_settings(payload: &serde_json::Value) -> ModuleResult<Settings
 struct RtspModule {
     runtime: RuntimeClient,
     controller: Controller,
+    logs: amaterasu_module_sdk::LogQueue,
     started: Instant,
 }
 
@@ -64,6 +65,8 @@ impl ManagedModule for RtspModule {
                 .transpose()?;
         }
         let mut controller = Controller::with_network(settings, network)?;
+        let (logger, logs) = runtime.log_emitter();
+        controller.set_logger(logger);
         controller.enable_stream_issue_reports();
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
@@ -71,12 +74,14 @@ impl ManagedModule for RtspModule {
         Ok(Self {
             runtime,
             controller,
+            logs,
             started: Instant::now(),
         })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
         let now = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.logs.flush(&self.runtime);
         self.controller.tick(&self.runtime, now)
     }
 
