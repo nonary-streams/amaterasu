@@ -163,6 +163,8 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
             );
         } else {
             assert_eq!(result["code"], "extension_profile_not_offered");
+            let fallback = host.response_from(3, "amaterasu.rtsp", start(session));
+            assert_eq!(fallback["state"], "active", "{fallback}");
             assert_eq!(host.plane.borrow().planned_planes, 0);
         }
     }

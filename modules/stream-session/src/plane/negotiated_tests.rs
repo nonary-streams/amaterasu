@@ -857,7 +857,14 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
     const VIDEO_CONTROL: &str = "amaterasu.video/1";
     const ENCODER_CONTROL: &str = "test.encoder/1";
     const ENCODER_NATIVE: &str = "test.encoder-native/1";
-    for (encoder_marker, framer_marker) in [(31u8, 1u8), (32, 2)] {
+    for (encoder_marker, framer_marker, multi_block) in
+        [(31u8, 1u8, false), (32, 2, false), (31, 1, true)]
+    {
+        let transport_fec_blocks = if multi_block {
+            VIDEO_FRAME_MAX_BLOCKS as u32
+        } else {
+            1
+        };
         let video_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
         let audio_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
         video_peer
@@ -902,8 +909,17 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                 )
             })
             .collect();
-        let profile_json = serde_json::json!({"codec":{"namespace_id":42,"value":9,"schema":1},
-            "framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":9,"payload_type":99,"encoding_name":"TEST9"});
+        let selector = if multi_block { 3 } else { 9 };
+        let mut profile_json = serde_json::json!({"codec":{"namespace_id":42,"value":9,"schema":1},
+            "framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":selector,"payload_type":99,"encoding_name":"TEST9"});
+        if multi_block {
+            profile_json["encoding_name"] = "PYROWAVE".into();
+            profile_json["wire_attributes"] = serde_json::json!([{
+                "phase": "describe",
+                "name": "x-ss-pyrowave.bitstream",
+                "value": "186f0393",
+            }]);
+        }
         let policy = serde_json::to_vec(&serde_json::json!({"principals":{
             "provider":{"provide":[MEDIA,ENCODER_CONTROL],"native_provide":[ENCODER_NATIVE,FRAMER,BAD_FRAMER,PLAN,MEDIA,CONTROL]},
             "video":{"provide":[VIDEO_CONTROL],"call":[ENCODER_CONTROL],"native_provide":[VIDEO,VIDEO_CONTROL],"native_use":[ENCODER_NATIVE]},
@@ -949,7 +965,7 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                     VideoProfileSnapshot {
                         profiles: vec![profile.clone()]
                     },
-                    9
+                    selector
                 )
                 .unwrap(),
                 profile
@@ -958,7 +974,7 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                 serde_json::json!({"action":"open","peer_ip":"127.0.0.1","video_port":video_peer.local_addr().unwrap().port(),
                     "audio_port":audio_peer.local_addr().unwrap().port(),"stream_audio":false,
                     "audio":{"packet_ms":10,"channels":2,"wire_payload_bytes":4,"ssrc":0},
-                    "video":{"packet_size":1024,"fec_percentage":0,"min_parity_shards":0,"max_fec_blocks":1}}), "consumer").unwrap();
+                    "video":{"packet_size":1024,"fec_percentage":0,"min_parity_shards":0,"max_fec_blocks":transport_fec_blocks}}), "consumer").unwrap();
             let codec = EncoderFormatId {
                 namespace_id: 42,
                 value: 9,
@@ -1100,10 +1116,11 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             unsupported.framer_service = BAD_FRAMER.into();
             assert!(probe_extension_chain(&consumer, &unsupported, media_stream, &config).is_err());
             let limits = probe_extension_chain(&consumer, &route, media_stream, &config).unwrap();
+            assert_eq!(limits.max_fec_blocks, transport_fec_blocks);
             let selection = VideoUnitSelection {
                 stream: video_stream,
                 generation: video_stream,
-                offer_id: 9,
+                offer_id: u64::from(selector),
                 codec,
                 framing,
                 source_id: 6,

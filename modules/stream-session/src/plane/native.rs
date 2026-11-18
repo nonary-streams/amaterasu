@@ -89,7 +89,10 @@ pub(super) fn probe_chain(
         || limits.network_overhead != if config.peer_ip.is_ipv6() { 48 } else { 28 }
         || limits.min_fec_percentage != u32::from(config.video.fec_percentage)
         || limits.min_parity_shards != u32::from(config.video.min_parity_shards)
-        || limits.max_fec_blocks != u32::from(config.video.max_fec_blocks)
+        // The approved extension transport may support more blocks than the
+        // standard codec path. The framer must also accept these exact limits.
+        || !(u32::from(config.video.max_fec_blocks)..=VIDEO_FRAME_MAX_BLOCKS as u32)
+            .contains(&limits.max_fec_blocks)
         || limits.max_fec_percentage < limits.min_fec_percentage
         || limits.max_fec_percentage > 255
         || limits.fec_policy_flags != 0
