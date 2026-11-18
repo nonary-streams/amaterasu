@@ -107,6 +107,23 @@ fn standalone() -> *const abi::NetworkApi {
     );
     output.cast()
 }
+// Another parallel fixture may briefly acquire the released ephemeral port.
+// Keep the assertion tied to the same endpoint and fail on a persistent owner.
+fn assert_udp_rebinds<T>(bind: impl Fn() -> std::io::Result<T>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match bind() {
+            Ok(_) => return,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("released UDP endpoint could not be rebound: {error}"),
+        }
+    }
+}
 #[test]
 fn opaque_udp_handles_preserve_datagrams_and_drop_closes_final_owner() {
     let network = Network::test_provider();
@@ -128,7 +145,7 @@ fn opaque_udp_handles_preserve_datagrams_and_drop_closes_final_owner() {
     drop(receiver);
     assert!(std::net::UdpSocket::bind(address).is_err());
     drop(clone);
-    assert!(std::net::UdpSocket::bind(address).is_ok());
+    assert_udp_rebinds(|| std::net::UdpSocket::bind(address));
 }
 #[test]
 fn shared_udp_sockets_can_coexist_and_old_providers_are_not_substituted() {
@@ -141,7 +158,7 @@ fn shared_udp_sockets_can_coexist_and_old_providers_are_not_substituted() {
     assert_eq!(second.local_addr().unwrap(), address);
     drop(first);
     drop(second);
-    assert!(network.bind_udp(address).is_ok());
+    assert_udp_rebinds(|| network.bind_udp(address));
 
     let mut old = Network::test_provider();
     old.capabilities.features &= !abi::SHARED_UDP;
@@ -229,7 +246,7 @@ fn incompatible_owned_table_releases_well_formed_prefix_resources() {
         let prefix = table.cast_mut().cast::<NativeInterface>();
         (*prefix).header.major = 99;
         assert!(Network::from_native_table(table).is_err());
-        assert!(std::net::UdpSocket::bind(address).is_ok());
+        assert_udp_rebinds(|| std::net::UdpSocket::bind(address));
     }
 }
 #[test]
