@@ -22,6 +22,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Verify the Windows integration token
+        if: runner.os == 'Windows'
+        run: python scripts/run_native_integration.py --verify-token
       - name: Initialize pinned core plugins
         run: git submodule update --init --recursive
       - uses: actions/checkout@v7
@@ -82,10 +85,10 @@ jobs:
       - name: Lint Rust workspace
         if: success() || (failure() && steps.workspace_tests.outcome == 'failure')
         run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
-      - run: python scripts/test_component_updates.py
-      - run: python scripts/test_platform_modules.py
-      - run: python scripts/test_host_service.py
-      - run: python scripts/test_management_api.py
+      - run: python scripts/run_native_integration.py test_component_updates.py
+      - run: python scripts/run_native_integration.py test_platform_modules.py
+      - run: python scripts/run_native_integration.py test_host_service.py
+      - run: python scripts/run_native_integration.py test_management_api.py
       - name: C ABI layout
         if: runner.os != 'Windows'
         run: cc -std=c11 -Wall -Wextra -Werror -Isdk/include scripts/check_abi.c -o target/check-abi && target/check-abi
