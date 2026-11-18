@@ -291,6 +291,7 @@ mod tests {
         let directory = root.join("management-tls");
         fs::create_dir(&directory).unwrap();
         set_user_dacl(&directory, &sid).unwrap();
+        crate::state_root::test_support::set_fixture_owner(&directory, &sid);
         let old = format!("management-key-{}.pem", "a".repeat(64));
         let current = format!("management-key-{}.pem", "b".repeat(64));
         for name in [&old, &current, "unrelated.txt"] {
