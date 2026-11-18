@@ -334,6 +334,9 @@ fn steam_install_tree_association_stops_only_the_verified_game_process() {
     std::fs::copy(std::env::current_exe().unwrap(), &game_executable).unwrap();
 
     let mut request = launch("steam-windows-tracked", "sleep");
+    // This fixture has no window to close. Give its forced stop a separate
+    // budget from the polling deadline rather than using the 10 s default.
+    request["exit_timeout_seconds"] = json!(1);
     request["executable"] = json!(game_executable);
     request["cwd"] = json!(install_directory);
     request["steam_id"] = json!("42");
@@ -2045,14 +2048,19 @@ fn shutdown_recovers_after_a_transient_job_process_query_failure() {
     let settled = status(&mut manager, "alice", process_id);
     assert_eq!(settled["process"]["state"], "cancelled", "{settled}");
 
-    let recovered = manager.handle("alice", launch("after-job-query", "exit"));
+    assert_eq!(
+        manager.handle("alice", launch("after-job-query", "exit"))["code"],
+        "host_stopping"
+    );
+    let mut replacement = ProcessManager::default();
+    let recovered = replacement.handle("alice", launch("after-job-query", "exit"));
     assert_eq!(recovered["process"]["state"], "running", "{recovered}");
     let recovered_id = recovered["process"]["process_id"].as_u64().unwrap();
     assert_eq!(
-        wait_for_exit(&mut manager, recovered_id)["process"]["success"],
+        wait_for_exit(&mut replacement, recovered_id)["process"]["success"],
         true
     );
-    manager.shutdown().unwrap();
+    replacement.shutdown().unwrap();
 }
 
 #[test]
