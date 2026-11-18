@@ -8,12 +8,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 pub(crate) const DESKTOP_FILE: &str = "org.amaterasu.StreamingHost.desktop";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const DRIVER_MARKER: &[u8] = b"AMATERASU_LINUX_VDD=b2946d02a09bc453d9e6d287623390ca1dedf964\0";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const CAPTURE_MARKER: &[u8] = b"AMATERASU_KWIN_CAPTURE=1\0";
 const DESKTOP_CAPTURE_MARKER: &[u8] = b"AMATERASU_KWIN_DESKTOP_CAPTURE=1\0";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 pub(crate) fn enabled(settings: &BTreeMap<String, Value>) -> bool {
     settings
         .get("amaterasu.capture-pipewire")

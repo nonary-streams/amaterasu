@@ -10,7 +10,6 @@ mod lifecycle_issues;
 #[cfg(all(test, feature = "isolated-helper", target_os = "linux", amaterasu_kms))]
 mod metadata_task;
 mod model;
-#[cfg(amaterasu_kms)]
 mod native;
 #[cfg(all(test, feature = "isolated-helper", target_os = "linux", amaterasu_kms))]
 mod open_task;

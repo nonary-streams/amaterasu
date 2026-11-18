@@ -1,11 +1,16 @@
+#[cfg(amaterasu_kms)]
 use std::{ffi::c_char, ffi::c_void};
 
+#[cfg(amaterasu_kms)]
 pub const ID_CAPACITY: usize = 192;
+#[cfg(amaterasu_kms)]
 pub const NAME_CAPACITY: usize = 128;
+#[cfg(amaterasu_kms)]
 pub const CARD_CAPACITY: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+#[cfg(amaterasu_kms)]
 pub struct NativeInfo {
     pub available: u32,
     pub output_count: u32,
@@ -15,6 +20,7 @@ pub struct NativeInfo {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(amaterasu_kms)]
 pub struct NativeOutput {
     pub left: i32,
     pub top: i32,
@@ -29,6 +35,7 @@ pub struct NativeOutput {
     pub card: [c_char; CARD_CAPACITY],
 }
 
+#[cfg(amaterasu_kms)]
 impl Default for NativeOutput {
     fn default() -> Self {
         Self {
