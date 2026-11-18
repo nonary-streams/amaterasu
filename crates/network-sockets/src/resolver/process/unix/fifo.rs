@@ -217,7 +217,24 @@ pub(crate) fn assert_pair_flags_and_eof(directory: &File) {
         );
     }
     drop(write);
-    assert_eq!(read.read(&mut [0; 1]).unwrap(), 0);
+    // A parallel fork can briefly inherit the descriptor before exec closes it.
+    // Require EOF on this exact reader after a bounded wait.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match read.read(&mut [0; 1]) {
+            Ok(bytes) => {
+                assert_eq!(bytes, 0);
+                break;
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => panic!("private resolver FIFO did not reach EOF: {error}"),
+        }
+    }
 }
 
 #[cfg(test)]
