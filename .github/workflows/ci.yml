@@ -35,7 +35,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev libpulse-dev pkg-config
+          sudo apt-get install -y libwayland-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev libpulse-dev libpipewire-0.3-dev libglib2.0-dev pkg-config
+          pkg-config --exists libpipewire-0.3 gio-2.0 gio-unix-2.0
       - name: Check VKMS shared wire sources
         run: python scripts/check_vkms_wire_sync.py
       - name: Configuration inventory coverage
