@@ -110,3 +110,26 @@ impl Drop for RevertImpersonation {
         }
     }
 }
+
+pub(super) fn set_fixture_owner(path: &std::path::Path, sid: &str) {
+    let sddl = super::wide(std::ffi::OsStr::new(&format!("O:{sid}"))).unwrap();
+    let name = super::wide(path.as_os_str()).unwrap();
+    let mut descriptor = ptr::null_mut();
+    let mut size = 0;
+    // SAFETY: the input is NUL-terminated and the API owns the descriptor allocation.
+    require_success(unsafe {
+        super::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            &mut size,
+        )
+    });
+    // SAFETY: the descriptor and fixture path are live for this synchronous call.
+    let applied = unsafe {
+        super::SetFileSecurityW(name.as_ptr(), super::OWNER_SECURITY_INFORMATION, descriptor)
+    };
+    // SAFETY: the conversion API returned a LocalAlloc-owned descriptor.
+    unsafe { super::LocalFree(descriptor) };
+    require_success(applied);
+}

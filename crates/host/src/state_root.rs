@@ -1329,8 +1329,9 @@ mod tests {
         let file = root.join("not-a-directory");
         fs::write(&file, b"tamper").unwrap();
         assert!(canonical_real_directory(&file, "test").is_err());
-        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", root.display()));
-        assert!(same_windows_path(&root, &verbatim));
+        let root_text = root.to_str().unwrap();
+        let plain = std::path::Path::new(root_text.strip_prefix(r"\\?\").unwrap_or(root_text));
+        assert!(same_windows_path(plain, &root));
         let _ = fs::remove_dir_all(root);
     }
 }

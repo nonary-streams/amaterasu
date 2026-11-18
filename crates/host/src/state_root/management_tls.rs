@@ -295,10 +295,9 @@ mod tests {
         let current = format!("management-key-{}.pem", "b".repeat(64));
         for name in [&old, &current, "unrelated.txt"] {
             let path = directory.join(name);
-            crate::state_root::test_support::with_interactive_permissions(|| {
-                fs::write(&path, b"key").unwrap();
-            });
+            fs::write(&path, b"key").unwrap();
             set_user_dacl(&path, &sid).unwrap();
+            crate::state_root::test_support::set_fixture_owner(&path, &sid);
         }
         prune_obsolete_user_files(&root, &sid, &[current.clone().into()]).unwrap();
         assert!(!directory.join(&old).exists());
