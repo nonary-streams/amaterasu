@@ -553,42 +553,51 @@ pub(crate) fn validate_processing_lifetimes(
     runtime: &RuntimeConfig,
     components: &[ComponentManifest],
 ) -> PackageResult<()> {
-    use amaterasu_contracts::processing_composition::CapabilityBinding;
-    let require_edge =
-        |caller: &str, provider: &CapabilityBinding, native: bool| -> PackageResult<()> {
-            let grants = runtime
-                .principals
-                .get(caller)
-                .ok_or("processing consumer is not packaged")?;
-            let access = if native {
-                &grants.native_use
-            } else {
-                &grants.call
-            };
-            if !access.contains(&provider.service) {
-                return Err("processing dependency lacks an effective grant".into());
-            }
-            if caller == "amaterasu.console" || caller == provider.principal {
-                return Ok(());
-            }
-            let consumer = components
-                .iter()
-                .find(|component| component.id == caller)
-                .ok_or("processing consumer component is not packaged")?;
-            let target = components
-                .iter()
-                .find(|component| component.id == provider.principal)
-                .ok_or("processing dependency component is not packaged")?;
-            if consumer.requires.get(&target.id) != Some(&target.version) {
-                return Err("processing dependency has no signed retirement order".into());
-            }
-            Ok(())
+    visit_processing_lifetimes(runtime, None, |caller, provider, native| {
+        let grants = runtime
+            .principals
+            .get(caller)
+            .ok_or("processing consumer is not packaged")?;
+        let access = if native {
+            &grants.native_use
+        } else {
+            &grants.call
         };
+        if !access.contains(&provider.service) {
+            return Err("processing dependency lacks an effective grant".into());
+        }
+        if caller == "amaterasu.console" || caller == provider.principal {
+            return Ok(());
+        }
+        let consumer = components
+            .iter()
+            .find(|component| component.id == caller)
+            .ok_or("processing consumer component is not packaged")?;
+        let target = components
+            .iter()
+            .find(|component| component.id == provider.principal)
+            .ok_or("processing dependency component is not packaged")?;
+        if consumer.requires.get(&target.id) != Some(&target.version) {
+            return Err("processing dependency has no signed retirement order".into());
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn visit_processing_lifetimes(
+    runtime: &RuntimeConfig,
+    selected: Option<&str>,
+    mut require_edge: impl FnMut(
+        &str,
+        &amaterasu_contracts::processing_composition::CapabilityBinding,
+        bool,
+    ) -> PackageResult<()>,
+) -> PackageResult<()> {
     for (principal, view) in &runtime.processing_compositions {
         let Some(processor) = &view.processor else {
             continue;
         };
-        if &processor.principal != principal {
+        if &processor.principal != principal || selected.is_some_and(|id| id != principal) {
             continue;
         }
         let consumer = view

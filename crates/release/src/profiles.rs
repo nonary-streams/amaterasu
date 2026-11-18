@@ -9,7 +9,7 @@ mod default_extensions;
 pub mod linux_session;
 mod operation_apis;
 mod platform_extensions;
-mod processing;
+use amaterasu_package::processing_policy as processing;
 mod remote_sessions;
 pub(crate) mod windows_side_by_side;
 

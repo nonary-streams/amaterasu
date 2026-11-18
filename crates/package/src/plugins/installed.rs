@@ -296,6 +296,26 @@ pub fn policy_for(
     Ok(approved)
 }
 
+pub(super) fn resolve_composition(
+    base: &[crate::ComponentManifest],
+    bootstrap: &BootstrapConfig,
+    plugins: &[VerifiedPlugin],
+) -> PackageResult<(
+    Vec<crate::ComponentManifest>,
+    amaterasu_contracts::RuntimeConfig,
+)> {
+    let mut approved = policy_for(bootstrap, plugins)?;
+    let mut base = base.to_vec();
+    super::rtx_hdr::apply(&mut approved, &mut base, plugins)?;
+    let components = super::compose(
+        &base,
+        plugins.iter().map(|plugin| &plugin.manifest),
+        &approved,
+    )?;
+    let runtime = super::runtime_configuration(&approved, &components);
+    Ok((components, runtime))
+}
+
 pub fn apply_locked(
     root: &Path,
     mut package: VerifiedPackage,
@@ -337,13 +357,9 @@ pub fn apply_locked(
         }
     }
     let plugins = verify_sources_locked(root, sources, bootstrap)?;
-    let approved = policy_for(bootstrap, &plugins)?;
-    let components = super::compose(
-        &package.manifest.components,
-        plugins.iter().map(|plugin| &plugin.manifest),
-        &approved,
-    )?;
-    package.runtime_config = super::runtime_configuration(&approved, &components);
+    let (components, runtime) =
+        resolve_composition(&package.manifest.components, bootstrap, &plugins)?;
+    package.runtime_config = runtime;
     // Absolute paths exist only in this verified, in-memory loader view. No
     // publisher manifest is rewritten or represented as newly signed bytes.
     package.manifest.components = components

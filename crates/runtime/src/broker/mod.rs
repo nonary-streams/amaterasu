@@ -520,6 +520,9 @@ impl Broker {
                                 self.configuration.host_context.running_components
                             );
                         }
+                        if self.configuration.host_context.rtx_hdr_addon_supported {
+                            payload["rtx_hdr_addon_supported"] = true.into();
+                        }
                         Response::Result { payload }
                     }
                     None => Response::error(

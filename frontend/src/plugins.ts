@@ -980,6 +980,10 @@ namespace Amaterasu {
         const status = await readDriverStatus();
         if (page.signal.aborted || request !== loadRequest || driverRequest !== driverReadRequest) return;
         const previousPhase = ready(driverStatus)?.operation?.phase;
+        if (previousPhase === "activating" && !status.supported) {
+          scheduleDriverPoll();
+          return;
+        }
         driverStatus = {state:"ready",value:status};
         driverFailure = null;
         if (status.operation?.phase === "ready" && previousPhase !== "ready") { await load(); return; }
@@ -1007,11 +1011,21 @@ namespace Amaterasu {
       driverChanging = true;
       ++driverReadRequest;
       driverFailure = null;
+      if (action === "activate" && operation) {
+        // The host may retire its listener before the reply reaches the browser.
+        // Keep polling until the reconnected host confirms the persisted result.
+        driverStatus = {state: "ready", value: {...status, operation: {...operation,
+          phase: "activating", cancellable: false}}};
+      }
       showView("drivers");
       render();
       try {
         await api.post<unknown>(`plugins/${action}`, payload);
-      } catch (error) { driverFailure = error; }
+      } catch (error) {
+        if (action === "activate" && error instanceof ApiError && error.status < 500)
+          driverStatus = {state: "ready", value: status};
+        driverFailure = error;
+      }
       finally { driverChanging = false; }
       await refreshDrivers();
     }
@@ -1732,10 +1746,13 @@ namespace Amaterasu {
       const installing: Part[] = [];
       if (!(plugin.status === "installed" && plugin.runningThisPackage)) {
         if (plugin.kind === "native_plugin") {
-          const supported = ready(driverStatus)?.supported === true;
-          const add = button(plugin.status === "update" ? "Update plugin" : "Add plugin", () => changeDriverSetup("prepare",plugin));
-          add.disabled = !canManage || !supported || driverChanging;
-          installing.push(add, el("p", "muted", supported ? "Setup checks this plugin's dependencies and prompts for any required drivers before activation." : "This host needs a provisioned plugin installation service to add independent plugins."));
+          if (plugin.status !== "installed") {
+            const supported = ready(driverStatus)?.supported === true;
+            const add = button(plugin.status === "update" ? "Update plugin" : "Add plugin", () => changeDriverSetup("prepare",plugin));
+            add.disabled = !canManage || !supported || driverChanging;
+            installing.push(add, el("p", "muted", supported ? "Setup checks this plugin's dependencies and prompts for any required drivers before activation." : "This host needs a provisioned plugin installation service to add independent plugins."));
+            if (plugin.slot === "amaterasu.rtx-hdr") installing.push(el("p", "muted", "Setup downloads the verified NVIDIA runtime. Activation waits for streams to end."));
+          }
         } else if (plugin.slot === "amaterasu.rtx-hdr" && plugin.status === "available") {
           installing.push(
             el("p", "", "RTX HDR is installed from Integrations, which also downloads the NVIDIA runtime it needs."),

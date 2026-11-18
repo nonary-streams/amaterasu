@@ -15,6 +15,7 @@ pub mod composition;
 pub mod installed;
 pub mod operation;
 pub mod preparation;
+pub mod rtx_hdr;
 #[cfg(test)]
 mod tests;
 

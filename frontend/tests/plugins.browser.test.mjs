@@ -248,7 +248,10 @@ test('driver setup uses exact approval, survives a page refresh and waits for id
       host.driver = {id:'example.virtual-display',name:'Virtual display',publisher:'Example',reason:'Creates a screen',required_by:['example.driver-feature','example.capture'],state:'missing',message:'<img src=x onerror=alert(1)>',may_require_reboot:true,installed_version:null};
       const previousReply = host.reply;
       host.reply = (route, body) => {
-        if (route === 'drivers/status') return {ok:true,supported:true,installation_revision:'a'.repeat(64),drivers:[],operation:host.setup};
+        if (route === 'drivers/status') {
+          if (host.restartReads > 0) { host.restartReads--; throw new Error('Host is restarting'); }
+          return {ok:true,supported:true,installation_revision:'a'.repeat(64),drivers:[],operation:host.setup};
+        }
         if (route === 'plugins/prepare') {
           host.setup = {id:'setup1',revision:'1',installation_revision:'a'.repeat(64),phase:'awaiting_approval',approval:'b'.repeat(64),drivers:[host.driver],error:null,cancellable:true};
           return {ok:true};
@@ -259,7 +262,11 @@ test('driver setup uses exact approval, survives a page refresh and waits for id
           return {ok:true};
         }
         if (route === 'plugins/retry') { host.setup.phase = 'ready_to_activate'; host.driver.state = 'ready'; host.setup.revision='3'; return {ok:true}; }
-        if (route === 'plugins/activate') { host.setup.phase = 'ready'; host.setup.cancellable=false; host.setup.revision='4'; return {ok:true}; }
+        if (route === 'plugins/activate') {
+          host.setup.phase = 'ready'; host.setup.cancellable=false; host.setup.revision='4';
+          host.restartReads=2;
+          throw new Error('The activation reply was lost when the host restarted');
+        }
         if (route === 'plugins/cancel') { host.setup.phase = 'cancelled'; host.setup.cancellable=false; return {ok:true}; }
         return previousReply(route,body);
       };

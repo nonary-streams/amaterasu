@@ -607,6 +607,7 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
         running_modules: Vec::new(),
         running_components: Vec::new(),
         plugin_setup_pending: false,
+        rtx_hdr_addon_supported: true,
         schema: 1,
         state_root: Some(r"C:\\ProgramData\\Amaterasu\\runtime\\user-state\\S-1-5-21-1".into()),
         package_root: Some(r"C:\\ProgramData\\Amaterasu\\packages".into()),
@@ -681,6 +682,7 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
     else {
         panic!("management did not receive the running package digest");
     };
+    assert_eq!(payload["rtx_hdr_addon_supported"], true);
     assert_eq!(
         payload,
         serde_json::json!({"digest":"a".repeat(64),"modules":[]})

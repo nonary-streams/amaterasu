@@ -15619,6 +15619,8 @@ var Amaterasu;
             driver_publisher_not_approved: "This driver's publisher needs approval on this computer.",
             plugin_revision_conflict: "This installation changed. Review the plugin again before continuing.",
             driver_stale_approval: "The required drivers changed. Review setup again before approving installation.",
+            rtx_hdr_addon_host_update_required: "Update the Amaterasu host and Core package before adding RTX HDR.",
+            rtx_hdr_already_in_core: "RTX HDR is included in this host's Core package.",
             plugin_trial_failed: "The plugin could not start. The previous working modules have been restored.",
             driver_not_cancellable: "Installation has reached a step that must finish before it can stop.",
         };
@@ -16452,6 +16454,10 @@ var Amaterasu;
                 if (page.signal.aborted || request !== loadRequest || driverRequest !== driverReadRequest)
                     return;
                 const previousPhase = ready(driverStatus)?.operation?.phase;
+                if (previousPhase === "activating" && !status.supported) {
+                    scheduleDriverPoll();
+                    return;
+                }
                 driverStatus = { state: "ready", value: status };
                 driverFailure = null;
                 if (status.operation?.phase === "ready" && previousPhase !== "ready") {
@@ -16489,12 +16495,18 @@ var Amaterasu;
             driverChanging = true;
             ++driverReadRequest;
             driverFailure = null;
+            if (action === "activate" && operation) {
+                driverStatus = { state: "ready", value: { ...status, operation: { ...operation,
+                            phase: "activating", cancellable: false } } };
+            }
             showView("drivers");
             render();
             try {
                 await api.post(`plugins/${action}`, payload);
             }
             catch (error) {
+                if (action === "activate" && error instanceof Amaterasu.ApiError && error.status < 500)
+                    driverStatus = { state: "ready", value: status };
                 driverFailure = error;
             }
             finally {
@@ -17088,10 +17100,14 @@ var Amaterasu;
             const installing = [];
             if (!(plugin.status === "installed" && plugin.runningThisPackage)) {
                 if (plugin.kind === "native_plugin") {
-                    const supported = ready(driverStatus)?.supported === true;
-                    const add = Amaterasu.button(plugin.status === "update" ? "Update plugin" : "Add plugin", () => changeDriverSetup("prepare", plugin));
-                    add.disabled = !canManage || !supported || driverChanging;
-                    installing.push(add, Amaterasu.el("p", "muted", supported ? "Setup checks this plugin's dependencies and prompts for any required drivers before activation." : "This host needs a provisioned plugin installation service to add independent plugins."));
+                    if (plugin.status !== "installed") {
+                        const supported = ready(driverStatus)?.supported === true;
+                        const add = Amaterasu.button(plugin.status === "update" ? "Update plugin" : "Add plugin", () => changeDriverSetup("prepare", plugin));
+                        add.disabled = !canManage || !supported || driverChanging;
+                        installing.push(add, Amaterasu.el("p", "muted", supported ? "Setup checks this plugin's dependencies and prompts for any required drivers before activation." : "This host needs a provisioned plugin installation service to add independent plugins."));
+                        if (plugin.slot === "amaterasu.rtx-hdr")
+                            installing.push(Amaterasu.el("p", "muted", "Setup downloads the verified NVIDIA runtime. Activation waits for streams to end."));
+                    }
                 }
                 else if (plugin.slot === "amaterasu.rtx-hdr" && plugin.status === "available") {
                     installing.push(Amaterasu.el("p", "", "RTX HDR is installed from Integrations, which also downloads the NVIDIA runtime it needs."), Amaterasu.button("Set up RTX HDR", () => context.navigate("integrations")));

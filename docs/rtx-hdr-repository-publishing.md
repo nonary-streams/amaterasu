@@ -1,6 +1,32 @@
-# Publishing the optional RTX HDR Linux session set
+# Publishing the RTX HDR add-on and legacy Linux set
 
-RTX HDR is distributed as an explicitly selected, publisher-signed complete
+The official Linux x86-64 add-on is installed from **Modules → Available → RTX
+HDR → Add plugin**. It requires Core 0.1.1 and its matching host executable. The
+installer checks and stages the NVIDIA runtime from NVIDIA's package index.
+Once preparation finishes, select **Finish adding plugin** to activate it when
+the host is idle. The Core package remains selected during the add-on trial.
+
+Build Amaterasu's RTX HDR provider with `linux-nvidia` and build the stock
+Display Settings and Foreground Context libraries from the same source. Then
+run the following with the official Core signing key in `AMATERASU_PUBLISHER_KEY`.
+
+```text
+amaterasu-release pack-rtx-hdr-addon ARTIFACTS ADDON 0.1.0 0.1.1 SEQUENCE EXPIRY
+amaterasu-release publish-repository BOOTSTRAP OUTPUT amaterasu LOCATION SEQUENCE EXPIRY \
+  --versions CORE_VERSIONS --set amaterasu.runtime amaterasu-core CORE \
+  --plugin amaterasu.rtx-hdr amaterasu-rtx-hdr ADDON
+```
+
+For this release, `CORE_VERSIONS` maps `amaterasu.runtime` to `0.1.1` and
+keeps the source versions of the individual components. Keep the matching host
+executable in the Linux release. The add-on has exact dependency versions and
+ships only Amaterasu libraries. The host selects the SDK roles and supplies the
+local runtime location. A host with RTX HDR bundled in Core already has those
+components and needs a separate migration before installing the add-on.
+
+## Legacy complete-set publishing
+
+Older installations can use an explicitly selected, publisher-signed complete
 Linux session set. The normal installer and Linux session set do not contain the
 RTX HDR provider or NVIDIA runtime. This workflow prepares repository files; it
 does not upload, activate, or restart anything.

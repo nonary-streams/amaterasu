@@ -14,6 +14,7 @@ pub mod playnite_extension;
 pub mod plugins;
 pub mod policy_approval;
 mod privileged;
+pub mod processing_policy;
 pub mod repository;
 mod staging;
 mod storage;

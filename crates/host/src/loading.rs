@@ -266,6 +266,8 @@ impl LoadedComponents {
         let state_root_string = path_to_unicode_string(&state_root)?;
         let mut runtime_config = package.runtime_config.clone();
         runtime_config.host_context.schema = 1;
+        runtime_config.host_context.rtx_hdr_addon_supported =
+            amaterasu_package::plugins::rtx_hdr::runtime_supports_addon(&runtime_component.version);
         runtime_config.host_context.state_root = Some(state_root_string.clone());
         runtime_config.host_lifecycle_control = true;
         runtime_config.host_package_activation_control = true;
