@@ -49,6 +49,8 @@ jobs:
       - run: cargo fmt --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --all --check
       - run: cargo test --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --locked
       - run: cargo clippy --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Use the host workspace's VKMS dependency lock
+        run: cp scripts/locks/capture-vkms-host.lock modules/capture-vkms/capture/Cargo.lock
       - run: cargo fmt --manifest-path modules/capture-vkms/capture/Cargo.toml --all --check
       - run: cargo test --manifest-path modules/capture-vkms/capture/Cargo.toml --locked
       - run: cargo clippy --manifest-path modules/capture-vkms/capture/Cargo.toml --all-targets --locked -- -D warnings

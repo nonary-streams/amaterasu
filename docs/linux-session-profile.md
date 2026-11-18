@@ -81,12 +81,14 @@ env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 15 \
     -p amaterasu-media-transport -p amaterasu-control-transport \
     -p amaterasu-frame-limiter -p amaterasu-stream-session -p amaterasu-rtsp
 git submodule update --init modules/capture-vkms
+cp scripts/locks/capture-vkms-host.lock modules/capture-vkms/capture/Cargo.lock
 env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 15 \
   cargo build --offline --locked --release --manifest-path modules/capture-vkms/capture/Cargo.toml
 ```
 
-The provider uses its own lockfile and pinned SDK. Fetch its dependencies before
-using `--offline`. Both builds share the `CARGO_TARGET_DIR` above.
+The capture provider uses the host-versioned integration lock for this
+build. Its standalone checkout retains its own SDK lock. Fetch dependencies
+before using `--offline`. Both builds share the `CARGO_TARGET_DIR` above.
 
 `scripts/test_linux_session_profile.py` uses software encoding and loopback fixtures.
 It does not verify the native GPU encoder or the Linux virtual-display backend.
