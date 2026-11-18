@@ -498,7 +498,7 @@ mod hydration_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "amaterasu-diagnostics-signed-apply-{}-{timestamp}",
             std::process::id()
         ));
@@ -716,7 +716,7 @@ mod hydration_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "amaterasu-diagnostics-signed-recovery-{}-{timestamp}",
             std::process::id()
         ));
@@ -816,7 +816,7 @@ mod hydration_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let state_root = std::env::temp_dir().join(format!(
+        let state_root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "amaterasu-diagnostics-hydration-{}-{timestamp}",
             std::process::id()
         ));

@@ -325,7 +325,7 @@ mod hydration_tests {
 
     #[test]
     fn successful_refresh_advances_revision_and_failed_sink_keeps_effective_policy() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "amaterasu-diagnostics-status-{}",
             std::process::id()
         ));
@@ -403,7 +403,7 @@ mod hydration_tests {
 
     #[test]
     fn persisted_sink_failure_is_visible_and_recovers_after_restart() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "amaterasu-diagnostics-sink-health-{}",
             std::process::id()
         ));
@@ -484,7 +484,7 @@ mod hydration_tests {
 
     #[test]
     fn blocked_log_directory_recovers_without_changing_the_logging_policy() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "amaterasu-diagnostics-blocked-directory-{}",
             std::process::id()
         ));
@@ -553,7 +553,7 @@ mod hydration_tests {
 
     #[test]
     fn pending_recovery_cannot_restore_a_superseded_revision() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "amaterasu-diagnostics-superseded-retry-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

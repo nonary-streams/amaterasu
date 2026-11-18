@@ -2748,7 +2748,6 @@ mod tests {
     #[test]
     fn artwork_worker_queue_is_bounded_while_a_fetch_is_running() {
         let mut worker = RemoteArtworkWorker::default();
-        let bytes = valid_jpeg();
         let (started_sender, started_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
         let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
@@ -2757,7 +2756,9 @@ mod tests {
             .start_with_fetcher(move |_| {
                 started_sender.send(()).unwrap();
                 fetch_release.lock().unwrap().recv().unwrap();
-                Ok(bytes.clone())
+                // The queue fixture needs a completion for each fetch, not
+                // a decode and resize competing with the short test deadline.
+                Err("fixture_fetch_failed")
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2798,7 +2799,11 @@ mod tests {
         release_sender.send(()).unwrap();
         let mut completed = 0;
         for _ in 0..100 {
-            completed += worker.drain().len();
+            for result in worker.drain() {
+                assert_eq!(result.request_id, completed as u64 + 1);
+                assert_eq!(result.result.err(), Some("fixture_fetch_failed"));
+                completed += 1;
+            }
             if completed == REMOTE_FETCH_QUEUE_CAPACITY + 1 {
                 return;
             }

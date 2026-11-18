@@ -150,7 +150,7 @@ fn sequence_exhaustion_does_not_evict_a_record() {
 
 #[test]
 fn configured_minimum_level_filters_file_output_but_keeps_caller_records() {
-    let state_root = std::env::temp_dir().join(format!(
+    let state_root = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "amaterasu-diagnostics-journal-{}",
         std::process::id()
     ));
