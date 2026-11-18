@@ -573,14 +573,13 @@ fn enroll_project_repository(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
-    use amaterasu_package::encode_hex;
-    use amaterasu_package::{random_identifier, write_json_atomically};
+    use amaterasu_package::random_identifier;
 
     /// Writes a production bootstrap and a signed active package under `root`,
     /// returning the publisher fingerprint.
     #[cfg(target_os = "linux")]
     fn install_signed_root(root: &Path, policy: amaterasu_contracts::RuntimeConfig) -> String {
+        use amaterasu_package::{encode_hex, write_json_atomically};
         use ed25519_dalek::{Signer, SigningKey};
         let signer = SigningKey::from_bytes(&[11u8; 32]);
         let key = *signer.verifying_key().as_bytes();

@@ -12,7 +12,7 @@ fn closed_loopback_connection_allows_immediate_transport_restart() {
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let (accepted, _) = transport.listeners[0].accept().unwrap();
+    let accepted = accept_fixture_connection(&transport);
     accepted.shutdown(Shutdown::Write).unwrap();
     let mut byte = [0];
     assert_eq!(client.read(&mut byte).unwrap(), 0);
@@ -35,6 +35,20 @@ use std::{
 
 fn server() -> Transport {
     Transport::bind("127.0.0.1:0".parse().unwrap(), false).unwrap()
+}
+
+fn accept_fixture_connection(server: &Transport) -> amaterasu_module_sdk::network::TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match server.listeners[0].accept() {
+            Ok((stream, _)) => return stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "loopback peer was not accepted");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("could not accept loopback fixture peer: {error}"),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -62,7 +76,7 @@ fn invalid_rebind_preserves_connections_waiting_in_listener_backlog() {
     assert_eq!(server.local_addr().unwrap(), address);
     // The existing listener must remain open, not just be rebound at the same
     // address, because a successful TCP handshake may be waiting to be accepted.
-    assert!(server.listeners[0].accept().is_ok());
+    accept_fixture_connection(&server);
 }
 
 #[test]
@@ -77,7 +91,7 @@ fn unrelated_bind_collision_preserves_existing_listener_backlog() {
         Err("tcp_bind_failed")
     );
     assert_eq!(server.local_addr().unwrap(), address);
-    assert!(server.listeners[0].accept().is_ok());
+    accept_fixture_connection(&server);
 }
 
 #[test]
@@ -98,7 +112,7 @@ fn later_bind_collision_or_duplicate_preserves_existing_listener_backlog() {
             Err("tcp_bind_failed")
         );
         assert_eq!(server.local_addr().unwrap(), address);
-        assert!(server.listeners[0].accept().is_ok());
+        accept_fixture_connection(&server);
     }
 }
 
