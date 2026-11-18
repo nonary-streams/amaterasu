@@ -682,10 +682,9 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
     else {
         panic!("management did not receive the running package digest");
     };
-    assert_eq!(payload["rtx_hdr_addon_supported"], true);
     assert_eq!(
         payload,
-        serde_json::json!({"digest":"a".repeat(64),"modules":[]})
+        serde_json::json!({"digest":"a".repeat(64),"modules":[],"rtx_hdr_addon_supported":true})
     );
     for caller in ["amaterasu.state", "amaterasu.audio", "other"] {
         assert!(matches!(
