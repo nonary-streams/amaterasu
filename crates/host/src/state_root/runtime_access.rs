@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn runtime_read_grants_do_not_inherit_into_private_state() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::state_root::test_support::temp_dir().join(format!(
             "amaterasu-runtime-access-{}-{}",
             std::process::id(),
             amaterasu_package::random_identifier().unwrap()
@@ -150,22 +150,24 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(
-            fs::read(root.join("sets/selected/module.dll")).unwrap(),
-            b"signed payload"
-        );
-        assert!(fs::write(root.join("sets/selected/module.dll"), b"modified").is_err());
-        assert!(fs::write(root.join("sets/selected/extra.dll"), b"unverified").is_err());
         // The shared repository lock is the sole writable machine-owned file.
         grant(&root.join("host.lock"), &sid, &owners, READ_WRITE).unwrap();
-        let lock = RootLock::acquire(&root).unwrap();
-        assert!(RootLock::acquire(&root).is_err());
-        drop(lock);
-        assert!(RootLock::acquire(&root).is_ok());
-        // The root's SID entry has no inheritance flags, so it cannot turn
-        // newly created machine-private descendants into user-readable data.
         validate_dacl(&root.join("data/secret"), private).unwrap();
-        assert!(fs::read(root.join("data/secret")).is_err());
+        crate::state_root::test_support::with_interactive_permissions(|| {
+            assert_eq!(
+                fs::read(root.join("sets/selected/module.dll")).unwrap(),
+                b"signed payload"
+            );
+            assert!(fs::write(root.join("sets/selected/module.dll"), b"modified").is_err());
+            assert!(fs::write(root.join("sets/selected/extra.dll"), b"unverified").is_err());
+            let lock = RootLock::acquire(&root).unwrap();
+            assert!(RootLock::acquire(&root).is_err());
+            drop(lock);
+            assert!(RootLock::acquire(&root).is_ok());
+            // The root SID entry has no inheritance flags, so it cannot turn
+            // new machine-private descendants into user-readable data.
+            assert!(fs::read(root.join("data/secret")).is_err());
+        });
         // Restore ownership access for cleanup in a non-elevated test process.
         let full = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})");
         set_dacl(&root.join("host.lock"), &full).unwrap();

@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn abandoned_stages_are_removed_without_touching_active_snapshots() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::state_root::test_support::temp_dir().join(format!(
             "amaterasu-tls-stage-test-{}-{}",
             std::process::id(),
             random_identifier().unwrap()
@@ -282,7 +282,7 @@ mod tests {
         let sid = sid_string(token).unwrap();
         // SAFETY: OpenProcessToken returned this owned token.
         unsafe { CloseHandle(token) };
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::state_root::test_support::temp_dir().join(format!(
             "amaterasu-tls-prune-{}-{}",
             std::process::id(),
             random_identifier().unwrap()
@@ -295,7 +295,9 @@ mod tests {
         let current = format!("management-key-{}.pem", "b".repeat(64));
         for name in [&old, &current, "unrelated.txt"] {
             let path = directory.join(name);
-            fs::write(&path, b"key").unwrap();
+            crate::state_root::test_support::with_interactive_permissions(|| {
+                fs::write(&path, b"key").unwrap();
+            });
             set_user_dacl(&path, &sid).unwrap();
         }
         prune_obsolete_user_files(&root, &sid, &[current.clone().into()]).unwrap();

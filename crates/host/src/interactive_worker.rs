@@ -1499,7 +1499,7 @@ fn quote_windows_argument(argument: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundUserProfile, CloseHandle, TOKEN_QUERY, quote_windows_argument};
+    use super::{CloseHandle, TOKEN_QUERY, quote_windows_argument, verify_profile_owner};
     use std::ffi::c_void;
 
     #[link(name = "advapi32")]
@@ -1520,12 +1520,18 @@ mod tests {
             unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
             0
         );
-        let profile = BoundUserProfile::for_token(token);
+        let profile = crate::state_root::test_support::temp_dir().join(format!(
+            "amaterasu-profile-test-{}",
+            amaterasu_package::random_identifier().unwrap()
+        ));
+        crate::state_root::test_support::with_interactive_permissions(|| {
+            std::fs::create_dir(&profile).unwrap();
+        });
+        let sid = verify_profile_owner(token, &profile);
         // SAFETY: OpenProcessToken returned this owned handle.
         unsafe { CloseHandle(token) };
-        let profile = profile.unwrap();
-        assert!(profile.path.is_dir());
-        assert!(profile.sid.starts_with("S-1-"));
+        std::fs::remove_dir(&profile).unwrap();
+        assert!(sid.unwrap().starts_with("S-1-"));
     }
 
     #[test]

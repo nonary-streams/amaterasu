@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 mod management_tls;
 mod runtime_access;
 mod seed;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) use management_tls::apply_staged_tls;
 pub(crate) use management_tls::protect_development_files;
 pub(crate) use seed::apply_pending_seed;
@@ -934,34 +936,36 @@ mod tests {
 
     #[test]
     fn steam_cache_parent_is_private_and_stable_across_restart() {
-        let root = std::env::temp_dir().join(format!(
+        let root = super::test_support::temp_dir().join(format!(
             "amaterasu-steam-host-cache-{}-{}",
             std::process::id(),
             amaterasu_package::random_identifier().unwrap()
         ));
-        fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let sddl = format!(
-            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})",
-            current_sid()
-        );
-        make_permissive(&root);
-        assert!(prepare_steam_artwork_cache_parent(&root).is_err());
-        set_dacl(&root, &sddl).unwrap();
-        let first = prepare_steam_artwork_cache_parent(&root).unwrap();
-        assert_eq!(first, root.join("provider-cache").join("steam"));
-        validate_dacl(&root.join("provider-cache"), &sddl).unwrap();
-        validate_dacl(&first, &sddl).unwrap();
-        assert_eq!(prepare_steam_artwork_cache_parent(&root).unwrap(), first);
-        fs::write(root.join("unrelated.txt"), b"keep").unwrap();
-        assert_eq!(fs::read(root.join("unrelated.txt")).unwrap(), b"keep");
-        fs::remove_dir_all(root).unwrap();
+        super::test_support::with_interactive_permissions(|| {
+            fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let sddl = format!(
+                "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})",
+                current_sid()
+            );
+            make_permissive(&root);
+            assert!(prepare_steam_artwork_cache_parent(&root).is_err());
+            set_dacl(&root, &sddl).unwrap();
+            let first = prepare_steam_artwork_cache_parent(&root).unwrap();
+            assert_eq!(first, root.join("provider-cache").join("steam"));
+            validate_dacl(&root.join("provider-cache"), &sddl).unwrap();
+            validate_dacl(&first, &sddl).unwrap();
+            assert_eq!(prepare_steam_artwork_cache_parent(&root).unwrap(), first);
+            fs::write(root.join("unrelated.txt"), b"keep").unwrap();
+            assert_eq!(fs::read(root.join("unrelated.txt")).unwrap(), b"keep");
+            fs::remove_dir_all(root).unwrap();
+        });
     }
 
     #[test]
     fn pending_seed_copy_isolated_from_its_machine_source() {
-        let root =
-            std::env::temp_dir().join(format!("amaterasu-state-root-copy-{}", std::process::id()));
+        let root = super::test_support::temp_dir()
+            .join(format!("amaterasu-state-root-copy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let seed = root.join("seed");
         let destination = root.join("destination");
@@ -979,7 +983,7 @@ mod tests {
 
     #[test]
     fn interrupted_stage_refreshes_new_seed_keys_and_preserves_user_credential() {
-        let root = std::env::temp_dir().join(format!(
+        let root = super::test_support::temp_dir().join(format!(
             "amaterasu-state-root-refreshed-stage-{}",
             std::process::id()
         ));
@@ -1069,7 +1073,7 @@ mod tests {
 
     #[test]
     fn legacy_completion_marker_replays_once_and_upgrades() {
-        let root = std::env::temp_dir().join(format!(
+        let root = super::test_support::temp_dir().join(format!(
             "amaterasu-state-root-legacy-marker-{}",
             std::process::id()
         ));
@@ -1110,7 +1114,7 @@ mod tests {
 
     #[test]
     fn existing_user_state_receives_only_missing_seed_files_once() {
-        let root = std::env::temp_dir().join(format!(
+        let root = super::test_support::temp_dir().join(format!(
             "amaterasu-state-root-existing-{}",
             std::process::id()
         ));
@@ -1170,7 +1174,7 @@ mod tests {
 
     #[test]
     fn existing_authentication_credential_wins_over_imported_seed() {
-        let root = std::env::temp_dir().join(format!(
+        let root = super::test_support::temp_dir().join(format!(
             "amaterasu-state-root-credential-wins-{}",
             std::process::id()
         ));
@@ -1202,7 +1206,7 @@ mod tests {
 
     #[test]
     fn oversized_namespace_merge_preserves_existing_state_and_no_completion_marker() {
-        let root = std::env::temp_dir().join(format!(
+        let root = super::test_support::temp_dir().join(format!(
             "amaterasu-state-root-namespace-limit-{}",
             std::process::id()
         ));
@@ -1239,8 +1243,8 @@ mod tests {
 
     #[test]
     fn pending_seed_is_claimed_once_by_the_first_sid() {
-        let root =
-            std::env::temp_dir().join(format!("amaterasu-state-root-claim-{}", std::process::id()));
+        let root = super::test_support::temp_dir()
+            .join(format!("amaterasu-state-root-claim-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         assert!(claim_pending_seed(&root, "S-1-5-21-1").unwrap());
@@ -1261,7 +1265,7 @@ mod tests {
 
     #[test]
     fn incomplete_seed_claim_fails_closed_before_another_user_can_copy_it() {
-        let root = std::env::temp_dir().join(format!(
+        let root = super::test_support::temp_dir().join(format!(
             "amaterasu-state-root-incomplete-claim-{}",
             std::process::id()
         ));
@@ -1316,7 +1320,7 @@ mod tests {
 
     #[test]
     fn rejects_a_non_directory_state_root_and_normalizes_verbatim_paths() {
-        let root = std::env::temp_dir().join(format!(
+        let root = super::test_support::temp_dir().join(format!(
             "amaterasu-state-root-tamper-{}",
             std::process::id()
         ));
