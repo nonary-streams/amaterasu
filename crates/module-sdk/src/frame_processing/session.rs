@@ -32,6 +32,23 @@ pub struct FrameDelivery {
     pub freshness: u32,
 }
 
+/// The endpoint that first returned a terminal native error during forwarding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameProcessingEndpoint {
+    Capture,
+    Processor(usize),
+    Consumer,
+}
+
+/// Evidence retained even when forwarding retires the connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameProcessingFailure {
+    pub endpoint: FrameProcessingEndpoint,
+    pub call: &'static str,
+    pub status: Status,
+    pub capture_generation: Option<u64>,
+}
+
 /// Native owners outlive this thread-confined session and its Drop barrier.
 /// The downstream consumer is retired before the processor on every exit path.
 pub struct FrameProcessingSession {
@@ -46,6 +63,7 @@ pub struct FrameProcessingSession {
     retired: bool,
     configuration_uncertain: bool,
     last_delivery: Option<FrameDelivery>,
+    failure: Cell<Option<FrameProcessingFailure>>,
     dispatch_us: Cell<u64>,
     module_thread: PhantomData<Rc<()>>,
 }
@@ -107,6 +125,7 @@ impl FrameProcessingSession {
             retired: false,
             configuration_uncertain: false,
             last_delivery: None,
+            failure: Cell::new(None),
             dispatch_us: Cell::new(0),
             module_thread: PhantomData,
         })
@@ -118,6 +137,25 @@ impl FrameProcessingSession {
     }
     pub fn last_delivery(&self) -> Option<FrameDelivery> {
         self.last_delivery
+    }
+    pub fn take_failure(&self) -> Option<FrameProcessingFailure> {
+        self.failure.take()
+    }
+    fn observe_failure(
+        &self,
+        endpoint: FrameProcessingEndpoint,
+        call: &'static str,
+        status: Status,
+    ) {
+        if !matches!(status, STATUS_OK | MEDIA_BUSY | MEDIA_PENDING) && self.failure.get().is_none()
+        {
+            self.failure.set(Some(FrameProcessingFailure {
+                endpoint,
+                call,
+                status,
+                capture_generation: self.input.0.map(|(generation, _)| generation),
+            }));
+        }
     }
     pub fn is_retired(&self) -> bool {
         self.retired
@@ -190,6 +228,7 @@ impl FrameProcessingSession {
     }
 
     fn forward_source(&mut self, flags: u32, refresh: bool) -> Result<Status, ConnectionError> {
+        self.failure.set(None);
         if self.retired {
             return Err(ConnectionError::Stale);
         }
@@ -219,6 +258,13 @@ impl FrameProcessingSession {
         }?;
         input.restore_state(self.input);
         let negotiated = input.negotiate_source(refresh);
+        if let Err(ConnectionError::Native(status)) = negotiated {
+            self.observe_failure(
+                FrameProcessingEndpoint::Capture,
+                "negotiate_resource",
+                status,
+            );
+        }
         self.input = input.take_state();
         negotiated?;
         if let Err(error) = self.negotiate_outputs() {
@@ -235,6 +281,15 @@ impl FrameProcessingSession {
         } else {
             input.forward(flags)
         };
+        if let Ok(status) = result
+            && self.last_delivery.is_none()
+        {
+            self.observe_failure(
+                FrameProcessingEndpoint::Capture,
+                "read_resource_frame",
+                status,
+            );
+        }
         self.input = input.take_state();
         if !matches!(result, Ok(STATUS_OK | MEDIA_BUSY | MEDIA_PENDING)) {
             self.cancel();
@@ -255,6 +310,12 @@ impl FrameProcessingSession {
             } else {
                 (unsafe { &*self.consumer }, self.consumer_stream)
             };
+            let downstream = if index + 1 < self.stages.len() {
+                FrameProcessingEndpoint::Processor(index + 1)
+            } else {
+                FrameProcessingEndpoint::Consumer
+            };
+            let upstream = FrameProcessingEndpoint::Processor(index);
             let mut inputs = Ids::default();
             let mut input_generation = 0;
             let status = unsafe {
@@ -265,6 +326,7 @@ impl FrameProcessingSession {
                     &mut input_generation,
                 )
             };
+            self.observe_failure(downstream, "enumerate_resources", status);
             check_enumeration(status, input_generation, &inputs)?;
             let context = processor.base.base.context;
             let mut outputs = Ids::default();
@@ -277,6 +339,7 @@ impl FrameProcessingSession {
                     &mut output_generation,
                 )
             };
+            self.observe_failure(upstream, "enumerate_outputs", status);
             check_enumeration(status, output_generation, &outputs)?;
             let mut configure = Configure {
                 ids: Ids::default(),
@@ -302,8 +365,10 @@ impl FrameProcessingSession {
             }
             if let Some(error) = configure.failure {
                 self.configuration_uncertain = configure.active;
+                self.observe_failure(downstream, "configure_resource", error);
                 return Err(ConnectionError::Native(error));
             }
+            self.observe_failure(upstream, "enumerate_outputs", status);
             check_enumeration(status, second_generation, &configure.ids)?;
             if output_generation != second_generation || outputs.ids != configure.ids.ids {
                 return Err(ConnectionError::Stale);
@@ -315,6 +380,7 @@ impl FrameProcessingSession {
                 unsafe { (processor.select_output)(context, stream, output_generation, offer) };
             if status != STATUS_OK {
                 self.configuration_uncertain = true;
+                self.observe_failure(upstream, "select_output", status);
                 return Err(ConnectionError::Native(status));
             }
             self.stages[index].output = Some((output_generation, offer));
@@ -434,14 +500,20 @@ unsafe extern "C" fn inputs(
     // SAFETY: the local bridge and processor remain live for this call.
     let session = unsafe { &*context.cast::<FrameProcessingSession>() };
     let processor = unsafe { &*session.stages[0].processor };
-    unsafe {
+    let status = unsafe {
         (processor.base.enumerate_resources)(
             processor.base.base.context,
             session.stages[0].stream,
             sink,
             generation,
         )
-    }
+    };
+    session.observe_failure(
+        FrameProcessingEndpoint::Processor(0),
+        "enumerate_resources",
+        status,
+    );
+    status
 }
 unsafe extern "C" fn configure_input(
     context: *mut c_void,
@@ -454,7 +526,7 @@ unsafe extern "C" fn configure_input(
     // SAFETY: the bridge borrows its session and source offer through configure.
     let session = unsafe { &*context.cast::<FrameProcessingSession>() };
     let processor = unsafe { &*session.stages[0].processor };
-    unsafe {
+    let status = unsafe {
         (processor.base.configure)(
             processor.base.base.context,
             session.stages[0].stream,
@@ -463,7 +535,15 @@ unsafe extern "C" fn configure_input(
             source_generation,
             source,
         )
+    };
+    if status != MEDIA_UNSUPPORTED {
+        session.observe_failure(
+            FrameProcessingEndpoint::Processor(0),
+            "configure_resource",
+            status,
+        );
     }
+    status
 }
 unsafe extern "C" fn cancel(context: *mut c_void, _: u64) {
     // SAFETY: the bridge borrows the session exclusively for its ordered barrier.
@@ -507,14 +587,18 @@ unsafe extern "C" fn output(context: *mut c_void, frame: *const CaptureResourceF
         unsafe { process_stage(state.session, state.index + 1, frame, state.flags) }
     } else {
         let consumer = unsafe { &*state.session.consumer };
-        unsafe {
+        let status = unsafe {
             (consumer.submit)(
                 consumer.base.context,
                 state.session.consumer_stream,
                 frame,
                 state.flags,
             )
-        }
+        };
+        state
+            .session
+            .observe_failure(FrameProcessingEndpoint::Consumer, "submit", status);
+        status
     };
     state.downstream_us = elapsed_us(started);
     state.result
@@ -544,6 +628,7 @@ unsafe fn process_stage(
     let started = Instant::now();
     let status =
         unsafe { (processor.process)(processor.base.base.context, stage.stream, input, sink) };
+    session.observe_failure(FrameProcessingEndpoint::Processor(index), "process", status);
     session.dispatch_us.set(
         session
             .dispatch_us
@@ -555,6 +640,11 @@ unsafe fn process_stage(
         || delivery.calls == 1 && status != delivery.result
         || delivery.calls == 0 && status == STATUS_OK
     {
+        session.observe_failure(
+            FrameProcessingEndpoint::Processor(index),
+            "validate_process_result",
+            STATUS_INTERNAL_ERROR,
+        );
         STATUS_INTERNAL_ERROR
     } else {
         status

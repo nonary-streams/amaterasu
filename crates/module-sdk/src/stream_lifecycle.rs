@@ -18,8 +18,8 @@
 //!   publishes a [`StreamBinding`] from its own operation prefix to the stream,
 //!   and the store files the providers' reports, earlier or later, under it.
 //! - **State** is the [`StreamLifecycleStore`] the launch owner keeps: one
-//!   [`StreamLifecycle`] per stream, with the first critical failure kept as
-//!   the root cause and every demoted fallback kept as a warning.
+//!   [`StreamLifecycle`] per stream, with the first direct evidence of a
+//!   critical failure kept as the root cause and demoted fallbacks kept as warnings.
 //! - **Getters** are [`StreamLifecycleStore::snapshot`], which the owner serves
 //!   to management.
 //!
@@ -140,6 +140,7 @@ pub enum LifecycleLayer {
     DisplaySettings,
     VirtualDisplay,
     Capture,
+    FrameProcessing,
     EncodeVideo,
     Audio,
     AudioEncode,
@@ -167,6 +168,7 @@ impl LifecycleLayer {
             Self::DisplaySettings => "display_settings",
             Self::VirtualDisplay => "virtual_display",
             Self::Capture => "capture",
+            Self::FrameProcessing => "frame_processing",
             Self::EncodeVideo => "encode_video",
             Self::Audio => "audio",
             Self::AudioEncode => "audio_encode",
@@ -186,7 +188,7 @@ impl LifecycleLayer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueDisposition {
-    /// The stream cannot start or continue. The first one is the root cause.
+    /// The stream cannot start or continue. Direct evidence takes precedence over reactions.
     CriticalFailure,
     /// A failure that was not critical; the stream continued on `fallback`.
     DemotedWarning,
@@ -194,9 +196,69 @@ pub enum IssueDisposition {
     AdvisoryWarning,
 }
 
+/// The exact error observed at an authenticated native service boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeStreamFailure {
+    pub service: String,
+    pub call: String,
+    pub status: crate::abi::Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_generation: Option<u64>,
+}
+
+impl NativeStreamFailure {
+    fn valid(&self) -> bool {
+        self.service
+            .rsplit_once('/')
+            .is_some_and(|(name, version)| {
+                identifier(name, MAX_IDENTIFIER)
+                    && !version.is_empty()
+                    && version.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            && self.service.len() <= MAX_IDENTIFIER
+            && identifier(&self.call, MAX_LABEL)
+            && self.status != crate::abi::STATUS_OK
+            && self.capture_generation != Some(0)
+    }
+
+    fn status_name(&self) -> &'static str {
+        use crate::abi::{STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT, STATUS_UNAVAILABLE};
+        use amaterasu_media::{
+            MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED,
+        };
+        match self.status {
+            STATUS_INVALID_ARGUMENT => "STATUS_INVALID_ARGUMENT",
+            STATUS_INTERNAL_ERROR => "STATUS_INTERNAL_ERROR",
+            STATUS_UNAVAILABLE => "STATUS_UNAVAILABLE",
+            MEDIA_PENDING => "MEDIA_PENDING",
+            MEDIA_BUSY => "MEDIA_BUSY",
+            MEDIA_CLOSED => "MEDIA_CLOSED",
+            MEDIA_UNSUPPORTED => "MEDIA_UNSUPPORTED",
+            MEDIA_BACKEND_ERROR => "MEDIA_BACKEND_ERROR",
+            _ => "native status",
+        }
+    }
+}
+
+impl std::fmt::Display for NativeStreamFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "{} returned {} ({}) from {}.",
+            self.service,
+            self.status_name(),
+            self.status,
+            self.call
+        )?;
+        if let Some(generation) = self.capture_generation {
+            write!(out, " Capture offer generation {generation}.")?;
+        }
+        Ok(())
+    }
+}
+
 /// One reported failure or warning: a mutation of a stream's lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StreamIssue {
     /// Any operation ID the reporter holds for the stream: the launch owner's
     /// stream key, or an ID the owner derived from it (`<key>-…`, `<key>.…`).
@@ -216,16 +278,32 @@ pub struct StreamIssue {
     pub site: String,
     /// Set when this is the reporter's own reaction to a dependency's
     /// failure, such as a caller ending a stream because a provider refused.
-    /// The dependency reports its failure itself; this issue never outranks
-    /// that report as the root cause.
+    /// A reaction stands in for the root cause until the store has direct
+    /// evidence, either first-hand or observed at the dependency boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caused_by: Option<LifecycleLayer>,
+    /// Direct observation at the failing call, retained independently of later reactions.
+    #[serde(
+        default,
+        deserialize_with = "read_optional_native_failure",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub native_failure: Option<Box<NativeStreamFailure>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_error: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested: Option<WarningValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective: Option<WarningValue>,
+}
+
+fn read_optional_native_failure<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<NativeStreamFailure>>, D::Error> {
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value::<NativeStreamFailure>(value).ok())
+        .filter(NativeStreamFailure::valid)
+        .map(Box::new))
 }
 
 impl StreamIssue {
@@ -307,6 +385,7 @@ impl StreamIssue {
             fallback,
             site: format!("{}:{}", site.file(), site.line()),
             caused_by: None,
+            native_failure: None,
             os_error: None,
             requested: None,
             effective: None,
@@ -328,6 +407,11 @@ impl StreamIssue {
     /// layer's failure.
     pub fn is_origin(&self) -> bool {
         self.caused_by.is_none()
+    }
+
+    pub fn with_native_failure(mut self, failure: NativeStreamFailure) -> Self {
+        self.native_failure = Some(Box::new(failure));
+        self
     }
 
     pub fn with_os_error(mut self, os_error: i32) -> Self {
@@ -362,6 +446,10 @@ impl StreamIssue {
                 .is_none_or(|fallback| identifier(fallback, MAX_IDENTIFIER))
             && (self.disposition != IssueDisposition::DemotedWarning || self.fallback.is_some())
             && bounded(&self.site, MAX_SITE)
+            && self
+                .native_failure
+                .as_deref()
+                .is_none_or(NativeStreamFailure::valid)
             && [&self.requested, &self.effective]
                 .into_iter()
                 .all(|value| match value {
@@ -448,6 +536,9 @@ impl StreamIssue {
         }
         if let Some(error) = self.os_error {
             let _ = write!(message, " OS error {error}.");
+        }
+        if let Some(failure) = &self.native_failure {
+            let _ = write!(message, " {failure}");
         }
         let _ = write!(message, " (Operation {})", self.operation);
         message

@@ -10,7 +10,8 @@ pub use factory::{FrameProcessor, FrameProcessorFactory, into_frame_processor_bi
 pub use input::{ProcessingFrame, RetainedProcessingInput};
 pub use output::ResourceOutputFrame;
 pub use session::{
-    FrameDelivery, FrameProcessingSession, FrameProcessingStage, MAX_PROCESSING_STAGES,
+    FrameDelivery, FrameProcessingEndpoint, FrameProcessingFailure, FrameProcessingSession,
+    FrameProcessingStage, MAX_PROCESSING_STAGES,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameResourceSelection {

@@ -17,6 +17,7 @@ struct State {
     consumer: *const FrameResourceConsumerApi,
     presentation: Cell<Option<HostVideoPresentation>>,
     submit_us: Cell<u64>,
+    submitted_to_provider: Cell<bool>,
 }
 
 pub struct PresentingResourceConsumer {
@@ -51,6 +52,7 @@ impl PresentingResourceConsumer {
             consumer,
             presentation: Cell::new(None),
             submit_us: Cell::new(0),
+            submitted_to_provider: Cell::new(false),
         });
         state.api.base.context = std::ptr::from_mut(&mut *state).cast();
         Ok(Self {
@@ -67,11 +69,17 @@ impl PresentingResourceConsumer {
         self.state.submit_us.get()
     }
 
+    /// Whether the last submission for this presentation reached the provider.
+    pub fn submitted_to_provider(&self) -> bool {
+        self.state.submitted_to_provider.get()
+    }
+
     /// Assign the stream timeline for the next submission. Without a
     /// presentation, submissions are declined: a frame on the capture clock
     /// would be rejected or misordered by a timeline-checking encoder.
     pub fn set_presentation(&mut self, presentation: HostVideoPresentation) {
         self.state.submit_us.set(0);
+        self.state.submitted_to_provider.set(false);
         self.state.presentation.set(Some(presentation));
     }
 }
@@ -140,6 +148,7 @@ unsafe extern "C" fn submit(
         Err(status) => return status,
     };
     let started = Instant::now();
+    state.submitted_to_provider.set(true);
     let status =
         unsafe { (consumer.submit)(consumer.base.context, stream, presented.descriptor(), flags) };
     state

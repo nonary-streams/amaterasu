@@ -66,13 +66,22 @@ The chain on a Linux launch:
 An operation matches a stream when it equals the key or an alias, or starts
 with one followed by `-`, `.` or `:`; the longest match wins. A binding may
 name its stream through an alias. Reports that arrive before their binding are
-kept as unattributed and filed under the stream when the binding arrives; the
-root cause is still the earliest critical failure by commit order.
+kept as unattributed and filed under the stream when the binding arrives.
 
 All fields except `operation` and `site` must be short identifiers
 (`[A-Za-z0-9_.:-]`, at most 64 bytes). An issue cannot carry a request body,
 path or message. Invalid issues are refused by `report` and counted by the
 subscriber.
+
+A report can include `native_failure` when the reporter directly observed a
+native call fail. It carries the versioned service, call, original signed
+status code, and capture offer generation when known. Use the selected service
+identity and the unmodified return code. This evidence names no paths, resource
+handles, frame contents, or provider messages.
+Older reports may omit it. Readers keep the base issue if optional native
+details are unavailable or malformed, and ignore unfamiliar fields. Upgrade
+the installed NVHTTP reader alongside a producer that emits this field if the
+installed reader predates this compatibility behavior.
 
 A module needs the topic's `publish` grant in its component definition
 (`crates/release/src/profiles.rs`, `STREAM_REPORT_TOPIC`). Without it the
@@ -89,9 +98,9 @@ store; warnings it relays for history were reported by their module.
 ## Dispositions
 
 - `critical_failure`: the stream cannot start or continue. The stream's
-  `root_cause` is the earliest critical failure that originated in its
-  reporter (no `caused_by`), by commit order; a reaction stands in only until
-  the origin's report arrives. Cleanup failures caused by it appear beside it.
+  `root_cause` is the earliest critical failure reported first-hand or observed
+  directly at a native call, by commit order. A downstream reaction stands in
+  until that evidence arrives. Cleanup failures caused by it appear beside it.
   A critical failure stops being the root cause when it is recovered from:
   its reporter later demotes the same code for the same operation, or a
   caller demotes with `caused_by` its layer and its code as `reason` (a

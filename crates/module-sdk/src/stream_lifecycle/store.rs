@@ -177,14 +177,15 @@ impl StreamLifecycle {
 }
 
 /// The root cause is the earliest failure that originated in its reporter.
-/// A caller's reaction to a dependency (`caused_by`) stands in only until the
-/// dependency's own report arrives. Commit order, not arrival, decides, so an
-/// earlier report filed late by a binding still wins.
+/// A direct observation at a native boundary is also evidence of the original
+/// failure. A downstream reaction stands in only until direct evidence arrives.
+/// Commit order breaks ties, even when an earlier report awaits a binding.
 fn outranks(entry: &LifecycleEntry, root: Option<&LifecycleEntry>) -> bool {
     let Some(root) = root else {
         return true;
     };
-    match (entry.issue.is_origin(), root.issue.is_origin()) {
+    let direct_evidence = |issue: &StreamIssue| issue.is_origin() || issue.native_failure.is_some();
+    match (direct_evidence(&entry.issue), direct_evidence(&root.issue)) {
         (true, false) => true,
         (false, true) => false,
         _ => entry.seq < root.seq,

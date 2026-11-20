@@ -53,6 +53,21 @@ test("repeat commits show their occurrence count and latest time", () => {
   assert.equal(alert.at, 1600);
 });
 
+test("native failures show the service, call and error without grouping different errors", () => {
+  const first = entry("attempt");
+  first.issue = {...first.issue, disposition: "critical_failure", code: "frame_processor_failed",
+    native_failure: {service: "amaterasu.rtx-hdr/1", call: "process", status: 13, capture_generation: 3}};
+  const second = {...first, issue: {...first.issue, native_failure: {...first.issue.native_failure, status: -79}}};
+  const {alerts} = lifecycleAlerts(reply([first, second]));
+  assert.equal(alerts.length, 2);
+  assert.match(alerts[0].message, /amaterasu\.rtx-hdr\/1 returned native status 13 from process/);
+  assert.match(alerts[0].message, /Capture offer generation 3/);
+  assert.match(alerts[1].message, /native status -79/);
+  const fallback = {...first, issue: {...first.issue, native_failure: {status: "invalid"}}};
+  const [baseAlert] = lifecycleAlerts(reply([fallback])).alerts;
+  assert.match(baseAlert.message, /frame processor failed/);
+});
+
 test("history reads only typed warning events", () => {
   const detail = {events:[{event_type:"stream_warnings", payload:{warnings:[entry("one").issue]}},
     {event_type:"log", payload:{message:"Optional client features"}}], events_truncated:true};

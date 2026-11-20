@@ -612,3 +612,99 @@ fn a_callers_fallback_recovers_a_providers_refusal() {
     );
     assert!(store.stream("launch-1").unwrap().healthy());
 }
+
+#[test]
+fn the_report_preserves_the_observed_native_failure_across_late_binding_and_reactions() {
+    let mut store = StreamLifecycleStore::new();
+    store.open("launch-1");
+    let native = NativeStreamFailure {
+        service: "amaterasu.rtx-hdr/1".into(),
+        call: "process".into(),
+        status: amaterasu_media::MEDIA_UNSUPPORTED,
+        capture_generation: Some(3),
+    };
+    let issue = StreamIssue::critical(
+        "ss-2a-video",
+        LifecycleLayer::EncodeVideo,
+        "running",
+        "frame_processor_failed",
+    )
+    .caused_by(LifecycleLayer::FrameProcessing)
+    .with_native_failure(native.clone());
+    assert!(issue.valid());
+    assert_eq!(
+        serde_json::from_value::<StreamIssue>(json!(issue)).unwrap(),
+        issue
+    );
+    assert!(
+        issue
+            .description()
+            .contains("amaterasu.rtx-hdr/1 returned MEDIA_UNSUPPORTED (13) from process")
+    );
+    store.commit_at(1, "amaterasu.linux-session-video", issue);
+    store.commit_at(
+        2,
+        "amaterasu.stream-session",
+        StreamIssue::critical(
+            "launch-1",
+            LifecycleLayer::StreamSession,
+            "media",
+            "video_hdr_metadata_unavailable",
+        )
+        .caused_by(LifecycleLayer::EncodeVideo),
+    );
+    store.commit_at(
+        3,
+        "amaterasu.nvhttp",
+        StreamIssue::critical(
+            "launch-1",
+            LifecycleLayer::Nvhttp,
+            "monitor_rtsp",
+            "rtsp_stream_failed",
+        )
+        .caused_by(LifecycleLayer::Rtsp),
+    );
+    store.bind("launch-1", "ss-2a");
+    let report = store.snapshot("launch-1").unwrap();
+    let root = report.root_cause.unwrap();
+    assert_eq!(root.issue.caused_by, Some(LifecycleLayer::FrameProcessing));
+    assert_eq!(root.issue.native_failure.as_deref(), Some(&native));
+    assert_eq!(root.issue.code, "frame_processor_failed");
+}
+
+#[test]
+fn optional_native_details_cannot_drop_an_otherwise_valid_report() {
+    let issue = StreamIssue::critical(
+        "attempt",
+        LifecycleLayer::EncodeVideo,
+        "running",
+        "video_failed",
+    );
+    let mut payload = json!(StreamReport::Issue(issue.clone()));
+    payload["future_context"] = json!({"not_yet_understood": true});
+    payload["native_failure"] = json!({
+        "service": "amaterasu.rtx-hdr/1", "call": "process", "status": 13, "future_context": 2,
+    });
+    let StreamReport::Issue(received) = serde_json::from_value(payload.clone()).unwrap() else {
+        panic!("expected an issue");
+    };
+    assert!(received.valid());
+    assert_eq!(received.native_failure.as_ref().unwrap().status, 13);
+
+    for invalid in [
+        json!("bad detail"),
+        json!({"service":"/private/path", "call":"process", "status":13}),
+    ] {
+        payload["native_failure"] = invalid;
+        assert_eq!(
+            serde_json::from_value::<StreamReport>(payload.clone()).unwrap(),
+            StreamReport::Issue(issue.clone())
+        );
+    }
+    payload["code"] = json!("invalid code with spaces");
+    assert!(
+        !serde_json::from_value::<StreamReport>(payload)
+            .unwrap()
+            .valid()
+    );
+}

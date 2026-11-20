@@ -227,6 +227,7 @@ struct Effect {
     name: &'static str,
     observers: Option<Rc<RefCell<Vec<RetainedProcessingInput>>>>,
     order: Rc<RefCell<Vec<&'static str>>>,
+    failure: Option<Status>,
 }
 impl FrameProcessor for Effect {
     fn configure_stream(&mut self, _: u64, _: &[u8]) -> Result<(), Status> {
@@ -278,6 +279,9 @@ impl FrameProcessor for Effect {
         _: u64,
         input: ProcessingFrame<'_>,
     ) -> Result<ResourceOutputFrame, Status> {
+        if let Some(status) = self.failure {
+            return Err(status);
+        }
         let source = input.descriptor();
         assert_eq!(source.resource.kind, self.kind.get());
         if let Some(observers) = &self.observers {
@@ -396,12 +400,19 @@ fn sink(sink: &mut Sink) -> FrameResourceConsumerApi {
     }
 }
 fn processor(order: Rc<RefCell<Vec<&'static str>>>) -> *const FrameProcessorApi {
+    processor_with_failure(order, None)
+}
+fn processor_with_failure(
+    order: Rc<RefCell<Vec<&'static str>>>,
+    failure: Option<Status>,
+) -> *const FrameProcessorApi {
     let api = into_frame_processor_binding(Effect {
         kind: Cell::new(0),
         output_kind: FRAME_RESOURCE_VENDOR_BASE + 30,
         name: "processor",
         observers: None,
         order,
+        failure,
     });
     let p = unsafe { &*api };
     assert_eq!(
@@ -499,6 +510,7 @@ fn busy_sink_releases_input_and_next_call_uses_newest_frame() {
     }
     .unwrap();
     assert_eq!(session.forward(0), Ok(MEDIA_BUSY));
+    assert_eq!(session.take_failure(), None);
     assert_eq!(source.references.get(), 0);
     assert_eq!(source.released.get(), 1);
     source.sequence += 100;
@@ -508,6 +520,91 @@ fn busy_sink_releases_input_and_next_call_uses_newest_frame() {
     drop(session);
     assert_eq!(source.references.get(), 0);
     unsafe { release_processor(processor) };
+}
+
+#[test]
+fn forwarding_preserves_the_first_native_error_after_cancellation() {
+    unsafe extern "C" fn capture_failed(
+        _: *mut c_void,
+        _: u64,
+        _: CaptureResourceFrameSink,
+    ) -> Status {
+        MEDIA_CLOSED
+    }
+    unsafe extern "C" fn encoder_failed(
+        _: *mut c_void,
+        _: u64,
+        _: *const CaptureResourceFrame,
+        _: u32,
+    ) -> Status {
+        -79
+    }
+
+    for (endpoint, call, status) in [
+        (
+            FrameProcessingEndpoint::Capture,
+            "read_resource_frame",
+            MEDIA_CLOSED,
+        ),
+        (
+            FrameProcessingEndpoint::Processor(0),
+            "process",
+            MEDIA_UNSUPPORTED,
+        ),
+        (FrameProcessingEndpoint::Consumer, "submit", -79),
+    ] {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let mut source = Source::new(FRAME_RESOURCE_VENDOR_BASE + 10);
+        let mut capture = capture(&mut source);
+        if endpoint == FrameProcessingEndpoint::Capture {
+            capture.read_resource_frame = capture_failed;
+        }
+        let processor = processor_with_failure(
+            order.clone(),
+            (endpoint == FrameProcessingEndpoint::Processor(0)).then_some(status),
+        );
+        let mut downstream = Sink {
+            kind: FRAME_RESOURCE_VENDOR_BASE + 30,
+            held: None,
+            busy: false,
+            saw_pending: false,
+            handle: ptr::null(),
+            order: order.clone(),
+        };
+        let mut sink = sink(&mut downstream);
+        if endpoint == FrameProcessingEndpoint::Consumer {
+            sink.submit = encoder_failed;
+        }
+        let mut session = unsafe {
+            FrameProcessingSession::new(
+                &capture,
+                2,
+                &[FrameProcessingStage {
+                    processor: &(*processor).base,
+                    stream: 1,
+                }],
+                &sink,
+                3,
+                FRAME_ACCESS_GPU,
+            )
+        }
+        .unwrap();
+        assert_eq!(session.forward_latest(0), Ok(status));
+        assert!(session.is_retired());
+        assert_eq!(*order.borrow(), ["consumer", "processor"]);
+        assert_eq!(
+            session.take_failure(),
+            Some(FrameProcessingFailure {
+                endpoint,
+                call,
+                status,
+                capture_generation: Some(3),
+            })
+        );
+        assert_eq!(session.take_failure(), None);
+        drop(session);
+        unsafe { release_processor(processor) };
+    }
 }
 #[test]
 fn stale_source_generation_retires_downstream_before_processor() {
@@ -636,6 +733,7 @@ fn multiple_steps_and_shared_readers_forward_dependencies_without_copies_or_comp
             name,
             observers: observe.then(|| observers.clone()),
             order: order.clone(),
+            failure: None,
         });
         let processor = unsafe { &*api };
         assert_eq!(

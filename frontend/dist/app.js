@@ -18332,6 +18332,14 @@ var Amaterasu;
         const parts = [Object.hasOwn(issueMessages, issue.code) ? issueMessages[issue.code] : words(issue.code) + "."];
         if (typeof issue.reason === "string" && issue.reason && issue.reason !== issue.code)
             parts.push("Reason: " + words(issue.reason) + ".");
+        if (issue.native_failure && typeof issue.native_failure === "object" && !Array.isArray(issue.native_failure)) {
+            const failure = fields(issue.native_failure);
+            if (typeof failure.service === "string" && typeof failure.call === "string" && Number.isSafeInteger(failure.status)) {
+                parts.push(`${failure.service} returned native status ${failure.status} from ${failure.call}.`);
+                if (Number.isSafeInteger(failure.capture_generation))
+                    parts.push(`Capture offer generation ${failure.capture_generation}.`);
+            }
+        }
         if (typeof issue.fallback === "string")
             parts.push("Used " + words(issue.fallback) + ".");
         for (const [name, label] of [["requested", "Requested"], ["effective", "Effective"], ["os_error", "OS error"]]) {
@@ -18383,7 +18391,8 @@ var Amaterasu;
                 !["critical_failure", "advisory_warning", "demoted_warning"].includes(String(issue.disposition)))
                 throw new Error("Invalid stream issue identity.");
             const key = JSON.stringify([issue.operation, entry.publisher, issue.layer, issue.phase, issue.disposition,
-                issue.code, issue.reason, issue.caused_by, issue.fallback, issue.requested, issue.effective, issue.os_error]);
+                issue.code, issue.reason, issue.caused_by, issue.fallback, issue.requested, issue.effective, issue.os_error,
+                issue.native_failure]);
             const previous = alerts.get(key);
             alerts.set(key, { key, occurrences: (previous?.occurrences ?? 0) + 1, message: issueText(issue), source: entry.publisher, operation: issue.operation, title: issue.disposition === "critical_failure" ? "Failure" : "Warning", at: Math.max(previous?.at ?? 0, Number(entry.at_ms)) });
         }
