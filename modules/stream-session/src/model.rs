@@ -192,8 +192,7 @@ impl ProcessingPlanProvider {
 pub struct ExtensionRoute {
     pub profile: amaterasu_contracts::media_profile::VideoProfile,
     /// The same extension at other media formats, such as 8-bit SDR beside
-    /// 10-bit HDR. A session uses the one matching the format its launch
-    /// probes, so an SDR client can stream or resume the extension too.
+    /// 10-bit HDR or another chroma sampling at the same depth and range.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alternate_profiles: Vec<amaterasu_contracts::media_profile::VideoProfile>,
     pub source_id: u64,
@@ -233,8 +232,34 @@ impl ExtensionRoute {
                 .all(|(i, service)| !services[..i].contains(service))
     }
 
-    fn profiles(&self) -> impl Iterator<Item = &amaterasu_contracts::media_profile::VideoProfile> {
+    pub(crate) fn profiles(
+        &self,
+    ) -> impl Iterator<Item = &amaterasu_contracts::media_profile::VideoProfile> {
         std::iter::once(&self.profile).chain(&self.alternate_profiles)
+    }
+
+    /// Keep chroma variants of the same wire profile for the launch probe.
+    pub(crate) fn for_launch_format(
+        &self,
+        format: &amaterasu_module_sdk::VideoStreamFormat,
+    ) -> Option<Self> {
+        let mut route = self.for_format(format)?;
+        let primary_format = route.profile.media_format.unwrap_or_default();
+        for profile in self.profiles() {
+            let media = profile.media_format.unwrap_or_default();
+            if media.bit_depth != primary_format.bit_depth
+                || media.dynamic_range != primary_format.dynamic_range
+                || media.chroma_sampling == primary_format.chroma_sampling
+            {
+                continue;
+            }
+            let mut sibling = profile.clone();
+            sibling.media_format = route.profile.media_format;
+            if sibling == route.profile {
+                route.alternate_profiles.push(profile.clone());
+            }
+        }
+        Some(route)
     }
 
     /// This route for one session: the profile whose media format matches
@@ -1613,6 +1638,21 @@ fn valid_minimum_fps_target(value: f64) -> bool {
 }
 
 impl VideoConfiguration {
+    pub(crate) fn with_extension_profile(
+        &self,
+        profile: &amaterasu_contracts::media_profile::VideoProfile,
+    ) -> Self {
+        use amaterasu_contracts::media_profile::ChromaSampling;
+        let mut config = self.clone();
+        config.video_stream_format.chroma_sampling =
+            match profile.media_format.unwrap_or_default().chroma_sampling {
+                ChromaSampling::Yuv420 => amaterasu_module_sdk::ChromaSampling::Yuv420,
+                ChromaSampling::Yuv444 => amaterasu_module_sdk::ChromaSampling::Yuv444,
+            };
+        config.extension_profile = Some(profile.clone());
+        config
+    }
+
     pub(crate) fn valid_extension_probe(&self) -> bool {
         self.extension_profile.is_none()
             && self.video_stream_format.validate().is_ok()

@@ -414,6 +414,7 @@ pub struct Broker {
     pub state_value: Option<Value>,
     pub state_fail_set: bool,
     pub extension_probe_supported: bool,
+    pub reject_extension_yuv444: bool,
     pub extension_probe_encoder_override: Option<Value>,
     pub extension_bad_unit: bool,
 }
@@ -1011,7 +1012,11 @@ impl Broker {
             return error("injected_cleanup_failure");
         }
         if service == "amaterasu.video/1" && action == "probe_source" {
-            return if self.extension_probe_supported {
+            return if self.extension_probe_supported
+                && !(self.reject_extension_yuv444
+                    && call.payload["configuration"]["video_stream_format"]["chroma_sampling"]
+                        == "yuv444")
+            {
                 json!({"ok":true,"source_id":call.payload["source_id"],"encoder":self.extension_probe_encoder_override.clone().unwrap_or_else(|| call.payload["encoder"].clone()),"profile":call.payload["configuration"]["extension_profile"]})
             } else {
                 error("encoder_probe_failed")

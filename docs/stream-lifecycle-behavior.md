@@ -111,6 +111,31 @@ expiry, restart cleanup and stale Quit replies. This change spans the NVHTTP,
 RTSP and stream-session components, which ship together. Real Moonlight
 playback and physical scanout require live verification.
 
+### PyroWave 4:4:4 negotiation review
+
+Codex reviewed the PyroWave 4:4:4 encoder revision and its Core gitlink,
+RTSP and stream-session changes, and signed composition update based on
+`b129e39f`. Serverinfo advertises the 4:4:4 bits when the composition enables
+both new launch profiles. Stream-session probes the selected launch depth and
+range in both 4:2:0 and 4:4:4 before RTSP publishes Moonlight's shared PyroWave
+marker. Each probe uses the exact encoder, media profile, and framing chain.
+The read-only probes share the original launch budget. A failed, malformed,
+or unconfirmed probe discards the partial offer and records a lifecycle warning.
+A pending read still settles against its original operation and cannot add a
+profile to a completed offer. RTSP proceeds with the standard codec offer.
+
+ANNOUNCE must match a verified profile. PLAY passes its exact sampling and
+negotiated color through the existing authenticated startup to video and the
+encoder's native configuration. The existing lifecycle owner still decides
+startup readiness and owns rollback and retirement. Encryption, source
+ownership, packet framing, and cleanup deadlines follow the same contracts.
+
+Coverage includes serverinfo capability bits, legacy and multiple-profile
+DESCRIBE replies, Moonlight-shaped SDR and HDR 4:4:4 ANNOUNCE, the selected
+video Open, optional probe rejection and timeout with standard startup, and
+GPU encode-decode at 8-bit SDR, 10-bit SDR, and HDR10. Live client playback and
+installed-package activation require separate verification.
+
 ## Preparation and restart
 
 Reached preparation steps own their undo commands, including steps with an

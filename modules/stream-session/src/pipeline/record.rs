@@ -146,7 +146,7 @@ pub(super) struct Record {
     pub providers: crate::providers::ProviderServices,
     pub extension_route: Option<crate::model::ExtensionRoute>,
     pub extension_checked: bool,
-    pub extension_limits: Option<amaterasu_media::VideoFramingLimits>,
+    pub extension_limits: Vec<amaterasu_media::VideoFramingLimits>,
     pub negotiated_route: Option<crate::plane::NegotiatedRoute>,
     pub id: u64,
     pub history: super::history::SessionHistory,
@@ -299,6 +299,20 @@ pub(super) struct UncertainJournalWrite {
 }
 
 impl Record {
+    pub(super) fn offered_extensions(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &amaterasu_contracts::media_profile::VideoProfile,
+            &amaterasu_media::VideoFramingLimits,
+        ),
+    > {
+        self.extension_route
+            .iter()
+            .filter(|_| self.extension_checked)
+            .flat_map(|route| route.profiles().zip(&self.extension_limits))
+    }
+
     pub fn accept_negotiated_unit(&mut self, payload: &Value) -> Result<(), &'static str> {
         let Some(profile) = self
             .start
@@ -311,13 +325,13 @@ impl Record {
             .extension_route
             .as_ref()
             .ok_or("extension_profile_not_offered")?;
-        let limits = self
-            .extension_limits
+        let (_, limits) = self
+            .offered_extensions()
+            .find(|(offered, _)| *offered == profile)
             .ok_or("extension_profile_not_offered")?;
         let unit: UnitResponse = serde_json::from_value(payload["negotiated_unit"].clone())
             .map_err(|_| "invalid_video_unit_selection")?;
-        if profile != &route.profile
-            || unit.stream != self.resources[&Resource::Video]
+        if unit.stream != self.resources[&Resource::Video]
             || unit.generation != unit.stream
             || unit.offer_id != u64::from(profile.wire_selector)
             || unit.source_id != route.source_id
@@ -337,12 +351,12 @@ impl Record {
             }
         };
         self.negotiated_route = Some(crate::plane::NegotiatedRoute {
-            profile: route.profile.clone(),
+            profile: profile.clone(),
             video_service: route.video_unit_service.clone(),
             framer_service: route.framer_service.clone(),
             transport_service: route.plan_transport_service.clone(),
             clock_origin_us: unit.clock_origin_us,
-            limits,
+            limits: *limits,
             selection: crate::plane::VideoUnitSelection {
                 stream: unit.stream,
                 generation: unit.generation,
@@ -413,7 +427,7 @@ impl Record {
             providers: Default::default(),
             extension_route: None,
             extension_checked: false,
-            extension_limits: None,
+            extension_limits: Vec::new(),
             negotiated_route: None,
             id,
             history: super::history::SessionHistory::new(id, config.history_activity_id.clone()),
@@ -748,7 +762,8 @@ impl Record {
             "encoder_provider": self.start.as_ref().and_then(|start| start.encoder_provider.as_deref()),
             "source_id": self.start.as_ref().and_then(|start| start.source_id),
             "client_feature_flags": self.start.as_ref().and_then(|start| start.client_feature_flags),
-            "extension_profile": self.extension_limits.as_ref().and_then(|_| self.extension_route.as_ref().map(|route| &route.profile)),
+            "extension_profile": self.offered_extensions().next().map(|(profile, _)| profile),
+            "extension_profiles": self.offered_extensions().map(|(profile, _)| profile).collect::<Vec<_>>(),
             "haptics_pcm_negotiated": self.start.as_ref().is_some_and(|start| {
                 start.client_feature_flags.is_some_and(|flags| {
                     flags & amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM != 0

@@ -122,6 +122,10 @@ impl Record {
     }
     #[track_caller]
     pub(super) fn report_extension_probe_fallback(&mut self, reason: &str) {
+        self.extension_checked = true;
+        // Moonlight sees a codec-wide DESCRIBE marker. A partial probe would
+        // let it choose a variant this launch cannot accept from serverinfo.
+        self.extension_limits.clear();
         let Some(operation) = self.config.rtsp_operation_id.clone() else {
             return;
         };

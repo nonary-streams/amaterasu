@@ -127,7 +127,6 @@ impl Pipeline {
                     pending.cancel();
                     record.shutdown_observations.push(pending);
                 }
-                record.extension_checked = true;
                 record.report_extension_probe_fallback("probe_deadline");
                 return self.deliver_success(record, job, now, send);
             }
@@ -162,7 +161,6 @@ impl Pipeline {
                     if job.step == Step::ProbeExtensionSource {
                         pending.cancel();
                         record.shutdown_observations.push(pending);
-                        record.extension_checked = true;
                         record.report_extension_probe_fallback("probe_unconfirmed");
                         return self.deliver_success(record, job, now, send);
                     }
@@ -267,7 +265,6 @@ impl Pipeline {
                             pending.cancel();
                             record.shutdown_observations.push(pending);
                         }
-                        record.extension_checked = true;
                         record.report_extension_probe_fallback("probe_unavailable");
                         return self.deliver_success(record, job, now, send);
                     }
@@ -714,29 +711,36 @@ impl Pipeline {
         operations: &mut NativeOperations<'_, '_>,
     ) -> bool {
         if job.step == Step::ProbeExtensionSource {
-            record.extension_checked = true;
-            if let Some(route) = &record.extension_route
-                && payload["ok"] == true
-                && payload["source_id"].as_u64() == Some(route.source_id)
+            let route = record
+                .extension_route
+                .as_ref()
+                .expect("selected extension route");
+            let profile = route
+                .profiles()
+                .nth(record.extension_limits.len())
+                .expect("pending extension profile");
+            let result = if payload["ok"] != true {
+                Err(safe_dependency_code(&payload))
+            } else if payload["source_id"].as_u64() == Some(route.source_id)
                 && payload["encoder"] == json!(route.encoder)
-                && payload["profile"] == json!(route.profile)
+                && payload["profile"] == json!(profile)
                 && let Some(media) = record.resources.get(&Resource::Media)
             {
-                record.extension_limits = match (operations.probe)(route, *media, &record.config) {
-                    Ok(limits) => Some(limits),
-                    Err(code) => {
-                        eprintln!("amaterasu extension downstream preflight rejected code={code}");
-                        None
+                let mut selected = route.clone();
+                selected.profile = profile.clone();
+                (operations.probe)(&selected, *media, &record.config)
+            } else {
+                Err("probe_unusable")
+            };
+            match result {
+                Ok(limits) => {
+                    record.extension_limits.push(limits);
+                    if record.extension_limits.len() < route.profiles().count() {
+                        return true;
                     }
-                };
-            }
-            if record.extension_limits.is_none() {
-                let reason = if payload["ok"] != true {
-                    safe_dependency_code(&payload)
-                } else {
-                    "probe_unusable"
-                };
-                record.report_extension_probe_fallback(reason);
+                    record.extension_checked = true;
+                }
+                Err(code) => record.report_extension_probe_fallback(code),
             }
             return self.deliver_success(record, job, now, send);
         }
@@ -2083,7 +2087,6 @@ impl Pipeline {
                     .sum::<usize>()
                     + record.shutdown_observations.len();
                 if outstanding_reads >= MAX_DEFERRED_READ_SETTLEMENTS {
-                    record.extension_checked = true;
                     record.report_extension_probe_fallback("probe_settlement_pending");
                 } else {
                     job.step = Step::ProbeExtensionSource;

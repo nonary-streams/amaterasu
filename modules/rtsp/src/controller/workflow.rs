@@ -370,30 +370,36 @@ impl Controller {
                 control_connect_data: record.config.connect_data,
                 udp_discovery: record.udp_discovery.clone(),
             };
-            let profile = if self.settings.extension_enabled
+            let mut offer = amaterasu_contracts::media_profile::VideoProfileSnapshot::default();
+            if self.settings.extension_enabled
                 && record.config.min_threads == 2
                 && record.config.qp == 28
             {
-                serde_json::from_value::<amaterasu_contracts::media_profile::VideoProfile>(
-                    payload["extension_profile"].clone(),
-                )
-                .ok()
-                .filter(|profile| profile.is_valid())
-            } else {
-                None
-            };
-            let negotiation = if let Some(profile) = &profile {
-                let snapshot = amaterasu_contracts::media_profile::VideoProfileSnapshot {
-                    profiles: vec![profile.clone()],
+                let profiles = match payload.get("extension_profiles") {
+                    Some(profiles) => serde_json::from_value(profiles.clone()),
+                    None if payload["extension_profile"].is_null() => Ok(Vec::new()),
+                    None => serde_json::from_value(payload["extension_profile"].clone())
+                        .map(|profile| vec![profile]),
                 };
+                if let Ok(profiles) = profiles {
+                    offer.profiles = profiles;
+                } else {
+                    record.report_invalid_extension_offer();
+                }
+                if !offer.validate() {
+                    offer.profiles.clear();
+                    record.report_invalid_extension_offer();
+                }
+            }
+            let negotiation = if offer.profiles.is_empty() {
+                Negotiation::new(launch, record.capabilities())
+            } else {
                 Negotiation::with_video_profiles(
                     launch,
                     record.capabilities(),
-                    snapshot.clone(),
-                    snapshot,
+                    offer.clone(),
+                    offer.clone(),
                 )
-            } else {
-                Negotiation::new(launch, record.capabilities())
             }
             .map_err(|_| "invalid_prepare_response")?;
             self.transport.as_mut().ok_or("disabled")?.add_ticket(
@@ -402,7 +408,7 @@ impl Controller {
                 &key,
             )?;
             record.session = Some(session);
-            record.extension_offer = profile;
+            record.extension_offer = offer.profiles;
             record.negotiation = Some(negotiation);
             record.needs_lookup = false;
             record.stream_state = Some("prepared".into());

@@ -452,7 +452,7 @@ impl Pipeline {
         {
             record.extension_route = self.settings.extension_route.as_ref().and_then(|route| {
                 let probe = record.config.extension_probe.as_ref()?;
-                route.for_format(&probe.video_stream_format)
+                route.for_launch_format(&probe.video_stream_format)
             });
         }
         record.lifecycle_input_required = lifecycle_input_required;
@@ -854,23 +854,24 @@ fn resolve_extension_start(
     let route = record
         .extension_route
         .as_ref()
-        .filter(|route| {
-            record.owner == "amaterasu.rtsp"
-                && configuration.client_feature_flags.is_some()
-                && record.extension_limits.is_some()
-                && &route.profile == profile
+        .filter(|_| {
+            record.owner == "amaterasu.rtsp" && configuration.client_feature_flags.is_some()
         })
+        .ok_or("extension_profile_not_offered")?;
+    let (_, limits) = record
+        .offered_extensions()
+        .find(|(offered, _)| *offered == profile)
         .ok_or("extension_profile_not_offered")?;
     let mut expected = record
         .config
         .extension_probe
-        .clone()
-        .expect("offered profile has probe configuration");
-    expected.extension_profile = Some(profile.clone());
+        .as_ref()
+        .expect("offered profile has probe configuration")
+        .with_extension_profile(profile);
     // The client selects its color mode in ANNOUNCE, after the offer
     // probe. Video checks the selected encoder with the final config.
     expected.color_mode = configuration.configuration.color_mode;
-    let pyrowave = amaterasu_gamestream::sdp::pyrowave::is_profile(&route.profile);
+    let pyrowave = amaterasu_gamestream::sdp::pyrowave::is_profile(profile);
     if pyrowave && (100_000..=expected.bitrate).contains(&configuration.configuration.bitrate) {
         expected.bitrate = configuration.configuration.bitrate;
     }
@@ -885,10 +886,6 @@ fn resolve_extension_start(
     configuration.encoder_provider = Some(route.encoder_provider.clone());
     configuration.encoder = route.encoder.clone();
     if let Some(wire_kbps) = configuration.extension_wire_bitrate_kbps.take() {
-        let limits = record
-            .extension_limits
-            .as_ref()
-            .expect("offered transport limits");
         let audio_bps = if record.config.stream_audio {
             record.config.audio.bitrate
         } else {

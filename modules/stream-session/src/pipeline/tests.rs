@@ -191,6 +191,102 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
 }
 
 #[test]
+fn paired_chroma_profiles_are_probed_before_start_or_standard_fallback() {
+    use amaterasu_contracts::media_profile::{ChromaSampling, VideoMediaFormat, VideoProfile};
+    use amaterasu_media::*;
+    for reject_full_chroma in [false, true] {
+        let mut profile: VideoProfile =
+            serde_json::from_str(include_str!("../../../../scripts/pyrowave/profile.json"))
+                .unwrap();
+        profile.codec.value = 1;
+        profile.media_format = Some(VideoMediaFormat::default());
+        let mut full_chroma = profile.clone();
+        full_chroma.media_format.as_mut().unwrap().chroma_sampling = ChromaSampling::Yuv444;
+        let route = serde_json::from_value(json!({"profile":profile,"alternate_profiles":[full_chroma],
+            "source_id":42,"encoder_provider":"fixture","encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
+            "video_unit_service":"example.units/1","framer_service":"example.framer/1","plan_transport_service":"example.plan/1"})).unwrap();
+        let mut host = Harness::new();
+        host.pipeline.settings.allowed_principals = vec!["amaterasu.rtsp".into()];
+        host.pipeline.settings.extension_route = Some(route);
+        host.broker.extension_probe_supported = true;
+        host.broker.reject_extension_yuv444 = reject_full_chroma;
+        host.extension_probe_limits = Some(VideoFramingLimits {
+            size: size_of::<VideoFramingLimits>() as u32,
+            version: VIDEO_FRAMING_LIMITS_VERSION,
+            packet_size: 1024,
+            max_datagrams: 64,
+            max_queue_bytes: 65536,
+            max_wire_bytes: 65536,
+            ..Default::default()
+        });
+        let mut request = prepare();
+        request["stream_audio"] = json!(false);
+        request["extension_probe"] = start(0)["configuration"]["configuration"].clone();
+        request["extension_probe"]["video_stream_format"] =
+            json!({"codec":"hevc","bit_depth":8,"dynamic_range":"sdr"});
+        let prepared = host.response_from(1, "amaterasu.rtsp", request);
+        let probes: Vec<_> = host
+            .broker
+            .calls
+            .iter()
+            .filter(|call| call.payload["action"] == "probe_source")
+            .collect();
+        assert_eq!(probes.len(), 2);
+        assert_eq!(
+            probes[0].payload["configuration"]["extension_profile"],
+            json!(profile)
+        );
+        assert_eq!(
+            probes[1].payload["configuration"]["extension_profile"],
+            json!(full_chroma)
+        );
+        assert_eq!(
+            probes[1].payload["configuration"]["video_stream_format"]["chroma_sampling"],
+            "yuv444"
+        );
+        let session = prepared["session"].as_u64().unwrap();
+        let mut request = start(session);
+        request["configuration"]["client_feature_flags"] = json!(0);
+        request["configuration"]["configuration"]["extension_profile"] = json!(full_chroma);
+        request["configuration"]["configuration"]["video_stream_format"] =
+            json!({"codec":"hevc","bit_depth":8,"dynamic_range":"sdr","chroma_sampling":"yuv444"});
+        let result = host.response_from(2, "amaterasu.rtsp", request);
+        if reject_full_chroma {
+            assert_eq!(prepared["extension_profiles"], json!([]));
+            assert_eq!(result["code"], "extension_profile_not_offered");
+            assert_eq!(
+                host.response_from(3, "amaterasu.rtsp", start(session))["state"],
+                "active"
+            );
+            assert_eq!(host.plane.borrow().planned_planes, 0);
+        } else {
+            assert_eq!(
+                prepared["extension_profiles"],
+                json!([profile, full_chroma])
+            );
+            assert_eq!(result["state"], "active", "{result}");
+            assert_eq!(host.plane.borrow().planned_planes, 1);
+            let video = host
+                .broker
+                .calls
+                .iter()
+                .find(|call| {
+                    call.service == "amaterasu.video/1" && call.payload["action"] == "open"
+                })
+                .unwrap();
+            assert_eq!(
+                video.payload["configuration"]["extension_profile"],
+                json!(full_chroma)
+            );
+            assert_eq!(
+                video.payload["configuration"]["video_stream_format"]["chroma_sampling"],
+                "yuv444"
+            );
+        }
+    }
+}
+
+#[test]
 fn authenticated_control_disconnect_is_confirmed_on_exact_owned_stream() {
     for (reason, expected, wrong_stream, plane_error) in [
         (

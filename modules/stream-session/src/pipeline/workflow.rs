@@ -604,14 +604,16 @@ impl Job {
                     .extension_route
                     .as_ref()
                     .expect("selected extension route");
-                let mut configuration = json!(
-                    record
-                        .config
-                        .extension_probe
-                        .as_ref()
-                        .expect("selected probe")
-                );
-                configuration["extension_profile"] = json!(route.profile);
+                let profile = route
+                    .profiles()
+                    .nth(record.extension_limits.len())
+                    .expect("next extension profile");
+                let configuration = record
+                    .config
+                    .extension_probe
+                    .as_ref()
+                    .expect("selected probe")
+                    .with_extension_profile(profile);
                 (
                     record.service(Resource::Video),
                     json!({"action":"probe_source", "source_id":route.source_id,

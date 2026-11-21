@@ -9,8 +9,7 @@ use amaterasu_media::VideoCodec;
 use amaterasu_module_sdk::{EncoderBackend, EncoderIdentity, EncoderSelection};
 use serde_json::Value;
 
-/// Moonlight's `ServerCodecModeSupport` bits (Limelight.h `SCM_*`). Only 8-bit
-/// 4:2:0 modes are advertised: no encoder path here produces 10-bit or 4:4:4.
+/// Moonlight's base `ServerCodecModeSupport` bits (Limelight.h `SCM_*`).
 const SCM_H264: u32 = 0x0000_0001;
 const SCM_HEVC: u32 = 0x0000_0100;
 const SCM_AV1_MAIN8: u32 = 0x0001_0000;

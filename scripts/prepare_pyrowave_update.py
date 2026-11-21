@@ -26,14 +26,34 @@ FRAMER = "amaterasu.encode.pyrowave-framing/1"
 UNITS = "amaterasu.video.pyrowave-units/1"
 TRANSPORT = "amaterasu.media-transport.pyrowave-plan/1"
 PROFILE = json.loads((Path(__file__).parent / "pyrowave/profile.json").read_text())
-# The same extension for SDR clients: Moonlight requests 8-bit 4:2:0 PyroWave
-# whenever HDR is off, and the encoder's 8-bit codec serves it.
+# 8-bit SDR and 10-bit HDR use different codec IDs. Chroma variants use
+# the same wire selector and are distinguished by the client's ANNOUNCE.
 SDR_PROFILE = deepcopy(PROFILE)
 SDR_PROFILE["codec"]["value"] = 1
 SDR_PROFILE["media_format"] = {"bit_depth": 8, "dynamic_range": "sdr", "chroma_sampling": "yuv420"}
+
+
+def full_chroma(profile):
+    variant = deepcopy(profile)
+    variant["media_format"]["chroma_sampling"] = "yuv444"
+    return variant
+
+
+FULL_CHROMA_PROFILES = [full_chroma(PROFILE), full_chroma(SDR_PROFILE)]
+PROFILES = [PROFILE, SDR_PROFILE, *FULL_CHROMA_PROFILES]
 LEGACY_PROFILE = deepcopy(PROFILE)
 LEGACY_PROFILE["wire_attributes"] = [attribute for attribute in PROFILE["wire_attributes"]
                                      if attribute["phase"] == "describe"]
+
+
+def previous_chroma_composition(value):
+    """Project the exact prior policy, including its original profile order."""
+    if isinstance(value, dict):
+        return {key: previous_chroma_composition(item) for key, item in value.items()
+                if key != "transport_yuv444"}
+    if isinstance(value, list):
+        return [previous_chroma_composition(item) for item in value if item not in FULL_CHROMA_PROFILES]
+    return value
 
 
 def previous_profile_composition(value):
@@ -58,16 +78,17 @@ def compose(bootstrap, manifest, approved):
     settings = policy["settings"]
     settings["amaterasu.encode"]["pyrowave"] = {
         "library_path": "/embedded/pyrowave", "gpu_only": True, "transport_enabled": True,
+        "transport_yuv444": True,
     }
     settings["amaterasu.linux-session-video"].update({
         "unit_service": UNITS,
         "source_encoder_providers": {"pyrowave": {"control_service": CONTROL,
-            "native_service": PROVIDER, "source_ids": [1], "extension_profiles": [PROFILE, SDR_PROFILE], "submitted": True}},
+            "native_service": PROVIDER, "source_ids": [1], "extension_profiles": PROFILES, "submitted": True}},
         "external_encoder_consumers": {"pyrowave": CONSUMER},
     })
-    settings["amaterasu.media-transport"].update({"plan_service": TRANSPORT, "extension_profiles": [PROFILE, SDR_PROFILE]})
+    settings["amaterasu.media-transport"].update({"plan_service": TRANSPORT, "extension_profiles": PROFILES})
     settings["amaterasu.stream-session"]["extension_route"] = {
-        "profile": PROFILE, "alternate_profiles": [SDR_PROFILE], "source_id": 1, "submitted": True, "encoder_provider": "pyrowave",
+        "profile": PROFILE, "alternate_profiles": PROFILES[1:], "source_id": 1, "submitted": True, "encoder_provider": "pyrowave",
         "encoder": {"clsid": "pyrowave", "friendly_name": "PyroWave", "hardware_url": None},
         "video_unit_service": UNITS, "framer_service": FRAMER, "plan_transport_service": TRANSPORT,
     }
@@ -83,7 +104,8 @@ def compose(bootstrap, manifest, approved):
         for field in fields:
             current = bootstrap["policy"]["settings"][principal]
             expected = settings[principal][field]
-            if field in current and current[field] not in (expected, previous_profile_composition(expected)):
+            before_chroma = previous_chroma_composition(expected)
+            if field in current and current[field] not in (expected, before_chroma, previous_profile_composition(before_chroma)):
                 raise ValueError(f"existing extension composition requires reconciliation: {principal}")
     additions = {
         "amaterasu.encode": {"provide": [CONTROL, PROVIDER, CONSUMER, FRAMER], "native_provide": [PROVIDER, CONSUMER, FRAMER]},

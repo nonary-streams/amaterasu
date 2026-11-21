@@ -100,7 +100,7 @@ impl Controller {
                     "configuration_mismatch",
                 );
                 if completed && success {
-                    if record.extension_offer.is_some()
+                    if !record.extension_offer.is_empty()
                         && request.header("x-amaterasu-codec-fallback")
                             == Some("pyrowave_bitstream_mismatch")
                     {

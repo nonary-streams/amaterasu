@@ -245,6 +245,10 @@ fn transport_extensions_add_only_explicit_extension_bits() {
         "transport_extensions":[{"codec_mode_mask":8388608,"bitstream":"186f0393"}]}))
     .unwrap();
     assert_eq!(snapshot.advertisement().codec_mode_support, 0x00800001);
+    let full_chroma = EncoderSnapshot::parse(&json!({"ok":true,"encoders":[],
+        "transport_extensions":[{"codec_mode_mask":0x0780_0000,"bitstream":"186f0393"}]}))
+    .unwrap();
+    assert_eq!(full_chroma.advertisement().codec_mode_support, 0x0780_0001);
     assert!(
         EncoderSnapshot::parse(&json!({"ok":true,"encoders":[],
         "transport_extensions":[{"codec_mode_mask":256}]}))

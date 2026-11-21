@@ -429,7 +429,13 @@ fn lost_read_only_probe_retires_at_the_admission_recovery_horizon() {
 
 #[test]
 fn unavailable_optional_extension_warns_and_standard_video_starts() {
-    for scenario in ["source", "downstream", "unconfirmed", "deadline"] {
+    for scenario in [
+        "source",
+        "downstream",
+        "unconfirmed",
+        "deadline",
+        "second_deadline",
+    ] {
         let mut host = Harness::new();
         host.pipeline.settings.allowed_principals = vec!["amaterasu.rtsp".into()];
         let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
@@ -446,7 +452,16 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
             ));
             host.broker.fail_cancel = true;
         }
-        host.extension_probe_limits = None;
+        if scenario == "second_deadline" {
+            let route = host.pipeline.settings.extension_route.as_mut().unwrap();
+            let mut full_chroma = route.profile.clone();
+            full_chroma.media_format = Some(amaterasu_contracts::media_profile::VideoMediaFormat {
+                chroma_sampling: amaterasu_contracts::media_profile::ChromaSampling::Yuv444,
+                ..Default::default()
+            });
+            route.alternate_profiles.push(full_chroma);
+            host.extension_probe_limits = Some(Default::default());
+        }
         let mut request = prepare();
         request["stream_audio"] = json!(false);
         request["extension_probe"] = start(0)["configuration"]["configuration"].clone();
@@ -473,7 +488,9 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
         let mut forced_deadline = false;
         for _ in 0..100 {
             host.tick();
-            if scenario == "deadline"
+            if (scenario == "deadline"
+                || (scenario == "second_deadline"
+                    && host.pipeline.records[&id].extension_limits.len() == 1))
                 && !forced_deadline
                 && let Some(job) = host.pipeline.job.as_mut()
                 && job.step == Step::ProbeExtensionSource
@@ -486,9 +503,10 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
                 break;
             }
         }
-        assert!(scenario != "deadline" || forced_deadline);
+        assert!(!scenario.ends_with("deadline") || forced_deadline);
         assert_eq!(host.broker.replies[&1]["state"], "prepared");
         assert!(host.broker.replies[&1]["extension_profile"].is_null());
+        assert_eq!(host.broker.replies[&1]["extension_profiles"], json!([]));
         host.tick();
         let issues = published(&host.broker.commands);
         assert!(

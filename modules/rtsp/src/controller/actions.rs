@@ -368,7 +368,7 @@ impl Controller {
             adjustments: Vec::new(),
             negotiated_color: None,
             negotiated_video: None,
-            extension_offer: None,
+            extension_offer: Vec::new(),
             extension_announce: None,
             url,
             session_token,

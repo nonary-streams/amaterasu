@@ -62,7 +62,7 @@ pub(super) struct Record {
     pub adjustments: Vec<amaterasu_gamestream::sdp::StreamAdjustment>,
     pub negotiated_color: Option<amaterasu_gamestream::sdp::ColorMode>,
     pub negotiated_video: Option<crate::model::NegotiatedVideo>,
-    pub extension_offer: Option<amaterasu_contracts::media_profile::VideoProfile>,
+    pub extension_offer: Vec<amaterasu_contracts::media_profile::VideoProfile>,
     pub extension_announce: Option<
         amaterasu_gamestream::sdp::Announce<amaterasu_gamestream::sdp::NegotiatedVideoFormat>,
     >,
@@ -112,6 +112,20 @@ pub(super) struct Record {
 
 impl Record {
     /// Publish the effective compatibility choices only after an accepted reply.
+    pub(super) fn report_invalid_extension_offer(&mut self) {
+        use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+        self.issues.push(
+            StreamIssue::demoted(
+                &self.config.operation_id,
+                LifecycleLayer::Rtsp,
+                "prepare",
+                "invalid_extension_offer",
+                "negotiate_standard_video",
+            )
+            .caused_by(LifecycleLayer::StreamSession),
+        );
+    }
+
     pub(super) fn report_announce_adjustments(&mut self) {
         use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
         use amaterasu_module_sdk::stream_warnings::WarningValue;
@@ -199,13 +213,13 @@ impl Record {
         else {
             return false;
         };
-        if self.extension_offer.as_ref() != Some(profile)
+        if !self.extension_offer.contains(profile)
             || !self.config.accepts_extension_announce(announce)
         {
             let expected = self.config.effective_profile();
             eprintln!(
                 "amaterasu rtsp extension announce mismatch profile_match={} width={}/{} height={}/{} fps={}/{} bitrate={}/{} refs={}/{} packet_size={}/{} packet_ms={}/{} color={:?}",
-                self.extension_offer.as_ref() == Some(profile),
+                self.extension_offer.contains(profile),
                 announce.video.width,
                 expected.width,
                 announce.video.height,
@@ -343,6 +357,12 @@ impl Record {
                     format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr,
                 )
             });
+            if profile.media_format.unwrap_or_default().chroma_sampling
+                == amaterasu_contracts::media_profile::ChromaSampling::Yuv444
+            {
+                payload["configuration"]["configuration"]["video_stream_format"]["chroma_sampling"] =
+                    json!("yuv444");
+            }
             payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
             payload["configuration"]["configuration"]["color_mode"] = json!(announce.video.color);
             if let Some(wire_kbps) =

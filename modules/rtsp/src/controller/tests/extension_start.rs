@@ -1,5 +1,5 @@
 use super::*;
-use amaterasu_contracts::media_profile::{VideoProfile, VideoProfileSnapshot};
+use amaterasu_contracts::media_profile::{ChromaSampling, VideoProfile, VideoProfileSnapshot};
 
 /// The PyroWave profile a launch is offered: 10-bit HDR, or the 8-bit SDR
 /// profile Moonlight requests when HDR is off.
@@ -17,9 +17,15 @@ fn launch_profile(hdr: bool) -> VideoProfile {
 }
 
 fn extension_record(hdr: bool) -> Record {
+    extension_record_with_chroma(hdr, ChromaSampling::Yuv420)
+}
+
+fn extension_record_with_chroma(hdr: bool, chroma: ChromaSampling) -> Record {
     let profile = launch_profile(hdr);
+    let mut full_chroma = profile.clone();
+    full_chroma.media_format.as_mut().unwrap().chroma_sampling = ChromaSampling::Yuv444;
     let snapshot = VideoProfileSnapshot {
-        profiles: vec![profile.clone()],
+        profiles: vec![profile, full_chroma],
     };
     let fixture =
         include_str!("../../../../../crates/gamestream/src/sdp/fixtures/moonlight-pyrowave10.sdp");
@@ -30,6 +36,14 @@ fn extension_record(hdr: bool) -> Record {
             "x-nv-video[0].dynamicRangeMode:1",
             "x-nv-video[0].dynamicRangeMode:0",
         )
+    };
+    let announcement = if chroma == ChromaSampling::Yuv444 {
+        announcement.replace(
+            "x-ss-video[0].chromaSamplingType:0",
+            "x-ss-video[0].chromaSamplingType:1",
+        )
+    } else {
+        announcement
     };
     let announce =
         amaterasu_gamestream::sdp::parse_profile_announce(announcement.as_bytes(), &snapshot)
@@ -43,7 +57,7 @@ fn extension_record(hdr: bool) -> Record {
     record.config.profile.hdr = hdr;
     record.config.sw_preset = Some("superfast".into());
     record.config.sw_tune = Some("zerolatency".into());
-    record.extension_offer = Some(profile);
+    record.extension_offer = snapshot.profiles;
     assert!(record.accept_extension_announce(&announce));
     record
 }
@@ -74,7 +88,7 @@ fn moonlight_generated_extension_request_adds_color_to_the_probed_configuration(
         let mut expected = record
             .config
             .extension_configuration(record.config.launch_extension_format(10));
-        expected["extension_profile"] = json!(record.extension_offer.as_ref().unwrap());
+        expected["extension_profile"] = json!(record.extension_offer.first().unwrap());
         expected["color_mode"] = json!("bt601_limited");
         assert_eq!(payload["configuration"]["configuration"], expected);
         assert_eq!(
@@ -85,6 +99,26 @@ fn moonlight_generated_extension_request_adds_color_to_the_probed_configuration(
             payload["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],
             if hdr { "hdr" } else { "sdr" }
         );
+    }
+}
+
+#[test]
+fn moonlight_pyrowave_444_announce_requires_an_exact_offer_and_preserves_chroma_at_play() {
+    for hdr in [false, true] {
+        let mut record = extension_record_with_chroma(hdr, ChromaSampling::Yuv444);
+        let announce = record.extension_announce.clone().unwrap();
+        let payload = record.authenticated_start_payload(23).unwrap();
+        let configuration = &payload["configuration"]["configuration"];
+        assert_eq!(
+            configuration["video_stream_format"]["chroma_sampling"],
+            "yuv444"
+        );
+        assert_eq!(
+            configuration["extension_profile"],
+            json!(record.extension_offer[1])
+        );
+        record.extension_offer.pop();
+        assert!(!record.accept_extension_announce(&announce));
     }
 }
 
@@ -164,7 +198,7 @@ fn extension_play_prepares_lifecycle_without_substituting_a_legacy_codec() {
             .expect("validated lifecycle preparation must reach video startup");
         assert_eq!(
             started["configuration"]["configuration"]["extension_profile"],
-            json!(controller.records[&5].extension_offer.as_ref().unwrap())
+            json!(controller.records[&5].extension_offer.first().unwrap())
         );
         assert_eq!(
             started["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],

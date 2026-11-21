@@ -1086,7 +1086,7 @@ pub(super) fn record(state: State) -> Record {
         adjustments: Vec::new(),
         negotiated_color: None,
         negotiated_video: None,
-        extension_offer: None,
+        extension_offer: Vec::new(),
         extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
@@ -1815,7 +1815,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         adjustments: Vec::new(),
         negotiated_color: None,
         negotiated_video: None,
-        extension_offer: None,
+        extension_offer: Vec::new(),
         extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
@@ -4479,7 +4479,7 @@ fn accepted_extension_announce_preserves_profile_and_rejects_changed_probe_param
         amaterasu_gamestream::sdp::parse_profile_announce(announcement.as_bytes(), &snapshot)
             .unwrap();
     assert!(!record.accept_extension_announce(&announce));
-    record.extension_offer = Some(profile.clone());
+    record.extension_offer = vec![profile.clone()];
     assert!(record.accept_extension_announce(&announce));
     let payload = record.authenticated_start_payload(23).unwrap();
     assert_eq!(
@@ -4506,11 +4506,16 @@ fn prepared_controller_advertises_only_the_preflighted_extension() {
     let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
         "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
         "payload_type":100,"encoding_name":"EXAMPLE"});
-    for (offered, hdr, reference_frames, expected) in [
-        (false, false, 0, false),
-        (true, false, 0, true),
-        (true, false, 1, true),
-        (true, true, 1, true),
+    let mut full_chroma = profile.clone();
+    full_chroma["media_format"] =
+        json!({"bit_depth":8,"dynamic_range":"sdr","chroma_sampling":"yuv444"});
+    for (offered, hdr, reference_frames, expected_count) in [
+        (Value::Null, false, 0, 0),
+        (profile.clone(), false, 0, 1),
+        (profile.clone(), false, 1, 1),
+        (profile.clone(), true, 1, 1),
+        (json!([profile, full_chroma]), false, 1, 2),
+        (json!([profile, profile]), false, 1, 0),
     ] {
         let settings: Settings = serde_json::from_value(json!({"enabled":true,"extension_enabled":true,"bind":"127.0.0.1:0","allowed_principals":["caller"]})).unwrap();
         let mut controller = Controller::new(settings).unwrap();
@@ -4526,9 +4531,13 @@ fn prepared_controller_advertises_only_the_preflighted_extension() {
             network: None,
             deadline: 5000,
         };
-        let prepared = json!({"ok":true,"state":"prepared","session":23,
-            "audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002","control_local":"127.0.0.1:51004",
-            "extension_profile":if offered { profile.clone() } else { Value::Null }});
+        let mut prepared = json!({"ok":true,"state":"prepared","session":23,
+            "audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002","control_local":"127.0.0.1:51004"});
+        if offered.is_array() {
+            prepared["extension_profiles"] = offered;
+        } else {
+            prepared["extension_profile"] = offered;
+        }
         let mut endpoint = Endpoint {
             active_request: true,
             ..Endpoint::default()
@@ -4552,10 +4561,11 @@ fn prepared_controller_advertises_only_the_preflighted_extension() {
         assert_eq!(
             String::from_utf8(description)
                 .unwrap()
-                .contains("EXAMPLE/90000"),
-            expected
+                .matches("EXAMPLE/90000")
+                .count(),
+            usize::from(expected_count > 0)
         );
-        assert_eq!(record.extension_offer.is_some(), expected);
+        assert_eq!(record.extension_offer.len(), expected_count);
     }
 }
 
@@ -4663,7 +4673,7 @@ fn extension_bit_depth_follows_the_launch_dynamic_range() {
             amaterasu_gamestream::sdp::parse_profile_announce(announcement.as_bytes(), &snapshot)
                 .unwrap();
         assert!(!record.accept_extension_announce(&announce));
-        record.extension_offer = Some(profile.clone());
+        record.extension_offer = vec![profile.clone()];
         assert!(record.accept_extension_announce(&announce));
         let payload = record.authenticated_start_payload(23).unwrap();
         assert_eq!(
