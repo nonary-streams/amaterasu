@@ -1,6 +1,8 @@
 //! Replaceable installation coordinator. All storage/network work runs off tick.
 pub mod adapters;
 pub mod broker;
+#[cfg(target_os = "linux")]
+pub mod builtin_drivers;
 pub mod helper;
 mod security;
 mod transport;
@@ -41,6 +43,8 @@ struct Installer {
     stopping: bool,
     activation_requested: bool,
     next_work: std::time::Instant,
+    #[cfg(target_os = "linux")]
+    builtin_drivers: builtin_drivers::Inventory,
 }
 impl Installer {
     fn base(&self) -> ModuleResult<String> {
@@ -95,9 +99,18 @@ impl Installer {
             &selected.active_drivers,
             &selected.active,
         );
-        Ok(
-            json!({"ok":true,"supported":true,"installation_revision":revision,"drivers":drivers,"operation":view}),
-        )
+        #[cfg(target_os = "linux")]
+        let builtin_drivers = self.builtin_drivers.observe();
+        #[cfg(not(target_os = "linux"))]
+        let builtin_drivers: Vec<Value> = Vec::new();
+        Ok(json!({
+            "ok": true,
+            "supported": true,
+            "installation_revision": revision,
+            "builtin_drivers": builtin_drivers,
+            "drivers": drivers,
+            "operation": view,
+        }))
     }
     fn receive(&mut self, action: &str, payload: &Value) -> ModuleResult<Value> {
         if action == "status" {
@@ -350,6 +363,8 @@ impl ManagedModule for Installer {
             stopping: false,
             activation_requested: false,
             next_work: std::time::Instant::now(),
+            #[cfg(target_os = "linux")]
+            builtin_drivers: builtin_drivers::Inventory::from_settings(&settings),
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {

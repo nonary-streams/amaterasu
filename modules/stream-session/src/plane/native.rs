@@ -156,10 +156,20 @@ impl NativeBackend {
         }
         let api = unsafe { video.table::<VideoApiV1_2>() }.map_err(|_| "native_layout_mismatch")?;
         let mut metadata = HdrMetadata::default();
-        match unsafe { (api.hdr_metadata)(api.base.context, self.handles.video, &mut metadata) } {
-            MEDIA_PENDING | MEDIA_BUSY => return Ok(()),
+        let status =
+            unsafe { (api.hdr_metadata)(api.base.context, self.handles.video, &mut metadata) };
+        match status {
+            // During video retirement the metadata query can observe closure
+            // before receive does. Let the media lane report that closure.
+            MEDIA_PENDING | MEDIA_BUSY | MEDIA_CLOSED => return Ok(()),
             STATUS_OK if metadata.enabled == 1 && metadata.reserved == 0 => {}
-            _ => return Err("video_hdr_metadata_unavailable"),
+            _ => {
+                eprintln!(
+                    "amaterasu video HDR metadata rejected video={} status={} enabled={} reserved={}",
+                    self.handles.video, status, metadata.enabled, metadata.reserved
+                );
+                return Err("video_hdr_metadata_unavailable");
+            }
         }
         if self.last_hdr == Some(metadata) {
             return Ok(());
@@ -982,10 +992,10 @@ impl<T> Delivery<T> {
             (STATUS_OK, Some(result)) => result.map(Some),
             (MEDIA_BUSY | MEDIA_PENDING, None) => Ok(None),
             (_, Some(Err(error))) => Err(error),
-            (MEDIA_CLOSED, _) => Err(if matches!(lane, DeliveryLane::Control) {
-                "native_control_closed"
-            } else {
-                "native_stream_closed"
+            (MEDIA_CLOSED, _) => Err(match lane {
+                DeliveryLane::Control => "native_control_closed",
+                DeliveryLane::Video => "video_stream_closed",
+                DeliveryLane::Pcm | DeliveryLane::Audio => "native_stream_closed",
             }),
             _ => {
                 // Only fixed lane names, numeric ABI status, and callback presence

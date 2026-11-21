@@ -9,7 +9,7 @@ import shutil
 import time
 
 from local_bound_input import differences, policy_value
-from local_full_update import compact, source_state, compiled_from
+from local_full_update import CORE_REPOSITORY, compiled_from, core_package, core_signing, sign_core_bundle, source_state
 
 REPLACEMENTS = {
     "amaterasu.encode": "libamaterasu_encode.so",
@@ -131,8 +131,6 @@ def compose(bootstrap, manifest, approved):
 
 
 def prepare(root, tree, work):
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     read = lambda path: json.loads(path.read_text())
     selection = read(root / "selection.json")
     if selection["pending"] or selection["trial"]:
@@ -144,13 +142,7 @@ def prepare(root, tree, work):
     manifest = read(active / "manifest.json")
     approved = read(root / "package-activation-policy.json")
     candidate, allowlist, delta = compose(bootstrap, manifest, approved)
-    repository = "amaterasu-rtx-hdr"
-    approval = read(root / "repositories/approved.json")["repositories"][repository]
-    fingerprint = approval["approval"]["fingerprint"]
-    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(read(root / "development-key.json")))
-    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    if hashlib.sha256(public).hexdigest() != fingerprint or approved["publisher_fingerprint"] != fingerprint:
-        raise ValueError("local key is not the existing approved publisher")
+    signing = core_signing(root, bootstrap, approved)
     for file in REPLACEMENTS.values():
         artifact = tree / "target/release" / file
         if compiled_from(artifact) != tree:
@@ -162,7 +154,7 @@ def prepare(root, tree, work):
     if b"submitted_extensions_worker_required" in video.read_bytes():
         raise ValueError("video was built without submitted extension support")
     work.mkdir(mode=0o700)
-    package = work / "bundle/native/amaterasu-linux-session-rtx-hdr/0.1.0"
+    package = core_package(work, manifest)
     package.mkdir(parents=True, mode=0o700)
     replaced = []
     for component in manifest["components"]:
@@ -180,23 +172,13 @@ def prepare(root, tree, work):
     manifest["sequence"] = max(selection["highest_sequence"], int(time.time())) + 1
     if manifest["expires_unix"] <= time.time():
         raise ValueError("installed manifest expiry must be renewed explicitly")
-    (package / "manifest.json").write_bytes(compact(manifest))
-    blob = (package / "manifest.json").read_bytes()
-    (package / "manifest.sig").write_bytes(compact({"key_id": fingerprint, "signature": key.sign(blob).hex()}))
-    package_digest = digest(package / "manifest.json")
-    catalog = compact({"schema": 1, "repository": repository,
-        "sequence": max(approval["checkpoint"]["highest_sequence"], int(time.time())) + 1,
-        "expires_unix": manifest["expires_unix"], "target": manifest["target"],
-        "candidates": [{"slot": "amaterasu.rtx-hdr", "implementation": "amaterasu-linux-session-rtx-hdr",
-            "version": "0.1.0", "kind": "native_set", "manifest_sha256": package_digest}]})
-    (work / "bundle/catalog.json").write_bytes(catalog)
-    (work / "bundle/catalog.sig").write_text(key.sign(b"amaterasu.repository.catalog.v1\n" + catalog).hex())
+    package_digest, catalog_digest = sign_core_bundle(package, manifest, signing)
     for name, value in [("candidate-bootstrap.json", candidate), ("package-activation-policy.json", allowlist),
                         ("policy-delta.json", delta)]:
         (work / name).write_text(json.dumps(value, indent=2) + "\n")
     metadata = {"root": str(root), "tree": str(tree), **source_state(tree),
-        "previous": selection["active"], "digest": package_digest, "repository": repository,
-        "catalog_digest": digest(work / "bundle/catalog.json"), "selection_revision": digest(root / "selection.json"),
+        "previous": selection["active"], "digest": package_digest, "repository": CORE_REPOSITORY,
+        "catalog_digest": catalog_digest, "selection_revision": digest(root / "selection.json"),
         "bootstrap_revision": digest(root / "bootstrap.json"),
         "activation_policy_revision": digest(root / "package-activation-policy.json"),
         "replaced": replaced, "unchanged_components": len(manifest["components"]) - len(replaced),

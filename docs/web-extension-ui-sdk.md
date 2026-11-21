@@ -432,7 +432,7 @@ suppresses the generic form for a provider with a selected custom UI. Providers
 without custom UI retain the generated settings card as a fallback. Plugins
 without settings can attach sections by omitting `settings_provider`.
 
-Application sections are collapsible. Set the optional Boolean
+Host settings and application sections are collapsible. Set the optional Boolean
 `default_expanded` in the signed UI configuration to show the section's controls
 immediately, as RTX HDR does. Omit it or set it to `false` to start closed.
 Users can still open or close each section; opening does not create overrides,
@@ -519,7 +519,16 @@ const chart = sdk.ui.metricChart({
 container.append(chart.element);
 ```
 
-The default `"full"` appearance includes axes, zoom and series controls.
+Full charts show the latest value in the visible window for each series. Select
+a legend entry to toggle its line. Zoom in and use the timeline slider or drag
+the plot to inspect an earlier window. Ctrl+wheel zooms around the pointer.
+**Fit values** fits the vertical scale to the visible measurements. **Expand**
+opens the same chart in a larger view. Escape returns focus to the opener.
+
+Hosts advertising `ui.chart-sample-axis/1` accept `xAxis: "sample"`. For
+measurements in acquisition order, supply one-based sample numbers in the
+point's `time` field. The axis and inspector display sample numbers (for
+example, `#24`). With the default `"time"` axis, supply Unix milliseconds.
 `setData()` and `dispose()` work with either appearance.
 
 Public TypeScript declarations are published in

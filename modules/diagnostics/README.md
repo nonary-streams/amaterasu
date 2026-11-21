@@ -87,10 +87,10 @@ or a path without an extension, selects a log directory. A file path selects a
 session prefix.
 
 Each accepted diagnostic record is still kept in its caller's bounded journal.
-Records at or above the configured level are also written as JSON lines to the
-worker's shared session log. Each line includes the runtime-supplied caller
-identity alongside the caller-supplied target, so records from different callers
-can be distinguished even when they use the same target. The file combines
+Records at or above the configured level also appear in the diagnostics
+session file as single lines with a timestamp, severity, component, target,
+message and labelled fields. The API retains structured records and preserves
+the runtime-supplied caller identity. The file combines
 records from callers, so callers must not submit secrets or content they do not
 intend to make available to the host account. Log files roll at 2 MiB, retain
 up to four rolled files plus the active file per session, and startup prunes old

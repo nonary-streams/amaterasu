@@ -296,8 +296,7 @@ impl Controller {
                     LogLevel::Warning,
                     "launch",
                     &format!(
-                        "record={id} event=record_dropped_for_capacity state={:?} \
-                         cleanup_error={}",
+                        "Released launch record {id} to make room. Last state: {:?}. Cleanup error: {}.",
                         record.state,
                         record.cleanup_error.unwrap_or("none"),
                     ),
@@ -391,11 +390,11 @@ impl Controller {
                 LogLevel::Warning,
                 "launch",
                 &format!(
-                    "record={id} event={} cleanup_error={error}",
+                    "Launch {id}: {}. Cleanup remains unconfirmed ({error}).",
                     if retained {
-                        "transport_cleanup_abandoned_application_retained"
+                        "stopped retrying transport cleanup and kept the application running"
                     } else {
-                        "cleanup_abandoned"
+                        "stopped retrying cleanup"
                     }
                 ),
             );
@@ -425,36 +424,34 @@ impl Controller {
                 continue;
             }
             record.reported_outcome = Some(outcome);
-            if !reportable(record) {
-                continue;
-            }
-            let level = if matches!(record.state, State::CleanupFailed | State::CleanupAbandoned) {
-                LogLevel::Warning
-            } else {
-                LogLevel::Info
+            let state = match record.state {
+                State::Starting => "Starting the requested application",
+                State::AwaitingDelivery => continue,
+                State::Ready => "Ready for the client to connect",
+                State::Paused => "Application paused between connections",
+                State::Stopping => "Stopping the session",
+                State::Stopped => "Session stopped",
+                State::Failed => "Launch failed",
+                State::CleanupFailed => "Cleanup is unconfirmed",
+                State::CleanupAbandoned => "Stopped retrying unconfirmed cleanup",
             };
-            let _ = logger.emit(
-                level,
-                "launch",
-                &format!(
-                    "record={} state={:?} stage={:?} failure={} cleanup_error={} \
-                     automatic_cleanup_retries={}",
-                    record.id,
-                    record.state,
-                    record.stage,
-                    record.failure.unwrap_or("none"),
-                    record.cleanup_error.unwrap_or("none"),
-                    record.automatic_cleanup_retries,
-                ),
-            );
+            let mut message = format!("Launch {}: {state}.", record.id);
+            if let Some(reason) = record.failure {
+                message.push_str(&format!(" Reason: {}.", reason.replace('_', " ")));
+            }
+            if let Some(reason) = record.cleanup_error {
+                message.push_str(&format!(
+                    " Cleanup: {}. Retries: {}.",
+                    reason.replace('_', " "),
+                    record.automatic_cleanup_retries
+                ));
+            }
+            let level = match record.state {
+                State::Failed => LogLevel::Error,
+                State::CleanupFailed | State::CleanupAbandoned => LogLevel::Warning,
+                _ => LogLevel::Info,
+            };
+            let _ = logger.emit(level, "launch", &message);
         }
     }
-}
-
-/// A record is worth a log line when it carries a failure or cleanup code, or
-/// when its cleanup was abandoned.
-fn reportable(record: &Record) -> bool {
-    record.failure.is_some()
-        || record.cleanup_error.is_some()
-        || record.state == State::CleanupAbandoned
 }

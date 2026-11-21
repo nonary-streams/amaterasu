@@ -874,7 +874,7 @@ impl Broker {
                 let _ = self.enqueue_log(
                     "amaterasu.runtime",
                     DEBUG_LEVEL,
-                    target.into(),
+                    format!("timing/{target}"),
                     part.to_string(),
                 );
             }
@@ -888,7 +888,7 @@ impl Broker {
         let _ = self.enqueue_log(
             "amaterasu.runtime",
             DEBUG_LEVEL,
-            "runtime.tick_holds".to_owned(),
+            "timing/runtime.tick_holds".to_owned(),
             report,
         );
     }

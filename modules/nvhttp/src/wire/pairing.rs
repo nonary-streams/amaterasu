@@ -380,7 +380,7 @@ impl Router {
             && payload["ok"] != true
             && payload["code"] == "not_paired"
         {
-            complete(
+            self.complete_identity_failure(
                 &job,
                 xml::error(401, "authenticated client is no longer paired"),
                 replies,
@@ -393,7 +393,7 @@ impl Router {
                 if let Some(client) = job.purpose.client() {
                     self.abort_transcript(client, now);
                 }
-                complete(
+                self.complete_identity_failure(
                     &job,
                     xml::error(
                         503,
@@ -480,57 +480,10 @@ impl Router {
                 resume,
             } => {
                 let connection = job.connection?;
-                let Some(client_id) = payload.get("client_id").and_then(Value::as_str) else {
-                    complete(
-                        &job,
-                        xml::error(503, "invalid paired client response"),
-                        replies,
-                    );
-                    return None;
-                };
-                let Some(certificate_id) = payload.get("certificate_id").and_then(Value::as_str)
-                else {
-                    complete(
-                        &job,
-                        xml::error(503, "invalid paired client response"),
-                        replies,
-                    );
-                    return None;
-                };
-                let config_overrides = match payload.get("config_overrides") {
-                    None | Some(Value::Null) => ClientConfigOverrides::default(),
-                    Some(value) => match serde_json::from_value(value.clone()) {
-                        Ok(config_overrides) => config_overrides,
-                        Err(_) => {
-                            complete(
-                                &job,
-                                xml::error(503, "invalid paired client response"),
-                                replies,
-                            );
-                            return None;
-                        }
-                    },
-                };
-                if payload["paired"] != 1 {
-                    complete(
-                        &job,
-                        xml::error(503, "invalid paired client response"),
-                        replies,
-                    );
-                    return None;
-                }
-                let peer = match peer.with_paired_identity(
-                    client_id.into(),
-                    certificate_id.into(),
-                    config_overrides,
-                ) {
+                let peer = match decode_peer_identity(peer, &payload) {
                     Ok(peer) => peer,
-                    Err(_) => {
-                        complete(
-                            &job,
-                            xml::error(503, "invalid paired client response"),
-                            replies,
-                        );
+                    Err(reply) => {
+                        self.complete_identity_failure(&job, reply, replies);
                         return None;
                     }
                 };
@@ -553,7 +506,7 @@ impl Router {
                 let peer = match decode_peer_identity(peer, &payload) {
                     Ok(peer) => peer,
                     Err(reply) => {
-                        complete(&job, reply, replies);
+                        self.complete_identity_failure(&job, reply, replies);
                         return None;
                     }
                 };
@@ -573,7 +526,7 @@ impl Router {
                         now,
                     )
                 {
-                    complete(&job, reply, replies);
+                    self.complete_identity_failure(&job, reply, replies);
                 }
                 None
             }
@@ -582,6 +535,18 @@ impl Router {
             | Purpose::Applications { .. }
             | Purpose::Artwork { .. } => None,
         }
+    }
+
+    fn complete_identity_failure(
+        &mut self,
+        job: &Job,
+        mut reply: Reply,
+        replies: &mut Vec<(u64, Reply)>,
+    ) {
+        if job.connection.is_some() {
+            self.record_identity_failure(&job.purpose, &mut reply);
+        }
+        complete(job, reply, replies);
     }
 
     fn resolve_begin(

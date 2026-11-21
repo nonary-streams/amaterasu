@@ -819,17 +819,18 @@ impl Controller {
                 .remove(&client)
                 .expect("pending reconnect");
             if let Err(code) = outcome {
-                replies.push((pending.connection, private_error(503, code)));
+                let mut reply = private_error(503, code);
+                self.record_refusal(&mut reply, "auxiliary_reconnect");
+                replies.push((pending.connection, reply));
             } else if !allowed(
                 pending.peer.certificate(),
                 pending.delivery_permission.clone(),
             ) {
-                replies.push((
-                    pending.connection,
-                    private_error(401, "paired client is no longer trusted"),
-                ));
+                let mut reply = private_error(401, "paired client is no longer trusted");
+                self.record_refusal(&mut reply, "auxiliary_reconnect");
+                replies.push((pending.connection, reply));
             } else {
-                if let Some(reply) = self.launch_auxiliary_for_route(
+                if let Some(mut reply) = self.launch_auxiliary_for_route(
                     pending.connection,
                     pending.request,
                     pending.peer,
@@ -837,6 +838,7 @@ impl Controller {
                     pending.response_kind,
                     now,
                 ) {
+                    self.record_refusal(&mut reply, "auxiliary_reconnect");
                     replies.push((pending.connection, reply));
                 }
                 self.set_presentation_delivery_permission(

@@ -67,7 +67,7 @@ fn prepared_capture(hdr: bool) -> Value {
 }
 
 #[test]
-fn moonlight_generated_extension_request_uses_the_probed_start_configuration() {
+fn moonlight_generated_extension_request_adds_color_to_the_probed_configuration() {
     for hdr in [false, true] {
         let record = extension_record(hdr);
         let payload = record.authenticated_start_payload(23).unwrap();
@@ -75,12 +75,45 @@ fn moonlight_generated_extension_request_uses_the_probed_start_configuration() {
             .config
             .extension_configuration(record.config.launch_extension_format(10));
         expected["extension_profile"] = json!(record.extension_offer.as_ref().unwrap());
+        expected["color_mode"] = json!("bt601_limited");
         assert_eq!(payload["configuration"]["configuration"], expected);
+        assert_eq!(
+            payload["configuration"]["extension_wire_bitrate_kbps"],
+            695_000
+        );
         assert_eq!(
             payload["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],
             if hdr { "hdr" } else { "sdr" }
         );
     }
+}
+
+#[test]
+fn pyrowave_wire_budget_honors_explicit_host_limit_and_legacy_requests() {
+    let mut record = extension_record(true);
+    let mut announce = record.extension_announce.clone().unwrap();
+    record.config.max_bitrate_kbps = Some(80_000);
+    assert!(record.accept_extension_announce(&announce));
+    let start = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(
+        start["configuration"]["extension_wire_bitrate_kbps"],
+        80_000
+    );
+
+    announce.video.configured_bitrate_kbps = None;
+    assert!(!record.accept_extension_announce(&announce));
+    announce.video.bitrate_kbps = 19_600;
+    assert!(record.accept_extension_announce(&announce));
+    let start = record.authenticated_start_payload(23).unwrap();
+    assert!(
+        start["configuration"]
+            .get("extension_wire_bitrate_kbps")
+            .is_none()
+    );
+    assert_eq!(
+        start["configuration"]["configuration"]["bitrate"],
+        19_600_000
+    );
 }
 
 #[test]

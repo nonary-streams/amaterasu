@@ -870,9 +870,11 @@ fn snapshot(selection: &ActivationState, revision: String) -> NativeSelectionSna
 
 const MAX_CATALOG_BYTES: u64 = 256 * 1024;
 const CATALOG_DOMAIN: &[u8] = b"amaterasu.repository.catalog.v1\n";
+/// The hex-encoded public signing key served alongside a repository catalog.
+pub const PUBLISHER_KEY_FILE: &str = "publisher.pub";
 
 /// Approval is for *every* native module slot and the UI, not an add-on scope.
-/// Callers must obtain `confirmed_fingerprint` through an independent channel.
+/// Callers must obtain explicit approval of the publisher fingerprint.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovedRepository {
@@ -896,7 +898,7 @@ impl fmt::Display for ApprovalRejection {
         formatter.write_str(match self {
             Self::Identity | Self::Location => "invalid repository identity or HTTPS location",
             Self::PublicKey => "invalid publisher public key",
-            Self::Fingerprint => "publisher fingerprint does not match independent confirmation",
+            Self::Fingerprint => "publisher fingerprint does not match confirmation",
         })
     }
 }
@@ -1264,7 +1266,8 @@ fn valid_segment(value: &str) -> bool {
         })
 }
 
-fn valid_https_location(value: &str) -> bool {
+/// Validates a repository address before any request is sent.
+pub fn valid_https_location(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("https://") else {
         return false;
     };

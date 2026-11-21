@@ -487,6 +487,8 @@ fn extension_attribute_rules_bound_optional_hints_and_reject_unsupported_modes()
         original.replace("t=0 0", "a=x-ss-video[0].pyrowaveCompression:1\r\nt=0 0"),
         original.replace("t=0 0", "a=x-ss-video[0].unknownCodecMode:1\r\nt=0 0"),
         original.replace("a=x-ss-video[0].pyrowaveFeatures:1 \r\n", ""),
+        original.replace("pyrowaveLinkMbps:1000", "pyrowaveLinkMbps:0"),
+        original.replace("pyrowaveLinkMbps:1000", "pyrowaveLinkMbps:invalid"),
     ] {
         assert!(
             sdp::parse_profile_announce(text.as_bytes(), &snapshot).is_err(),

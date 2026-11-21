@@ -3149,7 +3149,8 @@ namespace Amaterasu {
             const controls = Array.from(wrapper.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input, select, textarea"));
             if (controls.length && controls.every((control) => control.hasAttribute("data-draft-ignore"))) continue;
             const panelTitle = wrapper.closest(".panel")?.querySelector("h2")?.textContent ?? "";
-            const matched = !query || settingsSearchMatches(query, category.label, panelTitle,
+            const pluginTitle = wrapper.closest(".application-plugin-section")?.querySelector("summary")?.textContent ?? "";
+            const matched = !query || settingsSearchMatches(query, category.label, panelTitle, pluginTitle,
               wrapper.textContent ?? "", ...controls.map((control) => control.name));
             if (query && !matched) wrapper.setAttribute("data-settings-search-hidden", "");
             else wrapper.removeAttribute("data-settings-search-hidden");

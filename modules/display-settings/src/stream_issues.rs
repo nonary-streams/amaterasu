@@ -58,10 +58,6 @@ impl StreamIssues {
             .as_str()
             .filter(|code| identifier(code))
             .unwrap_or(UNNAMED_FAILURE);
-        eprintln!(
-            "display settings stream issue operation={} phase={} code={code}",
-            stream.operation, stream.phase
-        );
         self.outbox.push(StreamIssue::critical(
             stream.operation,
             LifecycleLayer::DisplaySettings,

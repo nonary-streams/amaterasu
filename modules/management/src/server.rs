@@ -1768,7 +1768,7 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
             && matches!(route.action, "account_tokens_list" | "account_tokens_issue" | "account_tokens_revoke"
                 | "account_sessions_list" | "account_sessions_revoke"))
             || (route.service == crate::SERVICE
-                && matches!(route.action, "repository_add" | "repository_refresh" | "repository_remove"
+                && matches!(route.action, "repository_preview" | "repository_add" | "repository_refresh" | "repository_remove"
                     | "package_update_activate" | "package_update_restore"
                     | "package_update_automatic"))
             || (route.service == amaterasu_module_sdk::drivers::INSTALLATION_SERVICE && route.action != "status"));
@@ -2303,6 +2303,7 @@ mod tests {
         // Publishers are enrolled and removed only from an administrator's
         // own session; an API token may read the listing and nothing more.
         for path in [
+            "/v1/repositories/preview",
             "/v1/repositories/add",
             "/v1/repositories/refresh",
             "/v1/repositories/remove",

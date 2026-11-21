@@ -135,6 +135,28 @@ impl RepositoryStore {
 
     pub fn approve(&self, approval: ApprovedRepository) -> PackageResult<()> {
         approval.validate()?;
+        self.insert_approval(approval, |_| Ok(()))
+    }
+
+    /// Enrolls a publisher and accepts its first catalog in one durable write.
+    pub fn approve_with_catalog(
+        &self,
+        approval: ApprovedRepository,
+        raw: &[u8],
+        signature: &str,
+        target: &str,
+        now: u64,
+    ) -> PackageResult<()> {
+        self.insert_approval(approval, |record| {
+            save_catalog(record, raw, signature, target, now)
+        })
+    }
+
+    fn insert_approval(
+        &self,
+        approval: ApprovedRepository,
+        initialize: impl FnOnce(&mut RepositoryRecord) -> PackageResult<()>,
+    ) -> PackageResult<()> {
         self.change(|state| {
             if state.repositories.len() >= MAX_REPOSITORIES {
                 return Err("repository approval limit reached".into());
@@ -142,15 +164,16 @@ impl RepositoryStore {
             if state.repositories.contains_key(&approval.id) {
                 return Err("repository identity already enrolled; rotate under a new ID".into());
             }
-            state.repositories.insert(
-                approval.id.clone(),
-                RepositoryRecord {
-                    approval,
-                    revoked: false,
-                    checkpoint: CatalogCheckpoint::default(),
-                    catalog: None,
-                },
-            );
+            let mut record = RepositoryRecord {
+                approval,
+                revoked: false,
+                checkpoint: CatalogCheckpoint::default(),
+                catalog: None,
+            };
+            initialize(&mut record)?;
+            state
+                .repositories
+                .insert(record.approval.id.clone(), record);
             Ok(())
         })
     }

@@ -1,0 +1,117 @@
+--- a/Granite/video/scaler.hpp
++++ b/Granite/video/scaler.hpp
+@@ -47,6 +47,8 @@
+ 
+ 		bool skip_dither;
+ 		bool force_linear_filtering;
++		// Optional row-major Cr, Y, Cb coefficients for RGB input.
++		const float *ycbcr_transform = nullptr;
+ 	};
+ 
+ 	void set_ycbcr_chroma_midpoint(float midpoint);
+--- a/Granite/video/scaler.cpp
++++ b/Granite/video/scaler.cpp
+@@ -349,7 +349,15 @@
+ 	};
+ 	auto *ubo = cmd.allocate_typed_constant_data<UBO>(0, 4, 1);
+ 
+-	if (info.output_color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT)
++	if (info.ycbcr_transform)
++	{
++		for (unsigned row = 0; row < 3; row++)
++		{
++			const float *c = info.ycbcr_transform + 4 * row;
++			ubo->gamma_space_transform[row] = vec4(c[0], c[1], c[2], c[3]);
++		}
++	}
++	else if (info.output_color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+ 	{
+ 		ubo->gamma_space_transform[0] = vec4(0.5f, -0.459786f, -0.0402143f, ycbcr_chroma_midpoint);
+ 		ubo->gamma_space_transform[1] = vec4(0.2627f, 0.678f, 0.0593f, 0.0f);
+--- a/pyrowave_c.cpp
++++ b/pyrowave_c.cpp
+@@ -1127,12 +1127,12 @@
+ 	return pyrowave_encoder_encode_gpu_synchronous_inner(encoder, acquire, release, views, rate_control);
+ }
+ 
+-pyrowave_result
+-pyrowave_encoder_encode_gpu_scaled_synchronous(pyrowave_encoder encoder,
+-											   const pyrowave_gpu_sync_operation *acquire,
+-											   const pyrowave_gpu_sync_operation *release,
+-											   const pyrowave_scaled_encode_info *scaling_info,
+-											   const pyrowave_rate_control *rate_control)
++static pyrowave_result encode_gpu_scaled(pyrowave_encoder encoder,
++                                         const pyrowave_gpu_sync_operation *acquire,
++                                         const pyrowave_gpu_sync_operation *release,
++                                         const pyrowave_scaled_encode_info *scaling_info,
++                                         const pyrowave_rate_control *rate_control,
++                                         const float *ycbcr_transform)
+ {
+ 	Util::set_thread_logging_interface(&null_logger);
+ 
+@@ -1199,6 +1199,7 @@
+ 	info.crop_rect = scaling_info->crop_rect;
+ 	info.skip_dither = scaling_info->skip_dither;
+ 	info.force_linear_filtering = scaling_info->force_linear_filtering;
++	info.ycbcr_transform = ycbcr_transform;
+ 	encoder->scaler.set_ycbcr_chroma_midpoint(scaling_info->ycbcr_chroma_midpoint);
+ 
+ 	if (scaling_info->view.view_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
+@@ -1296,6 +1297,31 @@
+ 	for (int i = 0; i < 3; i++)
+ 		buffers.planes[i] = &encoder->scaler_planes[i]->get_view();
+ 	return pyrowave_encoder_encode_gpu_synchronous_inner(encoder, nullptr, release, buffers, rate_control);
++}
++
++pyrowave_result
++pyrowave_encoder_encode_gpu_scaled_synchronous(pyrowave_encoder encoder,
++                                              const pyrowave_gpu_sync_operation *acquire,
++                                              const pyrowave_gpu_sync_operation *release,
++                                              const pyrowave_scaled_encode_info *scaling_info,
++                                              const pyrowave_rate_control *rate_control)
++{
++    return encode_gpu_scaled(encoder, acquire, release, scaling_info, rate_control, nullptr);
++}
++
++// The caller supplies three affine coefficients rows in Cr, Y, Cb order.
++// The scaler copies the rows into its uniforms during this call.
++extern "C" PYROWAVE_PUBLIC_API pyrowave_result
++pyrowave_amaterasu_encode_scaled_color_v1(pyrowave_encoder encoder,
++                                        const pyrowave_gpu_sync_operation *acquire,
++                                        const pyrowave_gpu_sync_operation *release,
++                                        const pyrowave_scaled_encode_info *scaling_info,
++                                        const pyrowave_rate_control *rate_control,
++                                        const float *ycbcr_transform)
++{
++    if (!ycbcr_transform || scaling_info->view.view_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
++        return PYROWAVE_ERROR_INVALID_ARGUMENT;
++    return encode_gpu_scaled(encoder, acquire, release, scaling_info, rate_control, ycbcr_transform);
+ }
+ 
+ pyrowave_result
+@@ -1859,7 +1885,8 @@
+ // qualifies the device path; importing a particular capture allocation remains
+ // a separate operation and may still fail.
+ extern "C" PYROWAVE_PUBLIC_API pyrowave_result
+-pyrowave_amaterasu_probe_v1(pyrowave_encoder encoder, bool hdr, size_t budget)
++pyrowave_amaterasu_probe_color_v1(pyrowave_encoder encoder, bool hdr, bool ten_bit, size_t budget,
++                                 const float *ycbcr_transform)
+ {
+     if (!encoder || !budget)
+         return PYROWAVE_ERROR_INVALID_ARGUMENT;
+@@ -1895,12 +1922,13 @@
+     scaling.view.swizzle = VK_COMPONENT_SWIZZLE_IDENTITY;
+     scaling.input_color_space = scaling.output_color_space =
+         hdr ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+-    scaling.intermediate_plane_format = hdr ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
++    scaling.intermediate_plane_format = ten_bit ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+     scaling.ycbcr_chroma_midpoint = hdr ? 512.0f / 1023.0f : 128.0f / 255.0f;
+     scaling.skip_dither = true;
+     pyrowave_rate_control rate = {};
+     rate.maximum_bitstream_size = budget;
+-    auto result = pyrowave_encoder_encode_gpu_scaled_synchronous(encoder, nullptr, nullptr, &scaling, &rate);
++    auto result = pyrowave_amaterasu_encode_scaled_color_v1(encoder, nullptr, nullptr, &scaling, &rate,
++                                                            ycbcr_transform);
+     device->wait_idle();
+     return result;
+ }

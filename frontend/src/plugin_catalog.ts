@@ -42,7 +42,13 @@ namespace Amaterasu {
     catalog: RepositoryCatalog;
   }
 
-  export type RepositoryChangeKind = "add" | "refresh" | "remove";
+  export type RepositoryChangeKind = "preview" | "add" | "refresh" | "remove";
+
+  export interface RepositoryPublisher {
+    id: string;
+    location: string;
+    fingerprint: string;
+  }
 
   export interface RepositoryOperation {
     id: number;
@@ -50,6 +56,7 @@ namespace Amaterasu {
     kind: RepositoryChangeKind;
     state: "running" | "succeeded" | "failed";
     code: string | null;
+    publisher?: RepositoryPublisher;
   }
 
   export interface RepositoryPage {
@@ -59,6 +66,7 @@ namespace Amaterasu {
     manageable: boolean;
     capacity: number | null;
     operation: RepositoryOperation | null;
+    preview?: RepositoryOperation | null;
   }
 
   export interface RunningModuleIdentity { id: string; version: string; sha256: string; runtime: boolean }
@@ -506,17 +514,26 @@ namespace Amaterasu {
     const operation = record(value, "Repository change status is invalid.");
     if (typeof operation.id !== "number" || !Number.isSafeInteger(operation.id) || operation.id < 1 ||
         typeof operation.repository !== "string" ||
-        (operation.kind !== "add" && operation.kind !== "refresh" && operation.kind !== "remove") ||
+        (operation.kind !== "preview" && operation.kind !== "add" && operation.kind !== "refresh" && operation.kind !== "remove") ||
         (operation.state !== "running" && operation.state !== "succeeded" && operation.state !== "failed") ||
         (operation.code !== null && typeof operation.code !== "string"))
       throw new Error("Repository change status is invalid.");
-    return {
+    const result: RepositoryOperation = {
       id: operation.id,
       repository: operation.repository,
       kind: operation.kind,
       state: operation.state,
       code: operation.code,
     };
+    if (operation.kind === "preview" && operation.state === "succeeded") {
+      const publisher = record(operation.publisher, "Repository publisher details are invalid.");
+      if (typeof publisher.id !== "string" || !IDENTITY.test(publisher.id) ||
+          typeof publisher.location !== "string" || publisher.location.length > 256 || !publisher.location.startsWith("https://") ||
+          typeof publisher.fingerprint !== "string" || !DIGEST.test(publisher.fingerprint))
+        throw new Error("Repository publisher details are invalid.");
+      result.publisher = { id: publisher.id, location: publisher.location, fingerprint: publisher.fingerprint };
+    }
+    return result;
   }
 
   export function parseRepositoryPage(value: unknown): RepositoryPage {
@@ -533,6 +550,7 @@ namespace Amaterasu {
       manageable: reply.manageable === true,
       capacity: typeof capacity === "number" && Number.isSafeInteger(capacity) && capacity > 0 ? capacity : null,
       operation: parseOperation(reply.operation),
+      preview: reply.preview === undefined ? undefined : parseOperation(reply.preview),
     };
   }
 
@@ -1075,7 +1093,7 @@ namespace Amaterasu {
 
   export const CORE_UPDATE_SOURCE = "amaterasu-core";
 
-  const CORE_UPDATE_ABOUT = "Every module Amaterasu ships. They update together as one signed package, and the host goes back to the package it had if a new one does not start.";
+  const CORE_UPDATE_ABOUT = "Built-in modules update as one signed package. If startup fails, the host restores the previous version.";
 
   const UPDATE_STEP_LABELS = ["Download", "Verify", "Wait for idle", "Restart"] as const;
   const RESTORE_STEP_LABELS = ["Wait for idle", "Restart"] as const;
@@ -1329,10 +1347,11 @@ namespace Amaterasu {
     repository_worker_unavailable: "The host could not start the change.",
     repository_state_unavailable: "The host could not read or save its repository list.",
     invalid_request: "The host did not accept that request.",
-    invalid_repository_id: "Enter the repository ID exactly as its publisher writes it: lowercase letters, digits, dots, dashes and underscores.",
+    invalid_repository_id: "The catalog contains an invalid repository ID.",
     invalid_repository_location: "Enter an https:// address with no query or fragment.",
-    invalid_publisher_key: "The publisher key is 64 hexadecimal characters.",
-    fingerprint_mismatch: "That fingerprint does not belong to this publisher key. Check both against what the publisher gave you.",
+    publisher_key_download_failed: "The host could not download a public signing key from that address. Check the address or ask the publisher for its current repository link.",
+    invalid_publisher_key: "The repository returned an invalid public signing key.",
+    fingerprint_mismatch: "The repository returned a different signing key. Review its fingerprint again before trusting it.",
     repository_exists: "A repository with this ID was already added. An ID that was removed cannot be added again.",
     repository_limit: "This host cannot hold any more repositories.",
     repository_unknown: "This repository is no longer enrolled.",
@@ -1350,41 +1369,19 @@ namespace Amaterasu {
     return (code && REPOSITORY_MESSAGES[code]) || "The repository change did not complete.";
   }
 
-  /// The form field a refused change points at, if any.
-  export function repositoryChangeField(code: string | null): "id" | "location" | "publicKey" | "fingerprint" | null {
-    switch (code) {
-      case "invalid_repository_id": case "repository_exists": case "catalog_identity_mismatch": return "id";
-      case "invalid_repository_location": case "catalog_download_failed": case "catalog_invalid": return "location";
-      case "invalid_publisher_key": case "catalog_rejected": return "publicKey";
-      case "fingerprint_mismatch": return "fingerprint";
-      default: return null;
-    }
-  }
-
-  export interface RepositoryDescriptor { id?: string; location?: string; publicKey?: string }
-
-  /// Reads the details a publisher hands out as one block of JSON. The key
-  /// fingerprint is deliberately not taken from it: the administrator confirms
-  /// that separately.
-  export function parseRepositoryDescriptor(text: string): RepositoryDescriptor | null {
+  /// Accepts the address from a publisher's older JSON share format.
+  export function parseRepositoryDescriptor(text: string): string | null {
     const trimmed = text.trim();
     if (!trimmed.startsWith("{") || trimmed.length > 4096) return null;
     let parsed: unknown;
     try { parsed = JSON.parse(trimmed); } catch { return null; }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     const source = parsed as Record<string, unknown>;
-    const field = (...names: string[]): string | undefined => {
-      for (const name of names) {
-        const value = source[name];
-        if (typeof value === "string" && value.trim() && value.length <= 512) return value.trim();
-      }
-      return undefined;
-    };
-    const id = field("id", "repository");
-    const location = field("location", "url");
-    const publicKey = field("public_key", "publicKey", "key");
-    if (!id && !location && !publicKey) return null;
-    return { ...(id ? { id } : {}), ...(location ? { location } : {}), ...(publicKey ? { publicKey: publicKey.toLowerCase() } : {}) };
+    for (const name of ["location", "url"]) {
+      const value = source[name];
+      if (typeof value === "string" && value.trim() && value.trim().length <= 256) return value.trim();
+    }
+    return null;
   }
 
   /// The interface bundle digest a versioned asset address names, if it has one.

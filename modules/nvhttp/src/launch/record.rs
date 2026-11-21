@@ -131,6 +131,8 @@ pub struct Record {
     pub lifecycle_session_target: Option<amaterasu_module_sdk::extension_api::LifecycleTarget>,
     pub lifecycle_end_fenced: bool,
     pub lifecycle_end_complete: bool,
+    pub paused_display_possible: bool,
+    pub paused_display_released: bool,
     pub lifecycle_application_retirement: ApplicationRetirementState,
     /// Changes only when an explicit cleanup retry follows a terminal proof failure.
     pub lifecycle_application_retirement_attempt: u32,
@@ -377,6 +379,8 @@ impl Record {
             lifecycle_session_target: None,
             lifecycle_end_fenced: false,
             lifecycle_end_complete: false,
+            paused_display_possible: false,
+            paused_display_released: false,
             lifecycle_application_retirement: ApplicationRetirementState::Unreported,
             lifecycle_application_retirement_attempt: 0,
             lifecycle_retirement_launch: None,
@@ -583,7 +587,16 @@ impl Record {
 
     #[track_caller]
     pub fn fail_cleanup(&mut self, error: &'static str) {
-        self.record_failure(error);
+        if matches!(
+            error,
+            "rtsp_cleanup_unconfirmed" | "paused_display_release_unconfirmed"
+        ) {
+            // An unconfirmed stop is a cleanup outcome. Keep the ticket
+            // fenced without recording a new cause of playback failure.
+            self.record_cleanup_warning(error);
+        } else {
+            self.record_failure(error);
+        }
         self.state = State::CleanupFailed;
         self.cleanup_error = Some(error);
         self.automatic_cleanup_retry_active = false;

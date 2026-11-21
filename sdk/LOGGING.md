@@ -29,3 +29,22 @@ combined target must fit 128 bytes. Control characters in targets and NUL in
 messages are rejected. Invalid UTF-8 is rejected by the host. Synchronous calls
 can return an error; queued logging may drop records under backpressure, so use
 bounded periodic summaries instead of emitting a log per frame.
+
+## Human-readable output and timing captures
+
+Write operator-facing messages as short sentences. Include a unit for each
+measurement and the effective choice when a setting changes. Use Info for
+milestones such as host readiness and the agreed playback format. Reserve
+Debug for details that explain an operation.
+
+Stream owners report warnings and failures through a typed `StreamIssue`.
+The SDK produces the source log message and the lifecycle store accepts the
+report for the exact operation. A plugin supplies its code, phase, safe reason
+and applicable fallback or values. The console obtains alerts from the store.
+See the [stream lifecycle contract](../docs/stream-lifecycle-store.md).
+
+Send structured measurement windows through `diagnostics::log_window`.
+The SDK supplies the reserved `timing/` target prefix. At Debug and Verbose,
+the host writes these records into the session's bounded timing capture.
+The ordinary log, terminal, and host-log download show human-readable events.
+See [reading a timing capture](../docs/streaming-latency-diagnostics.md).

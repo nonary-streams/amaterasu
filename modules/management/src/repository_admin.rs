@@ -4,18 +4,17 @@
 //! change runs on one worker thread, so the host thread never waits for the
 //! network or a durable write, and at most one change is in flight.
 //!
-//! Approval follows the release tool's rule: the administrator supplies the
-//! publisher key and a separately confirmed fingerprint. An enrolled identity
-//! can never be enrolled again, so a repository is recorded only after its
-//! catalog verifies under that key. Enrolling a repository lists its choices;
-//! it does not load or activate any of them.
+//! Inspection verifies the catalog with the key served by the repository.
+//! Enrollment pins the explicitly approved fingerprint and saves only a
+//! catalog signed by that key. It does not load or activate any choices.
 use crate::repository_transport::NetworkRepository;
 use amaterasu_module_sdk::network::Network;
 use amaterasu_package::repository::{
-    ApprovedRepository, Catalog, CatalogCheckpoint, RepositoryStore, RepositoryTransport,
-    observe_native_selection, verify_catalog,
+    ApprovedRepository, Catalog, CatalogCheckpoint, PUBLISHER_KEY_FILE, RepositoryStore,
+    RepositoryTransport, observe_native_selection, valid_https_location, verify_catalog,
 };
-use amaterasu_package::{PackageResult, current_target, unix_timestamp, web};
+use amaterasu_package::{PackageResult, current_target, decode_hex, sha256, unix_timestamp, web};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -54,6 +53,7 @@ pub(crate) struct ConsoleTrust {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OperationKind {
+    Preview,
     Add,
     Refresh,
     Remove,
@@ -62,6 +62,7 @@ enum OperationKind {
 impl OperationKind {
     fn name(self) -> &'static str {
         match self {
+            Self::Preview => "preview",
             Self::Add => "add",
             Self::Refresh => "refresh",
             Self::Remove => "remove",
@@ -69,18 +70,27 @@ impl OperationKind {
     }
 }
 
+#[derive(Serialize)]
+struct PublisherPreview {
+    id: String,
+    location: String,
+    fingerprint: String,
+}
+
+type OperationOutcome = Result<Option<PublisherPreview>, Refusal>;
+
 struct Job {
     operation: u64,
     repository: String,
     kind: OperationKind,
-    thread: JoinHandle<Result<(), Refusal>>,
+    thread: JoinHandle<OperationOutcome>,
 }
 
 struct FinishedOperation {
     operation: u64,
     repository: String,
     kind: OperationKind,
-    outcome: Result<(), Refusal>,
+    outcome: OperationOutcome,
 }
 
 pub(crate) struct RepositoryAdministration {
@@ -118,27 +128,79 @@ impl RepositoryAdministration {
         package_root: impl FnOnce() -> Option<PathBuf>,
     ) -> Value {
         let field = |name: &str| payload.get(name).and_then(Value::as_str);
-        let Some(id) = field("id") else {
-            return json!({"ok":false,"code":"invalid_request"});
-        };
-        let started = match action {
-            "repository_add" => {
-                let (Some(location), Some(public_key), Some(fingerprint)) =
-                    (field("location"), field("public_key"), field("fingerprint"))
-                else {
-                    return json!({"ok":false,"code":"invalid_request"});
-                };
-                checked_approval(id, location, public_key, fingerprint)
-                    .and_then(|approval| self.add(approval))
+        let started = match (action, field("id"), field("location"), field("fingerprint")) {
+            ("repository_preview", _, Some(location), _) => self.preview(location),
+            ("repository_add", Some(id), Some(location), Some(fingerprint)) => {
+                if let Some(public_key) = field("public_key") {
+                    checked_approval(id, location, public_key, fingerprint)
+                        .and_then(|approval| self.add(approval))
+                } else {
+                    self.add_discovered(id, location, fingerprint)
+                }
             }
-            "repository_refresh" => self.refresh(id.to_owned()),
-            "repository_remove" => self.remove(id.to_owned(), package_root()),
+            ("repository_refresh", Some(id), _, _) => self.refresh(id.to_owned()),
+            ("repository_remove", Some(id), _, _) => self.remove(id.to_owned(), package_root()),
             _ => Err("invalid_request"),
         };
         match started {
             Ok(operation) => json!({"ok":true,"operation":operation}),
             Err(code) => json!({"ok":false,"code":code}),
         }
+    }
+
+    fn preview(&mut self, location: &str) -> Result<u64, Refusal> {
+        let transport = self.discovery_transport(location)?;
+        let directory = self.store_directory.clone();
+        let location = location.to_owned();
+        self.start(String::new(), OperationKind::Preview, move || {
+            inspect_publisher(
+                &open_store(directory)?,
+                &location,
+                &transport,
+                &current_target(),
+            )
+            .map(Some)
+        })
+    }
+
+    fn add_discovered(
+        &mut self,
+        id: &str,
+        location: &str,
+        fingerprint: &str,
+    ) -> Result<u64, Refusal> {
+        if !crate::package_status::is_sha256(fingerprint) {
+            return Err("fingerprint_mismatch");
+        }
+        let transport = self.discovery_transport(location)?;
+        let directory = self.store_directory.clone();
+        let (id, location, fingerprint) =
+            (id.to_owned(), location.to_owned(), fingerprint.to_owned());
+        self.start(id.clone(), OperationKind::Add, move || {
+            let store = open_store(directory)?;
+            let approval = confirm_publisher(&id, &location, &fingerprint, &transport)?;
+            enroll(
+                &store,
+                approval,
+                &transport,
+                &current_target(),
+                unix_timestamp,
+            )?;
+            Ok(None)
+        })
+    }
+
+    fn discovery_transport(&self, location: &str) -> Result<NetworkRepository, Refusal> {
+        if location.len() > 256 || !valid_https_location(location) {
+            return Err("invalid_repository_location");
+        }
+        Ok(NetworkRepository::new(
+            location,
+            self.network.clone(),
+            self.cancelled.clone(),
+            Arc::new(AtomicU64::new(0)),
+            CATALOG_REQUEST_LIMIT,
+        ))
     }
 
     /// Enrolls a repository whose approval the caller has already checked.
@@ -160,8 +222,9 @@ impl RepositoryAdministration {
                 approval,
                 &transport,
                 &current_target(),
-                unix_timestamp(),
-            )
+                unix_timestamp,
+            )?;
+            Ok(None)
         })
     }
 
@@ -180,7 +243,8 @@ impl RepositoryAdministration {
                 Arc::new(AtomicU64::new(0)),
                 CATALOG_REQUEST_LIMIT,
             );
-            refresh(&store, &id, &transport, &current_target(), unix_timestamp())
+            refresh(&store, &id, &transport, &current_target(), unix_timestamp())?;
+            Ok(None)
         })
     }
 
@@ -202,7 +266,8 @@ impl RepositoryAdministration {
                 package_root.as_deref(),
                 &console,
                 unix_timestamp(),
-            )
+            )?;
+            Ok(None)
         })
     }
 
@@ -210,7 +275,7 @@ impl RepositoryAdministration {
         &mut self,
         repository: String,
         kind: OperationKind,
-        work: impl FnOnce() -> Result<(), Refusal> + Send + 'static,
+        work: impl FnOnce() -> OperationOutcome + Send + 'static,
     ) -> Result<u64, Refusal> {
         self.advance();
         if self.shutdown_announced {
@@ -257,8 +322,11 @@ impl RepositoryAdministration {
     }
 
     /// The running change, or the most recent one that finished.
-    fn operation(&self) -> Value {
-        if let Some(job) = &self.job {
+    fn operation(&self, preview: bool) -> Value {
+        let matches = |kind| (kind == OperationKind::Preview) == preview;
+        if let Some(job) = &self.job
+            && matches(job.kind)
+        {
             return json!({
                 "id": job.operation,
                 "repository": job.repository,
@@ -267,15 +335,24 @@ impl RepositoryAdministration {
                 "code": null,
             });
         }
-        self.finished.as_ref().map_or(Value::Null, |finished| {
-            json!({
-                "id": finished.operation,
-                "repository": finished.repository,
-                "kind": finished.kind.name(),
-                "state": if finished.outcome.is_ok() { "succeeded" } else { "failed" },
-                "code": finished.outcome.err(),
-            })
-        })
+        let Some(finished) = self
+            .finished
+            .as_ref()
+            .filter(|finished| matches(finished.kind))
+        else {
+            return Value::Null;
+        };
+        let mut result = json!({
+            "id": finished.operation,
+            "repository": finished.repository,
+            "kind": finished.kind.name(),
+            "state": if finished.outcome.is_ok() { "succeeded" } else { "failed" },
+            "code": finished.outcome.as_ref().err(),
+        });
+        if let Ok(Some(publisher)) = &finished.outcome {
+            result["publisher"] = json!(publisher);
+        }
+        result
     }
 
     /// Close admission without interrupting a change that is already running.
@@ -339,7 +416,8 @@ pub(crate) fn listing(
         "next_offset": next_offset,
         "manageable": administration.is_some(),
         "capacity": RepositoryStore::CAPACITY,
-        "operation": administration.map_or(Value::Null, RepositoryAdministration::operation),
+        "operation": administration.map_or(Value::Null, |admin| admin.operation(false)),
+        "preview": administration.map_or(Value::Null, |admin| admin.operation(true)),
     })
 }
 
@@ -369,6 +447,45 @@ fn open_store(directory: PathBuf) -> Result<RepositoryStore, Refusal> {
     RepositoryStore::new(directory).map_err(|_| "repository_state_unavailable")
 }
 
+fn fetch_publisher_key(transport: &impl RepositoryTransport) -> Result<String, Refusal> {
+    let bytes = transport
+        .get(PUBLISHER_KEY_FILE, 66)
+        .map_err(|_| "publisher_key_download_failed")?;
+    let key = std::str::from_utf8(&bytes).map_err(|_| "invalid_publisher_key")?;
+    Ok(key.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn confirm_publisher(
+    id: &str,
+    location: &str,
+    fingerprint: &str,
+    transport: &impl RepositoryTransport,
+) -> Result<ApprovedRepository, Refusal> {
+    let key = fetch_publisher_key(transport)?;
+    checked_approval(id, location, &key, fingerprint)
+}
+
+fn inspect_publisher(
+    store: &RepositoryStore,
+    location: &str,
+    transport: &impl RepositoryTransport,
+    target: &str,
+) -> Result<PublisherPreview, Refusal> {
+    let key = fetch_publisher_key(transport)?;
+    let fingerprint = sha256(&decode_hex::<32>(&key).map_err(|_| "invalid_publisher_key")?);
+    let (raw, signature) = fetch_catalog(transport)?;
+    let catalog: Catalog = serde_json::from_slice(&raw).map_err(|_| "catalog_invalid")?;
+    let approval = checked_approval(&catalog.repository, location, &key, &fingerprint)?;
+    let now = unix_timestamp();
+    check_enrollment_slot(store, &approval.id, target, now)?;
+    verify_initial_catalog(&approval, &raw, &signature, target, now)?;
+    Ok(PublisherPreview {
+        id: approval.id,
+        location: approval.location,
+        fingerprint: approval.fingerprint,
+    })
+}
+
 /// Records an approval only when the repository serves a catalog that this
 /// publisher key signed for this host.
 fn enroll(
@@ -376,34 +493,53 @@ fn enroll(
     approval: ApprovedRepository,
     transport: &impl RepositoryTransport,
     target: &str,
+    clock: impl Fn() -> u64,
+) -> Result<(), Refusal> {
+    check_enrollment_slot(store, &approval.id, target, clock())?;
+    let (raw, signature) = fetch_catalog(transport)?;
+    let now = clock();
+    verify_initial_catalog(&approval, &raw, &signature, target, now)?;
+    retry_while_locked(|| {
+        store.approve_with_catalog(approval.clone(), &raw, &signature, target, now)
+    })
+    .map_err(|_| "repository_state_unavailable")
+}
+
+fn check_enrollment_slot(
+    store: &RepositoryStore,
+    id: &str,
+    target: &str,
     now: u64,
 ) -> Result<(), Refusal> {
     let enrolled = store
         .list(target, now)
         .map_err(|_| "repository_state_unavailable")?;
-    if enrolled
-        .iter()
-        .any(|repository| repository.id == approval.id)
-    {
+    if enrolled.iter().any(|repository| repository.id == id) {
         return Err("repository_exists");
     }
     if enrolled.len() >= RepositoryStore::CAPACITY {
         return Err("repository_limit");
     }
-    let (raw, signature) = fetch_catalog(transport)?;
+    Ok(())
+}
+
+fn verify_initial_catalog(
+    approval: &ApprovedRepository,
+    raw: &[u8],
+    signature: &str,
+    target: &str,
+    now: u64,
+) -> Result<(), Refusal> {
     verify_catalog(
-        &approval,
-        &raw,
-        &signature,
+        approval,
+        raw,
+        signature,
         &CatalogCheckpoint::default(),
         target,
         now,
     )
-    .map_err(|_| catalog_refusal(&raw, &approval.id, target, now))?;
-    retry_while_locked(|| store.approve(approval.clone()))
-        .map_err(|_| "repository_state_unavailable")?;
-    retry_while_locked(|| store.accept_catalog(&approval.id, &raw, &signature, target, now))
-        .map_err(|_| "repository_state_unavailable")
+    .map(|_| ())
+    .map_err(|_| catalog_refusal(raw, &approval.id, target, now))
 }
 
 fn refresh(
@@ -619,6 +755,7 @@ mod tests {
             MemoryRepository(BTreeMap::from([
                 ("catalog.json", raw),
                 ("catalog.sig", signature.into_bytes()),
+                (PUBLISHER_KEY_FILE, self.public_key().into_bytes()),
             ]))
         }
 
@@ -730,6 +867,69 @@ mod tests {
     }
 
     #[test]
+    fn discovery_requires_a_valid_catalog_and_enrollment_pins_the_reviewed_key() {
+        let root = Root::new();
+        let store = root.store();
+        let publisher = Publisher::new("example-plugins", 3);
+        let replacement = Publisher::new(publisher.id, 4);
+        let location = &publisher.approval().location;
+        let now = unix_timestamp();
+        let original = publisher.serve(&publisher.catalog(publisher.id, TARGET, 5, now + 100));
+        let replacement_catalog =
+            replacement.serve(&replacement.catalog(publisher.id, TARGET, 6, now + 100));
+
+        let mut wrong_key = publisher.serve(&publisher.catalog(publisher.id, TARGET, 5, now + 100));
+        wrong_key
+            .0
+            .insert(PUBLISHER_KEY_FILE, replacement.public_key().into_bytes());
+        assert_eq!(
+            inspect_publisher(&store, location, &wrong_key, TARGET).err(),
+            Some("catalog_rejected")
+        );
+        wrong_key.0.remove(PUBLISHER_KEY_FILE);
+        assert_eq!(
+            inspect_publisher(&store, location, &wrong_key, TARGET).err(),
+            Some("publisher_key_download_failed")
+        );
+        let preview = inspect_publisher(&store, location, &original, TARGET).unwrap();
+        assert_eq!(preview.id, publisher.id);
+        assert_eq!(&preview.location, location);
+        assert_eq!(preview.fingerprint, publisher.fingerprint());
+        assert!(store.active_keys().unwrap().is_empty());
+
+        let confirm = |transport| {
+            confirm_publisher(
+                &preview.id,
+                &preview.location,
+                &preview.fingerprint,
+                transport,
+            )
+        };
+        assert_eq!(
+            confirm(&replacement_catalog).err(),
+            Some("fingerprint_mismatch")
+        );
+        assert!(store.list(TARGET, now).unwrap().is_empty());
+        enroll(
+            &store,
+            confirm(&original).unwrap(),
+            &original,
+            TARGET,
+            || now,
+        )
+        .unwrap();
+        assert_eq!(
+            store.approved(publisher.id).unwrap().public_key,
+            publisher.public_key()
+        );
+        assert_eq!(store.list(TARGET, now).unwrap()[0].candidates.len(), 1);
+        assert_eq!(
+            refresh(&store, publisher.id, &replacement_catalog, TARGET, now),
+            Err("catalog_rejected")
+        );
+    }
+
+    #[test]
     fn enrollment_records_a_repository_only_after_its_catalog_verifies() {
         let root = Root::new();
         let store = root.store();
@@ -761,7 +961,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                enroll(&store, publisher.approval(), &served, TARGET, NOW),
+                enroll(&store, publisher.approval(), &served, TARGET, || NOW),
                 Err(expected)
             );
             assert!(
@@ -775,7 +975,7 @@ mod tests {
             publisher.approval(),
             &publisher.current(),
             TARGET,
-            NOW,
+            || NOW,
         )
         .unwrap();
         assert_eq!(listed(&store), [("example-plugins".into(), false, 1)]);
@@ -785,7 +985,7 @@ mod tests {
                 publisher.approval(),
                 &publisher.current(),
                 TARGET,
-                NOW
+                || NOW
             ),
             Err("repository_exists")
         );
@@ -805,13 +1005,13 @@ mod tests {
                 publisher.approval(),
                 &publisher.current(),
                 TARGET,
-                NOW,
+                || NOW,
             )
             .unwrap();
         }
         let extra = Publisher::new("one-too-many", 200);
         assert_eq!(
-            enroll(&store, extra.approval(), &extra.current(), TARGET, NOW),
+            enroll(&store, extra.approval(), &extra.current(), TARGET, || NOW),
             Err("repository_limit")
         );
     }
@@ -830,7 +1030,7 @@ mod tests {
             publisher.approval(),
             &publisher.current(),
             TARGET,
-            NOW,
+            || NOW,
         )
         .unwrap();
 
@@ -868,7 +1068,7 @@ mod tests {
             publisher.approval(),
             &publisher.current(),
             TARGET,
-            NOW,
+            || NOW,
         )
         .unwrap();
         let retire_now = |package_root: Option<&Path>| {
@@ -894,7 +1094,7 @@ mod tests {
                 publisher.approval(),
                 &publisher.current(),
                 TARGET,
-                NOW
+                || NOW
             ),
             Err("repository_exists"),
             "a removed identity is never enrolled again"
@@ -911,7 +1111,7 @@ mod tests {
             publisher.approval(),
             &publisher.current(),
             TARGET,
-            NOW,
+            || NOW,
         )
         .unwrap();
         root.select_native(&"a".repeat(64), None);
@@ -981,7 +1181,7 @@ mod tests {
             publisher.approval(),
             &publisher.current(),
             TARGET,
-            NOW,
+            || NOW,
         )
         .unwrap();
         root.select_native(&"a".repeat(64), None);
@@ -1017,7 +1217,7 @@ mod tests {
             publisher.approval(),
             &publisher.serve(&catalog),
             &current_target(),
-            NOW,
+            || NOW,
         )
         .unwrap();
 
@@ -1086,6 +1286,13 @@ mod tests {
             refused("invalid_request")
         );
         assert_eq!(
+            change(
+                "repository_preview",
+                json!({"location":"https://real.test@other.test"})
+            ),
+            refused("invalid_repository_location")
+        );
+        assert_eq!(
             change("repository_install", json!({"id":"example-plugins"})),
             refused("invalid_request")
         );
@@ -1102,7 +1309,7 @@ mod tests {
             refused("fingerprint_mismatch")
         );
         assert!(!asked_for_root, "only a removal looks up the package root");
-        assert_eq!(administration.operation(), Value::Null);
+        assert_eq!(administration.operation(false), Value::Null);
         assert!(listed(&root.store()).is_empty());
     }
 
@@ -1115,7 +1322,7 @@ mod tests {
             publisher.approval(),
             &publisher.current(),
             TARGET,
-            NOW,
+            || NOW,
         )
         .unwrap();
         let mut administration = RepositoryAdministration::new(
@@ -1123,7 +1330,7 @@ mod tests {
             root.console(),
             Network::test_provider(),
         );
-        assert_eq!(administration.operation(), Value::Null);
+        assert_eq!(administration.operation(false), Value::Null);
 
         let gate = Arc::new(AtomicBool::new(false));
         let waiting = gate.clone();
@@ -1139,20 +1346,20 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(administration.operation()["state"], "running");
+        assert_eq!(administration.operation(false)["state"], "running");
         assert_eq!(
             administration.remove("example-plugins".into(), Some(root.0.clone())),
             Err("repository_busy")
         );
         gate.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while administration.operation()["state"] == "running" {
+        while administration.operation(false)["state"] == "running" {
             administration.advance();
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
         assert_eq!(
-            administration.operation(),
+            administration.operation(false),
             json!({
                 "id": first,
                 "repository": "example-plugins",
@@ -1168,13 +1375,13 @@ mod tests {
             .remove("example-plugins".into(), Some(root.0.clone()))
             .unwrap();
         assert!(second > first);
-        while administration.operation()["state"] == "running" {
+        while administration.operation(false)["state"] == "running" {
             administration.advance();
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
-        assert_eq!(administration.operation()["state"], "succeeded");
-        assert_eq!(administration.operation()["kind"], "remove");
+        assert_eq!(administration.operation(false)["state"], "succeeded");
+        assert_eq!(administration.operation(false)["kind"], "remove");
         assert_eq!(listed(&root.store()), [("example-plugins".into(), true, 0)]);
 
         administration.prepare_shutdown();

@@ -138,9 +138,9 @@ namespace Amaterasu {
     key: string;
     name: string;
     summary: TextValue;
-    meta: string;
+    version: string;
+    availability?: { label: string; installed: boolean };
     group: string;
-    emphasis: boolean;
   }
 
   interface PluginBrowser {
@@ -260,7 +260,11 @@ namespace Amaterasu {
             el("span", "plugin-row-text",
               el("span", "plugin-row-name", lit(entry.name)),
               el("span", "plugin-row-summary", entry.summary)),
-            el("span", `plugin-row-meta${entry.emphasis ? " plugin-row-meta--emphasis" : ""}`, lit(entry.meta)),
+            el("span", "plugin-row-meta",
+              entry.availability
+                ? el("span", entry.availability.installed ? "plugin-availability installed" : "plugin-availability", entry.availability.label)
+                : null,
+              el("span", "plugin-row-version", lit(entry.version))),
           );
           const item = el("li", "", control);
           items.append(item);
@@ -389,7 +393,7 @@ namespace Amaterasu {
       el("header", "plugin-update-source-head",
         el("div", "plugin-update-title", name, about),
         el("div", "plugin-update-status", state, actions)),
-      facts, detail, refused, permission, steps, transfer, changes, automatic, extras);
+      el("div", "plugin-source-body", facts, detail, refused, permission, steps, transfer, changes, automatic, extras));
     let shownFacts = "";
     let shownSteps = "";
     let shownChanges = "";
@@ -412,7 +416,7 @@ namespace Amaterasu {
       if (view.running)
         shown.push(fact(el("span", "muted", "Package"), " ",
           options.copyable(view.running, shortDigest(view.running), "package digest")));
-      if (view.repository) shown.push(fact(el("span", "muted", "from"), " ", options.repositoryLink(view.repository)));
+      if (view.repository) shown.push(fact(el("span", "muted", "Repository"), " ", options.repositoryLink(view.repository)));
       facts.replaceChildren(...shown);
       facts.hidden = shown.length === 0;
     }
@@ -579,7 +583,7 @@ namespace Amaterasu {
     const check = button("Check for updates", () => {
       if (check.getAttribute("aria-disabled") === "true") return;
       for (const entry of entries) if (entry.feed.view().actions.includes("check")) void perform(entry, "check");
-    });
+    }, "outline");
     const mark = el("span", "plugin-summary-mark");
     mark.setAttribute("aria-hidden", "true");
     const headline = el("p", "plugin-summary-headline");
@@ -842,6 +846,16 @@ namespace Amaterasu {
     // and the lists of earlier packages under it, are built once.
     const included = el("section", "plugin-included");
     setLocalizedAttribute(included, "aria-label", "Included in Amaterasu Core");
+    const families = el("ul", "plugin-families");
+    families.id = "plugin-core-families";
+    families.hidden = true;
+    const toggleFamilies = button("Included modules", () => {
+      families.hidden = !families.hidden;
+      toggleFamilies.setAttribute("aria-expanded", String(!families.hidden));
+    }, "plugin-family-toggle");
+    toggleFamilies.setAttribute("aria-controls", families.id);
+    toggleFamilies.setAttribute("aria-expanded", "false");
+    toggleFamilies.dataset.focusKey = "included modules";
     const versions = versionsList();
     const core = coreUpdateFeed(api, () => {
       const status = ready(selection);
@@ -864,8 +878,7 @@ namespace Amaterasu {
     const overview = el("div", "plugin-overview", updates.node, others);
 
     context.content.append(
-      sectionHeading("Modules", "What this host runs and how it stays up to date."),
-      ...(canRead ? [updates.summary] : []),
+      sectionHeading("Modules", "Manage installed modules, plugins and updates.", canRead ? updates.summary : null),
       tabList,
       viewArea,
     );
@@ -1017,14 +1030,16 @@ namespace Amaterasu {
     }
 
     function driverCard(driver: PluginDriver): HTMLElement {
+      const requiredBy = driver.requiredBy.map((id) =>
+        runningModules()?.find((module) => module.id === id)?.name ?? id);
       return el("section", "plugin-detail",
         el("h3", "", lit(driver.name)),
-        el("p", "plugin-detail-state", lit(driverStateLabel(driver.state))),
+        el("p", "plugin-detail-state", lit(driverReadinessLabel(driver))),
         el("p", "", lit(driver.reason)),
-        factList([["Publisher",lit(driver.publisher)], ["Required by",lit(driver.requiredBy.join(", "))],
+        factList([["Publisher",lit(driver.publisher)], ["Required by",lit(requiredBy.join(", "))],
           ["Installed version", driver.installedVersion ? lit(driver.installedVersion) : "Unknown"],
           driver.offeredVersion ? ["Version in plugin", lit(driver.offeredVersion)] : null,
-          ["Updates", lit(driverUpdateLabel(driver.update))]]),
+          driver.builtin ? null : ["Updates", lit(driverUpdateLabel(driver.update))]]),
         driver.message ? el("p", "", lit(driver.message)) : null,
         driver.mayRequireReboot && driver.state !== "ready" ? el("p", "muted", "Installation may require restarting this computer. It will not restart automatically.") : null);
     }
@@ -1053,18 +1068,21 @@ namespace Amaterasu {
         if (["failed", "reboot_required", "manual_action_required"].includes(operation.phase)) addControl("Check again", "retry");
         if (operation.cancellable) addControl("Cancel setup", "cancel");
       }
-      const installed = status.drivers;
+      const builtin = status.drivers.filter((driver) => driver.builtin);
+      const installed = status.drivers.filter((driver) => !driver.builtin);
       const pending = operation && !["ready", "cancelled"].includes(operation.phase) ? operation.drivers : [];
       viewArea.replaceChildren(el("div", "plugin-drivers",
         el("h2", "", "Drivers"),
-        operation ? el("div", "plugin-update-status", el("p", "", lit(driverSetupMessage(operation.phase))),
+        operation ? el("div", "plugin-driver-operation", el("p", "", lit(driverSetupMessage(operation.phase))),
           operation.error ? el("p", "", lit(driverSetupError(operation.error))) : null, el("div", "actions", ...controls)) : null,
         driverFailure ? errorPanel(driverFailure, refreshDrivers) : null,
+        builtin.length ? el("section", "plugin-driver-group", el("h3", "", "Host drivers"),
+          ...builtin.map(driverCard)) : null,
         installed.length ? el("p", "muted", "Installed plugin drivers · last verified during setup. Update information compares the installed version with the signed driver bundled in the plugin.") : null,
         ...installed.map(driverCard),
         operation && !["ready", "cancelled"].includes(operation.phase) && operation.drivers.length
-          ? el("section", "", el("h3", "", "Current setup"), ...operation.drivers.map(driverCard)) : null,
-        !installed.length && !pending.length ? el("p", "muted", "No verified driver inventory is available.") : null,
+          ? el("section", "plugin-driver-group", el("h3", "", "Current setup"), ...operation.drivers.map(driverCard)) : null,
+        !status.drivers.length && !pending.length ? el("p", "muted", "No verified driver inventory is available.") : null,
       ));
     }
 
@@ -1216,15 +1234,12 @@ namespace Amaterasu {
         ? document.activeElement.dataset.focusKey : undefined;
       const all = button(lit(`All ${plugins.length} modules`), () => showView("modules"), "link-button plugin-link");
       all.dataset.focusKey = "all modules";
-      included.replaceChildren(
-        el("header", "plugin-included-head", el("p", "plugin-label", "Included"), all),
-        el("ul", "plugin-families",
-          ...MODULE_FAMILIES.map((family) => familyRow(family, running, changes)),
-          builtIn.length ? looseRow("built-in", BUILT_IN_LABEL,
-            "Streaming, pairing, the library, this console and the rest of the host.", builtIn, changes, AMATERASU_SOURCE) : null,
-          foreign.length ? looseRow("foreign", "From other developers",
-            "Modules another developer wrote that ship inside this package.", foreign, changes, null) : null),
-      );
+      families.replaceChildren(...MODULE_FAMILIES.map((family) => familyRow(family, running, changes)));
+      if (builtIn.length) families.append(looseRow("built-in", BUILT_IN_LABEL,
+        "Streaming, pairing, the library, this console and the rest of the host.", builtIn, changes, AMATERASU_SOURCE));
+      if (foreign.length) families.append(looseRow("foreign", "From other developers",
+        "Modules another developer wrote that ship inside this package.", foreign, changes, null));
+      included.replaceChildren(el("header", "plugin-included-head", toggleFamilies, all), families);
       if (focused)
         Array.from(included.querySelectorAll<HTMLElement>("[data-focus-key]"))
           .find((control) => control.dataset.focusKey === focused)?.focus();
@@ -1371,9 +1386,8 @@ namespace Amaterasu {
             key: plugin.id,
             name: plugin.name,
             summary: plugin.summary || lit(plugin.id),
-            meta: plugin.version,
+            version: plugin.version,
             group: plugin.category,
-            emphasis: false,
           })),
           quietState("No modules match", "Try a different search or category."),
         );
@@ -1394,7 +1408,7 @@ namespace Amaterasu {
         browser.select(id);
       }
 
-      viewArea.replaceChildren(bar, browser.node);
+      viewArea.replaceChildren(el("div", "plugin-inventory", bar, browser.node));
       showMatches();
       if (revealInstalled && selectedInstalled) browser.focus(selectedInstalled);
       revealInstalled = false;
@@ -1597,7 +1611,7 @@ namespace Amaterasu {
         ]));
         const requiredDrivers = ready(driverStatus)?.drivers.filter((driver) => driver.requiredBy.includes(plugin.id) || driver.requiredComponents.includes(plugin.id)) ?? [];
         if (requiredDrivers.length) facts.append(detailSection("Drivers", ...requiredDrivers.map((driver) =>
-          button(lit(`${driver.name} · ${driverStateLabel(driver.state)}`), () => showView("drivers"), "link-button plugin-link"))));
+          button(lit(`${driver.name} · ${driverReadinessLabel(driver)}`), () => showView("drivers"), "link-button plugin-link"))));
         if (!description) return;
         const provides = [...new Set([...description.provides, ...description.nativeProvides])];
         const uses = [...new Set([...description.calls, ...description.nativeUses])];
@@ -1650,28 +1664,28 @@ namespace Amaterasu {
 
     /// What the repositories offer beyond the host's own package, compared with what the host runs.
     function renderOthers(): void {
-      const manage = (ready(listing)?.manageable ?? false) && canManage;
-      const add = manage ? button("Add repository", () => openAddRepository()) : null;
+      const enrolled = ready(listing);
+      const add = enrolled?.manageable && enrolled.preview !== undefined && canManage
+        ? button("Add repository", () => openAddRepository(), "outline") : null;
+      if (add) add.disabled = changing !== null || (enrolled?.capacity != null && enrolled.repositories.length >= enrolled.capacity);
       const head = el("header", "plugin-update-source-head",
         el("div", "plugin-update-title",
           el("h2", "plugin-update-name", "Plugins"),
-          el("p", "muted plugin-update-about", "Modules from other developers, offered by the repositories this host trusts.")),
+          el("p", "muted plugin-update-about", "Extensions from the repositories this host trusts.")),
         add ? el("div", "plugin-update-status", el("div", "actions plugin-others-actions", add)) : null);
+      const body = el("div", "plugin-source-body");
+      others.replaceChildren(head, body);
       if (listing.state === "loading") {
-        others.replaceChildren(head, el("p", "muted plugin-loading", "Loading repository catalogs…"));
+        body.append(el("p", "muted plugin-loading", "Loading repository catalogs…"));
         return;
       }
       if (listing.state === "failed") {
-        others.replaceChildren(head, errorPanel(listing.error, load));
+        body.append(errorPanel(listing.error, load));
         return;
       }
       const plugins = offers();
       if (!plugins.length) {
-        others.replaceChildren(head, el("p", "muted plugin-others-empty", activeRepositories().length > 1
-          ? "None of this host's repositories offers a plugin from another developer right now."
-          : manage
-            ? "No plugins yet. Add a developer's repository to see what it offers."
-            : "No plugins yet."));
+        body.append(el("p", "muted plugin-others-empty", "No additional plugins are listed in the approved repositories."));
         return;
       }
       const byKey = new Map(plugins.map((plugin) => [plugin.key, plugin]));
@@ -1700,17 +1714,16 @@ namespace Amaterasu {
             key: plugin.key,
             name: plugin.name,
             summary: plugin.summary || lit(plugin.slot),
-            meta: `${availabilityLabel(plugin)} · ${plugin.version}`,
+            version: plugin.version,
+            availability: { label: availabilityLabel(plugin), installed: plugin.status === "installed" },
             group: plugin.repository.id,
-            emphasis: plugin.status !== "installed",
           })),
           quietState("No plugins match", "Try a different search or category."),
         );
       };
       // A handful of plugins needs no search; a catalog's worth does.
       const searchable = plugins.length > SEARCHABLE_PLUGINS || availableFilter.query !== "" || availableFilter.category !== "";
-      others.replaceChildren(
-        head,
+      body.append(
         ...(searchable ? [toolbar(availableFilter, "Search plugins", categories, showMatches, count)] : []),
         browser.node,
       );
@@ -1788,13 +1801,15 @@ namespace Amaterasu {
       add.disabled = full || changing !== null;
       const intro = el("div", "repository-intro",
         el("p", "", "A repository is a publisher's signed list of plugins. The host accepts a catalog only when it is signed by the publisher key you approved."),
-        manage ? add : null,
+        manage && enrolled.preview !== undefined ? add : null,
       );
       const notes: HTMLElement[] = [];
       if (!manage)
         notes.push(el("p", "muted repository-note", enrolled.manageable
           ? "Only an administrator can add or remove repositories."
           : "This host version lists its repositories here but changes them with the release tool on the host."));
+      if (manage && enrolled.preview === undefined)
+        notes.push(el("p", "muted repository-note", "Update Amaterasu to add a repository by its address."));
       if (manage && full)
         notes.push(el("p", "muted repository-note", "This host holds as many repositories as it can, counting removed ones."));
       const list = active.length
@@ -1862,9 +1877,11 @@ namespace Amaterasu {
         while (true) {
           await new Promise((resolve) => setTimeout(resolve, CHANGE_POLL_MS));
           if (page.signal.aborted) throw new Error("The page was closed before the change finished.");
-          const current = parseRepositoryPage(await api.post<unknown>("repositories/list", { offset: 0 })).operation;
+          const listing = parseRepositoryPage(await api.post<unknown>("repositories/list", { offset: 0 }));
+          const current = route === "preview" ? listing.preview : listing.operation;
           if (current && current.id === operation && current.state !== "running") return current;
-          if (current && current.id > operation) throw new Error("Another repository change replaced this one. Refresh to see its result.");
+          const latest = listing.operation ?? listing.preview;
+          if (latest && latest.id > operation) throw new Error("Another repository change replaced this one. Refresh to see its result.");
           // A restarted host numbers its changes from one again and remembers none.
           if (!current || current.id < operation) throw new Error("The host restarted before this change finished. Refresh to see what was saved.");
           if (Date.now() > deadline) throw new Error("The host is still working on this change. Refresh in a moment to see its result.");
@@ -1907,114 +1924,121 @@ namespace Amaterasu {
     function openAddRepository(): void {
       const dialog = el("dialog", "plugin-form-dialog");
       setLocalizedAttribute(dialog, "aria-label", "Add a repository");
-      const text = (name: string, placeholder: string): HTMLInputElement => {
-        const control = input(name);
-        control.required = true;
-        control.autocomplete = "off";
-        control.spellcheck = false;
-        control.placeholder = placeholder;
-        control.setAttribute("autocapitalize", "none");
-        return control;
-      };
-      const location = text("repository_location", "https://");
-      location.type = "url";
-      const id = text("repository_id", "publisher-plugins");
-      const publicKey = text("repository_public_key", "");
-      const fingerprint = text("repository_fingerprint", "");
-      publicKey.className = fingerprint.className = "plugin-key-input";
-      const trust = input("repository_trust", "", "checkbox");
-      trust.required = true;
-      const controls = { location, id, publicKey, fingerprint } as const;
+      const location = input("repository_location", "", "url");
+      location.required = true;
+      location.autocomplete = "off";
+      location.spellcheck = false;
+      location.placeholder = "https://";
+      location.setAttribute("autocapitalize", "none");
+      const address = field("Repository address", location);
+      const review = el("div", "plugin-publisher-review");
+      review.hidden = true;
+      review.tabIndex = -1;
       const status = el("div", "plugin-form-status");
       status.setAttribute("aria-live", "polite");
-      const submit = el("button", "button primary", "Add repository");
+      const submit = el("button", "button primary", "Check repository");
       submit.type = "submit";
+      let publisher: RepositoryPublisher | null = null;
       let working = false;
       const close = (): void => { dialog.close(); dialog.remove(); };
       const cancel = button("Cancel", () => { if (!working) close(); });
-
-      // Publishers hand these details out as one block; pasting it anywhere
-      // in the form fills the fields it names. The fingerprint is left for
-      // the administrator to confirm.
+      const back = button("Back", () => {
+        showAddress();
+        status.replaceChildren();
+      });
+      back.hidden = true;
       const form = el("form", "plugin-form",
         el("h2", "", "Add a repository"),
-        el("p", "muted", "Enter the details its publisher gives you. Pasting the publisher's repository details into any field fills in the rest."),
-        field("Address", location, "Where the publisher hosts its catalog."),
-        field("Repository ID", id, "Exactly as the publisher writes it."),
-        field("Publisher key", publicKey, "The publisher's public signing key: 64 hexadecimal characters."),
-        field("Key fingerprint", fingerprint, "The key's SHA-256 fingerprint. Get it from the publisher somewhere other than the address above, so you know the key is really theirs."),
-        el("div", "notice plugin-trust",
-          el("strong", "", "Plugins are not sandboxed"),
-          el("p", "", "A plugin runs inside this host with your user account's access. A publisher you add can offer any module, including the one that serves this console. Add only publishers you trust.")),
-        el("label", "plugin-trust-check", trust, el("span", "", "I trust this publisher")),
+        address,
+        review,
         status,
-        el("div", "actions", cancel, submit),
+        el("div", "actions", cancel, back, submit),
       );
-      form.addEventListener("paste", (event) => {
-        const descriptor = parseRepositoryDescriptor(event.clipboardData?.getData("text") ?? "");
-        if (!descriptor) return;
+
+      location.addEventListener("paste", (event) => {
+        const address = parseRepositoryDescriptor(event.clipboardData?.getData("text") ?? "");
+        if (!address) return;
         event.preventDefault();
-        if (descriptor.location) location.value = descriptor.location;
-        if (descriptor.id) id.value = descriptor.id;
-        if (descriptor.publicKey) publicKey.value = descriptor.publicKey;
-        (descriptor.location ? descriptor.id ? descriptor.publicKey ? fingerprint : publicKey : id : location).focus();
+        location.value = address;
       });
-      const fail = (message: string, focus: keyof typeof controls | null): void => {
+
+      function showAddress(): void {
+        publisher = null;
+        review.hidden = back.hidden = true;
+        review.replaceChildren();
+        address.hidden = false;
+        location.disabled = false;
+        submit.replaceChildren(el("span", "", "Check repository"));
+        location.focus();
+      }
+
+      function showPublisher(checked: RepositoryPublisher): void {
+        publisher = checked;
+        address.hidden = location.disabled = true;
+        review.hidden = back.hidden = false;
+        review.replaceChildren(
+          el("h3", "plugin-detail-name", lit(checked.id)),
+          el("p", "repository-location", lit(checked.location)),
+          factList([
+            ["Signing key fingerprint", copyable(checked.fingerprint, groupedFingerprint(checked.fingerprint), "publisher key fingerprint")],
+          ]),
+          el("div", "notice plugin-trust",
+            el("p", "", "This publisher can offer replacements for any host module or the console. Native plugins run with your user account’s access.")),
+        );
+        submit.replaceChildren(el("span", "", "Trust and add"));
+      }
+
+      function fail(message: string): void {
         const alert = el("p", "repository-failure", lit(message));
         alert.setAttribute("role", "alert");
         status.replaceChildren(alert);
-        for (const [name, control] of Object.entries(controls)) {
-          if (name === focus) control.setAttribute("aria-invalid", "true");
-          else control.removeAttribute("aria-invalid");
-        }
-        if (focus) controls[focus].focus();
-      };
-      form.addEventListener("submit", (event) => {
+      }
+
+      form.addEventListener("submit", async (event) => {
         event.preventDefault();
-        if (working || !form.reportValidity()) return;
-        const hex = (control: HTMLInputElement) => control.value.replace(/[\s:]/g, "").toLowerCase();
-        const request = {
-          id: id.value.trim(),
-          location: location.value.trim(),
-          public_key: hex(publicKey),
-          fingerprint: hex(fingerprint),
-        };
-        // What the host would refuse outright is caught here, in its words.
-        const refused =
-          !/^https:\/\/\S+$/.test(request.location) || request.location.length > 256 ? "invalid_repository_location"
-          : !/^[a-z0-9._-]{1,128}$/.test(request.id) ? "invalid_repository_id"
-          : !/^[a-f0-9]{64}$/.test(request.public_key) ? "invalid_publisher_key"
-          : null;
-        if (refused) {
-          fail(repositoryChangeMessage(refused), repositoryChangeField(refused));
+        if (working) return;
+        const requested = location.value.trim();
+        if (!publisher && (!/^https:\/\/\S+$/.test(requested) || requested.length > 256)) {
+          fail(repositoryChangeMessage("invalid_repository_location"));
+          location.focus();
           return;
         }
-        if (!/^[a-f0-9]{64}$/.test(request.fingerprint)) {
-          fail("The key fingerprint is 64 hexadecimal characters.", "fingerprint");
-          return;
-        }
+        const confirmation = publisher;
+        let reviewed = false;
         working = true;
-        submit.disabled = cancel.disabled = true;
-        status.replaceChildren(el("p", "muted", "Checking the repository's catalog against this key…"));
-        void runRepositoryChange("add", request, request.id).then(async (result) => {
+        submit.disabled = cancel.disabled = back.disabled = location.disabled = true;
+        status.replaceChildren(el("p", "muted", confirmation ? "Adding repository…" : "Checking the repository’s signature…"));
+        try {
+          const result = confirmation
+            ? await runRepositoryChange("add", { ...confirmation }, confirmation.id)
+            : await runRepositoryChange("preview", { location: requested }, "");
           if (result.state === "failed") {
-            fail(repositoryChangeMessage(result.code), repositoryChangeField(result.code));
+            if (result.code === "fingerprint_mismatch" || result.code === "catalog_identity_mismatch") showAddress();
+            fail(repositoryChangeMessage(result.code));
+            return;
+          }
+          if (!confirmation) {
+            if (!result.publisher || result.publisher.location !== requested)
+              throw new Error("The host did not return the requested publisher.");
+            showPublisher(result.publisher);
+            status.replaceChildren();
+            reviewed = true;
             return;
           }
           close();
           await reloadRepositories();
-          const added = repositories().find((repository) => repository.id === request.id);
-          const count = added?.candidates.length ?? 0;
-          context.notify(lit(`Added ${request.id}. ${count === 1 ? "1 plugin is" : `${count} plugins are`} available.`));
+          const count = repositories().find((repository) => repository.id === confirmation.id)?.candidates.length ?? 0;
+          context.notify(lit(`Added ${confirmation.id}. ${count === 1 ? "1 plugin is" : `${count} plugins are`} available.`));
           showView("repositories");
-        }).catch((error: unknown) => {
-          const code = error instanceof ApiError ? error.code : null;
-          fail(error instanceof ApiError ? repositoryMessageFor(error) : messageOf(error), repositoryChangeField(code));
-        }).finally(() => {
+        } catch (error) {
+          fail(error instanceof ApiError ? repositoryMessageFor(error) : messageOf(error));
+        } finally {
           working = false;
-          submit.disabled = cancel.disabled = false;
-          if (viewArea.isConnected && view === "repositories") render();
-        });
+          submit.disabled = cancel.disabled = back.disabled = false;
+          location.disabled = publisher !== null;
+          if (reviewed) review.focus();
+          if (viewArea.isConnected) render();
+        }
       });
       dialog.addEventListener("cancel", (event) => {
         event.preventDefault();

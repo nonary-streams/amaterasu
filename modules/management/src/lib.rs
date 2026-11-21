@@ -484,7 +484,8 @@ impl ManagedModule for ManagementModule {
                 } else if action == Some("repository_list") {
                     self.repository_list(&payload)
                 } else if let Some(
-                    change @ ("repository_add" | "repository_refresh" | "repository_remove"),
+                    change @ ("repository_preview" | "repository_add" | "repository_refresh"
+                    | "repository_remove"),
                 ) = action
                 {
                     self.change_repository(change, &payload)

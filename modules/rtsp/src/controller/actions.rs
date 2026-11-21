@@ -164,7 +164,13 @@ impl Controller {
             .iter()
             .any(|allowed| allowed == &caller)
         {
-            rpc::complete(runtime, request, error("permission_denied"));
+            self.refuse_open(
+                runtime,
+                request,
+                &caller,
+                &config.operation_id,
+                "permission_denied",
+            );
             return;
         }
         if self
@@ -241,6 +247,9 @@ impl Controller {
             } else {
                 error("operation_conflict")
             };
+            if existing.config != config {
+                self.report_open_warning(&caller, &config.operation_id, "operation_conflict");
+            }
             rpc::complete(runtime, request, response);
             return;
         }
@@ -398,6 +407,13 @@ impl Controller {
             record.udp_discovery.as_ref(),
             media_binds,
         );
+        if record.config.lifecycle_capture_mode.is_external()
+            && record.config.lifecycle_session_target.is_some()
+        {
+            // This principal came from the broker's authenticated Open caller.
+            // The Open request itself cannot select a display release owner.
+            payload["application_owner"] = json!(record.owner);
+        }
         if self.settings.extension_enabled
             && record.config.min_threads == 2
             && record.config.qp == 28

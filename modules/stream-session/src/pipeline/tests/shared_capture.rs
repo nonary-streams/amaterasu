@@ -1,6 +1,7 @@
 use super::*;
 
 const OWNER: &str = "amaterasu.rtsp";
+const APPLICATION_OWNER: &str = "amaterasu.nvhttp";
 const SOURCE_OPERATION: &str = "nvhttp-original-source";
 
 fn target(stream: &str) -> Value {
@@ -27,6 +28,7 @@ fn preparation(client: u8, shared: bool) -> Value {
         SOURCE_OPERATION.into()
     });
     request["lifecycle_capture_mode"] = json!("external");
+    request["application_owner"] = json!(APPLICATION_OWNER);
     request["lifecycle_session_target"] =
         json!({"kind":"session","host_epoch":"epoch","session_id":"application","generation":1});
     if shared {
@@ -72,6 +74,230 @@ fn display_calls(host: &Harness, action: &str) -> usize {
             call.service == "amaterasu.virtual-display/1" && call.payload["action"] == action
         })
         .count()
+}
+
+fn start_resumable(host: &mut Harness, client: u8, timeout: u32) -> u64 {
+    let mut prepare = preparation(client, false);
+    prepare["paused_display_timeout_secs"] = json!(timeout);
+    prepare["rtsp_operation_id"] = json!(format!("resumable-{client}"));
+    let prepared = host.response_from(u64::from(client) * 10, OWNER, prepare);
+    let id = prepared["session"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{prepared}"));
+    let reply = host.response_from(
+        u64::from(client) * 10 + 1,
+        OWNER,
+        configuration(id, client, false),
+    );
+    assert_eq!(reply["state"], "active", "{reply}");
+    id
+}
+
+fn disconnect_and_pause(host: &mut Harness, id: u64) {
+    host.broker.control_failure = Some("peer_disconnected".into());
+    host.plane.borrow_mut().failure = Some("native_delivery_failed_control");
+    host.idle();
+    host.broker.control_failure = None;
+    host.plane.borrow_mut().failure = None;
+    let record = &host.pipeline.records[&id];
+    assert!(record.state.terminal(), "{}", record.response());
+    assert!(record.retains_paused_display(), "{}", record.response());
+    assert!(record.resources.is_empty());
+    let durable = &host.pipeline.journal.document.entries[&id];
+    assert!(durable.attempted_resources.is_empty());
+    assert!(durable.lifecycle_recovery.is_none());
+    assert!(durable.shared_capture.is_some());
+    assert_eq!(host.broker.virtual_display_references.len(), 1);
+}
+
+#[test]
+fn authenticated_resume_reuses_the_display_and_quit_releases_the_paused_hold() {
+    let mut host = host();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push(APPLICATION_OWNER.into());
+    host.pipeline.settings.history_owners.insert(OWNER.into());
+    let first = start_resumable(&mut host, 1, 0);
+    let first_source = host.pipeline.records[&first]
+        .shared_capture
+        .clone()
+        .unwrap();
+    disconnect_and_pause(&mut host, first);
+    assert_eq!(display_calls(&host, "remove"), 0);
+
+    let resumed = start_resumable(&mut host, 2, 0);
+    host.idle();
+    let resumed_source = host.pipeline.records[&resumed]
+        .shared_capture
+        .as_ref()
+        .unwrap();
+    assert_eq!(first_source.identity, resumed_source.identity);
+    assert_eq!(first_source.output, resumed_source.output);
+    assert_ne!(first_source.reference_id, resumed_source.reference_id);
+    assert_ne!(first_source.stream, resumed_source.stream);
+    assert_eq!(display_calls(&host, "remove"), 1);
+    assert_eq!(host.broker.virtual_display_references.len(), 1);
+    assert!(!host.pipeline.journal.document.entries.contains_key(&first));
+
+    disconnect_and_pause(&mut host, resumed);
+    let application = preparation(2, false)["lifecycle_session_target"].clone();
+    let release = json!({"action":"release_paused_display","application":application});
+    assert_eq!(
+        host.response_from(30, OWNER, release.clone())["code"],
+        "permission_denied"
+    );
+    let mut other = release.clone();
+    other["application"]["generation"] = json!(2);
+    assert_eq!(
+        host.response_from(31, APPLICATION_OWNER, other)["released"],
+        true
+    );
+    assert!(host.pipeline.records[&resumed].retains_paused_display());
+    assert_eq!(
+        host.response_from(32, APPLICATION_OWNER, release.clone())["released"],
+        false
+    );
+    host.idle();
+    assert_eq!(
+        host.response_from(33, APPLICATION_OWNER, release)["released"],
+        true
+    );
+    assert!(host.broker.virtual_display_references.is_empty());
+    assert!(host.pipeline.journal.document.entries.is_empty());
+}
+
+#[test]
+fn paused_display_expires_without_resuming_or_stopping_the_application() {
+    let mut host = host();
+    let first = start_resumable(&mut host, 1, 2);
+    disconnect_and_pause(&mut host, first);
+    assert_eq!(display_calls(&host, "remove"), 0);
+    host.now += 2000;
+    host.tick();
+    host.idle();
+    assert_eq!(display_calls(&host, "remove"), 1);
+    assert!(host.pipeline.journal.document.entries.is_empty());
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.session-lifecycle/1"
+            && call.payload["operation"] == "end_session"
+    }));
+}
+
+#[test]
+fn failed_resume_keeps_the_original_display_for_a_retry() {
+    let mut host = host();
+    let first = start_resumable(&mut host, 1, 0);
+    disconnect_and_pause(&mut host, first);
+    let mut prepare = preparation(2, false);
+    prepare["paused_display_timeout_secs"] = json!(0);
+    prepare["rtsp_operation_id"] = json!("failed-resume");
+    let prepared = host.response_from(20, OWNER, prepare);
+    let second = prepared["session"].as_u64().unwrap();
+    host.broker.fail_open = Some("amaterasu.video/1".into());
+    let failed = host.response_from(21, OWNER, configuration(second, 2, false));
+    assert_eq!(failed["state"], "failed", "{failed}");
+    host.broker.fail_open = None;
+    assert!(host.pipeline.records[&first].retains_paused_display());
+    assert_eq!(host.broker.virtual_display_references.len(), 1);
+    let third = start_resumable(&mut host, 3, 0);
+    assert_eq!(
+        host.pipeline.records[&third].virtual_display_output,
+        host.pipeline.records[&first].virtual_display_output,
+    );
+    host.idle();
+    assert_eq!(host.broker.virtual_display_references.len(), 1);
+}
+
+#[test]
+fn changed_resume_timing_retires_the_paused_display_before_applying_the_new_mode() {
+    let mut host = host();
+    let first = start_resumable(&mut host, 1, 0);
+    disconnect_and_pause(&mut host, first);
+    let old_source = host.pipeline.records[&first]
+        .shared_capture
+        .clone()
+        .unwrap();
+    let mut prepare = preparation(2, false);
+    prepare["paused_display_timeout_secs"] = json!(0);
+    prepare["rtsp_operation_id"] = json!("changed-mode-resume");
+    let prepared = host.response_from(20, OWNER, prepare);
+    let second = prepared["session"].as_u64().unwrap();
+    let mut start = configuration(second, 2, false);
+    start["configuration"]["configuration"]["fps"] = json!(120);
+    let reply = host.response_from(21, OWNER, start);
+    assert_eq!(reply["state"], "active", "{reply}");
+    let replacement = host.pipeline.records[&second]
+        .shared_capture
+        .as_ref()
+        .unwrap();
+    assert_ne!(old_source.identity, replacement.identity);
+    assert_eq!(replacement.refresh_millihz, 120_000);
+    let mutations: Vec<_> = host
+        .broker
+        .calls
+        .iter()
+        .filter(|call| call.service == "amaterasu.virtual-display/1")
+        .filter_map(|call| match call.payload["action"].as_str()? {
+            action @ ("create" | "remove") => Some(action),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(mutations, ["create", "remove", "create"]);
+}
+
+#[test]
+fn restart_releases_the_durable_paused_display_without_replaying_the_retired_transport() {
+    let mut host = host();
+    let first = start_resumable(&mut host, 1, 0);
+    disconnect_and_pause(&mut host, first);
+    let mut recovered = restart(&host);
+    recovered.idle();
+    assert_eq!(display_calls(&recovered, "remove"), 1);
+    assert!(recovered.broker.virtual_display_references.is_empty());
+    assert!(recovered.pipeline.journal.document.entries.is_empty());
+    assert!(!recovered.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.session-lifecycle/1"
+            && call.payload["operation"] == "retire_stream"
+    }));
+}
+
+#[test]
+fn refused_reuse_releases_the_old_hold_and_starts_with_a_compatible_display() {
+    let mut host = host();
+    let first = start_resumable(&mut host, 1, 0);
+    disconnect_and_pause(&mut host, first);
+    let old_identity = host.pipeline.records[&first]
+        .shared_capture
+        .as_ref()
+        .unwrap()
+        .identity
+        .clone();
+    let mut prepare = preparation(2, false);
+    prepare["paused_display_timeout_secs"] = json!(0);
+    prepare["rtsp_operation_id"] = json!("reuse-fallback");
+    let prepared = host.response_from(20, OWNER, prepare);
+    let second = prepared["session"].as_u64().unwrap();
+    host.broker.virtual_display_create_failure = Some("identity_conflict".into());
+    host.broker
+        .enqueue(21, OWNER, configuration(second, 2, false));
+    for _ in 0..200 {
+        host.tick();
+        if display_calls(&host, "remove") > 0 {
+            break;
+        }
+    }
+    assert_eq!(display_calls(&host, "remove"), 1);
+    host.broker.virtual_display_create_failure = None;
+    host.idle();
+    assert_eq!(host.broker.replies.remove(&21).unwrap()["state"], "active");
+    let current = host.pipeline.records[&second]
+        .shared_capture
+        .as_ref()
+        .unwrap();
+    assert_ne!(current.identity, old_identity);
+    assert_eq!(host.broker.virtual_display_references.len(), 1);
+    assert_eq!(display_calls(&host, "create"), 3);
 }
 
 fn restart(host: &Harness) -> Harness {

@@ -30,7 +30,7 @@ namespace Amaterasu {
     return value;
   }
 
-  export function renderHostLogs(context: PageContext, target: HTMLElement, alerts?: DiagnosticAlertObserver): () => Promise<void> {
+  export function renderHostLogs(context: PageContext, target: HTMLElement): () => Promise<void> {
     let generation = 0;
     let contents = "";
     let latestContents = "";
@@ -364,11 +364,9 @@ namespace Amaterasu {
           }
           updateFollowing();
         }
-        alerts?.snapshot(latestContents);
         progress.textContent = discarded ? `${discarded} older log segments were discarded before this snapshot.` : "Snapshot loaded.";
       } catch (error) {
         if (valid()) {
-          alerts?.unavailable();
           progress.replaceChildren(errorPanel(error));
         }
       } finally {

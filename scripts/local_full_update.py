@@ -31,9 +31,10 @@ SERVICE = "amaterasu-linux-session.service"
 UNIT = Path.home() / ".config/systemd/user" / SERVICE
 PROVENANCE = "install-provenance.json"
 HOST_INSTALL_PARENT = Path.home() / ".local/share/amaterasu"
-REPOSITORY = "amaterasu-rtx-hdr"
-SLOT = "amaterasu.rtx-hdr"
-IMPLEMENTATION = "amaterasu-linux-session-rtx-hdr"
+CORE_REPOSITORY = "amaterasu"
+CORE_SLOT = "amaterasu.runtime"
+CORE_IMPLEMENTATION = "amaterasu-core"
+CATALOG_DOMAIN = b"amaterasu.repository.catalog.v1\n"
 COMMIT_TIMEOUT_S = 120
 SEPARATELY_BUILT = {
     "amaterasu.capture-vkms": Path("modules/capture-vkms/capture/target/release"),
@@ -50,6 +51,81 @@ def compact(value) -> bytes:
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def core_signing(root: Path, bootstrap: dict, allowlist: dict):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    repositories = read_json(root / "repositories/approved.json")["repositories"]
+    approval = repositories.get(CORE_REPOSITORY)
+    if approval is None or approval["revoked"]:
+        raise ValueError("enroll the Amaterasu Core repository before preparing an update")
+    identity = approval["approval"]
+    fingerprint = identity["fingerprint"]
+    if (allowlist["publisher_fingerprint"] != fingerprint
+            or bootstrap["trusted_keys"].get(fingerprint) != identity["public_key"]):
+        raise ValueError("the host has not authorized the Core publisher for native activation")
+    encoded = os.environ.get("AMATERASU_PUBLISHER_KEY")
+    if encoded is None:
+        key_file = root / "development-key.json"
+        encoded = read_json(key_file) if key_file.is_file() else ""
+    key_bytes = bytes.fromhex(encoded.strip())
+    if len(key_bytes) != 32:
+        raise ValueError("provide the existing Core signing key through AMATERASU_PUBLISHER_KEY")
+    key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+    public_key = key.public_key()
+    public = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    if hashlib.sha256(public).hexdigest() != fingerprint:
+        raise ValueError("the signing key does not match the Core publisher")
+    checkpoint = approval["checkpoint"]["highest_sequence"]
+    saved = approval.get("catalog")
+    offers = []
+    if saved is not None:
+        raw = saved["raw"].encode()
+        public_key.verify(bytes.fromhex(saved["signature"]), CATALOG_DOMAIN + raw)
+        catalog = json.loads(raw)
+        if catalog["repository"] != CORE_REPOSITORY or catalog["sequence"] != checkpoint:
+            raise ValueError("the cached Core catalog differs from its approval")
+        offers = catalog["candidates"]
+    return key, fingerprint, checkpoint, offers
+
+
+def core_package(work: Path, manifest: dict) -> Path:
+    version = next(component["version"] for component in manifest["components"]
+                   if component["id"] == CORE_SLOT)
+    if version in (".", "..") or not re.fullmatch(r"[a-z0-9._-]{1,128}", version):
+        raise ValueError("the runtime version cannot be used in a repository path")
+    return work / "bundle/native" / CORE_IMPLEMENTATION / version
+
+
+def sign_core_bundle(package: Path, manifest: dict, signing: tuple) -> tuple[str, str]:
+    key, fingerprint, checkpoint, offers = signing
+    blob = compact(manifest)
+    digest = hashlib.sha256(blob).hexdigest()
+    (package / "manifest.json").write_bytes(blob)
+    (package / "manifest.sig").write_bytes(
+        compact({"key_id": fingerprint, "signature": key.sign(blob).hex()}))
+    candidate = {
+        "slot": CORE_SLOT, "implementation": CORE_IMPLEMENTATION,
+        "version": package.name, "kind": "native_set", "manifest_sha256": digest,
+    }
+    # Installed plugins still use this catalog to verify their original offer.
+    identity = (CORE_SLOT, CORE_IMPLEMENTATION, package.name)
+    retained = [offer for offer in offers
+                if (offer["slot"], offer["implementation"], offer["version"]) != identity]
+    catalog = compact({
+        "schema": 1,
+        "repository": CORE_REPOSITORY,
+        "sequence": max(checkpoint, int(time.time())) + 1,
+        "expires_unix": manifest["expires_unix"],
+        "target": manifest["target"],
+        "candidates": [candidate, *retained],
+    })
+    bundle = package.parents[2]
+    (bundle / "catalog.json").write_bytes(catalog)
+    (bundle / "catalog.sig").write_text(key.sign(CATALOG_DOMAIN + catalog).hex())
+    return digest, hashlib.sha256(catalog).hexdigest()
 
 
 def git(tree: Path, *arguments: str) -> bytes:
@@ -144,9 +220,6 @@ def service_host() -> tuple[Path, str]:
 
 
 def prepare(arguments) -> None:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-
     root, tree, work, host = (Path(value).resolve() for value in
                               (arguments.root, arguments.tree, arguments.work, arguments.host))
     work.mkdir(mode=0o700)
@@ -156,6 +229,7 @@ def prepare(arguments) -> None:
     bootstrap = read_json(root / "bootstrap.json")
     if bootstrap["development"] or bootstrap["allow_unsigned"]:
         raise SystemExit("local updates target a signed production bootstrap")
+    signing = core_signing(root, bootstrap, read_json(root / "package-activation-policy.json"))
     active = root / "sets" / selection["active"]
     manifest = read_json(active / "manifest.json")
     target = Path(arguments.target_dir).resolve() if arguments.target_dir else None
@@ -183,7 +257,7 @@ def prepare(arguments) -> None:
     if problems:
         raise SystemExit("refusing a mixed build:\n  " + "\n  ".join(problems))
 
-    package = work / "bundle/native" / IMPLEMENTATION / "0.1.0"
+    package = core_package(work, manifest)
     package.mkdir(parents=True, mode=0o700)
     for component in manifest["components"]:
         artifact = artifact_path(tree, component, target)
@@ -193,29 +267,7 @@ def prepare(arguments) -> None:
     manifest["sequence"] = selection["highest_sequence"] + 1
     if manifest["expires_unix"] <= time.time():
         raise SystemExit("the active manifest has expired")
-    (package / "manifest.json").write_bytes(compact(manifest))
-
-    approval = read_json(root / "repositories/approved.json")["repositories"][REPOSITORY]
-    identity = approval["approval"]
-    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(read_json(root / "development-key.json")))
-    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    if hashlib.sha256(public).hexdigest() != identity["fingerprint"]:
-        raise SystemExit("the local key is not the approved publisher")
-    blob = (package / "manifest.json").read_bytes()
-    (package / "manifest.sig").write_bytes(
-        compact({"key_id": identity["fingerprint"], "signature": key.sign(blob).hex()}))
-    digest = sha256(package / "manifest.json")
-    catalog = compact({
-        "schema": 1,
-        "repository": identity["id"],
-        "sequence": approval["checkpoint"]["highest_sequence"] + 1,
-        "expires_unix": manifest["expires_unix"],
-        "target": manifest["target"],
-        "candidates": [{"slot": SLOT, "implementation": IMPLEMENTATION, "version": "0.1.0",
-                        "kind": "native_set", "manifest_sha256": digest}],
-    })
-    (work / "bundle/catalog.json").write_bytes(catalog)
-    (work / "bundle/catalog.sig").write_text(key.sign(b"amaterasu.repository.catalog.v1\n" + catalog).hex())
+    digest, catalog_digest = sign_core_bundle(package, manifest, signing)
 
     (work / "metadata.json").write_bytes(compact({
         "previous": selection["active"],
@@ -223,8 +275,8 @@ def prepare(arguments) -> None:
         "bootstrap_revision": sha256(root / "bootstrap.json"),
         "activation_policy_revision": sha256(root / "package-activation-policy.json"),
         "digest": digest,
-        "catalog_digest": sha256(work / "bundle/catalog.json"),
-        "repository": REPOSITORY,
+        "catalog_digest": catalog_digest,
+        "repository": CORE_REPOSITORY,
         "activation_policy_candidate_sha256": sha256(work / "package-activation-policy.json") if allowlist is not None else None,
     }))
     (work / PROVENANCE).write_text(json.dumps({

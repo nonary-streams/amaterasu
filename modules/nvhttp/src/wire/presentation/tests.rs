@@ -154,6 +154,8 @@ struct Provider {
     hold_dispatch: bool,
     hold_begin_release: bool,
     observation_failure: bool,
+    invalid_identity: bool,
+    reject_dispatch: bool,
     timeouts: Vec<(String, u64)>,
 }
 
@@ -168,6 +170,8 @@ impl Provider {
             hold_dispatch: false,
             hold_begin_release: false,
             observation_failure: false,
+            invalid_identity: false,
+            reject_dispatch: false,
             timeouts: Vec::new(),
         }
     }
@@ -243,6 +247,9 @@ impl Provider {
         match method {
             "identity" => json!({"ok":true,"host_id":"host-instance"}),
             "check_client_certificate" => {
+                if self.invalid_identity {
+                    return json!({"ok": true, "paired": 1});
+                }
                 let pem = payload["certificate_pem"].as_str().unwrap();
                 let (_, der) = pem_rfc7468::decode_vec(pem.as_bytes()).unwrap();
                 json!({"ok":true,"paired":1,"client_id":"paired-client", "certificate_id":fingerprint(&der),"config_overrides":{}})
@@ -284,6 +291,12 @@ impl Provider {
                     busy: false,
                     current_game: None,
                     current_game_uuid: None
+                }
+            }),
+            "dispatch" if self.reject_dispatch => json!(session::Reply::Dispatched {
+                decision: Decision::Reject {
+                    status_code: 409,
+                    message: "not available".into()
                 }
             }),
             "dispatch" => json!(session::Reply::Dispatched {
@@ -381,6 +394,167 @@ fn peer() -> RequestContext {
 }
 
 #[test]
+fn malformed_launch_and_resume_are_refused_after_authentication() {
+    let mut router = router();
+    for target in ["/launch", "/resume"] {
+        let reply = dispatch(&mut router, target, peer(), Instant::now()).unwrap();
+        assert_eq!(reply.status, 400);
+        assert!(reply.rejection.is_none());
+    }
+    let mut untrusted = peer();
+    untrusted.peer_trusted = false;
+    let reply = dispatch(&mut router, "/launch", untrusted, Instant::now()).unwrap();
+    assert_eq!(reply.status, 401);
+    assert!(router.launches.refusal_snapshot("refused.3").is_none());
+    let mut denied = peer();
+    denied.launch_allowed = false;
+    denied.view_allowed = false;
+    denied.terminate_allowed = false;
+    let reply = dispatch(&mut router, "/launch", denied, Instant::now()).unwrap();
+    assert_eq!(reply.status, 403);
+    let issue = router
+        .launches
+        .refusal_snapshot("refused.3")
+        .unwrap()
+        .root_cause
+        .unwrap()
+        .issue;
+    assert_eq!(issue.phase, "request_authorization");
+}
+
+#[test]
+fn presentation_failures_record_the_request_without_duplicating_launch_refusals() {
+    let mut router = router();
+    let now = Instant::now();
+    let context = Context {
+        client: PresentationRouter::client(&peer()).unwrap(),
+        game: None,
+    };
+    let presentation = router.presentation.as_mut().unwrap();
+    let id = presentation
+        .queue(
+            Some(1),
+            vec![1, 2, 3],
+            context,
+            Stage::Info {
+                host_id: "host".into(),
+            },
+            Some(DispatchIntent::Launch),
+            now,
+        )
+        .unwrap();
+    let mut work = presentation.jobs.remove(&id).unwrap();
+    let mut replies = Vec::new();
+    finish(
+        &work,
+        xml::error(503, "provider unavailable"),
+        &mut router.launches,
+        &mut replies,
+    );
+    let snapshot = router.launches.refusal_snapshot("refused.1").unwrap();
+    let issue = snapshot.root_cause.unwrap().issue;
+    assert_eq!(issue.phase, "presentation_dispatch");
+    assert_eq!(issue.code, "presentation_request_failed");
+    assert_eq!(issue.reason, "http_503");
+    assert_eq!(replies[0].1.status, 503);
+
+    work.launch_handed_off = true;
+    finish(
+        &work,
+        xml::error(503, "already reported"),
+        &mut router.launches,
+        &mut replies,
+    );
+    assert!(router.launches.refusal_snapshot("refused.2").is_none());
+}
+
+#[test]
+fn semantic_presentation_failure_is_recorded_when_http_succeeds() {
+    let mut router = router();
+    let mut provider = Provider::new("policy");
+    provider.reject_dispatch = true;
+    let now = Instant::now();
+    let target = format!(
+        "/launch?appid=42&mode=1920x1080x60&rikey={}&rikeyid=7",
+        "00".repeat(16)
+    );
+    assert!(dispatch(&mut router, &target, peer(), now).is_none());
+    let reply = complete(&mut router, &mut provider, now);
+    assert_eq!(reply.status, 200);
+    let issue = router
+        .launches
+        .refusal_snapshot("refused.1")
+        .unwrap()
+        .root_cause
+        .unwrap()
+        .issue;
+    assert_eq!(issue.phase, "presentation_dispatch");
+    assert_eq!(issue.reason, "protocol_409");
+}
+
+#[test]
+fn invalid_identity_and_identity_timeout_are_reported_before_presentation() {
+    for timeout in [false, true] {
+        let mut router = router();
+        let mut provider = Provider::new("policy");
+        provider.invalid_identity = true;
+        let now = Instant::now();
+        let target = format!(
+            "/launch?appid=42&mode=1920x1080x60&rikey={}&rikeyid=7",
+            "00".repeat(16)
+        );
+        assert!(dispatch(&mut router, &target, peer(), now).is_none());
+        let reply = complete(
+            &mut router,
+            &mut provider,
+            if timeout {
+                now + super::super::SERVICE_TIMEOUT
+            } else {
+                now
+            },
+        );
+        assert_eq!(reply.status, if timeout { 504 } else { 503 });
+        let issue = router
+            .launches
+            .refusal_snapshot("refused.1")
+            .unwrap()
+            .root_cause
+            .unwrap()
+            .issue;
+        assert_eq!(issue.phase, "stream_identity");
+        assert_eq!(issue.reason, if timeout { "http_504" } else { "http_503" });
+        assert!(router.launches.refusal_snapshot("refused.2").is_none());
+    }
+}
+
+#[test]
+fn invalid_authenticated_peer_is_reported_before_identity_queueing() {
+    let target = format!(
+        "/launch?appid=42&mode=1920x1080x60&rikey={}&rikeyid=7",
+        "00".repeat(16)
+    );
+    for presentation in [false, true] {
+        let mut router = router();
+        if !presentation {
+            router.presentation = None;
+        }
+        let mut context = peer();
+        context.remote = "0.0.0.0".parse().unwrap();
+        let reply = dispatch(&mut router, &target, context, Instant::now()).unwrap();
+        assert_eq!(reply.status, 401);
+        let issue = router
+            .launches
+            .refusal_snapshot("refused.1")
+            .unwrap()
+            .root_cause
+            .unwrap()
+            .issue;
+        assert_eq!(issue.phase, "stream_identity");
+        assert_eq!(issue.code, "invalid_peer_identity");
+    }
+}
+
+#[test]
 fn launch_and_resume_refusals_identify_the_rejected_input() {
     for presentation in [false, true] {
         for route in ["launch", "resume"] {
@@ -430,6 +604,91 @@ fn launch_and_resume_refusals_identify_the_rejected_input() {
                 assert!(!record.contains("arbitrary_text"));
             }
         }
+    }
+}
+
+#[test]
+fn malformed_or_wrong_method_stream_requests_are_reported_before_routing() {
+    let mut router = router();
+    for (method, target, expected) in [("POST", "/launch", 405), ("GET", "/resume?bad=%", 400)] {
+        let reply = router
+            .dispatch_with(
+                1,
+                HttpRequest {
+                    method: method.into(),
+                    target: target.into(),
+                    body: vec![],
+                },
+                peer(),
+                Instant::now(),
+                &mut |_| panic!("must reject before broker calls"),
+            )
+            .unwrap();
+        assert_eq!(reply.status, expected);
+    }
+    let status = router.launches.management_status(None);
+    let refusals = status["recent_refusals"].as_array().unwrap();
+    assert_eq!(refusals.len(), 2);
+    assert_eq!(
+        refusals[0]["root_cause"]["issue"]["phase"],
+        "request_parsing"
+    );
+    assert_eq!(refusals[0]["root_cause"]["issue"]["reason"], "http_400");
+    assert_eq!(refusals[1]["root_cause"]["issue"]["reason"], "http_405");
+}
+
+#[test]
+fn pre_route_transport_failures_report_the_actual_failure_without_an_http_status() {
+    let mut router = router();
+    router.record_protocol_rejection(crate::server::StreamRequestFailure::Timeout);
+    router.record_protocol_rejection(crate::server::StreamRequestFailure::ConnectionClosed);
+    let status = router.launches.management_status(None);
+    let refusals = status["recent_refusals"].as_array().unwrap();
+    assert_eq!(
+        refusals[0]["root_cause"]["issue"]["reason"],
+        "connection_closed"
+    );
+    assert_eq!(
+        refusals[1]["root_cause"]["issue"]["reason"],
+        "request_timeout"
+    );
+    assert_eq!(
+        refusals[0]["root_cause"]["issue"]["phase"],
+        "request_transport"
+    );
+}
+
+#[test]
+fn disconnect_during_identity_or_presentation_records_the_failed_request_once() {
+    for during_presentation in [false, true] {
+        let mut router = router();
+        let mut provider = Provider::new("policy");
+        provider.hold_dispatch = true;
+        let now = Instant::now();
+        let target = format!(
+            "/launch?appid=42&mode=1920x1080x60&rikey={}&rikeyid=7",
+            "00".repeat(16)
+        );
+        assert!(dispatch(&mut router, &target, peer(), now).is_none());
+        if during_presentation {
+            for _ in 0..40 {
+                poll(&mut router, &mut provider, now);
+                if provider.calls.iter().any(|call| call.0 == "dispatch") {
+                    break;
+                }
+            }
+            assert!(provider.calls.iter().any(|call| call.0 == "dispatch"));
+        }
+        router.cancel_with(1, now, &mut |command| provider.send(command));
+        let issue = router
+            .launches
+            .refusal_snapshot("refused.1")
+            .unwrap()
+            .root_cause
+            .unwrap()
+            .issue;
+        assert_eq!(issue.code, "connection_closed");
+        assert!(router.launches.refusal_snapshot("refused.2").is_none());
     }
 }
 
@@ -649,6 +908,10 @@ fn synthetic_launch_controls_can_use_termination_without_launch_permission() {
             .contains("control completed")
     );
     assert!(matches!(reply.permission, Some(Permission::Paired)));
+    assert!(
+        router.launches.refusal_snapshot("refused.1").is_none(),
+        "a completed control is not a failed stream"
+    );
     let request = &provider
         .calls
         .iter()

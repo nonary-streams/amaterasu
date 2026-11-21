@@ -567,6 +567,11 @@ impl Stream {
         selection: PlannedVideoSelection,
     ) -> TransportResult<()> {
         self.validate_planned_video(selection)?;
+        let settings = VideoSettings {
+            max_fec_blocks: selection.limits.max_fec_blocks as u8,
+            ..self.video_settings.clone()
+        };
+        self.video = video_packetizer(&settings, settings.codec)?;
         self.planned_selection = Some(selection);
         Ok(())
     }
@@ -600,7 +605,8 @@ impl Stream {
             || limits.max_queue_bytes as usize > MAX_QUEUE_BYTES
             || limits.min_parity_shards != u32::from(self.video_settings.min_parity_shards)
             || limits.min_fec_percentage != u32::from(self.video_settings.fec_percentage)
-            || limits.max_fec_blocks != u32::from(self.video_settings.max_fec_blocks)
+            || !(u32::from(self.video_settings.max_fec_blocks)..=VIDEO_FRAME_MAX_BLOCKS as u32)
+                .contains(&limits.max_fec_blocks)
             || (limits.fec_policy_flags & VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED != 0
                 && !selection.allow_unprotected_fallback)
         {
@@ -614,6 +620,7 @@ impl Stream {
     pub fn probe_video_plan(
         &self,
         selection: &VideoPlanSelection,
+        modern_fec: bool,
     ) -> TransportResult<VideoFramingLimits> {
         let valid_id =
             |id: EncoderFormatId| id.namespace_id != 0 && id.value != 0 && id.schema != 0;
@@ -643,7 +650,13 @@ impl Stream {
             max_fec_percentage: 255,
             max_wire_bytes: MAX_QUEUE_BYTES as u64,
             min_fec_percentage: u32::from(self.video_settings.fec_percentage),
-            max_fec_blocks: u32::from(self.video_settings.max_fec_blocks),
+            // Negotiated PyroWave clients implement multi-block GameStream FEC.
+            // Keep the legacy block limit available to the standard codec path.
+            max_fec_blocks: if modern_fec {
+                VIDEO_FRAME_MAX_BLOCKS as u32
+            } else {
+                u32::from(self.video_settings.max_fec_blocks)
+            },
             fec_policy_flags: 0,
             reserved: 0,
         };
@@ -666,8 +679,9 @@ impl Stream {
     pub fn prepare_video_plan(
         &mut self,
         selection: &VideoPlanSelection,
+        modern_fec: bool,
     ) -> TransportResult<VideoFramingLimits> {
-        let limits = self.probe_video_plan(selection)?;
+        let limits = self.probe_video_plan(selection, modern_fec)?;
         self.configure_planned_video(PlannedVideoSelection {
             stream: selection.stream,
             generation: selection.generation,

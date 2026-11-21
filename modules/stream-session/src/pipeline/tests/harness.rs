@@ -303,6 +303,8 @@ pub struct Broker {
     pub fail_cancel: bool,
     pub fail_open: Option<String>,
     pub unsupported_audio_probe: Option<String>,
+    pub reject_audio_probe_admission: Option<String>,
+    pub audio_probe_admission_conflict: bool,
     pub fail_audio_reconfigure: Option<String>,
     pub fail_close: Option<String>,
     pub cleanup_failure: Option<(String, String)>,
@@ -730,6 +732,19 @@ impl Broker {
                 operation_id,
                 ..
             } => {
+                if payload["action"] == "probe"
+                    && self.reject_audio_probe_admission.as_deref() == Some(&service)
+                {
+                    return Ok(Response::Error {
+                        code: if self.audio_probe_admission_conflict {
+                            "conflict"
+                        } else {
+                            "service_unavailable"
+                        }
+                        .into(),
+                        message: String::new(),
+                    });
+                }
                 if service == "amaterasu.input/1"
                     && payload["action"] == "poll_gamepad_feedback"
                     && let Some(code) = &self.gamepad_admission_error
@@ -866,6 +881,7 @@ impl Broker {
                 }
                 Ok(Response::Ok)
             }
+            Command::Publish { .. } | Command::Log { .. } => Ok(Response::Ok),
             _ => panic!("unexpected broker operation"),
         }
     }
@@ -1550,9 +1566,10 @@ impl Broker {
                 json!({"ok":true,"monitors":monitors,"reference_owned":reference_owned,"parked":parked,"parked_outputs":parked_outputs})
             }
             "remove" => {
-                if payload["reference_id"]
-                    .as_str()
-                    .is_some_and(|reference| reference.starts_with("shared-source-"))
+                let reference = payload["reference_id"].as_str().expect("reference ID");
+                if reference.starts_with("shared-source-")
+                    && self.virtual_display_references.len() == 1
+                    && self.virtual_display_references.contains(reference)
                 {
                     assert!(
                         !self.allocations.iter().any(|((service, _), allocation)| {
@@ -1565,7 +1582,6 @@ impl Broker {
                 if self.virtual_display_remove_failure {
                     return error("cleanup_pending");
                 }
-                let reference = payload["reference_id"].as_str().expect("reference ID");
                 let released = self.virtual_display_references.remove(reference);
                 let reference_owned = self.virtual_display_references.contains(reference);
                 let removed = self.virtual_display_references.is_empty();

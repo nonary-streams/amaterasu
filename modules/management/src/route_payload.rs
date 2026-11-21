@@ -92,15 +92,17 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.management/1" if route.action == "package_selection_status" => {
             fields(object, &[], &[])
         }
+        "amaterasu.management/1" if route.action == "repository_preview" => {
+            fields(object, &["location"], &[])?;
+            repository_text(object, "location", 256)
+        }
         "amaterasu.management/1" if route.action == "repository_add" => {
-            fields(
-                object,
-                &["id", "location", "public_key", "fingerprint"],
-                &[],
-            )?;
+            fields(object, &["id", "location", "fingerprint"], &["public_key"])?;
             repository_text(object, "id", 128)?;
             repository_text(object, "location", 256)?;
-            repository_text(object, "public_key", 64)?;
+            if object.contains_key("public_key") {
+                repository_text(object, "public_key", 64)?;
+            }
             repository_text(object, "fingerprint", 64)
         }
         "amaterasu.management/1"
@@ -2672,7 +2674,13 @@ fn management_launch_identifier(value: &Value) -> bool {
 fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "management_launch_status" => {
-            fields(object, &[], &["reference"])?;
+            fields(object, &[], &["reference", "issues_only"])?;
+            if object.contains_key("issues_only")
+                && (object.get("issues_only") != Some(&Value::Bool(true))
+                    || object.contains_key("reference"))
+            {
+                return Err(INVALID);
+            }
             if object
                 .get("reference")
                 .is_some_and(|value| !management_launch_identifier(value))

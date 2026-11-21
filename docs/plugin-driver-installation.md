@@ -247,8 +247,14 @@ stream interruption.
 
 ## Driver inventory and version information
 
-The Modules > Drivers inventory records the last runtime-user verification of the
-successfully activated composition. Pending and failed setup appears separately;
+Modules > Drivers checks the Linux host drivers used by the enabled built-in
+VKMS capture and input providers in the loaded composition. It reads the loaded
+`vibeshine_drm` module version and queries the configured uinput device as the
+runtime user. These checks do not capture frames, create virtual input devices,
+or install drivers. The uinput version shown is the running kernel release.
+
+For independent plugins, the inventory records the last runtime-user verification
+of the successfully activated composition. Pending and failed setup appears separately;
 cancelling setup does not change the installed inventory. Existing selections
 without saved observations show no fabricated driver versions. These snapshots
 are not continuous OS monitoring.

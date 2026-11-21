@@ -1,4 +1,5 @@
 use super::*;
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
 
 impl Controller {
     pub(super) fn poll_transport(&mut self, now: u64) {
@@ -99,22 +100,25 @@ impl Controller {
                     "configuration_mismatch",
                 );
                 if completed && success {
-                    for adjustment in &record.adjustments {
-                        if self.pending_adjustment_logs.len() < 64 {
-                            self.pending_adjustment_logs.push_back(
-                                json!({
-                                    "event":"stream_adjustment", "stream":record.config.history_activity_id.as_deref().unwrap_or(&record.config.operation_id),
-                                    "code":adjustment.code,"requested":adjustment.requested,
-                                    "effective":adjustment.effective
-                                })
-                                .to_string(),
-                            );
-                        }
+                    if record.extension_offer.is_some()
+                        && request.header("x-amaterasu-codec-fallback")
+                            == Some("pyrowave_bitstream_mismatch")
+                    {
+                        record.issues.push(
+                            StreamIssue::demoted(
+                                record.config.operation_id.clone(),
+                                LifecycleLayer::Rtsp,
+                                "announce",
+                                "client_codec_fallback",
+                                "standard_video",
+                            )
+                            .because("client_reported_pyrowave_bitstream_mismatch"),
+                        );
                     }
-                    self.pending_ignored_client_features |= announce.client_feature_flags
-                        & !amaterasu_gamestream::sdp::KNOWN_CLIENT_FEATURE_FLAGS;
+                    record.report_announce_adjustments();
                 }
                 if !completed {
+                    record.adjustments.clear();
                     record.negotiated_encryption = None;
                     record.client_feature_flags = None;
                     record.negotiated_color = None;
@@ -133,7 +137,10 @@ impl Controller {
                     success,
                     "unsupported_video_format",
                 );
-                if !completed {
+                if completed && success {
+                    record.report_announce_adjustments();
+                } else if !completed {
+                    record.adjustments.clear();
                     record.extension_announce = None;
                 }
             }
@@ -179,12 +186,18 @@ impl Controller {
                 });
             }
             Err(error) => {
-                eprintln!(
-                    "amaterasu rtsp rejection ticket={ticket} method={:?} cseq={} status={} reason={error:?}",
-                    request.method,
-                    request.cseq,
-                    error.status()
-                );
+                if let Some(logger) = &self.logger {
+                    let _ = logger.emit(
+                        amaterasu_module_sdk::LogLevel::Warning,
+                        "negotiation",
+                        &format!(
+                            "Rejected {:?} request {} for ticket {ticket} (RTSP {}): {error:?}.",
+                            request.method,
+                            request.cseq,
+                            error.status()
+                        ),
+                    );
+                }
                 let replied = self.reply_status(connection, request.cseq, error.status());
                 record.close(Some("negotiation_failed"));
                 if replied {
@@ -352,10 +365,16 @@ impl Controller {
             self.records.insert(ticket, record);
             return;
         }
-        eprintln!(
-            "amaterasu rtsp connection interrupted ticket={ticket} state={:?} reason={reason}",
-            record.state
-        );
+        if let Some(logger) = &self.logger {
+            let _ = logger.emit(
+                amaterasu_module_sdk::LogLevel::Info,
+                "stream",
+                &format!(
+                    "RTSP connection for ticket {ticket} closed: {}.",
+                    reason.replace('_', " ")
+                ),
+            );
+        }
         let pending_mutation = self
             .job
             .iter_mut()

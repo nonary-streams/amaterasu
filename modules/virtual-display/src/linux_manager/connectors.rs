@@ -49,6 +49,49 @@ impl SysfsConnectors {
         Self { root }
     }
 
+    /// Check the kernel's current connector state independently of the
+    /// compositor. A connector name shared by multiple cards is ambiguous.
+    pub(super) fn physical_output_active(&self, output: &str) -> bool {
+        if !can_be_physical_output(output) {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return false;
+        };
+        let mut active = None;
+        for (index, entry) in entries.enumerate() {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            if index >= MAX_DRM_ENTRIES {
+                return false;
+            }
+            let name = entry.file_name();
+            let Some((card, connector)) = name.to_str().and_then(split_card_entry) else {
+                continue;
+            };
+            if connector != output {
+                continue;
+            }
+            let path = entry.path();
+            let has_state = |attribute: &str, expected: &str| {
+                fs::read_to_string(path.join(attribute)).is_ok_and(|value| value.trim() == expected)
+            };
+            if !has_state("status", "connected") {
+                continue;
+            }
+            if active.is_some() {
+                return false;
+            }
+            active = Some(
+                is_vibeshine_card(&self.root.join(card)) == Ok(false)
+                    && has_state("enabled", "enabled")
+                    && has_state("dpms", "On"),
+            );
+        }
+        active.unwrap_or(false)
+    }
+
     fn card_is_vibeshine(
         &self,
         cards: &mut BTreeMap<String, bool>,
@@ -61,6 +104,12 @@ impl SysfsConnectors {
         cards.insert(card.to_owned(), owned);
         Ok(owned)
     }
+}
+
+pub(super) fn can_be_physical_output(output: &str) -> bool {
+    !["Virtual-", "Writeback-", "Unknown-"]
+        .iter()
+        .any(|prefix| output.starts_with(prefix))
 }
 
 impl ConnectorInventory for SysfsConnectors {

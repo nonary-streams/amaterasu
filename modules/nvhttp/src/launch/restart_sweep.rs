@@ -200,7 +200,7 @@ impl RestartSweep {
                     return Some((
                         LogLevel::Warning,
                         format!(
-                            "Restart recovery could not list sessions. source=coordinator reason={reason}"
+                            "The lifecycle coordinator could not list sessions after restart: {reason}."
                         ),
                     ));
                 };
@@ -232,7 +232,7 @@ impl RestartSweep {
             outcome @ (Outcome::Rejected | Outcome::Settled | Outcome::Uncertain) => Some((
                 LogLevel::Warning,
                 format!(
-                    "Restart recovery could not list sessions. source=broker reason={} attempts={attempts}",
+                    "Could not query sessions after {attempts} attempts. The broker reported {}.",
                     broker_reason(&outcome, &active.call),
                 ),
             )),
@@ -286,7 +286,7 @@ impl RestartSweep {
         Some((
             LogLevel::Debug,
             format!(
-                "Restart recovery request failed. operation={} generation={} source={source} reason={reason}",
+                "Recovery of {} (generation {}) failed. The {source} reported {reason}.",
                 active.operation_id, active.generation,
             ),
         ))
@@ -304,27 +304,31 @@ impl RestartSweep {
         let mut reasons = round
             .failures
             .iter()
-            .map(|((source, reason), count)| format!("{source}.{reason}={count}"))
+            .map(|((source, reason), count)| format!("{source}: {reason} ({count})"))
             .collect::<Vec<_>>();
         if round.other_failures > 0 {
-            reasons.push(format!("other={}", round.other_failures));
+            reasons.push(format!("other causes ({})", round.other_failures));
         }
         let level = if failed > 0 || (round.listing_truncated && !will_continue) {
             LogLevel::Warning
         } else {
             LogLevel::Debug
         };
-        (
-            level,
-            format!(
-                "Restart recovery processed stranded sessions. round={} accepted={} failed={failed} listing_truncated={} will_continue={} reasons=[{}]",
-                self.listing_rounds,
-                round.accepted,
-                round.listing_truncated,
-                will_continue,
-                reasons.join(", "),
-            ),
-        )
+        let mut summary = format!(
+            "Restart recovery, round {}: requests accepted: {}. Failed: {failed}.",
+            self.listing_rounds, round.accepted
+        );
+        if !reasons.is_empty() {
+            summary.push_str(&format!(" Reasons: {}.", reasons.join(", ")));
+        }
+        if round.listing_truncated {
+            summary.push_str(if will_continue {
+                " Reading the next group of sessions."
+            } else {
+                " The session list was incomplete."
+            });
+        }
+        (level, summary)
     }
 }
 
@@ -487,14 +491,14 @@ mod tests {
             events[..4]
                 .iter()
                 .all(|(level, message)| *level == LogLevel::Debug
-                    && message.contains("operation=nvhttp-restart-abandon-"))
+                    && message.contains("Recovery of nvhttp-restart-abandon-"))
         );
         let (level, summary) = &events[4];
         assert_eq!(*level, LogLevel::Warning);
-        assert!(summary.contains("accepted=1 failed=4"));
-        assert!(summary.contains("broker.permission_denied=1"));
-        assert!(summary.contains("coordinator.no_reason_code=1"));
-        assert!(summary.contains("coordinator.release_work_unavailable=2"));
+        assert!(summary.contains("requests accepted: 1. Failed: 4."));
+        assert!(summary.contains("broker: permission_denied (1)"));
+        assert!(summary.contains("coordinator: no_reason_code (1)"));
+        assert!(summary.contains("coordinator: release_work_unavailable (2)"));
         assert!(
             events
                 .iter()

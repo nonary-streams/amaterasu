@@ -149,7 +149,7 @@ const SESSION_HISTORY: ComponentDefinition = ComponentDefinition {
     // Configuration delegates durable state calls under the original caller.
     calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
     publishes: &[],
-    subscribes: &[],
+    subscribes: &["nonary.stats.host-sample/1"],
     native_provides: &[],
     native_uses: &[],
     dependencies: &[RUNTIME_ID, "amaterasu.configuration"],
@@ -161,7 +161,7 @@ const HOST_METRICS: ComponentDefinition = ComponentDefinition {
     provides: &["amaterasu.host-metrics/1", "nonary.stats/1"],
     // Configuration delegates durable state calls under the original caller.
     calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
-    publishes: &[],
+    publishes: &["nonary.stats.host-sample/1"],
     subscribes: &[],
     native_provides: &[],
     native_uses: &[],

@@ -319,26 +319,3 @@ test("copy reports clipboard failures through an accessible status message", asy
   assert.equal(status.attributes["aria-live"], "polite");
   assert.equal(copy.disabled, false);
 });
-
-
-test("alert observer receives validated full snapshots and reports read failure", async () => {
-  const text = "[2026-11-13]: Warning: amaterasu.rtsp::rtsp.negotiation: Optional client features 0x00000010 are unsupported and ignored; streaming can continue.\n";
-  const bytes = Buffer.from(text);
-  let fail = false;
-  const api = { async post(route) {
-    if (route === "host-logs/close") return {ok:true};
-    if (fail) throw new Error("unavailable");
-    if (route === "host-logs/open") return {ok:true,snapshot:id,length:bytes.length,earlier_segments_discarded:0};
-    return {ok:true,snapshot:id,offset:0,next_offset:bytes.length,length:bytes.length,data:bytes.toString("base64"),eof:true};
-  }};
-  const snapshots = [];
-  let failures = 0;
-  const target = new Element("div"); target.setConnected(true);
-  const refresh = renderHostLogs({api}, target, {snapshot(value) { snapshots.push(value); }, unavailable() { failures++; }});
-  await wait(() => snapshots.length === 1);
-  assert.equal(snapshots[0], text);
-  fail = true;
-  await refresh();
-  assert.equal(failures, 1);
-  assert.equal(snapshots.length, 1);
-});

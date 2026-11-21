@@ -2,13 +2,24 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import ts from 'typescript';
+import { consoleSource, consoleStyles, serveConsoleAsset } from './browser-console-fixture.mjs';
 
 const chromium = '/usr/bin/chromium';
 const pause = (ms = 30) => new Promise(resolve => setTimeout(resolve, ms));
+
+const server = createServer((request, response) => {
+  if (serveConsoleAsset(request, response)) return;
+  response.setHeader('Content-Type', 'text/html');
+  response.end(`<!doctype html><html lang="en" data-theme="dark"><meta name="viewport" content="width=device-width,initial-scale=1">
+    ${consoleStyles}<div class="shell console-shell"><div class="console-columns"><aside class="sidebar"></aside>
+    <div class="workspace"><main id="page" class="content"></main></div></div></div></html>`);
+});
+test.before(() => new Promise(resolve => server.listen(0, '127.0.0.1', resolve)));
+test.after(() => new Promise(resolve => server.close(resolve)));
 
 // A host as the page sees it: four loaded modules from one repository, another
 // publisher's repository beside it, repository changes that finish a moment
@@ -18,7 +29,7 @@ const pause = (ms = 30) => new Promise(resolve => setTimeout(resolve, ms));
 const fakeHost = `
   window.host = {
     calls: [], notices: [], navigated: [], views: [],
-    role: 'administrator', scopes: null, manageable: true, describe: 'ok', nextOperation: 1, operation: null,
+    role: 'administrator', scopes: null, manageable: true, publisherChanged: false, describe: 'ok', nextOperation: 1, operation: null,
     digest: 'd'.repeat(64),
     // null is a host from before the update routes existed.
     pkg: null, act: {}, refuse: {}, onStatus: null, offline: false, versionsReply: null,
@@ -85,7 +96,11 @@ const fakeHost = `
     };
     if (route === 'repositories/list') return {
       ok: true, repositories: host.repositories, next_offset: null,
-      ...(host.manageable ? { manageable: true, capacity: 16, operation: host.operation } : {}),
+      ...(host.manageable ? {
+        manageable: true, capacity: 16,
+        operation: host.operation?.kind === 'preview' ? null : host.operation,
+        preview: host.operation?.kind === 'preview' ? host.operation : null,
+      } : {}),
     };
     if (route === 'modules/describe') {
       if (host.describe === 'missing') return { status: 404, ok: false, code: 'not_found' };
@@ -105,10 +120,15 @@ const fakeHost = `
       else host.act[action]?.(body);
       return host.status();
     }
+    if (route === 'repositories/preview') return host.change('preview', '', () => {
+      if (body.location.includes('unsigned')) return { state: 'failed', code: 'catalog_rejected' };
+      return { state: 'succeeded', code: null,
+        publisher: { id: 'new-plugins', location: body.location, fingerprint: 'ab'.repeat(32) } };
+    });
     if (route === 'repositories/add') {
-      if (body.fingerprint !== 'ab'.repeat(32)) return { ok: false, code: 'fingerprint_mismatch' };
       return host.change('add', body.id, () => {
-        if (body.location.includes('unsigned')) return { state: 'failed', code: 'catalog_rejected' };
+        if (host.publisherChanged || body.fingerprint !== 'ab'.repeat(32))
+          return { state: 'failed', code: 'fingerprint_mismatch' };
         host.repositories.push({ id: body.id, location: body.location, fingerprint: body.fingerprint, revoked: false,
           catalog: { state: 'current', sequence: '1', expires_unix: 1900000000 },
           candidates: [{ slot: 'new.recorder', implementation: 'new-recorder', version: '2.0.0', kind: 'native_set', manifest_sha256: '7'.repeat(64) }] });
@@ -216,16 +236,10 @@ async function withPage(prefix, run) {
     const viewport = (width, height = 900) =>
       command('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
 
-    const root = new URL('../../', import.meta.url);
-    const css = await readFile(new URL('frontend/public/styles.css', root), 'utf8');
     await viewport(1400);
-    await evaluate(`document.documentElement.dataset.theme = 'dark';
-      document.head.innerHTML = '<meta name="viewport" content="width=device-width, initial-scale=1">';
-      const style = document.createElement('style'); style.textContent = ${JSON.stringify(css)}; document.head.append(style);
-      document.body.innerHTML = '<main id="page" class="content"></main>';`);
-    const files = ['model.ts', 'api.ts', 'locale-catalogs.ts', 'locale.ts', 'ui.ts', 'plugin_catalog.ts', 'plugin_drivers.ts', 'plugins.ts'];
-    const source = (await Promise.all(files.map(file => readFile(new URL(`frontend/src/${file}`, root), 'utf8')))).join('\n');
-    await evaluate(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }));
+    await command('Page.navigate', { url: `http://127.0.0.1:${server.address().port}/` });
+    await waitFor(`document.readyState === 'complete' && !!document.querySelector('#page')`);
+    await evaluate(consoleSource);
     await evaluate(fakeHost);
     await run({ command, evaluate, waitFor, viewport });
   } finally {
@@ -324,6 +338,37 @@ test('driver inventory keeps committed versions separate from a cancelled setup'
   });
 });
 
+test('host drivers report device status and link from the modules that use them', { skip: !existsSync(chromium), timeout: 60000 }, async () => {
+  await withPage('amaterasu-host-drivers-', async ({evaluate, waitFor}) => {
+    await evaluate(`
+      const capture = {id:'org.nonary.virtual-display', name:'Vibeshine DRM (VKMS)', publisher:'Nonary',
+        reason:'Provides framebuffer export', required_by:['amaterasu.capture-vkms'], required_components:['amaterasu.capture-vkms'],
+        state:'ready', message:'The capture kernel module is loaded.', may_require_reboot:false, installed_version:'2.0.2.2'};
+      const input = {id:'linux.uinput', name:'Linux uinput', publisher:'Linux kernel', reason:'Creates virtual input devices',
+        required_by:['amaterasu.input'], required_components:['amaterasu.input'], state:'access_denied',
+        message:'The runtime account needs write access.', may_require_reboot:false, installed_version:null};
+      for (const id of [...capture.required_by, ...input.required_by]) {
+        host.modules.push({id, version:'1.0.0', sha256:'5'.repeat(64), runtime:false});
+      }
+      const previousReply = host.reply;
+      host.reply = (route, body) => route === 'drivers/status'
+        ? {ok:true, supported:true, installation_revision:'a'.repeat(64), builtin_drivers:[capture, input], drivers:[], operation:null}
+        : previousReply(route, body);
+      host.open('drivers');
+    `);
+    await waitFor(`document.querySelector('#plugin-view').textContent.includes('Linux uinput')`);
+    const text = await evaluate(`document.querySelector('#plugin-view').textContent`);
+    assert.match(text, /Vibeshine DRM \(VKMS\).*Ready.*Virtual display capture.*2\.0\.2\.2/);
+    assert.match(text, /Linux uinput.*Device access required.*Required byInput/);
+    assert.doesNotMatch(text, /Update availability unknown/);
+
+    await evaluate(`document.querySelector('#plugin-tab-modules').click(); host.row('Input').click()`);
+    await waitFor(`host.pressable('Linux uinput · Device access required')`);
+    await evaluate(`host.press('Linux uinput · Device access required')`);
+    await waitFor(`document.querySelector('#plugin-tab-drivers').getAttribute('aria-selected') === 'true'`);
+  });
+});
+
 test('the Modules page lists, explains and changes what a host can run', { skip: !existsSync(chromium), timeout: 60000 }, async () => {
   await withPage('amaterasu-modules-', async ({ command, evaluate, waitFor, viewport }) => {
     // The overview is where the page opens: Amaterasu Core with a row per
@@ -332,7 +377,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     await waitFor(`document.querySelectorAll('.plugin-family').length === 11`);
     assert.equal(await evaluate(`document.querySelector('h1').textContent`), 'Modules');
     assert.equal(await evaluate(`document.querySelector('.page-heading p').textContent`),
-      'What this host runs and how it stays up to date.');
+      'Manage installed modules, plugins and updates.');
     assert.deepEqual(await evaluate(`host.tabs()`), ['Overview*', 'All modules4', 'Drivers', 'Repositories3']);
     assert.deepEqual(await evaluate(`host.text('.plugin-family h3')`), ['Input', 'Audio', 'Screen capture', 'Video encoding', 'Display',
       'Remote session', 'RTX HDR', 'Frame limiter', 'Statistics', 'Runtime and SDK', 'From other developers']);
@@ -350,9 +395,10 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     // A module another developer wrote that ships in the package is named, with no source claimed for it.
     assert.deepEqual(await evaluate(`Array.from(host.family('From other developers').querySelectorAll('.plugin-family-member'), row => row.textContent)`), ['Overlay']);
     assert.equal(await evaluate(`host.family('From other developers').querySelectorAll('.plugin-family-sources a').length`), 0);
-    // The rows are a table of three columns on a wide screen.
-    assert.equal(await evaluate(`getComputedStyle(host.family('Display')).gridTemplateColumns.split(' ').length`), 3);
-    assert.equal(await evaluate(`document.querySelector('.plugin-included-head').textContent`), 'IncludedAll 4 modules');
+    assert.equal(await evaluate(`document.querySelector('.plugin-families').hidden`), true);
+    await evaluate(`host.press('Included modules')`);
+    assert.equal(await evaluate(`document.querySelector('.plugin-family-toggle').getAttribute('aria-expanded')`), 'true');
+    assert.equal(await evaluate(`host.family('Display').checkVisibility()`), true);
     // RTX HDR points at where it is set up.
     assert.equal(await evaluate(`host.family('Remote session').querySelector('.plugin-family-members')`), null);
     assert.equal(await evaluate(`host.family('Remote session').classList.contains('plugin-family--absent')`), true);
@@ -367,10 +413,15 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     assert.equal(await evaluate(`document.querySelector('.plugin-summary').dataset.tone`), 'neutral');
     assert.equal(await evaluate(`document.querySelector('.plugin-summary-detail').hidden`), true);
     assert.deepEqual(await evaluate(`host.text('.plugin-update-name')`), ['Amaterasu Core', 'Plugins']);
+    assert.equal(await evaluate(`(() => {
+      const [core, plugins] = [...document.querySelectorAll('.plugin-source-body')].map(body => body.getBoundingClientRect());
+      const heading = document.querySelector('.plugin-update-source-head').getBoundingClientRect();
+      return core.left > heading.right && Math.abs(core.left - plugins.left) < 1 && Math.abs(core.right - plugins.right) < 1;
+    })()`), true, 'Core and Plugins align their detail columns on desktop');
     assert.equal(await evaluate(`document.querySelector('.plugin-update-state').hidden`), true);
     assert.equal(await evaluate(`document.querySelector('.plugin-update-detail').textContent`), 'This host does not install updates from the console yet.');
     // The version is the one the repository gives the package the host runs.
-    assert.match(await evaluate(`document.querySelector('.plugin-update-facts').textContent`), /^Version 1\.2\.0Package d{12}Copyfrom house$/);
+    assert.match(await evaluate(`document.querySelector('.plugin-update-facts').textContent`), /^Version 1\.2\.0Package d{12}CopyRepository house$/);
     assert.equal(await evaluate(`host.button('Check for updates').disabled`), true);
     assert.deepEqual(await evaluate(`host.shown('.plugin-update-actions button, .plugin-update-step, .plugin-update-bar, .plugin-update-summary, .plugin-setting, .plugin-versions')`), []);
     assert.equal(await evaluate(`host.statusCalls()`), 1);
@@ -404,6 +455,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     await evaluate(`host.modules.push(...['nvhttp', 'pairing', 'rtsp', 'catalog'].map((name, index) => ({ id: 'amaterasu.' + name, version: '0.1.0', sha256: String(6 + index).repeat(64), runtime: false })));
       host.views.length = 0; host.open()`);
     await waitFor(`host.family('Built into Amaterasu') !== undefined`);
+    await evaluate(`host.press('Included modules')`);
     assert.deepEqual(await evaluate(`Array.from(host.family('Built into Amaterasu').querySelectorAll('.plugin-family-member'), row => row.textContent)`), ['5 modules']);
     await evaluate(`host.press('5 modules', host.family('Built into Amaterasu'))`);
     assert.deepEqual(await evaluate(`host.views`), ['modules']);
@@ -441,7 +493,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     assert.deepEqual(await evaluate(`host.text('.plugin-quiet-state h3')`), ['No modules match']);
     assert.equal(await evaluate(`getComputedStyle(document.querySelector('.plugin-detail-pane')).display`), 'none');
     // A family member hidden by the search is still opened from its row.
-    await evaluate(`document.querySelector('#plugin-tab-overview').click(); host.member('Runtime').click()`);
+    await evaluate(`document.querySelector('#plugin-tab-overview').click(); host.press('Included modules'); host.member('Runtime').click()`);
     assert.equal(await evaluate(`document.querySelector('input[name="plugin_search"]').value`), '');
     assert.equal(await evaluate(`document.querySelector('.plugin-detail-pane h2').textContent`), 'Runtime');
 
@@ -491,7 +543,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     }
     assert.equal(await evaluate(`document.querySelector('.plugin-others h2').textContent`), 'Plugins');
     assert.deepEqual(await evaluate(`host.text('.plugin-others .plugin-group-heading')`), ['house', 'studio']);
-    assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('.plugin-others .plugin-row'), row => row.querySelector('.plugin-row-name').textContent + ': ' + row.querySelector('.plugin-row-meta').textContent)`), [
+    assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('.plugin-others .plugin-row'), row => row.querySelector('.plugin-row-name').textContent + ': ' + [...row.querySelector('.plugin-row-meta').children].map(node => node.textContent).join(' · '))`), [
       'RTX HDR: Not installed · 0.1.0',
       'Frame limiter: Other version installed · 0.3.0',
       'Overlay: Installed · 1.2.0',
@@ -529,7 +581,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     // A host whose repositories offer nothing more says so in a line.
     await evaluate(`host.kept = host.repositories.splice(1); host.spare = host.repositories[0].candidates.pop(); host.open()`);
     await waitFor(`document.querySelector('.plugin-others-empty') !== null`);
-    assert.equal(await evaluate(`document.querySelector('.plugin-others-empty').textContent`), "No plugins yet. Add a developer's repository to see what it offers.");
+    assert.equal(await evaluate(`document.querySelector('.plugin-others-empty').textContent`), "No additional plugins are listed in the approved repositories.");
     assert.equal(await evaluate(`host.button('Add repository', document.querySelector('.plugin-others')) !== undefined`), true);
     await evaluate(`host.repositories[0].candidates.push(host.spare); host.repositories.push(...host.kept); host.views.length = 0; host.open()`);
     await waitFor(`document.querySelectorAll('.plugin-others .plugin-row').length === 3`);
@@ -548,32 +600,33 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     await waitFor(`host.card('stale')?.querySelector('[role="alert"]') !== null`, 'the refused check is reported');
     assert.match(await evaluate(`host.card('stale').querySelector('[role="alert"]').textContent`), /catalog has expired/);
 
-    // Adding: pasted details fill the form, a wrong fingerprint is caught, a good one enrolls.
+    // Enter an address, then review and approve the publisher the host found.
     await evaluate(`host.press('Add repository', document.querySelector('#plugin-view'))`);
     await waitFor(`document.querySelector('dialog.plugin-form-dialog')?.open === true`);
-    await evaluate(`(() => {
-      const paste = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: new DataTransfer() });
-      paste.clipboardData.setData('text', JSON.stringify({ id: 'new-plugins', location: 'https://new.example.test/unsigned', public_key: 'AB'.repeat(32), fingerprint: 'ab'.repeat(32) }));
-      document.querySelector('input[name="repository_location"]').dispatchEvent(paste);
-    })()`);
-    assert.deepEqual(await evaluate(`['repository_location', 'repository_id', 'repository_public_key', 'repository_fingerprint'].map(name => document.querySelector('input[name="' + name + '"]').value)`),
-      ['https://new.example.test/unsigned', 'new-plugins', 'ab'.repeat(32), '']);
-    assert.equal(await evaluate(`document.activeElement.name`), 'repository_fingerprint');
-    await evaluate(`host.fill('repository_fingerprint', '1234 '.repeat(16)); document.querySelector('.plugin-form').requestSubmit();`);
-    assert.equal(await evaluate(`host.calls.some(([route]) => route === 'repositories/add')`), false, 'the trust acknowledgement is required');
-    await evaluate(`document.querySelector('input[name="repository_trust"]').click(); document.querySelector('.plugin-form').requestSubmit();`);
-    await waitFor(`document.querySelector('.plugin-form [role="alert"]') !== null`);
-    assert.match(await evaluate(`document.querySelector('.plugin-form [role="alert"]').textContent`), /fingerprint does not belong to this publisher key/);
-    assert.equal(await evaluate(`document.querySelector('input[name="repository_fingerprint"]').getAttribute('aria-invalid')`), 'true');
-    assert.deepEqual(await evaluate(`host.calls.find(([route]) => route === 'repositories/add')[1]`),
-      { id: 'new-plugins', location: 'https://new.example.test/unsigned', public_key: 'ab'.repeat(32), fingerprint: '1234'.repeat(16) });
-
-    // The host checks the catalog before it enrolls anything.
-    await evaluate(`host.fill('repository_fingerprint', 'abab '.repeat(16)); document.querySelector('.plugin-form').requestSubmit();`);
-    await waitFor(`document.querySelector('.plugin-form [role="alert"]')?.textContent.includes('not signed by this publisher key')`);
-    assert.equal(await evaluate(`document.querySelector('input[name="repository_public_key"]').getAttribute('aria-invalid')`), 'true');
+    const form = "document.querySelector('.plugin-form')";
+    assert.deepEqual(await evaluate(`[...${form}.querySelectorAll('input')].map(input => input.name)`), ['repository_location']);
+    await evaluate(`host.fill('repository_location', 'https://new.example.test/unsigned'); host.press('Check repository', ${form})`);
+    await waitFor(`${form}.querySelector('[role="alert"]')?.textContent.includes('not signed by this publisher key')`);
     assert.equal(await evaluate(`host.repositories.length`), 3);
-    await evaluate(`host.fill('repository_location', 'https://new.example.test/repository'); document.querySelector('.plugin-form').requestSubmit();`);
+
+    await evaluate(`host.fill('repository_location', 'https://new.example.test/repository'); host.press('Check repository', ${form})`);
+    await waitFor(`host.button('Trust and add', ${form}) !== undefined`);
+    assert.match(await evaluate(`document.querySelector('.plugin-publisher-review').textContent`), /new-plugins.*new\.example\.test.*Signing key fingerprint.*abab.*Native plugins/);
+    assert.deepEqual(await evaluate(`host.calls.filter(([route]) => route === 'repositories/preview').at(-1)[1]`),
+      { location: 'https://new.example.test/repository' });
+    assert.equal(await evaluate(`host.calls.some(([route]) => route === 'repositories/add')`), false, 'inspection does not approve the publisher');
+    assert.equal(await evaluate(`host.repositories.length`), 3);
+
+    await evaluate(`host.publisherChanged = true; host.press('Trust and add', ${form})`);
+    await waitFor(`${form}.querySelector('[role="alert"]')?.textContent.includes('different signing key')`);
+    assert.equal(await evaluate(`host.button('Trust and add', ${form}) === undefined`), true);
+    assert.equal(await evaluate(`host.repositories.length`), 3);
+    assert.deepEqual(await evaluate(`host.calls.find(([route]) => route === 'repositories/add')[1]`),
+      { id: 'new-plugins', location: 'https://new.example.test/repository', fingerprint: 'ab'.repeat(32) });
+
+    await evaluate(`host.publisherChanged = false; host.press('Check repository', ${form})`);
+    await waitFor(`host.button('Trust and add', ${form}) !== undefined`);
+    await evaluate(`host.press('Trust and add', ${form})`);
     await waitFor(`document.querySelector('dialog.plugin-form-dialog') === null`, 'the dialog closes after enrollment');
     await waitFor(`host.card('new-plugins') !== undefined`);
     assert.equal(await evaluate(`host.notices.at(-1)`), 'Added new-plugins. 1 plugin is available.');
@@ -615,8 +668,24 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     await evaluate(`host.scopes = null`);
 
     // On a narrow screen the details open under the row and nothing scrolls sideways.
+    await viewport(320, 800);
+    await evaluate(`host.modules.push({
+      id: 'studio.' + 'module'.repeat(12), version: '1.0.0-' + 'preview'.repeat(5),
+      sha256: 'e'.repeat(64), runtime: false
+    }); host.open('modules')`);
+    await waitFor(`document.querySelectorAll('.plugin-row').length === 5`);
+    for (const width of [320, 390, 801, 1101, 1440, 3840]) {
+      await viewport(width, 800);
+      assert.equal(await evaluate(`(() => {
+        const tabs = document.querySelector('.plugin-tabs');
+        return tabs.scrollWidth <= tabs.clientWidth + 1 &&
+          [...tabs.children].every(tab => tab.getBoundingClientRect().right <= tabs.getBoundingClientRect().right + 1);
+      })()`), true, `all module views fit at ${width}px`);
+      assert.deepEqual(await evaluate(`[...document.querySelectorAll('.plugin-row-name, .plugin-row-summary, .plugin-row-meta')]
+        .filter(node => node.scrollWidth > node.clientWidth + 1).map(node => node.textContent)`), [], `full row text at ${width}px`);
+    }
     await viewport(380, 800);
-    await evaluate(`host.open('modules')`);
+    await evaluate(`host.modules.pop(); host.open('modules')`);
     await waitFor(`document.querySelectorAll('.plugin-row').length === 4`);
     assert.equal(await evaluate(`document.querySelector('.plugin-detail')`), null, 'nothing is opened until a row is chosen');
     await evaluate(`host.row('Displays').click()`);
@@ -631,6 +700,12 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     }
     // The families stack into one column there.
     await evaluate(`document.querySelector('#plugin-tab-overview').click()`);
+    assert.equal(await evaluate(`[...document.querySelectorAll('.plugin-update-source')].every(section => {
+      const heading = section.querySelector('header').getBoundingClientRect();
+      const body = section.querySelector('.plugin-source-body').getBoundingClientRect();
+      return body.top >= heading.bottom && Math.abs(body.left - heading.left) < 1;
+    })`), true, 'each section stacks below its own heading on phones');
+    await evaluate(`host.press('Included modules')`);
     assert.equal(await evaluate(`getComputedStyle(host.family('Display')).gridTemplateColumns.split(' ').length`), 1);
     // A member chosen from its row opens under its row in All modules there too.
     await evaluate(`host.member('Frame limiter').click()`);
@@ -668,9 +743,9 @@ test('the page follows Amaterasu Core from a check to a restart', { skip: !exist
     assert.equal(await evaluate(`document.querySelector('.plugin-update-name').textContent + '|' + host.headline()`), 'Amaterasu Core|Up to date');
     assert.equal(await evaluate(`document.querySelector('.plugin-update-source').dataset.tone`), 'good');
     assert.equal(await evaluate(`document.querySelector('.plugin-update-state').getAttribute('aria-live')`), 'polite');
-    assert.match(await evaluate(`document.querySelector('.plugin-update-facts').textContent`), /^Version 1\.2\.0Package d{12}Copyfrom house$/);
+    assert.match(await evaluate(`document.querySelector('.plugin-update-facts').textContent`), /^Version 1\.2\.0Package d{12}CopyRepository house$/);
     assert.equal(await evaluate(`document.querySelector('.plugin-update-about').textContent`),
-      'Every module Amaterasu ships. They update together as one signed package, and the host goes back to the package it had if a new one does not start.');
+      'Built-in modules update as one signed package. If startup fails, the host restores the previous version.');
     assert.deepEqual(await evaluate(`host.shown('.plugin-update-actions button, .plugin-update-step, .plugin-update-bar, .plugin-update-summary, .plugin-update-detail')`), []);
     assert.equal(await evaluate(`host.button('Check for updates').disabled`), false);
     assert.equal(await evaluate(`document.querySelector('.plugin-update-source .plugin-package-record').open`), false);
@@ -695,7 +770,7 @@ test('the page follows Amaterasu Core from a check to a restart', { skip: !exist
         host.pkg = { phase: 'checking' };
         host.onStatus = () => { host.pkg = { phase: 'available', update: host.offer, checked_unix_ms: Date.now() }; host.onStatus = null; };
       };
-      host.press('Check for updates'); host.member('Runtime').focus();`);
+      host.press('Included modules'); host.press('Check for updates'); host.member('Runtime').focus();`);
     await waitFor(`host.headline() === 'Checking for updates'`);
     assert.equal(await evaluate(`host.summary()`), 'Checking for updates…');
     assert.equal(await evaluate(`document.querySelector('.plugin-summary button').textContent + '|' + document.querySelector('.plugin-summary button').getAttribute('aria-disabled')`), 'Checking…|true');
@@ -824,7 +899,7 @@ test('the page follows Amaterasu Core from a check to a restart', { skip: !exist
     await waitFor(`host.headline() === 'Up to date' && host.member('Input') !== undefined`);
     assert.equal(await evaluate(`host.summary()`), 'Everything is up to date');
     // The version follows the package: it is the one the repository gives the new one.
-    assert.match(await evaluate(`document.querySelector('.plugin-update-facts').textContent`), /^Version 0\.3\.0Package e{12}Copyfrom house$/);
+    assert.match(await evaluate(`document.querySelector('.plugin-update-facts').textContent`), /^Version 0\.3\.0Package e{12}CopyRepository house$/);
     assert.deepEqual(await evaluate(`host.notices`), ['Update installed. The host is running package eeeeeeeeeeee.']);
     assert.deepEqual(await evaluate(`host.text('.plugin-family-state--changes')`), []);
     assert.equal(await evaluate(`host.calls.filter(([route]) => route === 'package-selection/status').length`), 2);

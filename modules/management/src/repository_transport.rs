@@ -1,7 +1,7 @@
-//! Repository retrieval through the Network SDK for one approved location.
+//! Repository retrieval through the Network SDK for one HTTPS location.
 //!
-//! The location only says where bytes are. Every caller verifies what it
-//! receives against the approved publisher key before using it.
+//! Callers verify signed metadata and pin the publisher key when an
+//! administrator approves a new location.
 use amaterasu_module_sdk::network::Network;
 use amaterasu_package::PackageResult;
 use amaterasu_package::repository::RepositoryTransport;

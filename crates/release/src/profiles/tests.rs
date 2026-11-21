@@ -110,6 +110,34 @@ fn host_metrics_has_the_delegated_configuration_state_grant() {
 }
 
 #[test]
+fn recording_profiles_route_host_observations_to_session_history() {
+    let topic = "nonary.stats.host-sample/1";
+    for profile in [
+        PackageProfile::Platform,
+        PackageProfile::StreamProbe,
+        PackageProfile::SoftwareProbe,
+        PackageProfile::LinuxProbe,
+        PackageProfile::LinuxSession,
+        PackageProfile::LinuxSessionRtxHdr,
+        PackageProfile::LinuxSessionExtensions,
+    ] {
+        let components = profile.components();
+        let publishers: Vec<_> = components
+            .iter()
+            .filter(|c| c.publishes.contains(&topic))
+            .map(|c| c.id)
+            .collect();
+        let subscribers: Vec<_> = components
+            .iter()
+            .filter(|c| c.subscribes.contains(&topic))
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(publishers, [HOST_METRICS.id]);
+        assert_eq!(subscribers, [SESSION_HISTORY.id]);
+    }
+}
+
+#[test]
 fn updater_and_tray_are_registered_with_only_the_required_management_calls() {
     assert_eq!(UPDATER.library, "amaterasu_updater");
     assert_eq!(UPDATER.provides, &["amaterasu.updater/1"]);

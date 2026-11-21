@@ -221,7 +221,7 @@ namespace Amaterasu {
         signal: controller.signal,
         features: Object.freeze([
           "ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1",
-          "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1", "ui.sparklines/1", "ui.assets/1", "ui.controls/3", "ui.elements/1",
+          "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1", "ui.sparklines/1", "ui.chart-sample-axis/1", "ui.assets/1", "ui.controls/3", "ui.elements/1",
           "ui.summary/1",
           ...(descriptor.settings_provider && (application || slot === "settings") ? ["ui.settings/1"] : []),
           ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : []),

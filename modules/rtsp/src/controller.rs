@@ -216,8 +216,7 @@ pub struct Controller {
     locals: Vec<SocketAddr>,
     records: BTreeMap<u64, Record>,
     pending_network: VecDeque<PendingNetwork>,
-    pending_ignored_client_features: u32,
-    pending_adjustment_logs: VecDeque<String>,
+    logger: Option<amaterasu_module_sdk::LogEmitter>,
     /// The job of an open ticket or an incoming request. While it is busy
     /// no further request is read, so only open tickets may occupy it.
     job: Option<Job>,
@@ -294,8 +293,7 @@ impl Controller {
             locals,
             records: BTreeMap::new(),
             pending_network: VecDeque::new(),
-            pending_ignored_client_features: 0,
-            pending_adjustment_logs: VecDeque::new(),
+            logger: None,
             job: None,
             retiring_jobs: BTreeMap::new(),
             parked_job: None,
@@ -316,6 +314,10 @@ impl Controller {
         })
     }
 
+    pub fn set_logger(&mut self, logger: amaterasu_module_sdk::LogEmitter) {
+        self.logger = Some(logger);
+    }
+
     pub fn tick(&mut self, runtime: &RuntimeClient, now: u64) -> ModuleResult<()> {
         let result = if self.quiescence.is_some() {
             self.tick_quiescing(runtime, now)
@@ -329,20 +331,6 @@ impl Controller {
     fn tick_running(&mut self, runtime: &RuntimeClient, now: u64) -> ModuleResult<()> {
         self.cap_announced_cleanup_deadline();
         self.poll_transport(now);
-        let ignored = std::mem::take(&mut self.pending_ignored_client_features);
-        if ignored != 0 {
-            // Diagnostics are best-effort and must never prevent playback.
-            let _ = runtime.log(amaterasu_module_sdk::LogLevel::Warning,
-                "rtsp.negotiation",
-                &format!("Optional client features {ignored:#010x} are unsupported and ignored; streaming can continue."));
-        }
-        while let Some(message) = self.pending_adjustment_logs.pop_front() {
-            let _ = runtime.log(
-                amaterasu_module_sdk::LogLevel::Warning,
-                "rtsp.compatibility",
-                &message,
-            );
-        }
         self.advance_late_observations(runtime);
         self.advance_shutdown_settlement(runtime);
         self.cap_announced_cleanup_deadline();

@@ -62,6 +62,10 @@ test("repository pages keep catalog status, the running change and management su
     manageable: true,
     capacity: 16,
     operation: { id: 3, repository: "publisher", kind: "refresh", state: "failed", code: "catalog_expired" },
+    preview: {
+      id: 4, repository: "", kind: "preview", state: "succeeded", code: null,
+      publisher: { id: "new", location: "https://new.example.test", fingerprint: "e".repeat(64) },
+    },
   });
   assert.equal(page.repositories[0].candidates[0].slot, "amaterasu.ui");
   assert.deepEqual(plain(page.repositories[0].catalog),
@@ -70,6 +74,8 @@ test("repository pages keep catalog status, the running change and management su
   assert.equal(page.capacity, 16);
   assert.deepEqual(plain(page.operation),
     { id: 3, repository: "publisher", kind: "refresh", state: "failed", code: "catalog_expired" });
+  assert.deepEqual(plain(page.preview.publisher),
+    { id: "new", location: "https://new.example.test", fingerprint: "e".repeat(64) });
   assert.equal(page.nextOffset, null);
 });
 
@@ -262,35 +268,28 @@ test("a repository's line says what it offers or what it needs", () => {
   assert.deepEqual(summary({ catalog: undefined }), { status: "1 plugin", attention: false });
 });
 
-test("every refusal the host can send has its own words and points at a field when one is wrong", () => {
+test("every refusal the host can send has its own words", () => {
   const fallback = plugins.repositoryChangeMessage(null);
   const source = readFileSync("../modules/management/src/repository_admin.rs", "utf8");
   const production = source.slice(0, source.indexOf("#[cfg(test)]"));
-  const codes = new Set(Array.from(production.matchAll(/"((?:repository|catalog|invalid|fingerprint|shutting)_[a-z_]+)"/g), (match) => match[1]));
-  for (const action of ["repository_add", "repository_refresh", "repository_remove"]) codes.delete(action);
+  const codes = new Set(Array.from(production.matchAll(/"((?:repository|catalog|publisher|invalid|fingerprint|shutting)_[a-z_]+)"/g), (match) => match[1]));
+  for (const action of ["repository_preview", "repository_add", "repository_refresh", "repository_remove"]) codes.delete(action);
   assert.ok(codes.size >= 15, `expected the host's refusal codes, found ${[...codes].join(", ")}`);
   for (const code of codes) {
     assert.notEqual(plugins.repositoryChangeMessage(code), fallback, `${code} has no message`);
   }
   assert.equal(plugins.repositoryChangeMessage("not_a_known_code"), fallback);
-  assert.equal(plugins.repositoryChangeField("fingerprint_mismatch"), "fingerprint");
-  assert.equal(plugins.repositoryChangeField("invalid_publisher_key"), "publicKey");
-  assert.equal(plugins.repositoryChangeField("catalog_identity_mismatch"), "id");
-  assert.equal(plugins.repositoryChangeField("catalog_download_failed"), "location");
-  assert.equal(plugins.repositoryChangeField("repository_busy"), null);
 });
 
-test("pasted repository details fill the form but never supply the fingerprint", () => {
-  const key = "3D4017C3E843895A92B70AA74D1B7EBC9C982CCF2EC4968CC0CD55F12AF4660C";
-  assert.deepEqual(plain(plugins.parseRepositoryDescriptor(JSON.stringify({
+test("pasted repository details supply only the address", () => {
+  assert.equal(plugins.parseRepositoryDescriptor(JSON.stringify({
     id: "example-plugins",
     location: "https://plugins.example.org/amaterasu",
-    public_key: key,
+    public_key: "c".repeat(64),
     fingerprint: "f".repeat(64),
-  }))), { id: "example-plugins", location: "https://plugins.example.org/amaterasu", publicKey: key.toLowerCase() });
-  assert.deepEqual(plain(plugins.parseRepositoryDescriptor(' {"repository":"r","url":"https://r.example"} ')),
-    { id: "r", location: "https://r.example" });
-  for (const text of ["https://plugins.example.org", "{not json", "[]", "{}", '{"id":7}', `{"id":"${"x".repeat(5000)}"}`])
+  })), "https://plugins.example.org/amaterasu");
+  assert.equal(plugins.parseRepositoryDescriptor(' {"repository":"r","url":"https://r.example"} '), "https://r.example");
+  for (const text of ["https://plugins.example.org", "{not json", "[]", "{}", '{"id":"example"}', `{"url":"${"x".repeat(5000)}"}`])
     assert.equal(plugins.parseRepositoryDescriptor(text), null);
 });
 
@@ -569,7 +568,7 @@ test("the Amaterasu Core row says where its update stands", () => {
   const current = row({ phase: "current", update: null });
   assert.equal(current.id, plugins.CORE_UPDATE_SOURCE);
   assert.equal(current.name, "Amaterasu Core");
-  assert.match(current.about, /^Every module Amaterasu ships\. They update together as one signed package/);
+  assert.match(current.about, /^Built-in modules update as one signed package\./);
   assert.deepEqual([current.headline, current.tone, current.detail], ["Up to date", "good", null]);
   assert.deepEqual([current.version, current.automatic, current.versions, current.restoring], ["0.1.0", null, false, null]);
   // A host ahead of its repository is up to date, and says why nothing newer was found.

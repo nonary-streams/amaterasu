@@ -315,6 +315,11 @@ impl LoadedComponents {
         inject_running_package_digest(&mut runtime_config, &package.digest)?;
         #[cfg(target_os = "linux")]
         crate::capture_authority::inject(package, &mut runtime_config.settings)?;
+        #[cfg(target_os = "linux")]
+        amaterasu_plugin_installation::builtin_drivers::configure(
+            &package.manifest.components,
+            &mut runtime_config,
+        );
         if package
             .manifest
             .components
@@ -784,6 +789,12 @@ impl LoadedComponents {
         // its bounded response before returning; LoadedComponents owns both.
         let output = unsafe { self.graph.lifecycle_endpoint.call(&input) }.ok()?;
         serde_json::from_slice(&output).ok()
+    }
+
+    pub fn report_ready(&self) {
+        if let Some(logger) = &self.graph.product_logger {
+            let _ = logger.emit(2, "amaterasu.host", "Host worker ready.");
+        }
     }
 
     pub fn health(&self) -> PackageResult<()> {

@@ -1302,6 +1302,13 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
             .iter()
             .any(|(request, response)| *request == 21 && response["code"] == "operation_conflict")
     );
+    assert!(controller.stream_issues.drain().any(|report| matches!(
+        report,
+        amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue)
+            if issue.code == "operation_conflict"
+                && issue.disposition == amaterasu_module_sdk::stream_lifecycle::IssueDisposition::AdvisoryWarning
+                && issue.valid()
+    )));
     assert_eq!(controller.records.len(), 1);
 }
 
@@ -1754,6 +1761,13 @@ fn quiescence_cancels_pending_display_verification_without_waiting_for_result() 
     assert!(controller.display_admission.is_some());
 
     assert!(!controller.quiesce(&runtime, 2));
+    assert!(controller.stream_issues.drain().any(|report| matches!(
+        report,
+        amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue)
+            if issue.code == "module_quiescing"
+                && issue.reason == "module_quiescing"
+                && issue.disposition == amaterasu_module_sdk::stream_lifecycle::IssueDisposition::AdvisoryWarning
+    )));
     controller.advance_display_cleanup(&runtime);
 
     assert!(controller.display_cleanup.is_empty());
@@ -4312,28 +4326,35 @@ fn accepted_fractional_announce_reaches_the_video_configuration_without_rounding
 
 #[test]
 fn unknown_optional_client_features_warn_without_reaching_stream_configuration() {
-    let (mut record, mut announce) = announced_profile_record();
-    assert_eq!(record.response()["warnings"], json!([]));
-    announce.client_feature_flags = u32::MAX;
-    assert!(record.accept_announce(&announce));
+    let (mut record, known) = announced_profile_record();
+    let wire = include_str!("../../../../crates/gamestream/src/sdp/fixtures/moonlight-h264.sdp")
+        .replace("encryptionEnabled:0", "encryptionEnabled:7")
+        .replace(
+            "x-ml-general.featureFlags:3",
+            "x-ml-general.featureFlags:4294967295",
+        );
+    let unknown = parse_announce(wire.as_bytes()).unwrap();
+    assert!(record.accept_announce(&unknown));
     let payload = record.authenticated_start_payload(23).unwrap();
     assert_eq!(payload["configuration"]["client_feature_flags"], 15);
     let warnings = record.response()["warnings"].clone();
-    let optional = warnings
+    assert_eq!(warnings, payload["configuration"]["stream_adjustments"]);
+    let flags: Vec<_> = warnings
         .as_array()
         .unwrap()
         .iter()
-        .find(|warning| warning["code"] == "unsupported_optional_client_features")
-        .unwrap();
-    assert_eq!(optional["ignored_feature_flags"], !15_u32);
-    announce.client_feature_flags = 3;
-    assert!(record.accept_announce(&announce));
+        .filter(|warning| warning["code"] == "optional_client_features")
+        .collect();
+    assert_eq!(flags.len(), 1);
+    assert_eq!(flags[0]["requested"], !15_u32);
+    assert_eq!(flags[0]["effective"], 0);
+    assert!(record.accept_announce(&known));
     assert!(
         !record.response()["warnings"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|warning| warning["code"] == "unsupported_optional_client_features")
+            .any(|warning| warning["code"] == "optional_client_features")
     );
 }
 
@@ -4367,6 +4388,36 @@ fn bandwidth_budget_and_fallback_details_reach_the_same_stream() {
             .iter()
             .any(|value| value["code"] == "bandwidth_adjusted")
     );
+}
+
+#[test]
+fn accepted_bitrate_adjustments_belong_to_the_ticket_and_match_playback() {
+    use amaterasu_module_sdk::stream_lifecycle::{IssueDisposition, StreamReport};
+    use amaterasu_module_sdk::stream_warnings::WarningValue;
+    for (operation, budget) in [("first-attempt", 10000), ("second-attempt", 8000)] {
+        let (mut record, mut announce) = announced_profile_record();
+        record.config.operation_id = operation.into();
+        announce.video.configured_bitrate_kbps = Some(budget);
+        assert!(record.accept_announce(&announce));
+        record.report_announce_adjustments();
+        let bitrate = record.negotiated_video.unwrap().bitrate_kbps;
+        let issue = record
+            .issues
+            .drain()
+            .find_map(|report| match report {
+                StreamReport::Issue(issue) if issue.code == "bandwidth_adjusted" => Some(issue),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(issue.operation, operation);
+        assert_eq!(issue.disposition, IssueDisposition::AdvisoryWarning);
+        assert_eq!(issue.effective, Some(WarningValue::Integer(bitrate.into())));
+        assert!(
+            record
+                .playback_description()
+                .contains(&format!("{bitrate} kbps"))
+        );
+    }
 }
 
 #[test]
@@ -4413,6 +4464,10 @@ fn accepted_extension_announce_preserves_profile_and_rejects_changed_probe_param
                 "x-ss-general.encryptionEnabled:7",
             )
             .replace(
+                "x-ml-general.featureFlags:3",
+                "x-ml-general.featureFlags:19",
+            )
+            .replace(
                 "x-nv-vqos[0].bitStreamFormat:0",
                 "x-nv-vqos[0].bitStreamFormat:4",
             )
@@ -4431,9 +4486,14 @@ fn accepted_extension_announce_preserves_profile_and_rejects_changed_probe_param
         payload["configuration"]["configuration"]["extension_profile"],
         json!(profile)
     );
-    assert_eq!(
-        payload["configuration"]["client_feature_flags"],
-        announce.client_feature_flags
+    assert_eq!(payload["configuration"]["client_feature_flags"], 3);
+    assert!(
+        payload["configuration"]["stream_adjustments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "optional_client_features"
+                && warning["requested"] == 16)
     );
     announce.video.width += 2;
     assert!(!record.accept_extension_announce(&announce));
@@ -4594,8 +4654,7 @@ fn extension_bit_depth_follows_the_launch_dynamic_range() {
         } else {
             announcement
         };
-        // The Windows PyroWave client leaves the legacy encoder CSC hint at
-        // its default. The extension bitstream owns its color metadata.
+        // Moonlight can request BT.601 limited via its default CSC hint.
         let announcement = announcement.replace(
             "x-nv-video[0].encoderCscMode:2",
             "x-nv-video[0].encoderCscMode:0",
@@ -4610,6 +4669,10 @@ fn extension_bit_depth_follows_the_launch_dynamic_range() {
         assert_eq!(
             payload["configuration"]["configuration"]["extension_profile"],
             json!(profile)
+        );
+        assert_eq!(
+            payload["configuration"]["configuration"]["color_mode"],
+            "bt601_limited"
         );
         assert_eq!(
             payload["configuration"]["client_feature_flags"],

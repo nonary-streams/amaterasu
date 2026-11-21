@@ -51,7 +51,7 @@
             { id: "dark", label: "Dark", content: buildTheme("dark", sdk.ui, use) },
           ],
         }));
-        grid.append(appearance.element);
+        grid.append(element("h1", "showcase-title", "UI Elements"), appearance.element);
         root.append(grid);
         container.append(root);
         return cleanup;
@@ -188,7 +188,7 @@
   }
 
   function buildTheme(themeName, ui, use) {
-    const swatch = element("section", "showcase-theme amaterasu-paper");
+    const swatch = element("section", "showcase-theme");
     swatch.setAttribute("data-theme", themeName);
     swatch.setAttribute("aria-label", themeName + " appearance sample");
 

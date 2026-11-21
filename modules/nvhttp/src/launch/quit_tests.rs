@@ -1,4 +1,44 @@
 #[test]
+fn unconfirmed_rtsp_cleanup_after_cross_client_quit_is_a_warning() {
+    let (mut controller, mut broker, now) = one_client_application();
+    broker.broker.fail_rtsp_cleanup = true;
+    assert!(controller.cancel(20, &peer(2), now).is_none());
+    let (connection, reply) = broker.reply(&mut controller, now);
+    assert_eq!(connection, 20);
+    assert_eq!(reply.status, 503);
+    assert!(reply_text(&reply).contains("stream cleanup is incomplete"));
+
+    let record = &controller.records[&1];
+    assert_eq!(record.state, State::CleanupFailed);
+    assert_eq!(record.cleanup_error, Some("rtsp_cleanup_unconfirmed"));
+    assert!(record.rtsp_requested);
+    assert_eq!(record.rtsp_ticket, Some(71));
+    assert!(!broker.broker.application_stopped);
+
+    // The client response releases the connection. Background retries must
+    // report the same warning while continuing to check the exact ticket.
+    for tick in 1..=25 {
+        controller.poll(now + Duration::from_millis(tick * 100), &mut |command| {
+            broker.send(command)
+        });
+    }
+    let lifecycle = lifecycle_of(&controller, 1);
+    assert!(lifecycle.healthy(), "{:?}", lifecycle.root_cause());
+    let entries: Vec<_> = lifecycle
+        .entries()
+        .filter(|entry| entry.issue.code == "rtsp_cleanup_unconfirmed")
+        .collect();
+    assert!(entries.len() >= 2);
+    for entry in entries {
+        assert_eq!(entry.issue.disposition, IssueDisposition::AdvisoryWarning);
+        assert_eq!(entry.issue.caused_by, Some(LifecycleLayer::Rtsp));
+        assert_eq!(entry.issue.phase, "verify_rtsp_stopped");
+    }
+    assert_eq!(controller.records[&1].rtsp_ticket, Some(71));
+    assert!(!broker.broker.application_stopped);
+}
+
+#[test]
 fn quit_during_transport_monitor_keeps_application_cleanup_authority() {
     for transport_state in [
         "playing", "closing", "closed", "failed", "invalid", "rejected", "settled",

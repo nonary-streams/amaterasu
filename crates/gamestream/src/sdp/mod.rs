@@ -6,6 +6,7 @@ mod compatibility;
 pub use compatibility::StreamAdjustment;
 mod diagnostics;
 mod negotiate;
+pub mod pyrowave;
 mod syntax;
 
 pub use diagnostics::rejection_context;
@@ -37,13 +38,7 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ColorMode {
-    Bt601Limited,
-    Bt601Full,
-    Bt709Limited,
-    Bt709Full,
-}
+pub use amaterasu_media::ColorMode;
 
 pub use amaterasu_contracts::encoder::VideoCodec;
 
@@ -65,7 +60,7 @@ pub struct Video<T = VideoStreamFormat> {
     pub bitrate_kbps: u32,
     /// Client-requested slice count, bounded by the native signed C-int representation.
     pub slices_per_frame: i32,
-    /// Original user-selected network budget, when sent by Moonlight.
+    /// User-selected network budget, limited by the peer's link for PyroWave.
     pub configured_bitrate_kbps: Option<u32>,
     pub color: ColorMode,
     /// Zero permits the host to choose; one requires a single reference frame.

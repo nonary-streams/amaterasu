@@ -129,6 +129,7 @@ pub const FRAME_TRANSFER_HLG: u32 = 4;
 pub const FRAME_MATRIX_RGB: u32 = 1;
 pub const FRAME_MATRIX_BT709: u32 = 2;
 pub const FRAME_MATRIX_BT2020_NCL: u32 = 3;
+pub const FRAME_MATRIX_BT601: u32 = 4;
 pub const FRAME_RANGE_FULL: u32 = 1;
 pub const FRAME_RANGE_LIMITED: u32 = 2;
 /// Force a codec recovery point on the submitted frame, or reject without consuming.

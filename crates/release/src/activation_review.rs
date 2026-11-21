@@ -4,6 +4,10 @@ const HOST_PACKAGE_ACTIVATION_SERVICE: &str = "amaterasu.host-package-activation
 const RTX_REPOSITORY_ID: &str = "amaterasu-rtx-hdr";
 const RTX_REPOSITORY_URL: &str =
     "https://raw.githubusercontent.com/nonary-streams/amaterasu-rtx-hdr/catalog";
+#[cfg(target_os = "linux")]
+const CORE_PUBLIC_KEY: &str = "6c399560a1dbe4b646d3be60344fa114d05cdcd7b567a3648958aa1818805b00";
+#[cfg(target_os = "linux")]
+const CORE_REPOSITORY_ID: &str = "amaterasu";
 use amaterasu_package::policy_approval::{PolicyCandidateContext, propose_policy_approval};
 use amaterasu_package::{BootstrapConfig, PackageResult, decode_hex, read_bounded, sha256};
 use serde_json::json;
@@ -175,6 +179,125 @@ fn validate_user_root(root: &Path) -> PackageResult<u32> {
         Err(error) => return Err(error.to_string()),
     }
     Ok(uid)
+}
+
+/// Enroll the official Core publisher on a stopped Linux user service.
+/// Only signing authority changes. The active set and prior grants stay in place
+/// until the normal signed package activation transaction accepts a Core set.
+#[cfg(target_os = "linux")]
+pub fn provision_core(root: &Path, expected_active: &str, fingerprint: &str) -> PackageResult<()> {
+    use amaterasu_package::policy_approval::PolicyAllowlist;
+    use amaterasu_package::repository::{RepositoryStore, verify_production_active};
+    use amaterasu_package::{
+        ActivationState, RootLock, read_json, unix_timestamp, write_json_atomically,
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    let approval = core_repository(fingerprint)?;
+    let uid = validate_user_root(root)?;
+    let _lock = RootLock::acquire(root)?;
+    if root.join("package-activation-journal.json").exists() {
+        return Err("finish the current package activation before provisioning Core".into());
+    }
+    let selection: ActivationState = read_json(&root.join("selection.json"))?;
+    if selection.active.as_deref() != Some(expected_active)
+        || selection.pending.is_some()
+        || selection.trial.is_some()
+    {
+        return Err("the active package changed or a transition is in progress".into());
+    }
+    let bootstrap_path = root.join("bootstrap.json");
+    let allowlist_path = root.join("package-activation-policy.json");
+    // The atomic writer creates private files owned by the service user.
+    // SAFETY: getegid takes no arguments and only reports the current group.
+    let gid = unsafe { getegid_for_provisioning() };
+    for path in [&bootstrap_path, &allowlist_path] {
+        let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if !metadata.is_file()
+            || metadata.uid() != uid
+            || metadata.gid() != gid
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            return Err(format!(
+                "{} must be a private service-user file",
+                path.display()
+            ));
+        }
+    }
+    let original = read_bounded(&bootstrap_path, 1024 * 1024)?;
+    let mut bootstrap: BootstrapConfig =
+        serde_json::from_slice(&original).map_err(|error| error.to_string())?;
+    let mut allowlist: PolicyAllowlist = read_json(&allowlist_path)?;
+    if bootstrap.development
+        || bootstrap.allow_unsigned
+        || !bootstrap
+            .policy
+            .principals
+            .get("amaterasu.management")
+            .is_some_and(|grants| grants.call.contains(HOST_PACKAGE_ACTIVATION_SERVICE))
+    {
+        return Err("Core requires a signed production host with package activation".into());
+    }
+    let active = verify_production_active(root, &bootstrap, &selection, unix_timestamp())?;
+    let recorded = selection
+        .repository_sets
+        .get(expected_active)
+        .ok_or("the active package has no recorded supplier")?;
+    let store = RepositoryStore::new(root.join("repositories"))?;
+    let previous = store.approved(&recorded.repository_id)?;
+    if active.signer_fingerprint.as_deref() != Some(recorded.key_fingerprint.as_str())
+        || recorded.key_fingerprint != previous.fingerprint
+        || (allowlist.publisher_fingerprint != previous.fingerprint
+            && allowlist.publisher_fingerprint != fingerprint)
+    {
+        return Err("the active package and protected publisher authorization differ".into());
+    }
+    if allowlist.publisher_fingerprint != fingerprint
+        && !allowlist_is_fully_applied(&allowlist_path, uid, &previous.fingerprint, &original)?
+    {
+        return Err(
+            "finish the previously approved policy changes before switching publishers".into(),
+        );
+    }
+    if let Some(trusted) = bootstrap.trusted_keys.get(fingerprint)
+        && trusted != CORE_PUBLIC_KEY
+    {
+        return Err("Core fingerprint is already assigned to another key".into());
+    }
+    enroll_repository(&store, approval)?;
+    if !bootstrap.trusted_keys.contains_key(fingerprint) {
+        bootstrap
+            .trusted_keys
+            .insert(fingerprint.into(), CORE_PUBLIC_KEY.into());
+        write_json_atomically(&bootstrap_path, &bootstrap)?;
+    }
+    if allowlist.publisher_fingerprint != fingerprint {
+        allowlist.publisher_fingerprint = fingerprint.into();
+        write_json_atomically(&allowlist_path, &allowlist)?;
+    }
+    println!("Authorized the official Core publisher for signed activation.");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn core_repository(
+    fingerprint: &str,
+) -> PackageResult<amaterasu_package::repository::ApprovedRepository> {
+    amaterasu_package::repository::ApprovedRepository::approve(
+        CORE_REPOSITORY_ID.into(),
+        format!(
+            "https://raw.githubusercontent.com/nonary-streams/amaterasu-repository/catalog/{}",
+            amaterasu_package::current_target()
+        ),
+        CORE_PUBLIC_KEY.into(),
+        fingerprint.into(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    #[link_name = "getegid"]
+    fn getegid_for_provisioning() -> u32;
 }
 
 /// Apply a previously reviewed authorization to a stopped Linux user service.
@@ -455,13 +578,17 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
         let publisher = active
             .signer_fingerprint
             .ok_or("active publisher unavailable")?;
+        let running_core = selection.repository_sets.get(digest).is_some_and(|origin| {
+            origin.repository_id == CORE_REPOSITORY_ID && origin.key_fingerprint == publisher
+        });
         // Reinstalling an already active optional package must not attempt to
         // replace the original allowlist with an empty policy delta.
-        if active
-            .manifest
-            .components
-            .iter()
-            .any(|component| component.id == "amaterasu.rtx-hdr")
+        if running_core
+            || active
+                .manifest
+                .components
+                .iter()
+                .any(|component| component.id == "amaterasu.rtx-hdr")
         {
             use std::os::unix::fs::MetadataExt;
             let policy_path = root.join("package-activation-policy.json");
@@ -487,6 +614,11 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
                 return Err(
                     "existing activation authority differs from the active publisher".into(),
                 );
+            }
+            if running_core {
+                let store =
+                    amaterasu_package::repository::RepositoryStore::new(root.join("repositories"))?;
+                return enroll_repository(&store, core_repository(&publisher)?);
             }
             crate::rtx_repository_publisher::check_composition(
                 &active.manifest,
@@ -552,15 +684,23 @@ fn enroll_project_repository(
         key.clone(),
         publisher.into(),
     )?;
-    let store = RepositoryStore::new(root.join("repositories"))?;
-    if let Ok(existing) = store.approved(RTX_REPOSITORY_ID) {
+    enroll_repository(&RepositoryStore::new(root.join("repositories"))?, expected)
+}
+
+#[cfg(target_os = "linux")]
+fn enroll_repository(
+    store: &amaterasu_package::repository::RepositoryStore,
+    expected: amaterasu_package::repository::ApprovedRepository,
+) -> PackageResult<()> {
+    if let Ok(existing) = store.approved(&expected.id) {
         if existing.location != expected.location
             || existing.fingerprint != expected.fingerprint
             || existing.public_key != expected.public_key
         {
-            return Err(
-                "existing RTX HDR repository approval differs from the project publisher".into(),
-            );
+            return Err(format!(
+                "existing {} approval differs from the project publisher",
+                expected.id
+            ));
         }
         return Ok(());
     }

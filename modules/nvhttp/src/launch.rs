@@ -782,6 +782,7 @@ pub struct Controller {
     /// What every layer reported about each stream: the root cause of a
     /// failure, demoted fallbacks and refusals, with who reported them.
     stream_lifecycle: amaterasu_module_sdk::stream_lifecycle::StreamLifecycleStore,
+    recent_refusals: VecDeque<String>,
     stream_issue_feed: Option<amaterasu_module_sdk::stream_lifecycle::StreamIssueFeed>,
     nonce: [u8; 16],
     next_id: u64,
@@ -857,6 +858,7 @@ impl Controller {
             pending_history_releases: VecDeque::new(),
             active_history_release: None,
             stream_lifecycle: Default::default(),
+            recent_refusals: VecDeque::new(),
             stream_issue_feed: None,
             nonce,
             next_id: 0,
@@ -884,11 +886,12 @@ impl Controller {
         self.logger = Some(logger);
     }
 
-    fn log_phase(&self, level: LogLevel, phase: workflow::Phase, event: &str) {
+    fn log_phase(&self, phase: workflow::Phase, event: &str) {
         if let Some(logger) = &self.logger {
             // The phase and event are internal enums and fixed strings; request
             // contents and client identities are deliberately excluded.
-            let _ = logger.emit(level, "launch", &format!("phase={phase:?} event={event}"));
+            let phase = lifecycle_issues::label(phase).replace('_', " ");
+            let _ = logger.emit(LogLevel::Debug, "launch", &format!("{event} ({phase})."));
         }
     }
 
@@ -1085,6 +1088,15 @@ impl Controller {
             || self.records.values().any(|record| !record.state.terminal())
     }
 
+    pub fn management_issues(&self) -> Value {
+        let (issues, partial) = self.stream_lifecycle.recent_issues();
+        let subscribed = self
+            .stream_issue_feed
+            .as_ref()
+            .is_some_and(|feed| feed.subscribed() && feed.malformed() == 0);
+        json!({"ok":true, "issues":issues, "incomplete":partial || !subscribed})
+    }
+
     /// Management sees only opaque launch identities and cleanup state. This is
     /// separate from RTSP's ticket and stream-session's owner-bound handles.
     pub fn management_status(&self, reference: Option<&str>) -> Value {
@@ -1112,6 +1124,13 @@ impl Controller {
         let unattributed: Vec<_> = self.stream_lifecycle.unattributed().collect();
         status["unattributed_issues"] = json!(unattributed);
         status["lifecycle_feed_gaps"] = json!(self.stream_lifecycle.gaps());
+        let refusals: Vec<_> = self
+            .recent_refusals
+            .iter()
+            .rev()
+            .filter_map(|key| self.stream_lifecycle.snapshot(key))
+            .collect();
+        status["recent_refusals"] = json!(refusals);
         status
     }
 
@@ -1256,6 +1275,18 @@ impl Controller {
         reply
     }
 
+    #[track_caller]
+    pub(crate) fn refuse_stream_request(
+        &mut self,
+        status: u16,
+        message: &str,
+        phase: &str,
+    ) -> Reply {
+        let mut reply = private_error(status, message);
+        self.record_refusal(&mut reply, phase);
+        reply
+    }
+
     fn validate_stream_request(
         &self,
         request: &LaunchRequest,
@@ -1396,7 +1427,6 @@ impl Controller {
             ),
         };
 
-        let warning_logger = self.logger.clone();
         if let Some(record) = self
             .records
             .values_mut()
@@ -1414,7 +1444,7 @@ impl Controller {
                 )
             {
                 for warning in request.advisory_warnings.0.clone() {
-                    workflow::add_stream_warning(record, warning_logger.as_ref(), warning);
+                    workflow::add_stream_warning(record, warning);
                 }
                 if matches!(record.state, State::Ready) {
                     record.launch_connection = Some(connection);
@@ -1551,7 +1581,7 @@ impl Controller {
             record.global_configured_virtual_sink = None;
             record.global_display_policy = json!({});
         }
-        workflow::add_request_warnings(&mut record, self.logger.as_ref());
+        workflow::add_request_warnings(&mut record);
         self.records.insert(id, record);
         None
     }
@@ -1631,10 +1661,13 @@ impl Controller {
         {
             return Some(private_error(409, "stream cleanup is already in progress"));
         }
-        eprintln!(
-            "amaterasu launch cancel requested state={:?} stage={:?}",
-            record.state, record.stage
-        );
+        if let Some(logger) = &self.logger {
+            let _ = logger.emit(
+                LogLevel::Info,
+                "launch",
+                "The client requested a stop. Starting cleanup.",
+            );
+        }
         record.cancel_connection = Some(connection);
         // A client disconnect can start transport retirement before its Quit
         // request arrives. Escalate that same cleanup to end the application;
@@ -2053,6 +2086,18 @@ impl Controller {
     }
 
     pub fn connection_closed(&mut self, connection: u64, now: Instant) {
+        let pending_request = self
+            .pending_auxiliary
+            .values()
+            .any(|pending| pending.connection == connection)
+            || self
+                .deferred_launch
+                .as_ref()
+                .is_some_and(|pending| pending.connection == connection)
+            || self
+                .pending_resume
+                .as_ref()
+                .is_some_and(|pending| pending.connection == connection);
         self.pending_auxiliary
             .retain(|_, pending| pending.connection != connection);
         self.drop_deferred_launch(connection);
@@ -2097,6 +2142,9 @@ impl Controller {
             && record.resume_abandoned
         {
             workflow::reject_resume(record, &mut self.management_replies);
+        }
+        if pending_request {
+            self.record_transport_failure("connection_closed");
         }
     }
 

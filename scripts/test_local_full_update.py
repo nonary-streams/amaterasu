@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import json
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from local_full_update import compiled_from, drift, foreign_artifacts, missing_backend_features  # noqa: E402
+from local_full_update import (  # noqa: E402
+    CATALOG_DOMAIN, compiled_from, core_package, drift, foreign_artifacts,
+    missing_backend_features, sign_core_bundle,
+)
 
 
 def component(identifier: str, file: str) -> dict:
@@ -69,6 +74,33 @@ class DriftTests(unittest.TestCase):
         manifest = self.manifest()
         manifest["components"].append({"id": "three", "sha256": "f" * 64})
         self.assertIn("three", drift(self.PROVENANCE, manifest, "c" * 64)[0])
+
+
+class CoreBundleTests(unittest.TestCase):
+    def test_local_core_catalog_keeps_independent_plugin_listings(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            manifest = {"components": [{"id": "amaterasu.runtime", "version": "0.2.1"}],
+                        "expires_unix": 1, "target": "linux-x86_64"}
+            key = Ed25519PrivateKey.generate()
+            plugin = {"slot": "example.plugin", "implementation": "example-plugin",
+                      "version": "1.0.0", "kind": "native_plugin", "manifest_sha256": "a" * 64}
+            package = core_package(work, manifest)
+            package.mkdir(parents=True)
+            digest, catalog_digest = sign_core_bundle(package, manifest, (key, "b" * 64, 0, [plugin]))
+            raw = (work / "bundle/catalog.json").read_bytes()
+            key.public_key().verify(bytes.fromhex((work / "bundle/catalog.sig").read_text()),
+                                    CATALOG_DOMAIN + raw)
+            catalog = json.loads(raw)
+            self.assertEqual(catalog_digest, hashlib.sha256(raw).hexdigest())
+            self.assertEqual(catalog["repository"], "amaterasu")
+            self.assertEqual(catalog["candidates"], [
+                {"slot": "amaterasu.runtime", "implementation": "amaterasu-core",
+                 "version": "0.2.1", "kind": "native_set", "manifest_sha256": digest},
+                plugin,
+            ])
 
 
 class NativeBackendTests(unittest.TestCase):

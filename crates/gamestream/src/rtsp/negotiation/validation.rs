@@ -131,7 +131,7 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
             eprintln!("amaterasu rtsp announce capability rejection reason={error:?}");
             Error::UnsupportedMedia
         })?;
-    media_common(value, capabilities)
+    media_common(value, capabilities, true)
 }
 
 pub(super) fn media_extension(
@@ -141,17 +141,29 @@ pub(super) fn media_extension(
     value
         .check_common_support(&capabilities.transport)
         .map_err(|_| Error::UnsupportedMedia)?;
-    media_common(value, capabilities)
+    // PyroWave uses the configured wire budget. The legacy field in Moonlight
+    // is reduced for FEC and capped at the old GameStream maximum of 100 Mbps.
+    media_common(
+        value,
+        capabilities,
+        sdp::pyrowave::wire_bitrate_kbps(value).is_none(),
+    )
 }
 
-fn media_common<T>(value: &sdp::Announce<T>, capabilities: &Capabilities) -> Result<(), Error> {
+fn media_common<T>(
+    value: &sdp::Announce<T>,
+    capabilities: &Capabilities,
+    check_legacy_bitrate: bool,
+) -> Result<(), Error> {
+    let bitrate_allowed =
+        !check_legacy_bitrate || value.video.bitrate_kbps <= capabilities.max_bitrate_kbps;
     if value.control != sdp::ControlProtocol::EncryptedEnet
         || !value.encryption.control_v2
         || !capabilities.supported_colors.contains(&value.video.color)
         || value.video.width > capabilities.max_width
         || value.video.height > capabilities.max_height
         || value.video.fps > capabilities.max_fps
-        || value.video.bitrate_kbps > capabilities.max_bitrate_kbps
+        || !bitrate_allowed
         || (capabilities.require_video_encryption && !value.encryption.video)
         || (capabilities.require_audio_encryption && !value.encryption.audio)
     {
@@ -163,7 +175,7 @@ fn media_common<T>(value: &sdp::Announce<T>, capabilities: &Capabilities) -> Res
             value.video.width <= capabilities.max_width
                 && value.video.height <= capabilities.max_height,
             value.video.fps <= capabilities.max_fps,
-            value.video.bitrate_kbps <= capabilities.max_bitrate_kbps,
+            bitrate_allowed,
             !capabilities.require_video_encryption || value.encryption.video,
             !capabilities.require_audio_encryption || value.encryption.audio,
         );

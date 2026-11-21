@@ -1,6 +1,7 @@
 //! Product-owned filtering and bounded session file policy for host records.
 mod host_logs;
 mod support_logs;
+mod timing_capture;
 pub use host_logs::HostLogService;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -196,12 +197,12 @@ impl LogRecord {
         })
     }
 
-    fn line(&self, timestamp_unix_ms: u128) -> Vec<u8> {
+    pub fn line(&self, timestamp_unix_ms: u128) -> Vec<u8> {
         let mut line = format!(
             "[{}]: {}: {}: {}\n",
             format_local_timestamp(timestamp_unix_ms),
             self.level.name(),
-            self.target,
+            component_label(&self.target),
             self.message
         )
         .into_bytes();
@@ -212,6 +213,30 @@ impl LogRecord {
             }
         }
         line
+    }
+}
+
+fn component_label(target: &str) -> &str {
+    let principal = target
+        .split_once("::")
+        .map_or(target, |(principal, _)| principal);
+    match principal {
+        "amaterasu.host" => "Host",
+        "amaterasu.runtime" => "Runtime",
+        "amaterasu.nvhttp" => "Launch and pairing",
+        "amaterasu.rtsp" => "RTSP",
+        "amaterasu.stream-session" => "Stream",
+        "amaterasu.session-lifecycle" => "Session lifecycle",
+        "amaterasu.application" => "Application",
+        "amaterasu.launch" => "Application launch",
+        "amaterasu.capture-vkms" => "Virtual display capture",
+        "amaterasu.video" => "Video",
+        "amaterasu.encode" => "Video encoder",
+        "amaterasu.audio" => "Audio",
+        "amaterasu.input" => "Input",
+        "amaterasu.host-metrics" => "Host metrics",
+        "amaterasu.rtx-hdr" => "RTX HDR",
+        _ => target,
     }
 }
 
@@ -459,6 +484,7 @@ pub struct SessionWriter {
     base_name: String,
     label: String,
     active_path: PathBuf,
+    timing: timing_capture::TimingCapture,
     file: Option<File>,
     completed: VecDeque<SnapshotSegment>,
     active_snapshots: Arc<AtomicUsize>,
@@ -539,6 +565,7 @@ impl SessionWriter {
             base_name,
             label,
             active_path,
+            timing: Default::default(),
             file: Some(file),
             completed: VecDeque::new(),
             active_snapshots: Arc::new(AtomicUsize::new(0)),
@@ -615,14 +642,6 @@ impl SessionWriter {
             length: segment_length,
         });
         Ok(())
-    }
-
-    pub fn write_record(&mut self, record: &LogRecord) -> io::Result<()> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        self.write_line(&record.line(timestamp))
     }
 
     pub fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
@@ -996,6 +1015,47 @@ fn map_send_error<T>(error: TrySendError<T>) -> LoggerError {
     }
 }
 
+/// A regular record is rendered once for both the file and stderr. Timing
+/// records are routed by the authenticated target namespace at every level.
+fn render_or_capture(
+    record: &LogRecord,
+    minimum: MinimumLevel,
+    session: Option<&mut SessionWriter>,
+) -> Option<Vec<u8>> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let timing_target = record.target.split_once("::").and_then(|(source, target)| {
+        target
+            .strip_prefix("timing/")
+            .map(|target| (source, target))
+    });
+    let Some((source, target)) = timing_target else {
+        return Some(record.line(timestamp));
+    };
+    if !minimum.allows(Level::Debug) {
+        return None;
+    }
+    let session = session?;
+    let message = session.timing.record(
+        &session.log_directory,
+        &session.label,
+        source,
+        target,
+        record,
+        timestamp as u64,
+    )?;
+    Some(
+        LogRecord {
+            level: Level::Warning,
+            target: "amaterasu.host".into(),
+            message,
+        }
+        .line(timestamp),
+    )
+}
+
 fn run_logger(events: Receiver<LoggerEvent>, initial_policy: LoggingPolicy) {
     let mut policy = initial_policy;
     let mut writer = SessionWriter::open(&policy.log_path, &policy.state_root).ok();
@@ -1062,15 +1122,12 @@ fn run_logger(events: Receiver<LoggerEvent>, initial_policy: LoggingPolicy) {
                     let _ = reply.try_send(source);
                 }
                 LoggerEvent::Record(record) => {
-                    if policy.minimum_level.allows(record.level) {
-                        let line = record.line(
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis(),
-                        );
-                        if let Some(session_writer) = &mut writer
-                            && session_writer.write_line(&line).is_err()
+                    if policy.minimum_level.allows(record.level)
+                        && let Some(line) =
+                            render_or_capture(&record, policy.minimum_level, writer.as_mut())
+                    {
+                        if let Some(session) = &mut writer
+                            && session.write_line(&line).is_err()
                         {
                             writer = None;
                             retry_at = Instant::now() + RETRY_INTERVAL;
@@ -1194,13 +1251,95 @@ mod tests {
         let timestamp = format_local_timestamp(1_783_000_000_123);
         assert_eq!(
             record.line(1_783_000_000_123),
-            format!("[{timestamp}]: Warning: amaterasu.nvhttp: Listener ready next line\n")
+            format!("[{timestamp}]: Warning: Launch and pairing: Listener ready next line\n")
                 .as_bytes()
         );
         assert!(LogRecord::new(6, "safe", "text").is_err());
         assert!(LogRecord::new(2, "bad\ntarget", "text").is_err());
         assert!(LogRecord::new(2, "safe", &"x".repeat(MAX_MESSAGE_BYTES + 1)).is_err());
         assert!(LogRecord::new(2, "safe", "private\0credential").is_err());
+    }
+
+    #[test]
+    fn ten_minutes_of_timing_windows_stay_out_of_info_and_debug_snapshots() {
+        for minimum in [Level::Info, Level::Debug] {
+            let directory = TestDirectory::new();
+            let policy =
+                LoggingPolicy::new(0, minimum as u8, "host.log", directory.0.clone()).unwrap();
+            let logger = ProductLogger::start(policy).unwrap();
+            // One ten-second window per sample, including a mislevelled provider.
+            for window in 0..60 {
+                let payload = serde_json::json!({"window":window,"max_us":250});
+                logger
+                    .emit(
+                        Level::Info as u8,
+                        "provider.test::timing/capture.presentation",
+                        &payload.to_string(),
+                    )
+                    .unwrap();
+            }
+            logger
+                .emit(2, "amaterasu.host", "Host worker ready.")
+                .unwrap();
+            let snapshot = logger.request_snapshot().unwrap().recv().unwrap().unwrap();
+            let text = String::from_utf8(snapshot.read_chunk(0, snapshot.len() as usize).unwrap())
+                .unwrap();
+            assert!(text.contains("Host worker ready."));
+            assert!(!text.contains('{') && !text.contains("max_us"));
+            let captures: Vec<_> = fs::read_dir(directory.0.join("logs"))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .collect();
+            if minimum == Level::Info {
+                assert!(captures.is_empty());
+            } else {
+                assert_eq!(captures.len(), 1);
+                let capture = fs::read_to_string(&captures[0]).unwrap();
+                assert_eq!(capture.lines().count(), 60);
+                for (index, line) in capture.lines().enumerate() {
+                    let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                    assert_eq!(record["source"], "provider.test");
+                    assert_eq!(record["target"], "capture.presentation");
+                    assert_eq!(record["payload"]["window"], index);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capture_reuses_two_private_segments_with_complete_lines() {
+        let root = TestDirectory::new();
+        let dir =
+            cap_std::fs::Dir::open_ambient_dir(&root.0, cap_std::ambient_authority()).unwrap();
+        let mut capture = timing_capture::TimingCapture::default();
+        for index in 0..900 {
+            let payload = serde_json::json!({"index":index,"sample":"x".repeat(6000)});
+            let record = LogRecord::new(1, "provider::timing/test", &payload.to_string()).unwrap();
+            capture
+                .write(&dir, "test", "provider", "test", &record, index)
+                .unwrap();
+        }
+        let mut indices = Vec::new();
+        for entry in std::fs::read_dir(&root.0).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.metadata().unwrap().len() <= ROLLOVER_SIZE);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o077, 0);
+            }
+            for line in std::fs::read_to_string(entry.path()).unwrap().lines() {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                indices.push(row["payload"]["index"].as_u64().unwrap());
+            }
+        }
+        indices.sort_unstable();
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 2);
+        assert!(indices[0] > 0);
+        assert_eq!(indices.last(), Some(&899));
+        assert!(indices.windows(2).all(|pair| pair[0] + 1 == pair[1]));
     }
 
     #[test]

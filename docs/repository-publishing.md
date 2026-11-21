@@ -12,8 +12,9 @@ Amaterasu's own modules ship together as **Amaterasu Core**. One catalog per
 platform lists the Core set, and a host moves from one set to the next as a
 whole: the host verifies a complete set under one signature, tries it, and
 returns to the previous set if it does not start. An update can change any
-module of the set and can add one. A module from another publisher is that
-publisher's to list in its own repository.
+module of the set and can add one. The same catalog can also list independently
+signed native plugins that an administrator can add from **Modules → Available**.
+A module from another publisher is that publisher's to list in its own repository.
 
 | | |
 | --- | --- |
@@ -26,9 +27,8 @@ publisher's to list in its own repository.
 
 The public key is
 `6c399560a1dbe4b646d3be60344fa114d05cdcd7b567a3648958aa1818805b00`. Its
-fingerprint is the SHA-256 of those 32 bytes; an administrator confirms the
-fingerprint from this document or another channel that is not the repository
-address before enrolling.
+fingerprint is the SHA-256 of those 32 bytes. An administrator can compare
+the fingerprint above with the one shown in the console.
 
 Each module keeps its own version. In-tree modules share the workspace version;
 a module mounted from its own repository carries the version in its
@@ -79,9 +79,20 @@ key, and then checks the finished tree exactly as an enrolled host will. It
 refuses an existing output directory, a catalog lifetime over one year, a
 changed artifact and a slot the set does not contain. It uploads nothing.
 
+To add an independent plugin, [pack its signed manifest and artifacts](plugin-driver-installation.md#package-and-sdk-contracts)
+and include `--plugin PLUGIN_ID IMPLEMENTATION PACKAGE` alongside the Core
+`--set` argument. Keep previously published plugin choices in later catalogs
+as long as installations still use them. The host checks the plugin's exact
+dependencies and grants against the active composition before setup.
+
 The catalog sequence must rise with every publication; the Unix time does
 that. A host refuses a catalog older than one it has accepted, and a set whose
 manifest sequence is below the one it runs.
+
+The generated `OUTPUT/<target>` includes `publisher.pub` alongside
+`catalog.json` and `catalog.sig`. Serve the public key file at the catalog
+address to enable enrollment by URL. Existing repositories can add the
+public key file without changing their signed catalogs.
 
 Publication is the commit that places `OUTPUT/<target>` at `<target>/` on the
 `catalog` branch of `nonary-streams/amaterasu-repository`. Review the catalog
@@ -90,20 +101,19 @@ directory on the branch while hosts may still be downloading it.
 
 ## Enrolling a host
 
-In the console, **Modules → Repositories → Add repository** takes the ID, the
-location for the host's platform, the public key, and the fingerprint. That
-lists what the repository offers.
+In the console, open **Modules → Repositories → Add repository** and paste the
+address for the host's platform. Choose **Check repository**, review the ID
+and signing key fingerprint, then choose **Trust and add** to list its offers.
 
-Installing from it also needs the host's protected policy to name this
-publisher: the bootstrap must trust the key under its fingerprint, and
-`package-activation-policy.json` must carry the same fingerprint. The console
-cannot make that change, by design. On a Linux user service,
-`amaterasu-release review-package-activation-policy` writes a report for a
-publisher fingerprint and `provision-package-activation` applies a reviewed
-report to the stopped service. Those commands were written for the RTX HDR
-publisher and have not been exercised with this one; qualify them on a test
-root before relying on them. A host installed from a seed that already names
-this publisher needs no such step.
+A Core update also needs the publisher authorized by the installed host.
+For an existing Linux user service, wait for streams to end, snapshot the
+installation's policy and recovery state, then stop the service and run
+`amaterasu-release provision-core-repository ROOT ACTIVE_DIGEST CONFIRMED_FINGERPRINT`
+as the service user. This checks the current signed set, enrolls the official
+repository, and authorizes its publisher while preserving the current grants
+and trusted keys. It leaves the active selection in place. Import and activate
+a compatible Core set through the [signed local activation flow](local-package-updates.md)
+to move the running package's provenance to the Core feed.
 
 ## What an update can and cannot change
 
@@ -118,10 +128,11 @@ not been done: the set has to carry the policy it proposes, and the console
 has to show an administrator what a new module asks for before the host
 records the approval.
 
-A module from another publisher cannot yet be installed beside Core at all.
-The host runs one set from one publisher, so a second publisher would have to
-ship every module. Installing and updating one module on its own needs the
-host to compose a set from more than one signed source.
+Independent native plugins use [the plugin installation workflow](plugin-driver-installation.md).
+The host preserves each plugin's publisher signature and checks it alongside
+the Core set. The host needs the plugin installation coordinator and must
+already authorize the plugin's requested grants. Changes requiring a driver
+need separate administrator approval for the signed driver payload.
 
 ## What is not automated yet
 

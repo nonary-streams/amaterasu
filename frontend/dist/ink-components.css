@@ -286,13 +286,10 @@
           calc(100% - 22px) calc(100% - 14px) no-repeat;
     }
 
-    .button:is(.primary, .secondary):not(.catalog-override-choice, .icon-button)::before {
-      inset: -1px -5px;
-    }
-
+    .button:is(.primary, .secondary):not(.catalog-override-choice, .icon-button)::before,
     .plugin-ui-card[data-appearance="brush"] > h2::before,
     .plugin-tablist > .plugin-tab[aria-selected="true"]::before {
-      inset: -1px -3px;
+      inset: 0;
     }
 
     .plugin-feedback-progressbar[value]::-webkit-progress-value {

@@ -4888,6 +4888,99 @@ fn missing_owner_lookup_never_retires_an_uncertain_open() {
 }
 
 #[test]
+fn uncertain_startup_mutation_reports_critical_before_cleanup() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    let id = *controller.records.keys().next().unwrap();
+    controller.records.get_mut(&id).unwrap().state = super::record::State::Starting;
+    let mut call = Call::new("service/1", json!({}), "uncertain-start".into(), 1000);
+    for _ in 0..3 {
+        assert!(matches!(
+            call.poll(&mut |_| Ok(Response::Pending)),
+            Outcome::Waiting
+        ));
+    }
+    let mut job = Job {
+        record: id,
+        phase: Phase::BindPresentationApplication,
+        call,
+        deadline: now + Duration::from_secs(1),
+    };
+    controller.advance(
+        &mut job,
+        now,
+        &mut |_| Ok(Response::Pending),
+        &mut Vec::new(),
+    );
+    let record = controller.records.get_mut(&id).unwrap();
+    assert_eq!(record.state, super::record::State::Stopping);
+    let reports: Vec<_> = record.issues.drain().collect();
+    assert!(
+        reports
+            .iter()
+            .any(|report| matches!(report, StreamReport::Issue(issue)
+        if issue.code == "broker_settlement_unconfirmed"
+            && issue.reason == "broker_settlement_unconfirmed"
+            && issue.disposition == IssueDisposition::CriticalFailure
+            && issue.valid()))
+    );
+}
+
+#[test]
+fn missing_application_during_startup_reports_critical_issue() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    let id = *controller.records.keys().next().unwrap();
+    controller.records.get_mut(&id).unwrap().state = super::record::State::Starting;
+    let job = Job {
+        record: id,
+        phase: Phase::LookupApplication,
+        call: Call::new("service/1", json!({}), "lookup".into(), 1000),
+        deadline: now,
+    };
+    controller.consume(&job, json!({"ok":false,"code":"launch_not_found"}), now, &mut Vec::new());
+    let record = controller.records.get_mut(&id).unwrap();
+    assert_eq!(record.state, super::record::State::Stopping);
+    assert!(record.issues.drain().any(|report| matches!(report, StreamReport::Issue(issue)
+        if issue.code == "application_launch_unavailable"
+            && issue.disposition == IssueDisposition::CriticalFailure
+            && !issue.reason.is_empty() && issue.valid())));
+}
+
+#[test]
+fn terminal_provider_during_startup_records_critical_issue() {
+    for (phase, service, expected) in [
+        (Phase::LookupApplication, "amaterasu.launch/1", "application_ended"),
+        (Phase::OpenRtsp, "amaterasu.rtsp/1", "rtsp_not_ready"),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker::default();
+        launch_ready(&mut controller, &mut broker, now);
+        let id = *controller.records.keys().next().unwrap();
+        controller.records.get_mut(&id).unwrap().state = super::record::State::Starting;
+        let mut payload = broker.response(service, &json!({"action":"status"}));
+        if phase == Phase::LookupApplication {
+            payload["launch"]["state"] = json!("stopped");
+        } else {
+            payload["state"] = json!("failed");
+            payload["failure"] = json!("provider_failed");
+        }
+        let job = Job { record: id, phase, call: Call::new(service, json!({}), "lookup".into(), 1000), deadline: now };
+        controller.consume(&job, payload, now, &mut Vec::new());
+        let record = controller.records.get_mut(&id).unwrap();
+        assert_eq!(record.state, super::record::State::Stopping);
+        assert!(record.issues.drain().any(|report| matches!(report, StreamReport::Issue(issue)
+            if issue.code == expected && issue.disposition == IssueDisposition::CriticalFailure && issue.valid())));
+    }
+}
+
+
+#[test]
 fn natural_application_exit_closes_the_stream_and_releases_the_application() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
@@ -5860,11 +5953,17 @@ fn retired_stream_failure_preserves_the_application_until_pause_is_verified() {
 }
 
 #[test]
-fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
-    use amaterasu_module_sdk::abi::{AbiHeader, BorrowedBytes, HostApi, ReplySink, Status, STATUS_OK};
+fn live_monitor_logs_the_committed_failure_once_and_keeps_healthy_polls_quiet() {
+    use amaterasu_module_sdk::abi::{
+        AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK, Status,
+    };
     use std::ffi::c_void;
 
-    unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, reply: ReplySink) -> Status {
+    unsafe extern "C" fn invoke(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> Status {
         // SAFETY: the test retains the vector and the runtime invokes this synchronously.
         let commands = unsafe { &mut *context.cast::<Vec<Command>>() };
         let bytes = unsafe { input.read() }.unwrap();
@@ -5875,7 +5974,11 @@ fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
     }
 
     let mut commands = Vec::<Command>::new();
-    let endpoint = HostApi { header: AbiHeader::of::<HostApi>(), context: (&mut commands as *mut Vec<Command>).cast(), invoke };
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut commands as *mut Vec<Command>).cast(),
+        invoke,
+    };
     let runtime = unsafe { amaterasu_module_sdk::RuntimeClient::from_endpoint(endpoint) };
     let (emitter, mut queue) = runtime.log_emitter();
     let now = Instant::now();
@@ -5887,17 +5990,36 @@ fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
     let record = controller.records.values().next().unwrap();
     let id = record.id;
     let ticket = record.rtsp_ticket.unwrap();
-    let mut payload = broker.response("amaterasu.rtsp/1", &json!({"action":"status","ticket":ticket}));
-    let job = workflow::Job { record: id, phase: workflow::Phase::MonitorRtsp,
-        call: call::Call::new("unused", json!({}), "unused".into(), 1000), deadline: now + Duration::from_secs(5) };
+    let mut payload = broker.response(
+        "amaterasu.rtsp/1",
+        &json!({"action":"status","ticket":ticket}),
+    );
+    let job = workflow::Job {
+        record: id,
+        phase: workflow::Phase::MonitorRtsp,
+        call: call::Call::new("unused", json!({}), "unused".into(), 1000),
+        deadline: now + Duration::from_secs(5),
+    };
     controller.consume(&job, payload.clone(), now, &mut Vec::new());
     queue.flush(&runtime);
     assert!(commands.is_empty());
     payload["state"] = json!("failed");
     payload["failure"] = json!("stream_failed");
     controller.consume(&job, payload, now, &mut Vec::new());
+    controller.commit_stream_lifecycle(&mut |command| broker.send(command));
     queue.flush(&runtime);
-    assert!(matches!(&commands[..], [Command::Log { level: 3, target, message }] if target == "launch" && message.contains("MonitorRtsp") && message.contains("unhealthy")));
+    let record = &controller.records[&id];
+    let root = controller
+        .stream_lifecycle
+        .stream(&record.rtsp_operation)
+        .unwrap()
+        .root_cause()
+        .unwrap();
+    assert_eq!(root.issue.operation, record.rtsp_operation);
+    assert!(
+        matches!(&commands[..], [Command::Log { level: 4, target, message }]
+        if target == "stream.lifecycle.failure" && message == &root.issue.description())
+    );
 }
 
 #[test]
@@ -6105,6 +6227,33 @@ fn a_refused_launch_is_recorded_with_the_line_that_refused_it() {
     assert_eq!(root.issue.phase, "launch_admission");
     assert_eq!(root.issue.reason, "http_503");
     assert!(root.issue.site.contains("launch.rs:"), "{}", root.issue.site);
+    let status = controller.management_status(None);
+    assert_eq!(status["recent_refusals"][0]["root_cause"]["issue"]["code"], "stream_settings_are_loading");
+}
+
+#[test]
+fn malformed_stream_request_is_recorded_before_launch_admission() {
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let reply = controller.refuse_stream_request(400, "missing query field", "request_parsing");
+    assert_eq!(reply.status, 400);
+    let issue = &controller.stream_lifecycle.stream("refused.1").unwrap().root_cause().unwrap().issue;
+    assert_eq!(issue.code, "missing_query_field");
+    assert_eq!(issue.phase, "request_parsing");
+    assert_eq!(issue.reason, "http_400");
+}
+
+#[test]
+fn recent_refusals_are_visible_and_bounded_when_no_launch_exists() {
+    let mut controller = Controller::new(Some(config())).unwrap();
+    for _ in 0..20 {
+        controller.refuse_stream_request(400, "missing query field", "request_parsing");
+    }
+    let status = controller.management_status(None);
+    assert!(status["launch"].is_null());
+    let refusals = status["recent_refusals"].as_array().unwrap();
+    assert_eq!(refusals.len(), 16);
+    assert_eq!(refusals[0]["root_cause"]["issue"]["operation"], "refused.20");
+    assert_eq!(refusals[15]["root_cause"]["issue"]["operation"], "refused.5");
 }
 
 #[test]

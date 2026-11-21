@@ -100,6 +100,7 @@ pub(super) struct Job {
     pub lifecycle_pause_tried: bool,
     pub lifecycle_retire_tried: bool,
     pub lifecycle_lookup: bool,
+    pub retire_paused_display: Option<u64>,
 }
 
 impl Job {
@@ -128,6 +129,7 @@ impl Job {
             lifecycle_pause_tried: false,
             lifecycle_retire_tried: false,
             lifecycle_lookup: false,
+            retire_paused_display: None,
         }
     }
 
@@ -135,11 +137,25 @@ impl Job {
     pub fn fail(&mut self, record: &mut Record, code: &'static str, now: u64) {
         eprintln!("amaterasu session failed step={:?} code={code}", self.step);
         if code != "request_cancelled" {
-            record.report_failure(
+            let cleanup_failure = self.cleanup
+                || (record.state == State::Stopping && record.outcome == State::Stopped);
+            record.report_failure_because(
                 super::lifecycle_issues::step_layer(self.step),
                 &super::lifecycle_issues::step_label(self.step),
-                code,
+                if cleanup_failure {
+                    "cleanup_step_failed"
+                } else {
+                    code
+                },
+                if self.step == Step::RecoverAudio {
+                    "audio_encoder_failed"
+                } else {
+                    code
+                },
             );
+            if cleanup_failure {
+                record.remember_cleanup_failure("cleanup_step_failed");
+            }
         }
         record.error.get_or_insert(code);
         record.outcome = if code == "request_cancelled" {
@@ -206,6 +222,7 @@ impl Job {
             .as_ref()
             .is_some_and(|start| start.lifecycle_target.is_some())
             && !self.lifecycle_pause_tried
+            && !record.lifecycle_consumers_retired()
         {
             return Some(Step::PauseLifecycle);
         }
@@ -277,7 +294,8 @@ impl Job {
         {
             return None;
         }
-        if !self.virtual_display_tried
+        if !record.retains_paused_display()
+            && !self.virtual_display_tried
             && record.virtual_display_attempted
             && record.config.virtual_display_intent.is_none()
         {
@@ -287,7 +305,7 @@ impl Job {
                 Step::RemoveOwnedVirtualDisplay
             });
         }
-        if !self.virtual_display_tried {
+        if !record.retains_paused_display() && !self.virtual_display_tried {
             if record.virtual_display_attempted && !record.virtual_display_status_verified {
                 return Some(Step::StatusVirtualDisplay);
             }
@@ -305,6 +323,7 @@ impl Job {
             .is_some_and(|start| start.lifecycle_target.is_some())
             && record.lifecycle_fenced
             && !self.lifecycle_retire_tried
+            && !record.lifecycle_consumers_retired()
         {
             if record
                 .attempted

@@ -35,6 +35,10 @@ impl StreamIssueFeed {
         self.malformed
     }
 
+    pub fn subscribed(&self) -> bool {
+        self.subscription.is_some()
+    }
+
     /// Why the subscription is not open, if it is not.
     pub fn unavailable(&self) -> Option<&str> {
         self.unavailable.as_deref()
@@ -61,6 +65,7 @@ impl StreamIssueFeed {
                     self.receive(delivery, store, logger);
                 }
                 Err(error) => {
+                    store.note_gap();
                     self.lose_subscription(error.to_string(), logger);
                     return read;
                 }
@@ -105,8 +110,7 @@ impl StreamIssueFeed {
                 let _ = logger.emit(
                     crate::LogLevel::Warning,
                     "stream.lifecycle.feed",
-                    &serde_json::json!({"event":"stream_issue_feed_unavailable","reason":reason})
-                        .to_string(),
+                    &format!("Stream issue updates are unavailable: {reason}. Will retry."),
                 );
             }
             self.unavailable = Some(reason);
@@ -142,7 +146,10 @@ impl StreamIssueFeed {
             let _ = logger.emit(
                 crate::LogLevel::Warning,
                 "stream.lifecycle.feed",
-                &serde_json::json!({"event":code,"publisher":publisher}).to_string(),
+                &format!(
+                    "Ignored a stream issue from {publisher}: {}.",
+                    code.replace('_', " ")
+                ),
             );
         }
     }

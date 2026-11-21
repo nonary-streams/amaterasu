@@ -3,8 +3,8 @@ use amaterasu_package::{
     BootstrapConfig, PackageResult, ReleaseManifest, ReleaseSignature, VerificationPolicy,
     current_target, decode_hex, encode_hex, read_json,
     repository::{
-        ApprovedRepository, Candidate, CandidateKind, Catalog, CatalogCheckpoint, verify_candidate,
-        verify_catalog,
+        ApprovedRepository, Candidate, CandidateKind, Catalog, CatalogCheckpoint,
+        PUBLISHER_KEY_FILE, verify_candidate, verify_catalog,
     },
     sha256, unix_timestamp, verify_package, write_json_atomically,
 };
@@ -122,6 +122,8 @@ pub fn publish(
         )?;
         fs::write(output.join("catalog.json"), &raw_catalog).map_err(|e| e.to_string())?;
         fs::write(output.join("catalog.sig"), &catalog_signature).map_err(|e| e.to_string())?;
+        fs::write(output.join(PUBLISHER_KEY_FILE), &approved.public_key)
+            .map_err(|e| e.to_string())?;
         Ok(())
     })();
     if result.is_err() {
@@ -424,6 +426,10 @@ mod tests {
         let secret: String = read_json(&fixture.key).unwrap();
         let signer = SigningKey::from_bytes(&decode_hex::<32>(&secret).unwrap());
         assert_eq!(signature.key_id, sha256(&signer.verifying_key().to_bytes()));
+        assert_eq!(
+            fs::read_to_string(output.join(PUBLISHER_KEY_FILE)).unwrap(),
+            encode_hex(signer.verifying_key().as_bytes())
+        );
         assert!(candidate.join("libamaterasu_rtx_hdr.so").is_file());
         assert!(fixture.run(&output).is_err());
         assert!(output.join("catalog.json").is_file());

@@ -12511,7 +12511,8 @@ var Amaterasu;
                         if (controls.length && controls.every((control) => control.hasAttribute("data-draft-ignore")))
                             continue;
                         const panelTitle = wrapper.closest(".panel")?.querySelector("h2")?.textContent ?? "";
-                        const matched = !query || settingsSearchMatches(query, category.label, panelTitle, wrapper.textContent ?? "", ...controls.map((control) => control.name));
+                        const pluginTitle = wrapper.closest(".application-plugin-section")?.querySelector("summary")?.textContent ?? "";
+                        const matched = !query || settingsSearchMatches(query, category.label, panelTitle, pluginTitle, wrapper.textContent ?? "", ...controls.map((control) => control.name));
                         if (query && !matched)
                             wrapper.setAttribute("data-settings-search-hidden", "");
                         else
@@ -14862,17 +14863,26 @@ var Amaterasu;
         const operation = record(value, "Repository change status is invalid.");
         if (typeof operation.id !== "number" || !Number.isSafeInteger(operation.id) || operation.id < 1 ||
             typeof operation.repository !== "string" ||
-            (operation.kind !== "add" && operation.kind !== "refresh" && operation.kind !== "remove") ||
+            (operation.kind !== "preview" && operation.kind !== "add" && operation.kind !== "refresh" && operation.kind !== "remove") ||
             (operation.state !== "running" && operation.state !== "succeeded" && operation.state !== "failed") ||
             (operation.code !== null && typeof operation.code !== "string"))
             throw new Error("Repository change status is invalid.");
-        return {
+        const result = {
             id: operation.id,
             repository: operation.repository,
             kind: operation.kind,
             state: operation.state,
             code: operation.code,
         };
+        if (operation.kind === "preview" && operation.state === "succeeded") {
+            const publisher = record(operation.publisher, "Repository publisher details are invalid.");
+            if (typeof publisher.id !== "string" || !IDENTITY.test(publisher.id) ||
+                typeof publisher.location !== "string" || publisher.location.length > 256 || !publisher.location.startsWith("https://") ||
+                typeof publisher.fingerprint !== "string" || !DIGEST.test(publisher.fingerprint))
+                throw new Error("Repository publisher details are invalid.");
+            result.publisher = { id: publisher.id, location: publisher.location, fingerprint: publisher.fingerprint };
+        }
+        return result;
     }
     function parseRepositoryPage(value) {
         const repositories = parseRepositoryList(value);
@@ -14888,6 +14898,7 @@ var Amaterasu;
             manageable: reply.manageable === true,
             capacity: typeof capacity === "number" && Number.isSafeInteger(capacity) && capacity > 0 ? capacity : null,
             operation: parseOperation(reply.operation),
+            preview: reply.preview === undefined ? undefined : parseOperation(reply.preview),
         };
     }
     Amaterasu.parseRepositoryPage = parseRepositoryPage;
@@ -15244,7 +15255,7 @@ var Amaterasu;
     }
     Amaterasu.packageUpdateRefusalMessage = packageUpdateRefusalMessage;
     Amaterasu.CORE_UPDATE_SOURCE = "amaterasu-core";
-    const CORE_UPDATE_ABOUT = "Every module Amaterasu ships. They update together as one signed package, and the host goes back to the package it had if a new one does not start.";
+    const CORE_UPDATE_ABOUT = "Built-in modules update as one signed package. If startup fails, the host restores the previous version.";
     const UPDATE_STEP_LABELS = ["Download", "Verify", "Wait for idle", "Restart"];
     const RESTORE_STEP_LABELS = ["Wait for idle", "Restart"];
     const UPDATE_HEADLINES = {
@@ -15469,10 +15480,11 @@ var Amaterasu;
         repository_worker_unavailable: "The host could not start the change.",
         repository_state_unavailable: "The host could not read or save its repository list.",
         invalid_request: "The host did not accept that request.",
-        invalid_repository_id: "Enter the repository ID exactly as its publisher writes it: lowercase letters, digits, dots, dashes and underscores.",
+        invalid_repository_id: "The catalog contains an invalid repository ID.",
         invalid_repository_location: "Enter an https:// address with no query or fragment.",
-        invalid_publisher_key: "The publisher key is 64 hexadecimal characters.",
-        fingerprint_mismatch: "That fingerprint does not belong to this publisher key. Check both against what the publisher gave you.",
+        publisher_key_download_failed: "The host could not download a public signing key from that address. Check the address or ask the publisher for its current repository link.",
+        invalid_publisher_key: "The repository returned an invalid public signing key.",
+        fingerprint_mismatch: "The repository returned a different signing key. Review its fingerprint again before trusting it.",
         repository_exists: "A repository with this ID was already added. An ID that was removed cannot be added again.",
         repository_limit: "This host cannot hold any more repositories.",
         repository_unknown: "This repository is no longer enrolled.",
@@ -15489,21 +15501,6 @@ var Amaterasu;
         return (code && REPOSITORY_MESSAGES[code]) || "The repository change did not complete.";
     }
     Amaterasu.repositoryChangeMessage = repositoryChangeMessage;
-    function repositoryChangeField(code) {
-        switch (code) {
-            case "invalid_repository_id":
-            case "repository_exists":
-            case "catalog_identity_mismatch": return "id";
-            case "invalid_repository_location":
-            case "catalog_download_failed":
-            case "catalog_invalid": return "location";
-            case "invalid_publisher_key":
-            case "catalog_rejected": return "publicKey";
-            case "fingerprint_mismatch": return "fingerprint";
-            default: return null;
-        }
-    }
-    Amaterasu.repositoryChangeField = repositoryChangeField;
     function parseRepositoryDescriptor(text) {
         const trimmed = text.trim();
         if (!trimmed.startsWith("{") || trimmed.length > 4096)
@@ -15518,20 +15515,12 @@ var Amaterasu;
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
             return null;
         const source = parsed;
-        const field = (...names) => {
-            for (const name of names) {
-                const value = source[name];
-                if (typeof value === "string" && value.trim() && value.length <= 512)
-                    return value.trim();
-            }
-            return undefined;
-        };
-        const id = field("id", "repository");
-        const location = field("location", "url");
-        const publicKey = field("public_key", "publicKey", "key");
-        if (!id && !location && !publicKey)
-            return null;
-        return { ...(id ? { id } : {}), ...(location ? { location } : {}), ...(publicKey ? { publicKey: publicKey.toLowerCase() } : {}) };
+        for (const name of ["location", "url"]) {
+            const value = source[name];
+            if (typeof value === "string" && value.trim() && value.trim().length <= 256)
+                return value.trim();
+        }
+        return null;
     }
     Amaterasu.parseRepositoryDescriptor = parseRepositoryDescriptor;
     function consoleDigestFromAssets(addresses) {
@@ -15564,7 +15553,7 @@ var Amaterasu;
             throw new Error("Driver identity is invalid.");
         return value;
     }
-    function driverRows(value) {
+    function driverRows(value, builtin = false) {
         if (!Array.isArray(value) || value.length > 64)
             throw new Error("Driver inventory is invalid.");
         const ids = new Set();
@@ -15588,7 +15577,7 @@ var Amaterasu;
             return { id, name: driverText(row.name, 128), publisher: driverText(row.publisher, 128), reason: driverText(row.reason, 1024),
                 requiredBy: row.required_by.map((id) => driverText(id, 128)), requiredComponents: components.map((id) => driverText(id, 128)), state: row.state,
                 message: driverText(row.message), mayRequireReboot: row.may_require_reboot,
-                installedVersion, offeredVersion, update: update };
+                installedVersion, offeredVersion, update: update, builtin };
         });
     }
     function parsePluginDriverStatus(value) {
@@ -15610,7 +15599,8 @@ var Amaterasu;
             if (operation.installationRevision !== installationRevision)
                 throw new Error("Plugin setup changed. Refresh to review it again.");
         }
-        return { supported: true, installationRevision, drivers: driverRows(reply.drivers), operation };
+        const builtin = reply.builtin_drivers === undefined ? [] : driverRows(reply.builtin_drivers, true);
+        return { supported: true, installationRevision, drivers: [...builtin, ...driverRows(reply.drivers)], operation };
     }
     Amaterasu.parsePluginDriverStatus = parsePluginDriverStatus;
     function driverSetupError(code) {
@@ -15641,6 +15631,14 @@ var Amaterasu;
         return ({ checking: "Checking", missing: "Not installed", incompatible: "Different version required", access_denied: "Device access required", unsupported: "Unsupported system", installing: "Installing", ready: "Ready", reboot_required: "Restart computer required", manual_action_required: "Action required", failed: "Setup failed" })[state];
     }
     Amaterasu.driverStateLabel = driverStateLabel;
+    function driverReadinessLabel(driver) {
+        if (driver.builtin && driver.state === "missing")
+            return "Unavailable";
+        if (driver.builtin && driver.state === "failed")
+            return "Check failed";
+        return driverStateLabel(driver.state);
+    }
+    Amaterasu.driverReadinessLabel = driverReadinessLabel;
     function driverSetupMessage(phase) {
         return ({ checking: "Checking required drivers…", awaiting_approval: "This plugin needs drivers before it can be used.", waiting_for_idle: "Setup will continue after the current stream ends.", installing: "Installing required drivers…", reboot_required: "Restart this computer when convenient, then check setup again.", manual_action_required: "Complete the action shown below, then check setup again.", ready_to_activate: "Drivers are ready. Finish adding the plugin when the host is idle.", activating: "Activating the plugin…", ready: "The plugin is ready.", failed: "Plugin setup needs attention.", cancelled: "Plugin setup was cancelled." })[phase];
     }
@@ -15849,7 +15847,9 @@ var Amaterasu;
                         sections.push(items);
                     }
                     const control = Amaterasu.button("", () => activate(entry.key), "plugin-row");
-                    control.replaceChildren(Amaterasu.el("span", "plugin-row-text", Amaterasu.el("span", "plugin-row-name", lit(entry.name)), Amaterasu.el("span", "plugin-row-summary", entry.summary)), Amaterasu.el("span", `plugin-row-meta${entry.emphasis ? " plugin-row-meta--emphasis" : ""}`, lit(entry.meta)));
+                    control.replaceChildren(Amaterasu.el("span", "plugin-row-text", Amaterasu.el("span", "plugin-row-name", lit(entry.name)), Amaterasu.el("span", "plugin-row-summary", entry.summary)), Amaterasu.el("span", "plugin-row-meta", entry.availability
+                        ? Amaterasu.el("span", entry.availability.installed ? "plugin-availability installed" : "plugin-availability", entry.availability.label)
+                        : null, Amaterasu.el("span", "plugin-row-version", lit(entry.version))));
                     const item = Amaterasu.el("li", "", control);
                     items.append(item);
                     rows.set(entry.key, { item, control });
@@ -15924,7 +15924,7 @@ var Amaterasu;
         mode.setAttribute("aria-describedby", modeNote.id = `${mode.id}-hint`);
         const automatic = Amaterasu.el("div", "plugin-setting", modeLabel, mode, modeNote);
         const extras = Amaterasu.el("div", "plugin-update-extra");
-        const node = Amaterasu.el("article", "plugin-update-source", Amaterasu.el("header", "plugin-update-source-head", Amaterasu.el("div", "plugin-update-title", name, about), Amaterasu.el("div", "plugin-update-status", state, actions)), facts, detail, refused, permission, steps, transfer, changes, automatic, extras);
+        const node = Amaterasu.el("article", "plugin-update-source", Amaterasu.el("header", "plugin-update-source-head", Amaterasu.el("div", "plugin-update-title", name, about), Amaterasu.el("div", "plugin-update-status", state, actions)), Amaterasu.el("div", "plugin-source-body", facts, detail, refused, permission, steps, transfer, changes, automatic, extras));
         let shownFacts = "";
         let shownSteps = "";
         let shownChanges = "";
@@ -15947,7 +15947,7 @@ var Amaterasu;
             if (view.running)
                 shown.push(fact(Amaterasu.el("span", "muted", "Package"), " ", options.copyable(view.running, Amaterasu.shortDigest(view.running), "package digest")));
             if (view.repository)
-                shown.push(fact(Amaterasu.el("span", "muted", "from"), " ", options.repositoryLink(view.repository)));
+                shown.push(fact(Amaterasu.el("span", "muted", "Repository"), " ", options.repositoryLink(view.repository)));
             facts.replaceChildren(...shown);
             facts.hidden = shown.length === 0;
         }
@@ -16076,7 +16076,7 @@ var Amaterasu;
             for (const entry of entries)
                 if (entry.feed.view().actions.includes("check"))
                     void perform(entry, "check");
-        });
+        }, "outline");
         const mark = Amaterasu.el("span", "plugin-summary-mark");
         mark.setAttribute("aria-hidden", "true");
         const headline = Amaterasu.el("p", "plugin-summary-headline");
@@ -16325,6 +16325,16 @@ var Amaterasu;
         const offers = () => Amaterasu.otherPublisherOffers(Amaterasu.availablePlugins(repositories(), ready(selection), consoleDigest), ready(selection));
         const included = Amaterasu.el("section", "plugin-included");
         Amaterasu.setLocalizedAttribute(included, "aria-label", "Included in Amaterasu Core");
+        const families = Amaterasu.el("ul", "plugin-families");
+        families.id = "plugin-core-families";
+        families.hidden = true;
+        const toggleFamilies = Amaterasu.button("Included modules", () => {
+            families.hidden = !families.hidden;
+            toggleFamilies.setAttribute("aria-expanded", String(!families.hidden));
+        }, "plugin-family-toggle");
+        toggleFamilies.setAttribute("aria-controls", families.id);
+        toggleFamilies.setAttribute("aria-expanded", "false");
+        toggleFamilies.dataset.focusKey = "included modules";
         const versions = versionsList();
         const core = coreUpdateFeed(api, () => {
             const status = ready(selection);
@@ -16345,7 +16355,7 @@ var Amaterasu;
         });
         const others = Amaterasu.el("section", "plugin-update-source plugin-others");
         const overview = Amaterasu.el("div", "plugin-overview", updates.node, others);
-        context.content.append(Amaterasu.sectionHeading("Modules", "What this host runs and how it stays up to date."), ...(canRead ? [updates.summary] : []), tabList, viewArea);
+        context.content.append(Amaterasu.sectionHeading("Modules", "Manage installed modules, plugins and updates.", canRead ? updates.summary : null), tabList, viewArea);
         function showView(next) {
             if (next === view)
                 return;
@@ -16503,10 +16513,11 @@ var Amaterasu;
             await refreshDrivers();
         }
         function driverCard(driver) {
-            return Amaterasu.el("section", "plugin-detail", Amaterasu.el("h3", "", lit(driver.name)), Amaterasu.el("p", "plugin-detail-state", lit(Amaterasu.driverStateLabel(driver.state))), Amaterasu.el("p", "", lit(driver.reason)), factList([["Publisher", lit(driver.publisher)], ["Required by", lit(driver.requiredBy.join(", "))],
+            const requiredBy = driver.requiredBy.map((id) => runningModules()?.find((module) => module.id === id)?.name ?? id);
+            return Amaterasu.el("section", "plugin-detail", Amaterasu.el("h3", "", lit(driver.name)), Amaterasu.el("p", "plugin-detail-state", lit(Amaterasu.driverReadinessLabel(driver))), Amaterasu.el("p", "", lit(driver.reason)), factList([["Publisher", lit(driver.publisher)], ["Required by", lit(requiredBy.join(", "))],
                 ["Installed version", driver.installedVersion ? lit(driver.installedVersion) : "Unknown"],
                 driver.offeredVersion ? ["Version in plugin", lit(driver.offeredVersion)] : null,
-                ["Updates", lit(Amaterasu.driverUpdateLabel(driver.update))]]), driver.message ? Amaterasu.el("p", "", lit(driver.message)) : null, driver.mayRequireReboot && driver.state !== "ready" ? Amaterasu.el("p", "muted", "Installation may require restarting this computer. It will not restart automatically.") : null);
+                driver.builtin ? null : ["Updates", lit(Amaterasu.driverUpdateLabel(driver.update))]]), driver.message ? Amaterasu.el("p", "", lit(driver.message)) : null, driver.mayRequireReboot && driver.state !== "ready" ? Amaterasu.el("p", "muted", "Installation may require restarting this computer. It will not restart automatically.") : null);
         }
         function renderDrivers() {
             if (driverStatus.state === "loading") {
@@ -16541,10 +16552,11 @@ var Amaterasu;
                 if (operation.cancellable)
                     addControl("Cancel setup", "cancel");
             }
-            const installed = status.drivers;
+            const builtin = status.drivers.filter((driver) => driver.builtin);
+            const installed = status.drivers.filter((driver) => !driver.builtin);
             const pending = operation && !["ready", "cancelled"].includes(operation.phase) ? operation.drivers : [];
-            viewArea.replaceChildren(Amaterasu.el("div", "plugin-drivers", Amaterasu.el("h2", "", "Drivers"), operation ? Amaterasu.el("div", "plugin-update-status", Amaterasu.el("p", "", lit(Amaterasu.driverSetupMessage(operation.phase))), operation.error ? Amaterasu.el("p", "", lit(Amaterasu.driverSetupError(operation.error))) : null, Amaterasu.el("div", "actions", ...controls)) : null, driverFailure ? Amaterasu.errorPanel(driverFailure, refreshDrivers) : null, installed.length ? Amaterasu.el("p", "muted", "Installed plugin drivers · last verified during setup. Update information compares the installed version with the signed driver bundled in the plugin.") : null, ...installed.map(driverCard), operation && !["ready", "cancelled"].includes(operation.phase) && operation.drivers.length
-                ? Amaterasu.el("section", "", Amaterasu.el("h3", "", "Current setup"), ...operation.drivers.map(driverCard)) : null, !installed.length && !pending.length ? Amaterasu.el("p", "muted", "No verified driver inventory is available.") : null));
+            viewArea.replaceChildren(Amaterasu.el("div", "plugin-drivers", Amaterasu.el("h2", "", "Drivers"), operation ? Amaterasu.el("div", "plugin-driver-operation", Amaterasu.el("p", "", lit(Amaterasu.driverSetupMessage(operation.phase))), operation.error ? Amaterasu.el("p", "", lit(Amaterasu.driverSetupError(operation.error))) : null, Amaterasu.el("div", "actions", ...controls)) : null, driverFailure ? Amaterasu.errorPanel(driverFailure, refreshDrivers) : null, builtin.length ? Amaterasu.el("section", "plugin-driver-group", Amaterasu.el("h3", "", "Host drivers"), ...builtin.map(driverCard)) : null, installed.length ? Amaterasu.el("p", "muted", "Installed plugin drivers · last verified during setup. Update information compares the installed version with the signed driver bundled in the plugin.") : null, ...installed.map(driverCard), operation && !["ready", "cancelled"].includes(operation.phase) && operation.drivers.length
+                ? Amaterasu.el("section", "plugin-driver-group", Amaterasu.el("h3", "", "Current setup"), ...operation.drivers.map(driverCard)) : null, !status.drivers.length && !pending.length ? Amaterasu.el("p", "muted", "No verified driver inventory is available.") : null));
         }
         function showUpdates() {
             const status = ready(selection);
@@ -16677,7 +16689,12 @@ var Amaterasu;
                 ? document.activeElement.dataset.focusKey : undefined;
             const all = Amaterasu.button(lit(`All ${plugins.length} modules`), () => showView("modules"), "link-button plugin-link");
             all.dataset.focusKey = "all modules";
-            included.replaceChildren(Amaterasu.el("header", "plugin-included-head", Amaterasu.el("p", "plugin-label", "Included"), all), Amaterasu.el("ul", "plugin-families", ...Amaterasu.MODULE_FAMILIES.map((family) => familyRow(family, running, changes)), builtIn.length ? looseRow("built-in", Amaterasu.BUILT_IN_LABEL, "Streaming, pairing, the library, this console and the rest of the host.", builtIn, changes, Amaterasu.AMATERASU_SOURCE) : null, foreign.length ? looseRow("foreign", "From other developers", "Modules another developer wrote that ship inside this package.", foreign, changes, null) : null));
+            families.replaceChildren(...Amaterasu.MODULE_FAMILIES.map((family) => familyRow(family, running, changes)));
+            if (builtIn.length)
+                families.append(looseRow("built-in", Amaterasu.BUILT_IN_LABEL, "Streaming, pairing, the library, this console and the rest of the host.", builtIn, changes, Amaterasu.AMATERASU_SOURCE));
+            if (foreign.length)
+                families.append(looseRow("foreign", "From other developers", "Modules another developer wrote that ship inside this package.", foreign, changes, null));
+            included.replaceChildren(Amaterasu.el("header", "plugin-included-head", toggleFamilies, all), families);
             if (focused)
                 Array.from(included.querySelectorAll("[data-focus-key]"))
                     .find((control) => control.dataset.focusKey === focused)?.focus();
@@ -16789,9 +16806,8 @@ var Amaterasu;
                     key: plugin.id,
                     name: plugin.name,
                     summary: plugin.summary || lit(plugin.id),
-                    meta: plugin.version,
+                    version: plugin.version,
                     group: plugin.category,
-                    emphasis: false,
                 })), quietState("No modules match", "Try a different search or category."));
             }
             function focusInstalled(id) {
@@ -16807,7 +16823,7 @@ var Amaterasu;
                 }
                 browser.select(id);
             }
-            viewArea.replaceChildren(bar, browser.node);
+            viewArea.replaceChildren(Amaterasu.el("div", "plugin-inventory", bar, browser.node));
             showMatches();
             if (revealInstalled && selectedInstalled)
                 browser.focus(selectedInstalled);
@@ -16978,7 +16994,7 @@ var Amaterasu;
                 ]));
                 const requiredDrivers = ready(driverStatus)?.drivers.filter((driver) => driver.requiredBy.includes(plugin.id) || driver.requiredComponents.includes(plugin.id)) ?? [];
                 if (requiredDrivers.length)
-                    facts.append(detailSection("Drivers", ...requiredDrivers.map((driver) => Amaterasu.button(lit(`${driver.name} · ${Amaterasu.driverStateLabel(driver.state)}`), () => showView("drivers"), "link-button plugin-link"))));
+                    facts.append(detailSection("Drivers", ...requiredDrivers.map((driver) => Amaterasu.button(lit(`${driver.name} · ${Amaterasu.driverReadinessLabel(driver)}`), () => showView("drivers"), "link-button plugin-link"))));
                 if (!description)
                     return;
                 const provides = [...new Set([...description.provides, ...description.nativeProvides])];
@@ -17020,24 +17036,25 @@ var Amaterasu;
             return detail;
         }
         function renderOthers() {
-            const manage = (ready(listing)?.manageable ?? false) && canManage;
-            const add = manage ? Amaterasu.button("Add repository", () => openAddRepository()) : null;
-            const head = Amaterasu.el("header", "plugin-update-source-head", Amaterasu.el("div", "plugin-update-title", Amaterasu.el("h2", "plugin-update-name", "Plugins"), Amaterasu.el("p", "muted plugin-update-about", "Modules from other developers, offered by the repositories this host trusts.")), add ? Amaterasu.el("div", "plugin-update-status", Amaterasu.el("div", "actions plugin-others-actions", add)) : null);
+            const enrolled = ready(listing);
+            const add = enrolled?.manageable && enrolled.preview !== undefined && canManage
+                ? Amaterasu.button("Add repository", () => openAddRepository(), "outline") : null;
+            if (add)
+                add.disabled = changing !== null || (enrolled?.capacity != null && enrolled.repositories.length >= enrolled.capacity);
+            const head = Amaterasu.el("header", "plugin-update-source-head", Amaterasu.el("div", "plugin-update-title", Amaterasu.el("h2", "plugin-update-name", "Plugins"), Amaterasu.el("p", "muted plugin-update-about", "Extensions from the repositories this host trusts.")), add ? Amaterasu.el("div", "plugin-update-status", Amaterasu.el("div", "actions plugin-others-actions", add)) : null);
+            const body = Amaterasu.el("div", "plugin-source-body");
+            others.replaceChildren(head, body);
             if (listing.state === "loading") {
-                others.replaceChildren(head, Amaterasu.el("p", "muted plugin-loading", "Loading repository catalogs…"));
+                body.append(Amaterasu.el("p", "muted plugin-loading", "Loading repository catalogs…"));
                 return;
             }
             if (listing.state === "failed") {
-                others.replaceChildren(head, Amaterasu.errorPanel(listing.error, load));
+                body.append(Amaterasu.errorPanel(listing.error, load));
                 return;
             }
             const plugins = offers();
             if (!plugins.length) {
-                others.replaceChildren(head, Amaterasu.el("p", "muted plugin-others-empty", activeRepositories().length > 1
-                    ? "None of this host's repositories offers a plugin from another developer right now."
-                    : manage
-                        ? "No plugins yet. Add a developer's repository to see what it offers."
-                        : "No plugins yet."));
+                body.append(Amaterasu.el("p", "muted plugin-others-empty", "No additional plugins are listed in the approved repositories."));
                 return;
             }
             const byKey = new Map(plugins.map((plugin) => [plugin.key, plugin]));
@@ -17065,13 +17082,13 @@ var Amaterasu;
                     key: plugin.key,
                     name: plugin.name,
                     summary: plugin.summary || lit(plugin.slot),
-                    meta: `${Amaterasu.availabilityLabel(plugin)} · ${plugin.version}`,
+                    version: plugin.version,
+                    availability: { label: Amaterasu.availabilityLabel(plugin), installed: plugin.status === "installed" },
                     group: plugin.repository.id,
-                    emphasis: plugin.status !== "installed",
                 })), quietState("No plugins match", "Try a different search or category."));
             };
             const searchable = plugins.length > SEARCHABLE_PLUGINS || availableFilter.query !== "" || availableFilter.category !== "";
-            others.replaceChildren(head, ...(searchable ? [toolbar(availableFilter, "Search plugins", categories, showMatches, count)] : []), browser.node);
+            body.append(...(searchable ? [toolbar(availableFilter, "Search plugins", categories, showMatches, count)] : []), browser.node);
             showMatches();
         }
         function availableDetail(plugin, heading) {
@@ -17131,12 +17148,14 @@ var Amaterasu;
             const full = enrolled.capacity !== null && repositories().length >= enrolled.capacity;
             const add = Amaterasu.button("Add repository", () => openAddRepository(), "primary");
             add.disabled = full || changing !== null;
-            const intro = Amaterasu.el("div", "repository-intro", Amaterasu.el("p", "", "A repository is a publisher's signed list of plugins. The host accepts a catalog only when it is signed by the publisher key you approved."), manage ? add : null);
+            const intro = Amaterasu.el("div", "repository-intro", Amaterasu.el("p", "", "A repository is a publisher's signed list of plugins. The host accepts a catalog only when it is signed by the publisher key you approved."), manage && enrolled.preview !== undefined ? add : null);
             const notes = [];
             if (!manage)
                 notes.push(Amaterasu.el("p", "muted repository-note", enrolled.manageable
                     ? "Only an administrator can add or remove repositories."
                     : "This host version lists its repositories here but changes them with the release tool on the host."));
+            if (manage && enrolled.preview === undefined)
+                notes.push(Amaterasu.el("p", "muted repository-note", "Update Amaterasu to add a repository by its address."));
             if (manage && full)
                 notes.push(Amaterasu.el("p", "muted repository-note", "This host holds as many repositories as it can, counting removed ones."));
             const list = active.length
@@ -17187,10 +17206,12 @@ var Amaterasu;
                     await new Promise((resolve) => setTimeout(resolve, CHANGE_POLL_MS));
                     if (page.signal.aborted)
                         throw new Error("The page was closed before the change finished.");
-                    const current = Amaterasu.parseRepositoryPage(await api.post("repositories/list", { offset: 0 })).operation;
+                    const listing = Amaterasu.parseRepositoryPage(await api.post("repositories/list", { offset: 0 }));
+                    const current = route === "preview" ? listing.preview : listing.operation;
                     if (current && current.id === operation && current.state !== "running")
                         return current;
-                    if (current && current.id > operation)
+                    const latest = listing.operation ?? listing.preview;
+                    if (latest && latest.id > operation)
                         throw new Error("Another repository change replaced this one. Refresh to see its result.");
                     if (!current || current.id < operation)
                         throw new Error("The host restarted before this change finished. Refresh to see what was saved.");
@@ -17232,105 +17253,112 @@ var Amaterasu;
         function openAddRepository() {
             const dialog = Amaterasu.el("dialog", "plugin-form-dialog");
             Amaterasu.setLocalizedAttribute(dialog, "aria-label", "Add a repository");
-            const text = (name, placeholder) => {
-                const control = Amaterasu.input(name);
-                control.required = true;
-                control.autocomplete = "off";
-                control.spellcheck = false;
-                control.placeholder = placeholder;
-                control.setAttribute("autocapitalize", "none");
-                return control;
-            };
-            const location = text("repository_location", "https://");
-            location.type = "url";
-            const id = text("repository_id", "publisher-plugins");
-            const publicKey = text("repository_public_key", "");
-            const fingerprint = text("repository_fingerprint", "");
-            publicKey.className = fingerprint.className = "plugin-key-input";
-            const trust = Amaterasu.input("repository_trust", "", "checkbox");
-            trust.required = true;
-            const controls = { location, id, publicKey, fingerprint };
+            const location = Amaterasu.input("repository_location", "", "url");
+            location.required = true;
+            location.autocomplete = "off";
+            location.spellcheck = false;
+            location.placeholder = "https://";
+            location.setAttribute("autocapitalize", "none");
+            const address = Amaterasu.field("Repository address", location);
+            const review = Amaterasu.el("div", "plugin-publisher-review");
+            review.hidden = true;
+            review.tabIndex = -1;
             const status = Amaterasu.el("div", "plugin-form-status");
             status.setAttribute("aria-live", "polite");
-            const submit = Amaterasu.el("button", "button primary", "Add repository");
+            const submit = Amaterasu.el("button", "button primary", "Check repository");
             submit.type = "submit";
+            let publisher = null;
             let working = false;
             const close = () => { dialog.close(); dialog.remove(); };
             const cancel = Amaterasu.button("Cancel", () => { if (!working)
                 close(); });
-            const form = Amaterasu.el("form", "plugin-form", Amaterasu.el("h2", "", "Add a repository"), Amaterasu.el("p", "muted", "Enter the details its publisher gives you. Pasting the publisher's repository details into any field fills in the rest."), Amaterasu.field("Address", location, "Where the publisher hosts its catalog."), Amaterasu.field("Repository ID", id, "Exactly as the publisher writes it."), Amaterasu.field("Publisher key", publicKey, "The publisher's public signing key: 64 hexadecimal characters."), Amaterasu.field("Key fingerprint", fingerprint, "The key's SHA-256 fingerprint. Get it from the publisher somewhere other than the address above, so you know the key is really theirs."), Amaterasu.el("div", "notice plugin-trust", Amaterasu.el("strong", "", "Plugins are not sandboxed"), Amaterasu.el("p", "", "A plugin runs inside this host with your user account's access. A publisher you add can offer any module, including the one that serves this console. Add only publishers you trust.")), Amaterasu.el("label", "plugin-trust-check", trust, Amaterasu.el("span", "", "I trust this publisher")), status, Amaterasu.el("div", "actions", cancel, submit));
-            form.addEventListener("paste", (event) => {
-                const descriptor = Amaterasu.parseRepositoryDescriptor(event.clipboardData?.getData("text") ?? "");
-                if (!descriptor)
+            const back = Amaterasu.button("Back", () => {
+                showAddress();
+                status.replaceChildren();
+            });
+            back.hidden = true;
+            const form = Amaterasu.el("form", "plugin-form", Amaterasu.el("h2", "", "Add a repository"), address, review, status, Amaterasu.el("div", "actions", cancel, back, submit));
+            location.addEventListener("paste", (event) => {
+                const address = Amaterasu.parseRepositoryDescriptor(event.clipboardData?.getData("text") ?? "");
+                if (!address)
                     return;
                 event.preventDefault();
-                if (descriptor.location)
-                    location.value = descriptor.location;
-                if (descriptor.id)
-                    id.value = descriptor.id;
-                if (descriptor.publicKey)
-                    publicKey.value = descriptor.publicKey;
-                (descriptor.location ? descriptor.id ? descriptor.publicKey ? fingerprint : publicKey : id : location).focus();
+                location.value = address;
             });
-            const fail = (message, focus) => {
+            function showAddress() {
+                publisher = null;
+                review.hidden = back.hidden = true;
+                review.replaceChildren();
+                address.hidden = false;
+                location.disabled = false;
+                submit.replaceChildren(Amaterasu.el("span", "", "Check repository"));
+                location.focus();
+            }
+            function showPublisher(checked) {
+                publisher = checked;
+                address.hidden = location.disabled = true;
+                review.hidden = back.hidden = false;
+                review.replaceChildren(Amaterasu.el("h3", "plugin-detail-name", lit(checked.id)), Amaterasu.el("p", "repository-location", lit(checked.location)), factList([
+                    ["Signing key fingerprint", copyable(checked.fingerprint, Amaterasu.groupedFingerprint(checked.fingerprint), "publisher key fingerprint")],
+                ]), Amaterasu.el("div", "notice plugin-trust", Amaterasu.el("p", "", "This publisher can offer replacements for any host module or the console. Native plugins run with your user account’s access.")));
+                submit.replaceChildren(Amaterasu.el("span", "", "Trust and add"));
+            }
+            function fail(message) {
                 const alert = Amaterasu.el("p", "repository-failure", lit(message));
                 alert.setAttribute("role", "alert");
                 status.replaceChildren(alert);
-                for (const [name, control] of Object.entries(controls)) {
-                    if (name === focus)
-                        control.setAttribute("aria-invalid", "true");
-                    else
-                        control.removeAttribute("aria-invalid");
-                }
-                if (focus)
-                    controls[focus].focus();
-            };
-            form.addEventListener("submit", (event) => {
+            }
+            form.addEventListener("submit", async (event) => {
                 event.preventDefault();
-                if (working || !form.reportValidity())
+                if (working)
                     return;
-                const hex = (control) => control.value.replace(/[\s:]/g, "").toLowerCase();
-                const request = {
-                    id: id.value.trim(),
-                    location: location.value.trim(),
-                    public_key: hex(publicKey),
-                    fingerprint: hex(fingerprint),
-                };
-                const refused = !/^https:\/\/\S+$/.test(request.location) || request.location.length > 256 ? "invalid_repository_location"
-                    : !/^[a-z0-9._-]{1,128}$/.test(request.id) ? "invalid_repository_id"
-                        : !/^[a-f0-9]{64}$/.test(request.public_key) ? "invalid_publisher_key"
-                            : null;
-                if (refused) {
-                    fail(Amaterasu.repositoryChangeMessage(refused), Amaterasu.repositoryChangeField(refused));
+                const requested = location.value.trim();
+                if (!publisher && (!/^https:\/\/\S+$/.test(requested) || requested.length > 256)) {
+                    fail(Amaterasu.repositoryChangeMessage("invalid_repository_location"));
+                    location.focus();
                     return;
                 }
-                if (!/^[a-f0-9]{64}$/.test(request.fingerprint)) {
-                    fail("The key fingerprint is 64 hexadecimal characters.", "fingerprint");
-                    return;
-                }
+                const confirmation = publisher;
+                let reviewed = false;
                 working = true;
-                submit.disabled = cancel.disabled = true;
-                status.replaceChildren(Amaterasu.el("p", "muted", "Checking the repository's catalog against this key…"));
-                void runRepositoryChange("add", request, request.id).then(async (result) => {
+                submit.disabled = cancel.disabled = back.disabled = location.disabled = true;
+                status.replaceChildren(Amaterasu.el("p", "muted", confirmation ? "Adding repository…" : "Checking the repository’s signature…"));
+                try {
+                    const result = confirmation
+                        ? await runRepositoryChange("add", { ...confirmation }, confirmation.id)
+                        : await runRepositoryChange("preview", { location: requested }, "");
                     if (result.state === "failed") {
-                        fail(Amaterasu.repositoryChangeMessage(result.code), Amaterasu.repositoryChangeField(result.code));
+                        if (result.code === "fingerprint_mismatch" || result.code === "catalog_identity_mismatch")
+                            showAddress();
+                        fail(Amaterasu.repositoryChangeMessage(result.code));
+                        return;
+                    }
+                    if (!confirmation) {
+                        if (!result.publisher || result.publisher.location !== requested)
+                            throw new Error("The host did not return the requested publisher.");
+                        showPublisher(result.publisher);
+                        status.replaceChildren();
+                        reviewed = true;
                         return;
                     }
                     close();
                     await reloadRepositories();
-                    const added = repositories().find((repository) => repository.id === request.id);
-                    const count = added?.candidates.length ?? 0;
-                    context.notify(lit(`Added ${request.id}. ${count === 1 ? "1 plugin is" : `${count} plugins are`} available.`));
+                    const count = repositories().find((repository) => repository.id === confirmation.id)?.candidates.length ?? 0;
+                    context.notify(lit(`Added ${confirmation.id}. ${count === 1 ? "1 plugin is" : `${count} plugins are`} available.`));
                     showView("repositories");
-                }).catch((error) => {
-                    const code = error instanceof Amaterasu.ApiError ? error.code : null;
-                    fail(error instanceof Amaterasu.ApiError ? repositoryMessageFor(error) : Amaterasu.messageOf(error), Amaterasu.repositoryChangeField(code));
-                }).finally(() => {
+                }
+                catch (error) {
+                    fail(error instanceof Amaterasu.ApiError ? repositoryMessageFor(error) : Amaterasu.messageOf(error));
+                }
+                finally {
                     working = false;
-                    submit.disabled = cancel.disabled = false;
-                    if (viewArea.isConnected && view === "repositories")
+                    submit.disabled = cancel.disabled = back.disabled = false;
+                    location.disabled = publisher !== null;
+                    if (reviewed)
+                        review.focus();
+                    if (viewArea.isConnected)
                         render();
-                });
+                }
             });
             dialog.addEventListener("cancel", (event) => {
                 event.preventDefault();
@@ -18288,180 +18316,161 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
-    function streamCompatibilityAlerts(contents) {
-        const alerts = new Map();
-        const pattern = /^\[([^\]\r\n]{1,64})\]: Warning: amaterasu\.rtsp::rtsp\.negotiation: Optional client features (0x[0-9a-f]{8}) are unsupported and ignored; streaming can continue\.$/;
-        for (const line of contents.split("\n")) {
-            const warningLine = /^\[([^\]\r\n]{1,64})\]: Warning: amaterasu\.nvhttp::stream\.warning: (\{.{1,2048}\})$/.exec(line.replace(/\r$/, ""));
-            if (warningLine) {
-                try {
-                    const value = JSON.parse(warningLine[2]);
-                    const warning = value.warning;
-                    const scalar = (item) => item === undefined || typeof item === "boolean" ||
-                        (typeof item === "number" && Number.isSafeInteger(item)) ||
-                        (typeof item === "string" && /^[a-zA-Z0-9._\/:\-]{1,64}$/.test(item));
-                    if (value.event === "stream_warning" && typeof value.stream === "string" &&
-                        /^(rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16})$/.test(value.stream) &&
-                        warning && typeof warning.code === "string" && /^[a-zA-Z0-9._\/:\-]{1,64}$/.test(warning.code) &&
-                        typeof warning.source === "string" && /^[a-zA-Z0-9._\/:\-]{1,128}$/.test(warning.source) &&
-                        typeof warning.reason === "string" && /^[a-zA-Z0-9._\/:\-]{1,64}$/.test(warning.reason) &&
-                        (warning.os_error === undefined || (Number.isInteger(warning.os_error) && warning.os_error >= -2147483648 && warning.os_error <= 2147483647)) &&
-                        scalar(warning.requested) && scalar(warning.effective)) {
-                        const key = `warning:${value.stream}:${warning.code}:${warning.reason}`;
-                        const existing = alerts.get(key);
-                        if (existing) {
-                            existing.occurrences++;
-                            existing.lastSeen = warningLine[1];
-                        }
-                        else {
-                            if (alerts.size >= 32)
-                                alerts.delete(alerts.keys().next().value);
-                            alerts.set(key, { key, featureFlags: "", occurrences: 1, lastSeen: warningLine[1], warning: { stream: value.stream, ...warning } });
-                        }
-                    }
-                }
-                catch { }
-                continue;
-            }
-            const fallback = /^\[([^\]\r\n]{1,64})\]: Warning: (?:amaterasu\.rtsp::rtsp|amaterasu\.stream-session::stream)\.compatibility: (\{.{1,2048}\})$/.exec(line.replace(/\r$/, ""));
-            if (fallback) {
-                try {
-                    const value = JSON.parse(fallback[2]);
-                    if (value.event === "stream_adjustment" && typeof value.stream === "string" && /^(rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16})$/.test(value.stream) &&
-                        ["refresh_hint_ignored", "intra_refresh_unavailable", "audio_quality_default", "hevc_capability_hint_ignored", "invalid_optional_hints", "optional_client_features", "bandwidth_adjusted", "compatibility_defaults", "capture_fallback", "encoder_fallback"].includes(value.code) &&
-                        (value.reason === undefined || (typeof value.reason === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value.reason))) &&
-                        Number.isSafeInteger(value.requested) && value.requested >= 0 && value.requested <= 4294967295 &&
-                        Number.isSafeInteger(value.effective) && value.effective >= 0 && value.effective <= 4294967295) {
-                        const key = `adjustment:${value.stream}:${value.code}:${value.requested}:${value.effective}`;
-                        const existing = alerts.get(key);
-                        if (existing) {
-                            existing.occurrences++;
-                            existing.lastSeen = fallback[1];
-                        }
-                        else {
-                            if (alerts.size >= 32)
-                                alerts.delete(alerts.keys().next().value);
-                            alerts.set(key, { key, featureFlags: "", occurrences: 1, lastSeen: fallback[1], adjustment: value });
-                        }
-                    }
-                }
-                catch { }
-                continue;
-            }
-            const match = pattern.exec(line.replace(/\r$/, ""));
-            if (!match)
-                continue;
-            const flags = match[2];
-            const numeric = Number.parseInt(flags.slice(2), 16);
-            if (numeric === 0 || (numeric & 15) !== 0)
-                continue;
-            const key = `optional-client-features:${flags}`;
-            const existing = alerts.get(key);
-            if (existing) {
-                existing.occurrences++;
-                existing.lastSeen = match[1];
-            }
-            else {
-                if (alerts.size >= 32)
-                    alerts.delete(alerts.keys().next().value);
-                alerts.set(key, { key, featureFlags: flags, occurrences: 1, lastSeen: match[1] });
-            }
-        }
-        return [...alerts.values()];
+    function fields(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Invalid stream issue record.");
+        return value;
     }
-    Amaterasu.streamCompatibilityAlerts = streamCompatibilityAlerts;
+    const issueMessages = {
+        optional_client_features: "Ignored unsupported optional client features.",
+        intra_refresh_unavailable: "The encoder does not support the requested intra-refresh mode.",
+        bandwidth_adjusted: "Reduced the video bitrate to allow room for audio and network overhead.",
+        refresh_hint_ignored: "Ignored an inconsistent display refresh hint.",
+        hevc_capability_hint_ignored: "Ignored an unrecognized HEVC capability hint.",
+        invalid_optional_hints: "Ignored invalid optional client hints.",
+        compatibility_defaults: "Used defaults for optional settings omitted by the client.",
+        audio_quality_default: "Used the configured audio quality.",
+        proton_policy_unavailable: "The global Proton controller preference was unavailable.",
+        proton_hook_unavailable: "Could not confirm the Proton controller helper.",
+        application_output_unavailable: "Could not use the configured application output.",
+        detached_command_unavailable: "Could not start an optional detached command.",
+        capture_fallback: "Switched to a compatible capture source.",
+        encoder_fallback: "Switched to a compatible encoder.",
+    };
+    function issueText(issue) {
+        if (typeof issue.code !== "string" || !issue.code)
+            throw new Error("Stream issue has no code.");
+        const words = (value) => value.replaceAll("_", " ");
+        const parts = [Object.hasOwn(issueMessages, issue.code) ? issueMessages[issue.code] : words(issue.code) + "."];
+        if (typeof issue.reason === "string" && issue.reason && issue.reason !== issue.code)
+            parts.push("Reason: " + words(issue.reason) + ".");
+        if (typeof issue.fallback === "string")
+            parts.push("Used " + words(issue.fallback) + ".");
+        for (const [name, label] of [["requested", "Requested"], ["effective", "Effective"], ["os_error", "OS error"]]) {
+            const value = issue[name];
+            if (value == null)
+                continue;
+            if (typeof value !== "boolean" && typeof value !== "string" && !Number.isSafeInteger(value))
+                throw new Error("Invalid stream issue value.");
+            let display = typeof value === "string" ? words(value) : String(value);
+            if (typeof value === "number" && name !== "os_error") {
+                if (issue.code === "bandwidth_adjusted")
+                    display = value + " kbps";
+                else if (issue.code === "refresh_hint_ignored")
+                    display = value / 100 + " Hz";
+                else if (issue.code === "optional_client_features" || issue.code === "invalid_optional_hints")
+                    display = "0x" + value.toString(16).toUpperCase();
+            }
+            parts.push(label + ": " + display + ".");
+        }
+        return parts.join(" ");
+    }
+    function retainedStreamWarnings(detail) {
+        if (!detail)
+            return "Warning history unavailable.";
+        const messages = new Set();
+        for (const event of detail.events) {
+            const field = event.event_type === "stream_warnings" ? "warnings" : event.event_type === "stream_adjustments" ? "adjustments" : null;
+            if (!field)
+                continue;
+            const items = fields(event.payload)[field];
+            if (!Array.isArray(items))
+                throw new Error("Invalid stream warning history.");
+            for (const item of items)
+                messages.add(issueText(fields(item)));
+        }
+        if (detail.events_truncated)
+            messages.add("Some earlier events are unavailable.");
+        return [...messages].join(" ") || "No warnings recorded.";
+    }
+    Amaterasu.retainedStreamWarnings = retainedStreamWarnings;
+    function lifecycleAlerts(value) {
+        const reply = fields(value);
+        if (reply.ok !== true || typeof reply.incomplete !== "boolean" || !Array.isArray(reply.issues))
+            throw new Error("Stream issue history is unavailable.");
+        const alerts = new Map();
+        for (const value of reply.issues) {
+            const entry = fields(value), issue = fields(entry.issue);
+            if (typeof issue.operation !== "string" || typeof entry.publisher !== "string" || !Number.isSafeInteger(entry.at_ms) ||
+                !["critical_failure", "advisory_warning", "demoted_warning"].includes(String(issue.disposition)))
+                throw new Error("Invalid stream issue identity.");
+            const key = JSON.stringify([issue.operation, entry.publisher, issue.layer, issue.phase, issue.disposition,
+                issue.code, issue.reason, issue.caused_by, issue.fallback, issue.requested, issue.effective, issue.os_error]);
+            const previous = alerts.get(key);
+            alerts.set(key, { key, occurrences: (previous?.occurrences ?? 0) + 1, message: issueText(issue), source: entry.publisher, operation: issue.operation, title: issue.disposition === "critical_failure" ? "Failure" : "Warning", at: Math.max(previous?.at ?? 0, Number(entry.at_ms)) });
+        }
+        return { alerts: [...alerts.values()].sort((a, b) => b.at - a.at), incomplete: reply.incomplete };
+    }
+    Amaterasu.lifecycleAlerts = lifecycleAlerts;
     function renderDiagnosticAlerts(context, target) {
-        const storageKey = `amaterasu.diagnostic-alert-dismissals.v1.${encodeURIComponent(context.api.hostOrigin)}`;
+        const storageKey = "amaterasu.lifecycle-dismissals." + context.api.hostOrigin;
         const dismissed = new Set();
-        let persistent = true;
-        let alerts = [];
-        let state = "loading";
         try {
-            const stored = JSON.parse(window.localStorage.getItem(storageKey) ?? "[]");
-            if (Array.isArray(stored))
-                for (const key of stored.slice(-64)) {
-                    if (typeof key === "string" && /^(optional-client-features:0x[0-9a-f]{8}|adjustment:(?:rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16}):[a-z_]+:[0-9]+:[0-9]+|warning:(?:rtsp-[0-9a-f]{16}|nvhttp-[0-9a-f]{32}-[0-9a-f]{16}-rtsp|stream-session-[0-9a-f]{16}):[a-zA-Z0-9._\/\-]+:[a-zA-Z0-9._\/\-]+)$/.test(key))
+            const saved = JSON.parse(window.localStorage.getItem(storageKey) ?? "[]");
+            if (Array.isArray(saved))
+                for (const key of saved.slice(-64))
+                    if (typeof key === "string")
                         dismissed.add(key);
-                }
         }
-        catch {
-            persistent = false;
-        }
+        catch { }
+        let snapshot;
+        let status = "Reading stream issues…";
+        let generation = 0;
+        let timer;
         function save() {
             while (dismissed.size > 64)
                 dismissed.delete(dismissed.values().next().value);
             try {
                 window.localStorage.setItem(storageKey, JSON.stringify([...dismissed]));
             }
-            catch {
-                persistent = false;
-            }
+            catch { }
+            render();
         }
         function render() {
             const list = Amaterasu.el("div");
             list.setAttribute("aria-live", "polite");
-            const visible = alerts.filter((alert) => !dismissed.has(alert.key));
-            for (const alert of visible) {
-                if (alert.warning) {
-                    const warning = alert.warning;
-                    const message = warning.code === "proton_policy_unavailable"
-                        ? "The global controller compatibility preference was unavailable. The recorded fallback applies where no app or client override is set."
-                        : warning.code === "proton_hook_unavailable"
-                            ? "The optional Proton controller compatibility helper could not be confirmed. The application continued launching."
-                            : warning.code === "application_output_unavailable"
-                                ? "The configured application output could not be used. The application continued without that output."
-                                : warning.code === "detached_command_unavailable"
-                                    ? "An optional detached command could not start. The application continued launching."
-                                    : warning.code === "invalid_client_hint"
-                                        ? "An invalid optional client hint was ignored. The stream settings were preserved."
-                                        : "An optional stream feature was unavailable. Streaming continued.";
-                    list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", "Stream continued with a warning"), Amaterasu.el("p", "", message), Amaterasu.el("p", "muted", `Stream: ${warning.stream}. Source: ${warning.source}. Reason: ${warning.reason}.${warning.os_error === undefined ? "" : ` OS error: ${warning.os_error}.`}${warning.requested === undefined ? "" : ` Requested: ${warning.requested}.`}${warning.effective === undefined ? "" : ` Used: ${warning.effective}.`} Last seen: ${alert.lastSeen}.`), Amaterasu.button("Dismiss", () => { dismissed.add(alert.key); save(); render(); })));
+            for (const item of snapshot?.alerts ?? []) {
+                if (dismissed.has(item.key))
                     continue;
-                }
-                if (alert.adjustment) {
-                    const adjustment = alert.adjustment;
-                    const messages = {
-                        refresh_hint_ignored: "An inconsistent display refresh hint was ignored. The requested stream frame rate is used.",
-                        intra_refresh_unavailable: "Intra refresh is unavailable. Streaming continues with the default refresh behavior.",
-                        audio_quality_default: "The requested audio quality is unavailable. Streaming continues with the configured audio quality.",
-                        hevc_capability_hint_ignored: "An unrecognized HEVC capability hint was ignored. The negotiated video format is unchanged.",
-                        invalid_optional_hints: "Invalid optional client hints were ignored. Required media and security settings are unchanged.",
-                        optional_client_features: "Unsupported optional client features were ignored.",
-                        bandwidth_adjusted: "The video bitrate was reduced to allow room for audio and network overhead.",
-                        capture_fallback: "The capture provider could not initialize. Streaming continues with a compatible capture path.",
-                        encoder_fallback: "The encoder could not initialize. Streaming continues with a compatible encoder.",
-                        compatibility_defaults: "The client omitted optional settings. Compatible defaults were used.",
-                    };
-                    list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", "Stream continued with adjusted settings"), Amaterasu.el("p", "", messages[adjustment.code]), Amaterasu.el("p", "muted", adjustment.code === "invalid_optional_hints"
-                        ? `Stream: ${adjustment.stream}. Ignored hint mask: 0x${adjustment.requested.toString(16)}. Last seen: ${alert.lastSeen}.`
-                        : `Stream: ${adjustment.stream}. Requested: ${adjustment.requested}; used: ${adjustment.effective}.${adjustment.reason ? ` Reason: ${adjustment.reason}.` : ""} Last seen: ${alert.lastSeen}.`), Amaterasu.button("Dismiss", () => { dismissed.add(alert.key); save(); render(); })));
-                    continue;
-                }
-                const dismiss = Amaterasu.button("Dismiss", () => { dismissed.add(alert.key); save(); render(); });
-                dismiss.setAttribute("aria-label", `Dismiss optional client feature alert ${alert.featureFlags}`);
-                list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", "Some optional client features are unavailable"), Amaterasu.el("p", "", "Streaming can continue. Amaterasu ignored optional features advertised by your client that this host does not recognize."), Amaterasu.el("p", "", "If you need these features, check for host and client updates. Otherwise, no action is needed."), Amaterasu.el("p", "muted", `Feature flags: ${alert.featureFlags}. Seen ${alert.occurrences} time(s) in the retained host log. Last seen: ${alert.lastSeen}.`), dismiss));
+                list.append(Amaterasu.el("article", "notice", Amaterasu.el("h3", "", item.title), Amaterasu.el("p", "", item.message), Amaterasu.el("p", "muted", item.source + " · " + item.operation + " · " + new Date(item.at).toLocaleString() + (item.occurrences > 1 ? " · " + item.occurrences + " occurrences" : "")), Amaterasu.button("Dismiss", () => { dismissed.add(item.key); save(); })));
             }
-            if (!visible.length && state === "ready")
-                list.append(Amaterasu.el("p", "muted", "No undismissed stream compatibility alerts in the retained host log."));
-            if (state === "loading")
-                list.append(Amaterasu.el("p", "muted", "Checking the retained host log for stream compatibility alerts…"));
-            if (state === "unavailable")
-                list.append(Amaterasu.el("p", "notice", context.api.allows("host-logs.read")
-                    ? "Alerts could not be refreshed. Previously loaded alerts remain visible. Use Refresh to try again."
-                    : "Host-log read access is required to view stream compatibility alerts."));
-            const restore = Amaterasu.button("Restore dismissed alerts", () => { dismissed.clear(); save(); render(); });
-            restore.disabled = dismissed.size === 0;
-            target.replaceChildren(Amaterasu.panel("Alerts", list, restore, Amaterasu.el("p", "muted", persistent
-                ? "Dismissals are saved for this host in this browser. Dismissing an alert does not change streaming or delete logs. Different feature flags can raise a new alert."
-                : "Browser storage is unavailable. Dismissals last only while this page is open; streaming and logs are unchanged."), Amaterasu.el("p", "muted", "Alerts cover reported stream adjustments and optional-feature warnings in the retained host log. They refresh with the host log; paused log refresh also pauses new alerts.")));
+            if (status)
+                list.append(Amaterasu.el("p", "muted", status));
+            else if (!list.childElementCount)
+                list.append(Amaterasu.el("p", "muted", "No undismissed stream issues."));
+            if (snapshot?.incomplete)
+                list.append(Amaterasu.el("p", "notice", "Some stream issue records are unavailable."));
+            const restore = Amaterasu.button("Restore dismissed alerts", () => { dismissed.clear(); save(); });
+            restore.disabled = !dismissed.size;
+            target.replaceChildren(Amaterasu.panel("Alerts", list, restore));
         }
-        if (!context.api.allows("host-logs.read"))
-            state = "unavailable";
+        async function refresh() {
+            const current = ++generation;
+            window.clearTimeout(timer);
+            if (!context.api.allows("session.read")) {
+                snapshot = undefined;
+                status = "Session read access is required to view stream issues.";
+                render();
+                return;
+            }
+            try {
+                const result = lifecycleAlerts(await context.api.post("nvhttp/launch_status", { issues_only: true }));
+                if (current !== generation || !target.isConnected)
+                    return;
+                snapshot = result;
+                status = "";
+            }
+            catch {
+                if (current !== generation || !target.isConnected)
+                    return;
+                status = "Stream issues could not be refreshed.";
+            }
+            render();
+            timer = window.setTimeout(() => { if (target.isConnected)
+                void refresh(); }, 5000);
+        }
         render();
-        return {
-            snapshot(contents) { alerts = streamCompatibilityAlerts(contents); state = "ready"; render(); },
-            unavailable() { state = "unavailable"; render(); },
-        };
+        return refresh;
     }
     Amaterasu.renderDiagnosticAlerts = renderDiagnosticAlerts;
 })(Amaterasu || (Amaterasu = {}));
@@ -18497,7 +18506,7 @@ var Amaterasu;
             throw new Error("The host returned an invalid log response.");
         return value;
     }
-    function renderHostLogs(context, target, alerts) {
+    function renderHostLogs(context, target) {
         let generation = 0;
         let contents = "";
         let latestContents = "";
@@ -18882,12 +18891,10 @@ var Amaterasu;
                     }
                     updateFollowing();
                 }
-                alerts?.snapshot(latestContents);
                 progress.textContent = discarded ? `${discarded} older log segments were discarded before this snapshot.` : "Snapshot loaded.";
             }
             catch (error) {
                 if (valid()) {
-                    alerts?.unavailable();
                     progress.replaceChildren(Amaterasu.errorPanel(error));
                 }
             }
@@ -20139,7 +20146,7 @@ var Amaterasu;
     Amaterasu.diagnosticSessionOutcome = diagnosticSessionOutcome;
     function renderDiagnostics(context) {
         const alertsArea = Amaterasu.el("div");
-        const alertObserver = Amaterasu.renderDiagnosticAlerts(context, alertsArea);
+        const refreshAlerts = Amaterasu.renderDiagnosticAlerts(context, alertsArea);
         const area = Amaterasu.el("div");
         const performanceArea = Amaterasu.el("div");
         const hostLogArea = Amaterasu.el("div");
@@ -20239,6 +20246,7 @@ var Amaterasu;
         });
         level.addEventListener("change", () => { selectedMatch = 0; renderFilteredRecords(); });
         context.content.append(Amaterasu.sectionHeading("Diagnostics", "Stream performance, host logs, caller-scoped records, and separately recorded stream outcomes.", Amaterasu.button("Refresh", () => {
+            void refreshAlerts();
             void refreshPerformance?.();
             void refreshHostLogs?.();
             void loadRecentSessions();
@@ -20262,18 +20270,18 @@ var Amaterasu;
                 const details = await Promise.all(list.sessions.map(async (session) => {
                     try {
                         const detail = parseHistoryDetailReply(await context.api.post("history/session_detail", { session_id: session.session_id }), session.session_id).detail;
-                        return { session, outcome: diagnosticSessionOutcome(detail) };
+                        return { session, outcome: diagnosticSessionOutcome(detail), warnings: Amaterasu.retainedStreamWarnings(detail) };
                     }
                     catch {
-                        return { session, outcome: "Outcome unavailable · refresh to retry" };
+                        return { session, outcome: "Outcome unavailable · refresh to retry", warnings: "Warning history unavailable." };
                     }
                 }));
                 if (!context.content.isConnected || request !== sessionRequest)
                     return;
-                sessionsArea.replaceChildren(Amaterasu.table(["Started", "State", "Recorded outcome"], details.map(({ session, outcome }) => [
+                sessionsArea.replaceChildren(Amaterasu.table(["Started", "State", "Recorded outcome", "Recorded warnings"], details.map(({ session, outcome, warnings }) => [
                     new Date(session.started_at_unix * 1000).toLocaleString(),
                     session.ended_at_unix == null ? Amaterasu.badge("Active", "good") : "Ended",
-                    outcome,
+                    outcome, warnings,
                 ])), Amaterasu.el("p", "muted", `Showing at most ${DIAGNOSTIC_SESSION_LIMIT} recent sessions. Client and device identity are not displayed.`));
             }
             catch (error) {
@@ -20334,7 +20342,8 @@ var Amaterasu;
         if (context.api.allows("diagnostics.read"))
             refreshPerformance = Amaterasu.renderPerformance(context, performanceArea);
         if (context.api.allows("host-logs.read"))
-            refreshHostLogs = Amaterasu.renderHostLogs(context, hostLogArea, alertObserver);
+            refreshHostLogs = Amaterasu.renderHostLogs(context, hostLogArea);
+        void refreshAlerts();
         void load();
         void loadRecentSessions();
     }
@@ -23338,7 +23347,7 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
-    function validateExtensionChartSeries(series) {
+    function validateExtensionChartSeries(series, xAxis) {
         if (!Array.isArray(series) || series.length > 8 || new Set(series.map((s) => s.id)).size !== series.length)
             throw new Error("Invalid chart series.");
         for (const item of series) {
@@ -23348,6 +23357,7 @@ var Amaterasu;
             let previous = -Infinity;
             for (const point of item.points) {
                 if (!point || !Number.isFinite(point.time) || point.time < previous ||
+                    (xAxis === "sample" && (!Number.isSafeInteger(point.time) || point.time < 1)) ||
                     (point.value !== null && !Number.isFinite(point.value)))
                     throw new Error("Invalid chart point.");
                 previous = point.time;
@@ -23391,7 +23401,7 @@ var Amaterasu;
                 return { element, setValue, dispose };
             },
             metricChart(options) {
-                validateExtensionChartSeries(options.series);
+                validateExtensionChartSeries(options.series, options.xAxis);
                 if (!options.label || typeof options.unit !== "string" ||
                     (options.minimum !== undefined && !Number.isFinite(options.minimum)) ||
                     (options.maximum !== undefined && !Number.isFinite(options.maximum)) ||
@@ -23399,199 +23409,417 @@ var Amaterasu;
                     throw new Error("Invalid chart scale.");
                 if (options.appearance !== undefined && options.appearance !== "full" && options.appearance !== "sparkline")
                     throw new Error("Invalid chart appearance.");
-                const sparkline = options.appearance === "sparkline";
-                const width = 640;
-                const plot = sparkline
-                    ? { left: 4, top: 4, right: 636, bottom: 48 }
-                    : { left: 40, top: 10, right: 630, bottom: 150 };
-                const plotWidth = plot.right - plot.left;
-                const plotHeight = plot.bottom - plot.top;
-                const svg = chartSvg("svg", {
-                    viewBox: `0 0 ${width} ${sparkline ? 52 : 180}`,
-                    role: "img", class: "plugin-metric-plot", tabindex: "0", "aria-label": options.label,
-                    ...(sparkline ? { preserveAspectRatio: "none" } : {}),
-                });
-                const legend = Amaterasu.el("div", "plugin-chart-legend");
-                const readout = Amaterasu.el("p", "plugin-chart-readout muted", sparkline ? null : "Hover or use arrow keys to inspect values.");
-                readout.setAttribute("aria-live", "polite");
-                const controls = Amaterasu.el("div", "plugin-chart-controls");
-                const heading = Amaterasu.el("h3", "", options.label);
-                const latest = sparkline ? Amaterasu.el("p", "plugin-chart-latest") : null;
-                const element = sparkline
-                    ? Amaterasu.el("section", "plugin-metric-chart plugin-metric-chart-sparkline", heading, latest, svg, readout)
-                    : Amaterasu.el("section", "plugin-metric-chart", heading, legend, svg, controls, readout);
-                let series = options.series;
-                let disposed = signal.aborted;
-                let zoom = 1;
-                let inspected = 0;
-                let timestamps = [];
-                let domainStart = 0, domainEnd = 1;
-                const hidden = new Set();
-                const formatter = sparkline ? new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }) : null;
-                const formatValue = (value) => {
-                    if (value == null)
-                        return "Unavailable";
-                    if (!formatter)
-                        return `${value.toFixed(2)} ${options.unit}`;
-                    const number = formatter.format(value);
-                    if (!options.unit)
-                        return number;
-                    return options.unit === "%" ? `${number}%` : `${number} ${options.unit}`;
-                };
-                const showPoint = (time) => {
-                    if (disposed)
-                        return;
-                    const values = series.filter((s) => !hidden.has(s.id)).map((s) => {
-                        const point = s.points.reduce((best, p) => !best || Math.abs(p.time - time) < Math.abs(best.time - time) ? p : best, undefined);
-                        return `${s.label}: ${formatValue(point?.value)}`;
-                    });
-                    svg.querySelector(".plugin-chart-cursor")?.remove();
-                    const x = plot.left + plotWidth * Math.max(0, Math.min(1, (time - domainStart) / Math.max(1, domainEnd - domainStart)));
-                    svg.append(chartSvg("path", {
-                        class: "plugin-chart-cursor", d: `M ${x} ${plot.top} V ${plot.bottom}`,
-                        stroke: "var(--muted)", "stroke-dasharray": "3 3",
-                        ...(sparkline ? { "vector-effect": "non-scaling-stroke" } : {}),
-                    }));
-                    readout.textContent = `${new Date(time).toLocaleTimeString()} · ${values.join(" · ")}`;
-                };
-                const clearReadout = () => {
-                    svg.querySelector(".plugin-chart-cursor")?.remove();
-                    readout.textContent = "";
-                };
-                const draw = () => {
-                    if (disposed)
-                        return;
-                    const visible = series.filter((s) => !hidden.has(s.id));
-                    timestamps = [...new Set(visible.flatMap((s) => s.points.map((p) => p.time)))].sort((a, b) => a - b);
-                    const end = timestamps.at(-1) ?? 1;
-                    const begin = end - (end - (timestamps[0] ?? 0)) / zoom;
-                    domainStart = begin;
-                    domainEnd = end;
-                    timestamps = timestamps.filter(time => time >= begin);
-                    const points = visible.flatMap((s) => s.points.filter((p) => p.time >= begin));
-                    const values = points.flatMap((p) => p.value === null ? [] : [p.value]);
-                    const low = options.minimum ?? Math.min(0, ...values);
-                    const high = options.maximum ?? Math.max(low + 1, ...values);
-                    svg.replaceChildren();
-                    if (!sparkline) {
-                        for (const fraction of [0, .5, 1]) {
-                            const y = plot.bottom - plotHeight * fraction;
-                            svg.append(chartSvg("path", { d: `M ${plot.left} ${y} H ${plot.right}`, stroke: "var(--line)", fill: "none" }));
-                            const label = chartSvg("text", { x: "36", y: String(y + 4), "text-anchor": "end", fill: "currentColor", "font-size": "10" });
-                            label.textContent = (low + (high - low) * fraction).toFixed(1);
-                            svg.append(label);
-                        }
-                    }
-                    const strokes = sparkline
-                        ? ["var(--good)", "var(--accent-text)", "var(--fg)"]
-                        : ["var(--accent)", "var(--strong)", "var(--muted)"];
-                    for (const [index, item] of visible.entries()) {
-                        let path = "";
-                        let lastCoordinate = "";
-                        let segmentLength = 0;
-                        const finishSegment = () => {
-                            if (sparkline && segmentLength === 1)
-                                path += `L${lastCoordinate} `;
-                            segmentLength = 0;
-                        };
-                        for (const point of item.points) {
-                            if (point.time < begin || point.value === null) {
-                                finishSegment();
-                                continue;
-                            }
-                            const x = plot.left + plotWidth * (point.time - begin) / Math.max(end - begin, 1);
-                            const y = plot.bottom - plotHeight * Math.max(0, Math.min(1, (point.value - low) / (high - low)));
-                            lastCoordinate = `${x.toFixed(2)} ${y.toFixed(2)}`;
-                            path += `${segmentLength ? "L" : "M"}${lastCoordinate} `;
-                            segmentLength++;
-                        }
-                        finishSegment();
-                        const dash = sparkline ? ["none", "6 2", "3 2"][Math.floor(index / 3)] : index > 2 ? "5 3" : "none";
-                        svg.append(chartSvg("path", {
-                            d: path, fill: "none", stroke: strokes[index % strokes.length], "stroke-width": "2", "stroke-dasharray": dash,
-                            ...(sparkline ? { "stroke-linecap": "round", "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke" } : {}),
-                        }));
-                    }
-                    const measured = points.filter((point) => point.value !== null).length;
-                    if (latest) {
-                        const values = visible.map(item => ({
-                            label: item.label,
-                            value: formatValue(item.points.at(-1)?.value),
-                        }));
-                        const labelled = values.map(item => `${item.label}: ${item.value}`).join(" · ");
-                        latest.textContent = values.length === 1 ? values[0].value : labelled || "Unavailable";
-                        svg.setAttribute("aria-label", `${options.label}. Latest: ${labelled || "Unavailable"}. ${measured} measured values. Missing values are gaps. Use arrow keys to inspect values.`);
-                        clearReadout();
-                    }
-                    else {
-                        svg.setAttribute("aria-label", `${options.label}. ${measured} measured values. ${zoom}× zoom. Missing values are gaps.`);
-                    }
-                };
-                const updateLegend = () => {
-                    legend.replaceChildren();
-                    for (const item of series) {
-                        const toggle = Amaterasu.button(item.label, () => { if (hidden.has(item.id))
-                            hidden.delete(item.id);
-                        else
-                            hidden.add(item.id); updateLegend(); draw(); });
-                        toggle.setAttribute("aria-pressed", String(!hidden.has(item.id)));
-                        legend.append(toggle);
-                    }
-                };
-                if (!sparkline) {
-                    for (const [label, factor] of [["Zoom in", 2], ["Zoom out", .5], ["Reset zoom", 0]])
-                        controls.append(Amaterasu.button(label, () => { zoom = factor ? Math.max(1, Math.min(64, zoom * factor)) : 1; draw(); }));
-                    updateLegend();
-                }
-                const onKey = (event) => {
-                    if (disposed || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) || !timestamps.length)
-                        return;
-                    event.preventDefault();
-                    inspected = event.key === "Home" ? 0 : event.key === "End" ? timestamps.length - 1 : Math.max(0, Math.min(timestamps.length - 1, inspected + (event.key === "ArrowLeft" ? -1 : 1)));
-                    showPoint(timestamps[inspected]);
-                };
-                const onPointer = (event) => {
-                    const bounds = svg.getBoundingClientRect();
-                    const first = timestamps[0], last = timestamps.at(-1);
-                    if (disposed || first === undefined || last === undefined || bounds.width <= 0)
-                        return;
-                    const fraction = ((event.clientX - bounds.left) / bounds.width * width - plot.left) / plotWidth;
-                    showPoint(domainStart + Math.max(0, Math.min(1, fraction)) * (domainEnd - domainStart));
-                };
-                svg.addEventListener("keydown", onKey);
-                svg.addEventListener("pointermove", onPointer);
-                if (sparkline) {
-                    svg.addEventListener("pointerleave", clearReadout);
-                    svg.addEventListener("blur", clearReadout);
-                }
-                const dispose = () => {
-                    disposed = true;
-                    signal.removeEventListener("abort", dispose);
-                    svg.removeEventListener("keydown", onKey);
-                    svg.removeEventListener("pointermove", onPointer);
-                    svg.removeEventListener("pointerleave", clearReadout);
-                    svg.removeEventListener("blur", clearReadout);
-                };
-                signal.addEventListener("abort", dispose, { once: true });
-                draw();
-                return {
-                    element,
-                    setData(next) {
-                        validateExtensionChartSeries(next);
-                        if (disposed)
-                            return;
-                        series = next;
-                        if (!sparkline)
-                            updateLegend();
-                        draw();
-                    },
-                    dispose,
-                };
+                if (options.xAxis !== undefined && options.xAxis !== "sample" && options.xAxis !== "time")
+                    throw new Error("Invalid chart horizontal axis.");
+                return createMetricChart(options, signal);
             },
         };
         return Object.freeze(ui);
     }
     Amaterasu.createExtensionUiChartsV1 = createExtensionUiChartsV1;
+    const chartWidth = 1000, chartHeight = 200;
+    const chartNumber = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
+    const chartScaleNumber = new Intl.NumberFormat(undefined, { maximumSignificantDigits: 5 });
+    const clockSeconds = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+    const clockMillis = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", fractionalSecondDigits: 3, hour12: false });
+    function chartValue(value, unit) {
+        if (value == null)
+            return "Unavailable";
+        return chartNumber.format(value) + (unit && unit !== "%" ? " " : "") + unit;
+    }
+    function metricLine(points, start, end, low, high) {
+        let path = "", coordinate = "", length = 0;
+        const finish = () => {
+            if (length === 1)
+                path += `L${coordinate} `;
+            length = 0;
+        };
+        for (const point of points) {
+            if (point.time < start || point.time > end)
+                continue;
+            if (point.value === null) {
+                finish();
+                continue;
+            }
+            const x = end === start ? chartWidth / 2 : chartWidth * (point.time - start) / (end - start);
+            const y = chartHeight * (1 - Math.max(0, Math.min(1, (point.value - low) / (high - low))));
+            coordinate = `${x.toFixed(2)} ${y.toFixed(2)}`;
+            path += `${length ? "L" : "M"}${coordinate} `;
+            length++;
+        }
+        finish();
+        return path;
+    }
+    function chartScale(values, options, fit) {
+        const min = values.length ? Math.min(...values) : 0;
+        const max = values.length ? Math.max(...values) : 1;
+        const fixedLow = fit ? undefined : options.minimum;
+        const fixedHigh = fit ? undefined : options.maximum;
+        let low = fixedLow ?? (fit ? min : Math.min(0, min));
+        let high = fixedHigh ?? max;
+        if (high <= low) {
+            const padding = Math.abs(fixedHigh ?? low) * .05 || 1;
+            if (fixedHigh === undefined)
+                high = low + padding;
+            else
+                low = high - padding;
+        }
+        const rough = (high - low) / 4;
+        const magnitude = 10 ** Math.floor(Math.log10(rough));
+        const steps = [1, 2, 2.5, 5, 10];
+        const step = magnitude * steps.reduce((best, candidate) => Math.abs(candidate - rough / magnitude) < Math.abs(best - rough / magnitude) ? candidate : best);
+        if (fixedLow === undefined)
+            low = Math.floor(low / step) * step;
+        if (fixedHigh === undefined)
+            high = low + Math.ceil((high - low) / step) * step;
+        const intervals = Math.max(2, Math.min(7, Math.round((high - low) / step) || 4));
+        return { low, high, intervals };
+    }
+    function nearestChartTime(times, target) {
+        let low = 0, high = times.length;
+        while (low < high) {
+            const mid = Math.floor((low + high) / 2);
+            if (times[mid] < target)
+                low = mid + 1;
+            else
+                high = mid;
+        }
+        const left = times[low - 1], right = times[low];
+        return left !== undefined && (right === undefined || target - left <= right - target) ? left : right;
+    }
+    function fullChartFrame(element, heading, label, svg, readout, signal, controls) {
+        const command = (text, title, action) => {
+            const control = Amaterasu.button(text, () => { if (!signal.aborted)
+                action(); }, "plugin-chart-button");
+            control.title = title;
+            control.setAttribute("aria-label", title);
+            return control;
+        };
+        const yAxis = Amaterasu.el("div", "plugin-chart-y");
+        const timeLabels = Array.from({ length: 3 }, () => Amaterasu.el("span"));
+        const empty = Amaterasu.el("span", "plugin-chart-empty");
+        const legend = Amaterasu.el("div", "plugin-chart-legend");
+        const pan = Amaterasu.el("input", "plugin-chart-pan");
+        pan.type = "range";
+        pan.min = "0";
+        pan.max = "1000";
+        pan.step = "1";
+        pan.setAttribute("aria-label", "Position in chart history");
+        const panLabel = Amaterasu.el("label", "plugin-chart-history", Amaterasu.el("span", "", "Timeline"), pan);
+        const zoomIn = command("+", "Zoom in", () => controls.zoom(2));
+        const zoomOut = command("−", "Zoom out", () => controls.zoom(.5));
+        const reset = command("Reset", "Reset zoom", controls.reset);
+        const scale = command("Fit values", "Fit vertical scale to visible values", controls.fit);
+        const dialog = Amaterasu.el("dialog", "plugin-chart-dialog");
+        dialog.setAttribute("aria-label", label);
+        const expand = Amaterasu.button("Expand", () => {
+            if (signal.aborted)
+                return;
+            if (dialog.open) {
+                dialog.close();
+                return;
+            }
+            dialog.append(body);
+            expand.textContent = "Close";
+            expand.setAttribute("aria-label", "Close expanded chart");
+            dialog.showModal();
+            expand.focus();
+        }, "plugin-chart-button");
+        expand.setAttribute("aria-label", `Expand ${label}`);
+        expand.setAttribute("aria-haspopup", "dialog");
+        const body = Amaterasu.el("div", "plugin-chart-body");
+        body.append(Amaterasu.el("div", "plugin-chart-heading", heading, expand), legend, Amaterasu.el("div", "plugin-chart-axes", yAxis, Amaterasu.el("div", "plugin-chart-surface", svg, empty), Amaterasu.el("div", "plugin-chart-x", ...timeLabels)), Amaterasu.el("div", "plugin-chart-footer", readout, Amaterasu.el("div", "plugin-chart-controls", zoomIn, zoomOut, reset), scale), panLabel);
+        element.append(body, dialog);
+        dialog.addEventListener("close", () => {
+            element.insertBefore(body, dialog);
+            expand.textContent = "Expand";
+            expand.setAttribute("aria-label", `Expand ${label}`);
+            if (!signal.aborted && expand.isConnected)
+                expand.focus({ preventScroll: true });
+        }, { signal });
+        pan.addEventListener("input", () => controls.pan(pan.valueAsNumber / 1000), { signal });
+        return { dialog, yAxis, timeLabels, empty, legend, pan, panLabel, zoomIn, zoomOut, reset, scale };
+    }
+    function createMetricChart(options, signal) {
+        const sparkline = options.appearance === "sparkline";
+        const heading = Amaterasu.el("h3", "", options.label);
+        const svg = chartSvg("svg", {
+            viewBox: `0 0 ${chartWidth} ${chartHeight}`, preserveAspectRatio: "none", role: "img",
+            class: "plugin-metric-plot", tabindex: "0", "aria-label": options.label,
+        });
+        const readout = Amaterasu.el("p", "plugin-chart-readout muted");
+        readout.setAttribute("aria-live", "polite");
+        const latest = Amaterasu.el("p", "plugin-chart-latest");
+        const element = Amaterasu.el("section", sparkline ? "plugin-metric-chart plugin-metric-chart-sparkline" : "plugin-metric-chart plugin-chart-full");
+        const listener = new AbortController();
+        if (signal.aborted)
+            listener.abort();
+        let disposed = signal.aborted;
+        let series = options.series;
+        const hidden = new Set();
+        let zoom = 1;
+        let pinnedEnd = null;
+        let fit = false;
+        let first = 0, last = 0, start = 0, end = 0;
+        let times = [];
+        let maxZoom = 64;
+        let yLow = 0, yHigh = 1;
+        let inspected;
+        const keys = new Map();
+        const frame = sparkline ? null : fullChartFrame(element, heading, options.label, svg, readout, listener.signal, {
+            zoom: factor => changeZoom(factor, 1),
+            reset() { zoom = 1; pinnedEnd = null; draw(); },
+            fit() { fit = !fit; draw(); },
+            pan(fraction) {
+                const span = end - start;
+                panTo(first + span + fraction * (last - first - span));
+            },
+        });
+        if (!frame)
+            element.append(heading, latest, svg, readout);
+        function panTo(nextEnd) {
+            pinnedEnd = nextEnd >= last ? null : Math.max(first + (last - first) / zoom, nextEnd);
+            draw();
+        }
+        function changeZoom(factor, anchor) {
+            const next = Math.max(1, Math.min(maxZoom, zoom * factor));
+            if (next === zoom || last <= first)
+                return;
+            const nextEnd = start + (end - start) * anchor + (last - first) / next * (1 - anchor);
+            zoom = next;
+            panTo(nextEnd);
+        }
+        function updateLegend() {
+            if (!frame)
+                return;
+            const { legend } = frame;
+            const ids = new Set(series.map(item => item.id));
+            for (const [id, key] of keys)
+                if (!ids.has(id)) {
+                    key.toggle.remove();
+                    keys.delete(id);
+                    hidden.delete(id);
+                }
+            series.forEach((item, index) => {
+                let key = keys.get(item.id);
+                if (!key) {
+                    const toggle = Amaterasu.button("", () => {
+                        if (disposed)
+                            return;
+                        if (hidden.has(item.id))
+                            hidden.delete(item.id);
+                        else
+                            hidden.add(item.id);
+                        draw();
+                    }, "plugin-chart-button");
+                    const name = Amaterasu.el("span", "plugin-chart-key-name"), value = Amaterasu.el("strong");
+                    toggle.replaceChildren(name, value);
+                    key = { toggle, name, value, latest: "" };
+                    keys.set(item.id, key);
+                }
+                if (legend.children[index] !== key.toggle)
+                    legend.insertBefore(key.toggle, legend.children[index] ?? null);
+                key.name.textContent = item.label;
+                key.toggle.setAttribute("aria-label", item.label);
+                key.toggle.title = `Show or hide ${item.label}`;
+                key.toggle.dataset.series = String(index);
+            });
+        }
+        function showInspection() {
+            svg.querySelector(".plugin-chart-cursor-layer")?.remove();
+            const time = inspected === undefined ? undefined : nearestChartTime(times, inspected);
+            const single = series.length === 1 ? series[0] : undefined;
+            if (single?.label === options.label) {
+                const key = keys.get(single.id);
+                if (key)
+                    key.name.textContent = time === undefined ? "Latest" : "Selected sample";
+            }
+            if (time === undefined) {
+                inspected = undefined;
+                for (const key of keys.values())
+                    key.value.textContent = key.latest;
+                readout.textContent = frame && times.length ? `Through ${formatTime(times.at(-1))}` : "";
+                return;
+            }
+            inspected = time;
+            const x = end === start ? chartWidth / 2 : chartWidth * (time - start) / (end - start);
+            const cursor = chartSvg("g", { class: "plugin-chart-cursor-layer" });
+            cursor.append(chartSvg("path", { class: "plugin-chart-cursor", d: `M${x} 0 V${chartHeight}`,
+                stroke: "var(--muted)", "stroke-dasharray": "3 3", "vector-effect": "non-scaling-stroke" }));
+            const values = [];
+            series.forEach((item, index) => {
+                if (hidden.has(item.id))
+                    return;
+                const point = item.points.find(point => point.time === time && point.value !== null);
+                const value = chartValue(point?.value, options.unit);
+                values.push(`${item.label}: ${value}`);
+                const key = keys.get(item.id);
+                if (key)
+                    key.value.textContent = value;
+                if (frame && point?.value != null) {
+                    const y = chartHeight * (1 - Math.max(0, Math.min(1, (point.value - yLow) / (yHigh - yLow))));
+                    cursor.append(chartSvg("path", { d: `M${x} ${y}h0`, class: "plugin-chart-line", "data-series": String(index),
+                        stroke: "currentColor", "stroke-width": "7", "stroke-linecap": "round", "vector-effect": "non-scaling-stroke" }));
+                }
+            });
+            svg.append(cursor);
+            readout.textContent = `${formatTime(time)} · ${values.join(" · ")}`;
+        }
+        function formatTime(time) {
+            if (options.xAxis === "sample")
+                return `#${Math.round(time).toLocaleString()}`;
+            if (!Number.isFinite(new Date(time).getTime()))
+                return String(time);
+            return (end > start && end - start < 3000 ? clockMillis : clockSeconds).format(time);
+        }
+        function draw() {
+            if (disposed)
+                return;
+            const starts = series.flatMap(item => item.points.length ? [item.points[0].time] : []);
+            const ends = series.flatMap(item => item.points.length ? [item.points.at(-1).time] : []);
+            first = starts.length ? Math.min(...starts) : 0;
+            last = ends.length ? Math.max(...ends) : first;
+            maxZoom = options.xAxis === "sample" ? Math.min(64, Math.max(1, last - first)) : 64;
+            zoom = Math.min(zoom, maxZoom);
+            const span = (last - first) / zoom;
+            end = Math.max(first + span, Math.min(last, pinnedEnd ?? last));
+            start = end - span;
+            const visible = series.filter(item => !hidden.has(item.id));
+            const inWindow = (p) => p.time >= start && p.time <= end;
+            const points = visible.flatMap(item => item.points.filter(inWindow));
+            times = [...new Set(points.map(p => p.time))].sort((a, b) => a - b);
+            const values = points.flatMap(p => p.value === null ? [] : [p.value]);
+            const { low, high, intervals } = chartScale(values, options, fit);
+            yLow = low;
+            yHigh = high;
+            svg.replaceChildren();
+            if (frame) {
+                const { yAxis, timeLabels, empty, zoomIn, zoomOut, reset, panLabel, pan, scale } = frame;
+                if (yAxis.children.length !== intervals + 1)
+                    yAxis.replaceChildren(...Array.from({ length: intervals + 1 }, () => Amaterasu.el("span")));
+                Array.from(yAxis.children).forEach((tick, i) => {
+                    const fraction = i / intervals;
+                    tick.textContent = chartScaleNumber.format(i === intervals ? low : high - (high - low) * fraction);
+                    svg.append(chartSvg("path", { class: "plugin-chart-gridline", d: `M0 ${chartHeight * fraction} h${chartWidth}`,
+                        stroke: "var(--line)", "vector-effect": "non-scaling-stroke" }));
+                });
+                timeLabels.forEach((label, i) => {
+                    label.textContent = starts.length && (span > 0 || i === 1) ? formatTime(start + span * i / 2) : "";
+                });
+                empty.textContent = !visible.length && series.length ? "Select a series to display" : "No readings in this window";
+                empty.hidden = values.length > 0;
+                svg.setAttribute("data-zoomed", String(zoom > 1));
+                zoomIn.disabled = last === first || zoom >= maxZoom;
+                zoomOut.disabled = reset.disabled = zoom === 1;
+                panLabel.hidden = zoom === 1 || last === first;
+                pan.value = String(Math.round(1000 * (start - first) / (last - first - span || 1)));
+                pan.setAttribute("aria-valuetext", `${formatTime(start)} to ${formatTime(end)}`);
+                scale.setAttribute("aria-pressed", String(fit));
+            }
+            const latestValues = [];
+            series.forEach((item, index) => {
+                const key = keys.get(item.id);
+                let lastPoint;
+                for (let i = item.points.length - 1; i >= 0; i--) {
+                    const point = item.points[i];
+                    if (point.time < start)
+                        break;
+                    if (point.time <= end) {
+                        lastPoint = point;
+                        break;
+                    }
+                }
+                const value = chartValue(lastPoint?.value, options.unit);
+                if (key) {
+                    key.toggle.setAttribute("aria-pressed", String(!hidden.has(item.id)));
+                    key.latest = value;
+                    key.value.textContent = value;
+                }
+                if (hidden.has(item.id))
+                    return;
+                latestValues.push(`${item.label}: ${value}`);
+                const d = metricLine(item.points, start, end, low, high);
+                svg.append(chartSvg("path", { d, class: "plugin-chart-line", "data-series": String(index),
+                    fill: "none", stroke: "currentColor", "stroke-width": sparkline ? "2" : "2.5", "stroke-linecap": "round",
+                    "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke" }));
+            });
+            const labelled = latestValues.join(" · ") || "Unavailable";
+            if (sparkline)
+                latest.textContent = series.length === 1 ? chartValue(series[0].points.at(-1)?.value, options.unit) : labelled;
+            svg.setAttribute("aria-label", `${options.label}. Latest: ${labelled}. ${values.length} measured values. ${zoom}× zoom. Missing values are gaps. Use arrow keys to inspect values.`);
+            if (inspected !== undefined && (inspected < start || inspected > end))
+                inspected = undefined;
+            showInspection();
+        }
+        const events = { signal: listener.signal };
+        const pointerFraction = (event) => {
+            const bounds = svg.getBoundingClientRect();
+            return Math.max(0, Math.min(1, (event.clientX - bounds.left) / (bounds.width || 1)));
+        };
+        let drag;
+        function inspectPointer(event) {
+            inspected = start + pointerFraction(event) * (end - start);
+            showInspection();
+        }
+        svg.addEventListener("pointermove", event => {
+            if (drag?.id === event.pointerId)
+                panTo(drag.end - (event.clientX - drag.x) * drag.span / (svg.getBoundingClientRect().width || 1));
+            inspectPointer(event);
+        }, events);
+        svg.addEventListener("pointerdown", event => {
+            if (event.button !== 0 || !event.isPrimary)
+                return;
+            inspectPointer(event);
+            if (!sparkline && zoom > 1) {
+                drag = { id: event.pointerId, x: event.clientX, end, span: end - start };
+                svg.setPointerCapture(event.pointerId);
+            }
+        }, events);
+        svg.addEventListener("lostpointercapture", () => { drag = undefined; }, events);
+        const clear = () => { if (!drag) {
+            inspected = undefined;
+            showInspection();
+        } };
+        svg.addEventListener("pointerleave", clear, events);
+        svg.addEventListener("blur", clear, events);
+        svg.addEventListener("keydown", event => {
+            if (!times.length || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key))
+                return;
+            event.preventDefault();
+            const index = inspected === undefined ? -1 : times.indexOf(inspected);
+            const next = event.key === "Home" ? 0 : event.key === "End" ? times.length - 1 :
+                Math.max(0, Math.min(times.length - 1, index + (event.key === "ArrowLeft" ? -1 : 1)));
+            inspected = times[next];
+            showInspection();
+        }, events);
+        if (!sparkline) {
+            svg.addEventListener("wheel", event => {
+                if (!event.ctrlKey || event.deltaY === 0)
+                    return;
+                event.preventDefault();
+                changeZoom(event.deltaY < 0 ? 2 : .5, pointerFraction(event));
+            }, { ...events, passive: false });
+            updateLegend();
+        }
+        function dispose() {
+            disposed = true;
+            listener.abort();
+            if (frame?.dialog.open)
+                frame.dialog.close();
+            signal.removeEventListener("abort", dispose);
+        }
+        signal.addEventListener("abort", dispose, { once: true });
+        draw();
+        return { element, setData(next) {
+                validateExtensionChartSeries(next, options.xAxis);
+                if (disposed)
+                    return;
+                series = next;
+                if (!sparkline)
+                    updateLegend();
+                draw();
+            }, dispose };
+    }
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -23637,7 +23865,10 @@ var Amaterasu;
                 if (!descriptor.placements?.includes(slot))
                     continue;
                 const area = Amaterasu.el("section", "plugin-surface");
-                container.append(area);
+                const section = slot === "settings"
+                    ? Amaterasu.pluginSettingsSection(descriptor.name, descriptor.default_expanded === true, area)
+                    : null;
+                container.append(section ?? area);
                 const child = new Amaterasu.ExtensionPages(context.api);
                 children.push(child);
                 try {
@@ -23646,8 +23877,11 @@ var Amaterasu;
                         await child.mountSlot(descriptor.id, area, slot);
                 }
                 catch (error) {
-                    if (!disposed)
+                    if (!disposed) {
+                        if (section)
+                            section.open = true;
                         area.replaceChildren(Amaterasu.errorPanel(error));
+                    }
                 }
             }
         }).catch((error) => { if (!disposed)
@@ -23841,7 +24075,7 @@ var Amaterasu;
                 signal: controller.signal,
                 features: Object.freeze([
                     "ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1",
-                    "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1", "ui.sparklines/1", "ui.assets/1", "ui.controls/3", "ui.elements/1",
+                    "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1", "ui.sparklines/1", "ui.chart-sample-axis/1", "ui.assets/1", "ui.controls/3", "ui.elements/1",
                     "ui.summary/1",
                     ...(descriptor.settings_provider && (application || slot === "settings") ? ["ui.settings/1"] : []),
                     ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : []),
@@ -24380,11 +24614,12 @@ var Amaterasu;
         }
     }
     Amaterasu.claimModuleSettings = claimModuleSettings;
-    function applicationPluginSection(title, defaultExpanded, content) {
+    function pluginSettingsSection(title, defaultExpanded, content) {
         const section = Amaterasu.el("details", "application-plugin-section", Amaterasu.el("summary", "application-plugin-summary", Amaterasu.literalText(title)), Amaterasu.el("div", "application-plugin-content", content));
         section.open = defaultExpanded;
         return section;
     }
+    Amaterasu.pluginSettingsSection = pluginSettingsSection;
     function sessionExtensionApplyPolicyHelp(policy) {
         switch (policy) {
             case "next_session": return "Requires a new application session.";
@@ -24589,7 +24824,7 @@ var Amaterasu;
             renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
             for (const descriptor of sections) {
                 const container = Amaterasu.el("div");
-                const section = applicationPluginSection(descriptor.name, descriptor.default_expanded === true, container);
+                const section = pluginSettingsSection(descriptor.name, descriptor.default_expanded === true, container);
                 custom.append(section);
                 const mount = pages.mountApplication(descriptor.id, container, application);
                 mounts.add(mount);
@@ -24878,7 +25113,7 @@ var Amaterasu;
                         });
                     });
                     return showAllOptions
-                        ? applicationPluginSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
+                        ? pluginSettingsSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
                         : Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || descriptor.provider), form);
                 });
                 if (sharedChoices)
@@ -25152,7 +25387,7 @@ var Amaterasu;
             if (page === "maintenance")
                 return this.api.role === "administrator" && this.api.allows("configuration.write");
             const scope = pageScopes[page];
-            return !scope || this.api.allows(scope) || (page === "diagnostics" && this.api.allows("host-logs.read")) || (page === "accounts" && this.api.allows("configuration.write"));
+            return !scope || this.api.allows(scope) || (page === "diagnostics" && (this.api.allows("host-logs.read") || this.api.allows("session.read"))) || (page === "accounts" && this.api.allows("configuration.write"));
         }
         releaseDraftGuard() {
             this.draftGuards.dispose();

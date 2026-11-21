@@ -24,8 +24,8 @@ Unix timestamp at most one year away. The publisher verifies the source package
 before signing the same composition with the requested release expiry.
 
 The publisher verifies the source package, the complete RTX profile, and its
-processor dependency and grants. It emits canonical signed `catalog.json` and
-`catalog.sig`, plus the signed manifest and artifacts beneath
+processor dependency and grants. It emits canonical signed `catalog.json`,
+`catalog.sig`, and the public signing key in `publisher.pub`, plus the signed manifest and artifacts beneath
 `native/amaterasu-linux-session-rtx-hdr/<version>/`. The catalog choice has
 slot `amaterasu.rtx-hdr`, implementation
 `amaterasu-linux-session-rtx-hdr`, and the version from the signed component.

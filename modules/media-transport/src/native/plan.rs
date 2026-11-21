@@ -214,17 +214,6 @@ mod tests {
 
     #[test]
     fn native_plan_transport_checks_owner_profile_and_host_fec_before_delivery() {
-        let (video, audio) = receivers();
-        let codec = EncoderFormatId {
-            namespace_id: 7,
-            value: 2,
-            schema: 1,
-        };
-        let framing = EncoderFormatId {
-            namespace_id: 7,
-            value: 3,
-            schema: 1,
-        };
         let profile = VideoProfile {
             codec: FormatId {
                 namespace_id: 7,
@@ -242,6 +231,31 @@ mod tests {
             media_format: None,
             wire_attributes: Vec::new(),
         };
+        check_owned_fec_plan(profile, 1);
+    }
+
+    #[test]
+    fn native_pyrowave_plan_admits_multiple_protected_blocks() {
+        let profile =
+            serde_json::from_str(include_str!("../../../../scripts/pyrowave/profile.json"))
+                .unwrap();
+        check_owned_fec_plan(profile, 4);
+    }
+
+    fn check_owned_fec_plan(profile: VideoProfile, max_fec_blocks: u32) {
+        let (video, audio) = receivers();
+        let native_id = |id: &FormatId| EncoderFormatId {
+            namespace_id: id.namespace_id,
+            value: id.value,
+            schema: id.schema,
+        };
+        let codec = native_id(&profile.codec);
+        let framing = native_id(&profile.framing);
+        let wire_selector = u64::from(profile.wire_selector);
+        let payload_type = u32::from(profile.payload_type);
+        let mut encoding_name = [0; 32];
+        let encoding_name_len = profile.encoding_name.len();
+        encoding_name[..encoding_name_len].copy_from_slice(profile.encoding_name.as_bytes());
         let settings = Settings {
             enabled: true,
             allowed_principals: vec!["owner".into()],
@@ -285,7 +299,7 @@ mod tests {
                 version: 2,
                 stream: 5,
                 generation: 5,
-                offer_id: 4,
+                offer_id: wire_selector,
                 source_id: 6,
                 config_generation: 1,
                 codec,
@@ -295,13 +309,9 @@ mod tests {
                 metadata_required: 0,
                 reserved: 0,
             },
-            payload_type: 100,
-            encoding_name_len: 7,
-            encoding_name: {
-                let mut name = [0; 32];
-                name[..7].copy_from_slice(b"EXAMPLE");
-                name
-            },
+            payload_type,
+            encoding_name_len: encoding_name_len as u32,
+            encoding_name,
         };
         let mut limits = std::mem::MaybeUninit::<VideoFramingLimits>::uninit();
         let other = bind_owner("other");
@@ -351,7 +361,7 @@ mod tests {
         selection.base.version = 1;
         check_rejected(&selection);
         selection = exact;
-        selection.base.offer_id = 5;
+        selection.base.offer_id = wire_selector + 1;
         assert_eq!(
             unsafe {
                 ((*table).prepare)(
@@ -363,7 +373,7 @@ mod tests {
             },
             STATUS_INVALID_ARGUMENT
         );
-        selection.base.offer_id = 4;
+        selection.base.offer_id = wire_selector;
         selection.base.metadata_required = 1;
         assert_eq!(
             unsafe {
@@ -389,6 +399,7 @@ mod tests {
             STATUS_OK
         );
         let limits = unsafe { limits.assume_init() };
+        assert_eq!(limits.max_fec_blocks, max_fec_blocks);
         assert_eq!(
             (limits.min_fec_percentage, limits.min_parity_shards),
             (20, 2)
@@ -399,7 +410,7 @@ mod tests {
             version: VIDEO_UNIT_VERSION,
             stream: 5,
             generation: 5,
-            offer_id: 4,
+            offer_id: wire_selector,
             codec,
             framing,
             access_unit_id: 1,
@@ -449,6 +460,30 @@ mod tests {
         let received = video.recv(&mut packet).unwrap();
         assert!(received >= 44);
         assert_eq!(&packet[40..44], &data);
+        if max_fec_blocks > 1 {
+            let payload = vec![42; 380 * (limits.packet_size as usize - 16) - 8];
+            let mut unit = unit;
+            unit.access_unit_id += 1;
+            unit.data = BorrowedBytes::new(&payload);
+            plan.framed_bytes = unit.data;
+            plan.block_count = 2;
+            plan.blocks[0] = VideoFecBlock {
+                first_data_shard: 0,
+                data_shards: 212,
+                parity_shards: 43,
+                percentage: 20,
+            };
+            plan.blocks[1] = VideoFecBlock {
+                first_data_shard: 212,
+                data_shards: 168,
+                parity_shards: 34,
+                percentage: 20,
+            };
+            assert_eq!(
+                unsafe { ((*table).submit)((*table).base.context, stream, &unit, &plan) },
+                STATUS_OK
+            );
+        }
         unsafe { ((*table).base.release.unwrap())((*table).base.context) };
     }
 }

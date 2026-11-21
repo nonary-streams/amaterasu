@@ -102,12 +102,23 @@ try {
         await new Promise(resolve => setTimeout(resolve, 20));
     } throw Error(`Timed out: ${expression}; DOM: ${await evaluate("document.body.innerText")}`); };
     await until(`document.querySelector('#host-plugins input[type=range][max="1000"]')`);
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll('#host-plugins details > summary')].map(node => node.textContent)`),
+        ['Display', 'Frame limiting']);
+    await evaluate(`document.querySelectorAll('#host-plugins details > summary').forEach(summary => summary.click())`);
+    assert.equal(await evaluate(`document.querySelector('#host-plugins input[type=range]').checkVisibility()`), true);
     assert.equal(await evaluate(`getComputedStyle(document.querySelector('#legacy-display')).display==='none'`), true, 'signed ownership replaces legacy controls');
     assert.match(await evaluate(`document.querySelector('#sections').textContent`), /amaterasu.display/);
     await evaluate(`[...document.querySelectorAll('#sections .plugin-row')].find(row => row.textContent.includes('Frame limiter')).click()`);
     assert.match(await evaluate(`document.querySelector('#sections .plugin-detail-pane').textContent`), /amaterasu\.frame-limiter/);
-    await evaluate(`{const control=document.querySelector('#host-plugins input[type=range][max="1000"]');control.value='59.94';control.dispatchEvent(new Event('input',{bubbles:true}));}`);
+    await evaluate(`{
+      const control = document.querySelector('#host-plugins input[type=range][max="1000"]');
+      control.value = '59.94';
+      control.dispatchEvent(new Event('input', { bubbles: true }));
+      control.closest('details').querySelector('summary').click();
+    }`);
     await until(`documents.host.values.frame_limiter_fps_limit===59.94`);
+    await evaluate(`document.querySelector('#host-plugins details:not([open]) > summary').click()`);
+    assert.equal(await evaluate(`document.querySelector('#host-plugins input[type=range][max="1000"]').value`), '59.94');
     await until(`[...document.querySelectorAll('#host-plugins select')].some(node=>node.labels?.[0]?.textContent.includes('Display preparation'))`);
     await evaluate(`{const control=[...document.querySelectorAll('#host-plugins select')].find(node=>node.labels?.[0]?.textContent.includes('Display preparation'));control.value='ensure_primary';control.dispatchEvent(new Event('change',{bubbles:true}));}`);
     await until(`hostState.configured_display_policy.dd_configuration_option==='ensure_primary'`);

@@ -173,6 +173,9 @@ browser API calls.
   acceptance does not establish client delivery.
 - Process inventory and termination with confirmation, plus explicit status refresh.
 - Steam provider refresh, discovery pages, partial-scan warnings, and scan status.
+- Diagnostics shows lifecycle warnings and failures with `session.read`, including the
+  affected operation, requested and effective values, and recorded refusals. A feed
+  gap is visible. The recent sessions table shows the warnings retained in session history.
 - Diagnostics provides search, match navigation and export for the current
   host log when `host-logs.read` is granted. A level filter and search narrow
   the preview; search and the plain-text download use the full retained current-session snapshot.
@@ -189,10 +192,9 @@ browser API calls.
   permissions and an expiry, create and revoke browser-issued credentials, and
   copy the secret once. It does not display native-caller or legacy tokens, and
   never stores the secret in browser storage. An uncertain issuance is not retried.
-- Modules (addressed as `#plugins`, the page's former name) opens with one line that
-  answers whether the host is up to date, with the request that checks every source,
-  and three views: `#plugins` (the overview), `#plugins/modules` and
-  `#plugins/repositories`. The former `#plugins/core`, `#plugins/publishers`,
+- Modules has four views at `#plugins` (the overview), `#plugins/modules`,
+  `#plugins/drivers` and `#plugins/repositories`. The overview shows whether
+  the host is up to date and lets you check every source. The former `#plugins/core`, `#plugins/publishers`,
   `#plugins/installed`, `#plugins/available` and `#updates` addresses still open the
   views that replaced them.
   The overview has a section per update source. Amaterasu Core, every module Amaterasu
@@ -216,7 +218,7 @@ browser API calls.
   cannot read the automatic-update setting either, so the page turns that setting off
   before it asks for the switch, and asks for nothing if that is refused. A host that
   is still reading its packages (`loading`) is asked again a few times.
-  Under Amaterasu Core, Included lists the families of modules that carry a stream with
+  Under Amaterasu Core, expand **Included modules** to see the families that carry a stream with
   the repository each is built from, then the modules built into Amaterasu itself and
   any another developer wrote. Plugins compares what the approved repositories offer
   beyond the host's own package with what is loaded; the console cannot install those.

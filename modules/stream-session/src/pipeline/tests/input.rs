@@ -1572,6 +1572,70 @@ fn authoritative_capture_geometry_enables_absolute_output_mapping() {
 }
 
 #[test]
+fn virtual_display_geometry_refresh_preserves_held_keys_and_mouse_buttons() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.desktop_geometry = Some(desktop_geometry());
+    host.broker.input_absolute_pointer = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["absolute_input"], true);
+    // Exercise the active owned-display geometry refresh without the display
+    // allocation workflow, which is independent of control translation.
+    host.pipeline
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .start
+        .as_mut()
+        .unwrap()
+        .output = super::super::virtual_display::REQUESTED_OUTPUT.into();
+    let right_button = |pressed, sequence| crate::plane::ControlRecord {
+        message_type: 0x0206,
+        payload: vec![0, 0, 0, 5, if pressed { 8 } else { 9 }, 0, 0, 0, 3],
+        sequence,
+    };
+    let mut geometry = desktop_geometry();
+    host.plane.borrow_mut().desktop_geometry =
+        Some(serde_json::from_value(geometry.clone()).unwrap());
+    host.plane
+        .borrow_mut()
+        .controls
+        .extend([keyboard(true, 0xa0), right_button(true, 2)]);
+    host.idle();
+    assert_eq!(host.broker.input_events.len(), 2);
+
+    // The pointer should use the new geometry while the held inputs still
+    // have an owner. A later loss of geometry must also preserve releases.
+    geometry["output"]["left"] = json!(0);
+    let updated: amaterasu_media::CaptureGeometry = serde_json::from_value(geometry).unwrap();
+    host.plane.borrow_mut().desktop_geometry = Some(updated);
+    host.plane
+        .borrow_mut()
+        .controls
+        .extend([absolute(3, 0, 0, 1000, 500), keyboard(false, 0xa0)]);
+    host.idle();
+    host.plane.borrow_mut().desktop_geometry = None;
+    host.plane
+        .borrow_mut()
+        .controls
+        .push(right_button(false, 4));
+    host.idle();
+
+    let bounds = updated.normalized_output().unwrap();
+    assert_eq!(
+        host.broker.input_events,
+        vec![
+            json!({"kind":"key","key":{"platform":"moonlight_vk","code":0xa0},"state":"down"}),
+            json!({"kind":"button","button":"right","pressed":true}),
+            json!({"kind":"absolute","x":bounds.left,"y":bounds.top}),
+            json!({"kind":"key","key":{"platform":"moonlight_vk","code":0xa0},"state":"up"}),
+            json!({"kind":"button","button":"right","pressed":false}),
+        ]
+    );
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+}
+
+#[test]
 fn fitted_client_viewports_map_mouse_and_touch_edges_without_the_letterbox() {
     let mut host = Harness::new();
     enable_input(&mut host);
@@ -2270,6 +2334,13 @@ fn provider_without_optional_extension_keeps_legacy_feedback() {
         host.response_from(2, "test.protocol", request)["state"],
         "active"
     );
+    host.pipeline
+        .records
+        .get_mut(&session)
+        .unwrap()
+        .config
+        .rtsp_operation_id = Some("launch-feedback".into());
+    host.pipeline.enable_stream_issue_reports();
     let feedback = amaterasu_gamestream::control::HostFeedback::Rumble {
         controller: 0,
         low_frequency: 1,
@@ -2283,6 +2354,23 @@ fn provider_without_optional_extension_keeps_legacy_feedback() {
     }
     assert!(host.pipeline.records[&session].feedback_contributions_unsupported);
     assert_eq!(host.plane.borrow().feedback, vec![feedback]);
+    let warnings: Vec<_> = host
+        .broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Publish { topic, payload }
+                if topic == "amaterasu.stream.report/1"
+                    && payload["kind"] == "issue"
+                    && payload["code"] == "input_feedback_unsupported" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["disposition"], "advisory_warning");
 }
 
 #[test]

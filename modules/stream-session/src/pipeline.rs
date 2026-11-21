@@ -13,6 +13,7 @@ mod input_timing;
 mod journal;
 mod lifecycle;
 mod lifecycle_issues;
+mod paused_display;
 mod quiescence;
 mod record;
 mod responses;
@@ -137,13 +138,17 @@ fn input_job_due(record: &Record) -> bool {
     !record.input_events.is_empty() && !record.input_direct_active
 }
 
+const MAX_DEFERRED_READ_SETTLEMENTS: usize = 8;
+
 pub struct Pipeline {
     /// Publish recorded stream issues to the launch owner.
     report_stream_issues: bool,
+    admission_issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
     settings: Settings,
     service: String,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
+    display_start_waiter: Option<Job>,
     sequence: u64,
     started: Instant,
     live_status_epoch: Option<String>,
@@ -181,10 +186,12 @@ impl Pipeline {
         settings.providers.validate_for_owner(&service)?;
         Ok(Self {
             report_stream_issues: false,
+            admission_issues: Default::default(),
             settings,
             service,
             records: BTreeMap::new(),
             job: None,
+            display_start_waiter: None,
             sequence: 0,
             started: Instant::now(),
             live_status_epoch: None,
@@ -379,6 +386,7 @@ impl Pipeline {
             && self.journal.document.entries.is_empty()
             && self.recovery_queue.is_empty()
             && self.job.is_none()
+            && self.display_start_waiter.is_none()
             && !self.history_activities.has_active_reservations()
             && self.records.values().all(|record| {
                 record.state.terminal()
@@ -532,7 +540,7 @@ impl Pipeline {
                 for part in amaterasu_module_sdk::diagnostics::window_parts(&summary) {
                     let _ = send(Command::Log {
                         level: amaterasu_module_sdk::diagnostics::WINDOW_LOG_LEVEL as u8,
-                        target: "stream.timing".into(),
+                        target: "timing/stream.timing".into(),
                         message: part.to_string(),
                     });
                 }
@@ -551,6 +559,18 @@ impl Pipeline {
         self.progress_host_metrics(now, send);
         self.progress_session_effects(now, send);
         self.tray_activity.progress(now, send);
+        if self.job.is_none()
+            && let Some(mut start) = self.display_start_waiter.take()
+        {
+            if self.shutdown_admission_closed() {
+                let record = self
+                    .records
+                    .get_mut(&start.session)
+                    .expect("saved display startup");
+                start.fail(record, "host_stopping", now);
+            }
+            self.job = Some(start);
+        }
         if let Some(mut job) = self.job.take() {
             let session = job.session;
             let mut record = self
@@ -561,7 +581,15 @@ impl Pipeline {
             let retain = self.advance(&mut record, &mut job, now, send, &mut operations);
             self.records.insert(record.id, record);
             if retain {
-                self.job = Some(job);
+                if let Some(predecessor) = job.retire_paused_display.take() {
+                    let deadline = job.deadline;
+                    self.display_start_waiter = Some(job);
+                    self.begin_paused_display_release(predecessor, now);
+                    let release = self.job.as_mut().expect("display retirement was scheduled");
+                    release.deadline = release.deadline.min(deadline);
+                } else {
+                    self.job = Some(job);
+                }
             } else if self.recovery_ids.contains(&session) {
                 if !self.journal.document.entries.contains_key(&session) {
                     self.recovery_ids.remove(&session);
@@ -631,6 +659,10 @@ impl Pipeline {
                 job.step = step;
             }
             self.job = Some(job);
+            return Ok(());
+        }
+        if let Some(id) = self.paused_display_due(now) {
+            self.begin_paused_display_release(id, now);
             return Ok(());
         }
         if self.background_turn && self.schedule_control(now) {
@@ -1030,6 +1062,11 @@ impl Pipeline {
         if step == Step::ObserveActiveBinding {
             let record = self.records.get_mut(&id).expect("selected record");
             let Some(next) = record.lifecycle_validation_sequence.checked_add(1) else {
+                record.report_failure(
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                    "observe_active_binding",
+                    "lifecycle_sequence_exhausted",
+                );
                 record.state = State::Stopping;
                 record.outcome = State::Failed;
                 record.error = Some("lifecycle_sequence_exhausted");
@@ -1106,6 +1143,11 @@ impl Pipeline {
             if matches!(record.state, State::Prepared | State::Armed)
                 && now >= record.prepared_until
             {
+                record.report_failure(
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                    "prepare",
+                    "prepare_expired",
+                );
                 record.state = State::Stopping;
                 record.outcome = State::Failed;
                 record.error = Some("prepare_expired");
@@ -1136,6 +1178,11 @@ impl Pipeline {
                     .values()
                     .any(|(command, _)| command.low_frequency == 0 && command.high_frequency == 0)
             {
+                record.report_failure(
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
+                    "rumble",
+                    "rumble_zero_delivery_timeout",
+                );
                 record.rumble_stop_unconfirmed = true;
                 record.error.get_or_insert("rumble_zero_delivery_timeout");
                 record.outcome = State::Failed;
@@ -1161,6 +1208,7 @@ impl Pipeline {
             if record.error == Some("rumble_zero_delivery_timeout") {
                 plane.stop();
             }
+            let mut rumble_delivery_failed = false;
             if let Some((slot, (command, expires_at))) = record
                 .rumble_pending
                 .first_key_value()
@@ -1183,6 +1231,7 @@ impl Pipeline {
                     }
                     Ok(false) => {}
                     Err(_) => {
+                        rumble_delivery_failed = true;
                         record.rumble_stop_unconfirmed = true;
                         record.rumble_pending.clear();
                         record.rumble_active_until.clear();
@@ -1196,6 +1245,13 @@ impl Pipeline {
             }
             let media_active = matches!(record.state, State::Active | State::Stopping);
             let result = plane.tick(media_active, control_budget);
+            if rumble_delivery_failed {
+                record.report_failure(
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
+                    "rumble",
+                    "rumble_delivery_failed",
+                );
+            }
             match result {
                 Ok(progress) => {
                     record.history.observe_encode_timing(progress.encode_timing);
@@ -1206,6 +1262,11 @@ impl Pipeline {
                         if let Err(code) =
                             input::configure_translator(record, record.input_absolute_pointer)
                         {
+                            record.report_failure(
+                                amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
+                                "configure_translator",
+                                code,
+                            );
                             record.error = Some(code);
                             record.state = State::Stopping;
                             record.outcome = State::Failed;

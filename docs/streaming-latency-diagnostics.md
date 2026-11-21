@@ -7,13 +7,12 @@ encryption keys or lease tokens. Logging failure never changes stream outcomes.
 Optional network diagnostics use the public, versioned provider contract and SDK
 adapter; existing v1 providers remain usable.
 
-These summaries are debug records. A window is written every ten seconds
-whether or not anything happened, and a full set of them is about a megabyte a
-minute, which would push real events out of the rolled host log within
-minutes. To record them, select **Debug** as the host log level or set
-`min_log_level` to `debug` in the bootstrap's `global` settings. The
-[flow tracing](flow-tracing.md) reports also use Debug in the log. A module
-emits a window with `diagnostics::log_window`, which applies this level.
+To record timing windows, select **Debug** or **Verbose** for the host log
+level. The SDK sends each window through `diagnostics::log_window`. The host
+routes its structured target into two rotating 2 MiB JSONL segments alongside
+the session log. The terminal, ordinary log, host-log download and support
+bundle exclude these captures. The Performance panel retains recent tracing
+reports independently of the log level.
 
 These records are per-module aggregates. To follow one input event or frame
 across modules, and to see which module held the host thread while it waited,
@@ -27,17 +26,18 @@ each module call directly and should be preferred when the two disagree.
 
 Run the same game, scene, stream format, resolution, frame rate, bitrate and client
 settings for each comparison. Diagnostics continuously retain interval maxima,
-small bounded samples of long observations and pending ages. Preserve the host
-log, including rolled segments in chronological order. An already recorded
-incident does not need to be reproduced to inspect its measured host stages.
+small bounded samples of long observations and pending ages. Preserve the files named
+`<session>.log.timing.0.jsonl` and `<session>.log.timing.1.jsonl` as soon
+as possible after the incident. The numbers alternate. Pass the older file
+first, using file modification times to determine the order. A short recording
+may have only one segment.
 
 ```sh
-python3 scripts/streaming_diagnostics.py /path/to/amaterasu.log
-python3 scripts/streaming_diagnostics.py /path/to/amaterasu.log --json > timing-report.json
+python3 scripts/streaming_diagnostics.py "$older_segment" "$newer_segment"
+python3 scripts/streaming_diagnostics.py "$only_segment" --json > timing-report.json
 ```
 
-The reader accepts new structured records and existing capture, encoder and
-transport records. It keeps the last 300 diagnostic records by default (bounded
+The reader consumes each capture's timestamp, source, target and payload. It keeps the last 300 diagnostic records by default (bounded
 to at most 1000 with `--windows`), groups stages by target and local identity,
 and ranks their maxima. The reported p95 is the **worst window's upper bound**;
 percentiles are never averaged or represented as a combined percentile. `--json`

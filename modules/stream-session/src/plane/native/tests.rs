@@ -9,7 +9,7 @@ fn closed_control_lane_is_distinct_from_other_native_closures() {
     ));
     assert!(matches!(
         Delivery::<()>::default().finish(MEDIA_CLOSED, DeliveryLane::Video),
-        Err("native_stream_closed")
+        Err("video_stream_closed")
     ));
 }
 
@@ -26,6 +26,7 @@ struct Provider {
     alternate_audio: bool,
     submitted_pcm: bool,
     timed_video_calls: usize,
+    video_status: Status,
     timed_media_calls: usize,
     timed_media_busy: bool,
     timing_received: u64,
@@ -299,6 +300,9 @@ unsafe extern "C" fn video(context: *mut c_void, stream: u64, sink: PacketSink) 
     assert_eq!(stream, 10);
     // SAFETY: the stable boxed provider is exclusively used by this synchronous test.
     let provider = unsafe { &mut *context.cast::<Provider>() };
+    if provider.video_status != STATUS_OK {
+        return provider.video_status;
+    }
     let mut bytes = [0, 0, 1, 0x65, 9];
     let packet = EncodedPacket {
         codec: CODEC_H264,
@@ -367,6 +371,24 @@ unsafe extern "C" fn geometry_unavailable(
 }
 unsafe extern "C" fn hdr_unavailable(_: *mut c_void, _: u64, _: *mut HdrMetadata) -> Status {
     MEDIA_UNSUPPORTED
+}
+
+unsafe extern "C" fn hdr_follows_video(
+    context: *mut c_void,
+    _: u64,
+    output: *mut HdrMetadata,
+) -> Status {
+    // SAFETY: the test owns the provider and lends a writable metadata slot.
+    let provider = unsafe { &*context.cast::<Provider>() };
+    if provider.video_status == STATUS_OK {
+        unsafe {
+            output.write(HdrMetadata {
+                enabled: 1,
+                ..HdrMetadata::default()
+            })
+        };
+    }
+    provider.video_status
 }
 
 unsafe extern "C" fn pcm(context: *mut c_void, _: u64, sink: AudioSink) -> Status {
@@ -630,6 +652,46 @@ fn disabled_audio_handles() -> Handles {
         processed_audio: None,
         video_codec: CODEC_H264,
     }
+}
+
+#[test]
+fn closed_hdr_query_allows_video_receive_to_report_the_closure() {
+    let mut host = Host::new();
+    let context = (&mut *host.provider as *mut Provider).cast();
+    let mut base = prefix::<VideoApiV1_3>(context);
+    base.header.minor = 3;
+    host.timed_video = Some(Box::new(VideoApiV1_3 {
+        base: VideoApiV1_2 {
+            base,
+            receive: video,
+            geometry: geometry_unavailable,
+            hdr_metadata: hdr_follows_video,
+        },
+        receive_timed: timed_video,
+    }));
+    let mut handles = disabled_audio_handles();
+    handles.hdr = true;
+    let mut backend = NativeBackend::new(
+        &host.runtime(),
+        handles,
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
+    assert!(matches!(backend.desktop_geometry(), Ok(None)));
+    assert_eq!(host.provider.sent_control.len(), 1, "valid HDR is signaled");
+    host.provider.video_status = MEDIA_UNSUPPORTED;
+    assert!(matches!(
+        backend.desktop_geometry(),
+        Err("video_hdr_metadata_unavailable")
+    ));
+    host.provider.video_status = MEDIA_CLOSED;
+    assert!(matches!(backend.desktop_geometry(), Ok(None)));
+    assert!(matches!(backend.video(), Err("video_stream_closed")));
+    assert_eq!(
+        host.provider.sent_control.len(),
+        1,
+        "closure sends no HDR change"
+    );
 }
 
 #[test]

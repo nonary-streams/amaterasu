@@ -39,6 +39,11 @@ versioned when they change, so replacing some libraries can produce a set that
 loads and then fails while streaming. `scripts/local_full_update.py prepare`
 refuses any library or host not compiled from the named tree and records what it
 installed; `scripts/local_full_update.py check ROOT` reports later drift.
+The preparation scripts use the approved `amaterasu` repository and the
+`amaterasu-core` package line. Supply its existing signing key through
+`AMATERASU_PUBLISHER_KEY`. If the installation still uses the RTX HDR
+repository, follow the [Core enrollment instructions](repository-publishing.md#enrolling-a-host)
+before preparing its next Core update.
 Both preparation and the installed audit reject an enabled Linux virtual-display
 provider without its compiled `linux-libvirtualdisplay` backend. A library built
 from the right source tree alone does not establish that the backend is present.

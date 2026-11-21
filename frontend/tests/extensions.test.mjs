@@ -73,7 +73,7 @@ test("extension registration is bound to a loaded signed script and calls use de
   assert.equal(env.mounts(), 1);
   assert.deepEqual(Array.from(env.sdk().features), [
     "ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1",
-    "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1", "ui.sparklines/1", "ui.assets/1", "ui.controls/3", "ui.elements/1",
+    "ui.tabs/1", "ui.dialog/1", "ui.dialog-actions/1", "ui.charts/1", "ui.sparklines/1", "ui.chart-sample-axis/1", "ui.assets/1", "ui.controls/3", "ui.elements/1",
     "ui.summary/1",
   ]);
   assert.equal(Object.isFrozen(env.sdk().features), true);

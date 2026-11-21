@@ -131,7 +131,11 @@ pub const WINDOW_LOG_LEVEL: crate::LogLevel = crate::LogLevel::Debug;
 /// Emit complete structured observations within the host logger's record budget.
 pub fn log_window(runtime: &crate::RuntimeClient, target: &str, payload: &serde_json::Value) {
     for part in window_parts(payload) {
-        let _ = runtime.log(WINDOW_LOG_LEVEL, target, &part.to_string());
+        let _ = runtime.log(
+            WINDOW_LOG_LEVEL,
+            &format!("timing/{target}"),
+            &part.to_string(),
+        );
     }
 }
 pub use amaterasu_timing_metrics::window_parts;

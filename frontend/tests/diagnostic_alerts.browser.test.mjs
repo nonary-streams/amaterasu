@@ -17,30 +17,27 @@ test("Diagnostics compatibility alerts render, dismiss and restore in Chromium a
     const script = ts.transpile(source, {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None});
     const css = await readFile("public/styles.css", "utf8");
     const html = `<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style><main class="content" id="alerts"></main><pre id="result"></pre><script>${script}</script><script>
-      try {
+      (async () => {try {
         const target = document.getElementById('alerts');
-        const context = {api:{hostOrigin:'https://browser-alert.test',allows:()=>true}};
+        const issue = {operation:'ticket-a', disposition:'advisory_warning', code:'optional_client_features', phase:'announce', requested:16, effective:0};
+        const entry = {issue, publisher:'amaterasu.rtsp', at_ms:1};
+        const reply = {ok:true,issues:[entry,entry],incomplete:false};
+        const context = {api:{hostOrigin:'https://browser-alert.test',allows:s=>s==='session.read',
+          post:async route=>{if(route!=='nvhttp/launch_status') throw Error('unexpected route'); return reply;}}};
         localStorage.clear();
-        const warn = '[2026-11-13 14:00:00]: Warning: amaterasu.rtsp::rtsp.negotiation: Optional client features 0x00000010 are unsupported and ignored; streaming can continue.\\n';
-        let observer = Amaterasu.renderDiagnosticAlerts(context, target);
-        observer.snapshot(warn + warn);
+        await Amaterasu.renderDiagnosticAlerts(context, target)();
         const check = (value, message) => {if(!value) throw Error(message);};
         const button = text => [...target.querySelectorAll('button')].find(node=>node.textContent===text);
         check(target.querySelectorAll('article').length===1, 'dedup');
-        check(target.textContent.includes('Seen 2 time'), 'occurrences');
+        check(target.textContent.includes('Requested: 0x10'), 'requested flags');
         check(target.scrollWidth<=target.clientWidth, 'mobile horizontal overflow');
-        check(button('Dismiss').getAttribute('aria-label').includes('0x00000010'), 'accessible dismiss');
         button('Dismiss').click();
-        check(target.querySelectorAll('article').length===0, 'dismiss');
-        observer = Amaterasu.renderDiagnosticAlerts(context, target);
-        observer.snapshot(warn);
+        await Amaterasu.renderDiagnosticAlerts(context, target)();
         check(target.querySelectorAll('article').length===0, 'stored dismissal');
         button('Restore dismissed alerts').click();
         check(target.querySelectorAll('article').length===1, 'restore');
-        observer.unavailable();
-        check(target.textContent.includes('could not be refreshed'), 'stale state');
         document.getElementById('result').textContent='ALERT_BROWSER_PASS';
-      } catch (error) {document.getElementById('result').textContent='ALERT_BROWSER_FAIL: '+error.message;}
+      } catch (error) {document.getElementById('result').textContent='ALERT_BROWSER_FAIL: '+error.message;}})();
     </script>`;
     const file = join(root, "alerts.html");
     await writeFile(file, html);

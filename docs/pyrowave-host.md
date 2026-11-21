@@ -26,11 +26,20 @@ NVHTTP, RTSP, stream-session and video delegation chain, in both the signed
 manifest and startup policy. The broker intersects ancestor authority, so a
 direct video probe alone does not qualify a normal launch.
 The signed profile in `scripts/pyrowave/profile.json` also declares the client's
-record-framing announcement and disabled adaptive modes. Optional link/pacing
-hints are accepted without enabling bandwidth calibration. Compression and
+record-framing announcement and disabled adaptive modes. The optional peer link
+hint caps the configured wire rate at 80% of the reported link. Pacing hints are
+accepted without enabling bandwidth calibration. Compression and
 undeclared critical attributes remain rejected. Optional attribute declarations
 extend the JSON profile contract; they do not change the native ABI. Rebuild
 encode, video, media-transport, stream-session and RTSP together when using them.
+
+For PyroWave, Moonlight's configured bitrate is the total wire budget. Moonlight
+caps the legacy GameStream encoder field at 100 Mbps. RTSP applies the host
+bitrate cap and passes the configured budget to stream-session, which reserves
+audio and network overhead using the prepared transport limits. This route uses
+length-prefixed frames with full-frame protection and permits up to four FEC
+blocks per frame. A client that omits the configured bitrate uses the bounded
+legacy field.
 
 The local candidate selects 10-bit 4:2:0 PyroWave. A 10-bit wire profile
 retains the launch's output range: SDR uses BT.709/sRGB and HDR uses BT.2020/PQ.
@@ -40,10 +49,25 @@ ten-bit RGB capture; HDR requires capture-owned PQ provenance. HDR metadata uses
 the existing reliable control channel and requires the selected video's metadata
 interface. Processing and capture provenance checks remain enforced.
 
-Eight-bit encoding remains available in the SDK. The current composition offers
-one selected wire profile per launch. 4:4:4, adaptive FEC, bandwidth calibration
-and automatic profile fallback are not implemented. Existing bitrate limits
-remain in effect. Tests and a signed candidate do not establish client playback.
+The host offers one PyroWave profile per launch. When its optional probe
+fails, the host records a warning and offers the standard codecs supported for
+that launch. Moonlight must honor the launch's DESCRIBE to choose a standard
+codec before ANNOUNCE. When the client asks for HDR, the fallback needs a
+compatible 10-bit codec. Once both sides agree on a format, startup requires
+a keyframe in that format.
+
+PyroWave applies the color range from the client's ANNOUNCE during pixel
+conversion. SDR uses the negotiated BT.601 or BT.709 matrix, and HDR uses
+BT.2020/PQ at either range. The sequence header carries the actual range.
+BT.601 is signaled by GameStream's color negotiation because the PyroWave
+sequence header has no BT.601 matrix identifier.
+
+The VKMS snapshotter tries renderable scanout layouts if it cannot allocate a
+renderable linear buffer. This preserves RGB precision and provides a shared
+DMA-BUF layout on GPUs whose render-only buffers cannot be imported by
+Vulkan. SDR PyroWave can use either 8-bit or 10-bit RGB capture while keeping
+the selected wire precision. 4:4:4, adaptive FEC and bandwidth calibration
+remain unimplemented.
 
 For a compatible installed source set, `scripts/prepare_pyrowave_update.py ROOT
 OUTPUT` prepares a signed candidate and exact proposed policy without changing

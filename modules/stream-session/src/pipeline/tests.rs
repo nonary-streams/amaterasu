@@ -96,7 +96,7 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
     let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
         "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
         "payload_type":100,"encoding_name":"EXAMPLE"});
-    let route: crate::model::ExtensionRoute = serde_json::from_value(json!({"profile":profile,
+    let mut route: crate::model::ExtensionRoute = serde_json::from_value(json!({"profile":profile,
         "source_id":42,"encoder_provider":"fixture", "encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
         "video_unit_service":"example.units/1","framer_service":"example.framer/1","plan_transport_service":"example.plan/1"})).unwrap();
     let limits = VideoFramingLimits {
@@ -116,12 +116,20 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
         fec_policy_flags: 0,
         reserved: 0,
     };
-    for (source_ok, downstream_ok, wrong_identity, expected_offer) in [
-        (false, true, false, false),
-        (true, false, false, false),
-        (true, true, true, false),
-        (true, true, false, true),
+    for (source_ok, downstream_ok, wrong_identity, expected_offer, wire_budget) in [
+        (false, true, false, false, None::<u32>),
+        (true, false, false, false, None),
+        (true, true, true, false, None),
+        (true, true, false, true, None),
+        (true, true, false, true, Some(45_000)),
     ] {
+        if wire_budget.is_some() {
+            route.profile =
+                serde_json::from_str(include_str!("../../../../scripts/pyrowave/profile.json"))
+                    .unwrap();
+            route.profile.media_format = None;
+        }
+        let profile = json!(route.profile);
         let mut host = Harness::new();
         host.pipeline.settings.allowed_principals = vec!["amaterasu.rtsp".into()];
         host.pipeline.settings.extension_route = Some(route.clone());
@@ -140,6 +148,10 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
         let mut request = start(session);
         request["configuration"]["client_feature_flags"] = json!(0);
         request["configuration"]["configuration"]["extension_profile"] = profile.clone();
+        request["configuration"]["configuration"]["color_mode"] = json!("bt601_limited");
+        if let Some(budget) = wire_budget {
+            request["configuration"]["extension_wire_bitrate_kbps"] = json!(budget);
+        }
         let result = host.response_from(2, "amaterasu.rtsp", request);
         if expected_offer {
             assert_eq!(result["state"], "active");
@@ -154,6 +166,14 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
                 .unwrap();
             assert_eq!(video.payload["source_id"], 42);
             assert_eq!(video.payload["configuration"]["extension_profile"], profile);
+            if wire_budget.is_some() {
+                let bitrate = video.payload["configuration"]["bitrate"].as_u64().unwrap();
+                assert!(bitrate > 10_000_000 && bitrate < 45_000_000, "{bitrate}");
+            }
+            assert_eq!(
+                video.payload["configuration"]["color_mode"],
+                "bt601_limited"
+            );
             assert!(
                 !host
                     .broker

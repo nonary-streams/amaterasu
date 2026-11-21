@@ -303,6 +303,7 @@ declare namespace AmaterasuPluginUi {
       minimum?: number;
       maximum?: number;
       appearance?: "full" | "sparkline";
+      xAxis?: "time" | "sample";
     }
 
   interface ExtensionUiChartsV1 {

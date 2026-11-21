@@ -7,6 +7,7 @@ namespace Amaterasu {
     id: string; name: string; publisher: string; reason: string; requiredBy: string[]; requiredComponents: string[];
     state: DriverReadiness; message: string; mayRequireReboot: boolean; installedVersion: string | null;
     offeredVersion: string | null; update: "unknown" | "available" | "current" | "newer_installed";
+    builtin: boolean;
   }
   export interface PluginSetupOperation {
     id: string; revision: string; installationRevision: string; phase: DriverSetupPhase;
@@ -31,7 +32,7 @@ namespace Amaterasu {
     if (typeof value !== "string" || !DRIVER_DIGEST.test(value)) throw new Error("Driver identity is invalid.");
     return value;
   }
-  function driverRows(value: unknown): PluginDriver[] {
+  function driverRows(value: unknown, builtin = false): PluginDriver[] {
     if (!Array.isArray(value) || value.length > 64) throw new Error("Driver inventory is invalid.");
     const ids = new Set<string>();
     return value.map((entry: unknown) => {
@@ -50,7 +51,7 @@ namespace Amaterasu {
       return { id, name:driverText(row.name,128), publisher:driverText(row.publisher,128), reason:driverText(row.reason,1024),
         requiredBy:row.required_by.map((id:unknown)=>driverText(id,128)), requiredComponents:components.map((id:unknown)=>driverText(id,128)), state:row.state as DriverReadiness,
         message:driverText(row.message), mayRequireReboot:row.may_require_reboot,
-        installedVersion, offeredVersion, update:update as PluginDriver["update"] };
+        installedVersion, offeredVersion, update:update as PluginDriver["update"], builtin };
     });
   }
   export function parsePluginDriverStatus(value: unknown): PluginDriverStatus {
@@ -68,7 +69,8 @@ namespace Amaterasu {
         approval:driverDigest(row.approval),drivers:driverRows(row.drivers),error:row.error === null ? null : driverText(row.error),cancellable:row.cancellable};
       if (operation.installationRevision !== installationRevision) throw new Error("Plugin setup changed. Refresh to review it again.");
     }
-    return {supported:true,installationRevision,drivers:driverRows(reply.drivers),operation};
+    const builtin = reply.builtin_drivers === undefined ? [] : driverRows(reply.builtin_drivers, true);
+    return {supported:true,installationRevision,drivers:[...builtin, ...driverRows(reply.drivers)],operation};
   }
 
   export function driverSetupError(code: string): string {
@@ -93,6 +95,11 @@ namespace Amaterasu {
   }
   export function driverStateLabel(state: DriverReadiness): string {
     return ({checking:"Checking",missing:"Not installed",incompatible:"Different version required",access_denied:"Device access required",unsupported:"Unsupported system",installing:"Installing",ready:"Ready",reboot_required:"Restart computer required",manual_action_required:"Action required",failed:"Setup failed"})[state];
+  }
+  export function driverReadinessLabel(driver: PluginDriver): string {
+    if (driver.builtin && driver.state === "missing") return "Unavailable";
+    if (driver.builtin && driver.state === "failed") return "Check failed";
+    return driverStateLabel(driver.state);
   }
   export function driverSetupMessage(phase: DriverSetupPhase): string {
     return ({checking:"Checking required drivers…",awaiting_approval:"This plugin needs drivers before it can be used.",waiting_for_idle:"Setup will continue after the current stream ends.",installing:"Installing required drivers…",reboot_required:"Restart this computer when convenient, then check setup again.",manual_action_required:"Complete the action shown below, then check setup again.",ready_to_activate:"Drivers are ready. Finish adding the plugin when the host is idle.",activating:"Activating the plugin…",ready:"The plugin is ready.",failed:"Plugin setup needs attention.",cancelled:"Plugin setup was cancelled."})[phase];

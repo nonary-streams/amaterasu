@@ -44,10 +44,12 @@ impl Pipeline {
                 | Operation::StartWhenAuthenticated { .. }
         );
         if opens_session && self.shutdown_admission_closed() {
+            self.report_open_rejection(&owner, &operation, "host_stopping");
             rpc::complete(send, request, error("host_stopping"));
             return;
         }
         if opens_session && !self.admission_ready() {
+            self.report_open_rejection(&owner, &operation, "restart_recovery_unconfirmed");
             rpc::complete(send, request, error("restart_recovery_unconfirmed"));
             return;
         }
@@ -58,6 +60,7 @@ impl Pipeline {
                 | Operation::StartWhenAuthenticated { .. }
         ) && let Err(code) = self.authorize_open(&owner)
         {
+            self.report_open_rejection(&owner, &operation, code);
             rpc::complete(send, request, error(code));
             return;
         }
@@ -149,6 +152,13 @@ impl Pipeline {
                     rpc::complete(send, input.request, json!({"ok":true}));
                 }
             }
+            Operation::ReleasePausedDisplay { application } => self.release_paused_display(
+                input.request,
+                &input.owner,
+                application,
+                input.now,
+                send,
+            ),
             Operation::Prepare(config) => self.prepare(input, *config, send),
             Operation::Start {
                 session,
@@ -186,6 +196,35 @@ impl Pipeline {
         }
     }
 
+    fn report_open_rejection(&mut self, owner: &str, operation: &Operation, code: &str) {
+        match operation {
+            Operation::Prepare(config) => {
+                self.report_prepare_refusal(owner, config.rtsp_operation_id.as_deref(), code);
+            }
+            Operation::Start { session, .. }
+            | Operation::StartWhenAuthenticated { session, .. } => {
+                if let Some(record) = self
+                    .records
+                    .get_mut(session)
+                    .filter(|record| record.owner == owner)
+                {
+                    record.report_request_warning("start", code);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn report_owned_start_rejection(&mut self, owner: &str, session: u64, code: &str) {
+        if let Some(record) = self
+            .records
+            .get_mut(&session)
+            .filter(|record| record.owner == owner)
+        {
+            record.report_request_warning("start", code);
+        }
+    }
+
     fn reconfigure_audio(
         &mut self,
         input: Incoming,
@@ -193,6 +232,11 @@ impl Pipeline {
         audio: crate::model::AudioWire,
         send: &mut Send<'_>,
     ) {
+        let outstanding_reads: usize = self
+            .records
+            .values()
+            .map(|record| record.shutdown_observations.len())
+            .sum();
         let Some(record) = self
             .records
             .get_mut(&session)
@@ -202,10 +246,17 @@ impl Pipeline {
             return;
         };
         if record.state != State::Prepared || !record.config.stream_audio {
+            record.report_request_warning("reconfigure_audio", "invalid_state");
             rpc::complete(send, input.request, error("invalid_state"));
             return;
         }
+        if outstanding_reads >= MAX_DEFERRED_READ_SETTLEMENTS {
+            record.report_request_warning("reconfigure_audio", "audio_probe_settlement_pending");
+            rpc::complete(send, input.request, error("audio_probe_settlement_pending"));
+            return;
+        }
         let (Some(old), Some(new)) = (&record.config.audio.custom, &audio.custom) else {
+            record.report_request_warning("reconfigure_audio", "unsupported_audio_reconfiguration");
             rpc::complete(
                 send,
                 input.request,
@@ -218,6 +269,7 @@ impl Pipeline {
             || new.processing.is_some() != old.processing.is_some()
             || new.stream.generation <= old.stream.generation
         {
+            record.report_request_warning("reconfigure_audio", "invalid_audio_reconfiguration");
             rpc::complete(send, input.request, error("invalid_audio_reconfiguration"));
             return;
         }
@@ -255,11 +307,17 @@ impl Pipeline {
         } = input;
 
         if let Err(code) = config.validate(self.settings.allow_remote) {
+            self.report_prepare_refusal(&owner, config.rtsp_operation_id.as_deref(), code);
             rpc::complete(send, request, error(code));
             return;
         }
         if config.lifecycle_session_target.is_some() && self.settings.providers.lifecycle.is_none()
         {
+            self.report_prepare_refusal(
+                &owner,
+                config.rtsp_operation_id.as_deref(),
+                "lifecycle_provider_not_selected",
+            );
             rpc::complete(send, request, error("lifecycle_provider_not_selected"));
             return;
         }
@@ -270,6 +328,11 @@ impl Pipeline {
             .is_some_and(|custom| custom.processing.is_some())
             && self.settings.providers.audio_processor.is_none()
         {
+            self.report_prepare_refusal(
+                &owner,
+                config.rtsp_operation_id.as_deref(),
+                "audio_processor_not_selected",
+            );
             rpc::complete(send, request, error("audio_processor_not_selected"));
             return;
         }
@@ -288,12 +351,13 @@ impl Pipeline {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
-        if let Some(record) = self.records.values().find(|record| {
+        if let Some(record) = self.records.values_mut().find(|record| {
             record.owner == owner && record.config.operation_id == config.operation_id
         }) {
             let reply = if record.config == config {
                 record.response()
             } else {
+                record.report_request_warning("prepare", "operation_conflict");
                 error("operation_conflict")
             };
             rpc::complete(send, request, reply);
@@ -301,6 +365,11 @@ impl Pipeline {
         }
         // Existing operations may finish or retry while no new stream is admitted.
         if self.package_barrier_pending {
+            self.report_prepare_refusal(
+                &owner,
+                config.rtsp_operation_id.as_deref(),
+                "package_activation_pending",
+            );
             rpc::complete(send, request, error("package_activation_pending"));
             return;
         }
@@ -315,6 +384,11 @@ impl Pipeline {
                 .history_activities
                 .matches(activity_id, rtsp_operation_id, now)
             {
+                self.report_prepare_refusal(
+                    &owner,
+                    config.rtsp_operation_id.as_deref(),
+                    "history_activity_unavailable",
+                );
                 rpc::complete(send, request, error("history_activity_unavailable"));
                 return;
             }
@@ -326,12 +400,18 @@ impl Pipeline {
                 self.settings.max_live_sessions,
             )
         {
+            self.report_prepare_refusal(
+                &owner,
+                config.rtsp_operation_id.as_deref(),
+                "capacity_exceeded",
+            );
             rpc::complete(send, request, error("capacity_exceeded"));
             return;
         }
         let id = match self.new_id() {
             Ok(id) => id,
             Err(code) => {
+                self.report_prepare_refusal(&owner, config.rtsp_operation_id.as_deref(), code);
                 rpc::complete(send, request, error(code));
                 return;
             }
@@ -348,6 +428,7 @@ impl Pipeline {
         ) {
             Ok(source) => source,
             Err(code) => {
+                self.report_prepare_refusal(&owner, config.rtsp_operation_id.as_deref(), code);
                 rpc::complete(send, request, error(code));
                 return;
             }
@@ -403,6 +484,7 @@ impl Pipeline {
         if mode == StartMode::BeforePlay
             && (owner != "amaterasu.rtsp" || !self.settings.lifecycle_admitters.contains(&owner))
         {
+            self.report_owned_start_rejection(&owner, session, "permission_denied");
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
@@ -411,6 +493,7 @@ impl Pipeline {
             || !configuration.stream_adjustments.is_empty())
             && !lifecycle_admitter
         {
+            self.report_owned_start_rejection(&owner, session, "permission_denied");
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
@@ -421,6 +504,7 @@ impl Pipeline {
                 .as_ref()
                 .is_none_or(|policy| policy.authority != owner || !policy.approves(agreement))
         {
+            self.report_owned_start_rejection(&owner, session, "permission_denied");
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
@@ -433,13 +517,21 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
+        if configuration.configuration.extension_profile.is_none()
+            && configuration.extension_wire_bitrate_kbps.is_some()
+        {
+            rpc::complete(send, request, error("invalid_extension_wire_budget"));
+            return;
+        }
         if let Err(code) = resolve_extension_start(record, &mut configuration) {
+            record.report_request_warning("start", code);
             rpc::complete(send, request, error(code));
             return;
         }
         if let Err(code) =
             validate_start_configuration(lifecycle_admitter, record, &mut configuration)
         {
+            record.report_request_warning("start", code);
             rpc::complete(send, request, error(code));
             return;
         }
@@ -447,6 +539,7 @@ impl Pipeline {
             && record.start.is_some()
             && record.video_warmup_requested != (mode == StartMode::BeforePlay)
         {
+            record.report_request_warning("start", "start_configuration_conflict");
             rpc::complete(send, request, error("start_configuration_conflict"));
             return;
         }
@@ -456,6 +549,7 @@ impl Pipeline {
             return;
         }
         if record.state != State::Prepared {
+            record.report_request_warning("start", "invalid_state");
             rpc::complete(send, request, error("invalid_state"));
             return;
         }
@@ -513,6 +607,11 @@ impl Pipeline {
             record.armed_accepted = true;
             record.next_auth_poll = now;
         } else {
+            record.report_failure(
+                amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                "arm",
+                "completion_unavailable",
+            );
             record.state = State::Stopping;
             record.outcome = State::Cancelled;
             record.error = Some("completion_unavailable");
@@ -577,10 +676,14 @@ impl Pipeline {
             // A failed or unconfirmed write requires authoritative journal
             // reconciliation. A retry must not fence a target held only in RAM,
             // or race a late write using a new operation identity.
-            record.state = State::CleanupFailed;
-            record
+            let code = record
                 .cleanup_error
-                .get_or_insert("lifecycle_journal_write_unconfirmed");
+                .unwrap_or("lifecycle_journal_write_unconfirmed");
+            record.fail_cleanup(
+                amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                "persist_journal",
+                code,
+            );
             self.journal_waiting_stops.insert(record.id);
             rpc::complete(send, request, record.response());
             return;
@@ -599,8 +702,11 @@ impl Pipeline {
             Ok(job) => job,
             Err(_) => {
                 self.journal.failed = true;
-                record.state = State::CleanupFailed;
-                record.cleanup_error = Some("lifecycle_journal_write_failed");
+                record.fail_cleanup(
+                    amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::StreamSession,
+                    "persist_journal",
+                    "lifecycle_journal_write_failed",
+                );
                 rpc::complete(send, request, record.response());
                 return;
             }
@@ -761,6 +867,13 @@ fn resolve_extension_start(
         .clone()
         .expect("offered profile has probe configuration");
     expected.extension_profile = Some(profile.clone());
+    // The client selects its color mode in ANNOUNCE, after the offer
+    // probe. Video checks the selected encoder with the final config.
+    expected.color_mode = configuration.configuration.color_mode;
+    let pyrowave = amaterasu_gamestream::sdp::pyrowave::is_profile(&route.profile);
+    if pyrowave && (100_000..=expected.bitrate).contains(&configuration.configuration.bitrate) {
+        expected.bitrate = configuration.configuration.bitrate;
+    }
     if configuration.configuration != expected
         || configuration.source_id.is_some()
         || configuration.encoder_provider.is_some()
@@ -771,6 +884,31 @@ fn resolve_extension_start(
     configuration.source_id = Some(route.source_id);
     configuration.encoder_provider = Some(route.encoder_provider.clone());
     configuration.encoder = route.encoder.clone();
+    if let Some(wire_kbps) = configuration.extension_wire_bitrate_kbps.take() {
+        let limits = record
+            .extension_limits
+            .as_ref()
+            .expect("offered transport limits");
+        let audio_bps = if record.config.stream_audio {
+            record.config.audio.bitrate
+        } else {
+            0
+        };
+        let Some(bitrate) = (wire_kbps <= 1_000_000 && pyrowave)
+            .then(|| {
+                amaterasu_gamestream::sdp::pyrowave::encoder_bitrate_bps(
+                    wire_kbps,
+                    configuration.configuration.fps,
+                    audio_bps,
+                    limits,
+                )
+            })
+            .flatten()
+        else {
+            return Err("invalid_extension_wire_budget");
+        };
+        configuration.configuration.bitrate = bitrate;
+    }
     Ok(())
 }
 

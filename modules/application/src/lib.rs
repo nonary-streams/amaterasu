@@ -10,9 +10,7 @@ mod proton_hook;
 mod steam_tracking;
 pub use processes::ProcessManager;
 
-use amaterasu_module_sdk::{
-    Command, LogLevel, ManagedModule, ModuleResult, Response, RuntimeClient,
-};
+use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 
 pub const SERVICE: &str = "amaterasu.application/1";
 
@@ -50,14 +48,6 @@ impl ManagedModule for ApplicationModule {
 
     fn tick(&mut self) -> ModuleResult<()> {
         self.processes.reap_exited().map_err(str::to_owned)?;
-        for (process_id, warning) in self.processes.take_warnings() {
-            // Diagnostics must not become another launch dependency.
-            let _ = self.runtime.log(
-                LogLevel::Warning,
-                "launch",
-                &serde_json::json!({"event":"application_warning","process":process_id,"warning":warning}).to_string(),
-            );
-        }
         match self.runtime.send(Command::Poll {})? {
             Response::Request {
                 id,

@@ -711,12 +711,28 @@ mod owned {
             .is_some_and(|index| index > 0)
     }
 
-    pub(in super::super) fn absent(record: &Record, payload: &Value) -> bool {
-        payload["ok"] == true
-            && (payload["removed"] == true && payload["identity"] == identity(record)
-                || payload["monitors"]
-                    .as_array()
-                    .is_some_and(|monitors| monitors.is_empty()))
+    pub(in super::super) fn owned_reference_released(record: &Record, payload: &Value) -> bool {
+        if payload["ok"] != true {
+            return false;
+        }
+        let identity = identity(record);
+        let monitors = payload["monitors"].as_array();
+        if payload["removed"] == true && payload["identity"] == identity
+            || monitors.is_some_and(Vec::is_empty)
+        {
+            return true;
+        }
+        if record.shared_capture.is_none() || payload["reference_owned"] != false {
+            return false;
+        }
+        // The successor may own the same monitor. Retire only our reference
+        // and leave the connector alive while that successor is capturing.
+        payload["identity"] == identity
+            && (payload["reference_released"].is_boolean() || payload["parked"] == true)
+            || monitors.is_some_and(|monitors| {
+                matches!(monitors.as_slice(), [monitor]
+                    if monitor["specification"]["identity"] == identity && monitor["state"] == "ready")
+            })
     }
     pub(in super::super) fn owned_shutdown(record: &Record, send: &mut rpc::Send<'_>) -> bool {
         // Shared output removal needs confirmed retirement of every local video
@@ -780,8 +796,8 @@ mod owned {
     }
 }
 pub(super) use owned::{
-    absent, accept_ready, identity, is_kwin_virtual_output, owned_create, owned_remove,
-    owned_shutdown, owned_status, requested,
+    accept_ready, identity, is_kwin_virtual_output, owned_create, owned_reference_released,
+    owned_remove, owned_shutdown, owned_status, requested,
 };
 
 #[cfg(test)]

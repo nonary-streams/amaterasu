@@ -27,7 +27,7 @@ namespace Amaterasu {
     actions: SessionExtensionAction[];
   }
 
-  function applicationPluginSection(title: string, defaultExpanded: boolean, content: HTMLElement): HTMLDetailsElement {
+  export function pluginSettingsSection(title: string, defaultExpanded: boolean, content: HTMLElement): HTMLDetailsElement {
     const section = el("details", "application-plugin-section",
       el("summary", "application-plugin-summary", literalText(title)),
       el("div", "application-plugin-content", content));
@@ -221,7 +221,7 @@ namespace Amaterasu {
       renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
       for (const descriptor of sections) {
         const container = el("div");
-        const section = applicationPluginSection(descriptor.name, descriptor.default_expanded === true, container);
+        const section = pluginSettingsSection(descriptor.name, descriptor.default_expanded === true, container);
         custom.append(section);
         const mount = pages.mountApplication(descriptor.id, container, application);
         mounts.add(mount);
@@ -477,7 +477,7 @@ namespace Amaterasu {
             });
           });
           return showAllOptions
-            ? applicationPluginSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
+            ? pluginSettingsSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
             : panel(literalText(descriptor.display_name || descriptor.provider), form);
         });
         if (sharedChoices) sharedChoices.list.append(...sharedGroups);

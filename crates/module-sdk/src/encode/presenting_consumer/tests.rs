@@ -164,6 +164,7 @@ fn retained_processed_frame_reaches_the_consumer_on_the_video_timeline() {
     let frame = processed(&producer, &pixels, FRAME_RESOURCE_DMABUF);
     let status = unsafe { (api.submit)(api.base.context, 7, &frame, 0) };
     assert_eq!(status, STATUS_OK);
+    assert!(adapter.submitted_to_provider());
     // The consumer still holds the frame after submit returned.
     assert_eq!(producer.retained.get(), 1);
     let held = consumer.held.borrow()[0];
@@ -223,6 +224,7 @@ fn frames_without_a_timeline_or_dmabuf_storage_are_declined() {
     adapter.set_presentation(TIMELINE);
     let cpu = processed(&producer, &pixels, FRAME_RESOURCE_DMABUF + 100);
     assert_eq!(submit(&cpu), MEDIA_UNSUPPORTED);
+    assert!(!adapter.submitted_to_provider());
     assert!(consumer.held.borrow().is_empty());
     assert_eq!(producer.retained.get(), 0);
 }

@@ -471,3 +471,73 @@ fn retirement_attempt_ids_stay_bounded_and_counter_exhaustion_is_reported() {
     assert_eq!(controller.cancel(20, &peer(1), now).unwrap().status, 503);
     assert!(controller.records[&1].cancel_connection.is_none());
 }
+#[test]
+fn quit_waits_for_the_exact_application_display_release() {
+    use workflow::Phase;
+
+    let now = Instant::now();
+    let (mut controller, target, _) = retirement_cleanup_fixture(now);
+    let record = controller.records.get_mut(&1).unwrap();
+    record.lifecycle_end_fenced = true;
+    record.lifecycle_application_retirement = record::ApplicationRetirementState::Verified;
+    record.paused_display_possible = true;
+    assert_eq!(workflow::next_phase(record), Phase::ReleasePausedDisplay);
+
+    let job = workflow::Job {
+        record: 1,
+        phase: Phase::ReleasePausedDisplay,
+        call: call::Call::new("unused", json!({}), "unused".into(), 1_000),
+        deadline: now + Duration::from_secs(5),
+    };
+    controller.consume(
+        &job,
+        json!({"ok":true,"application":target,"released":false}),
+        now,
+        &mut Vec::new(),
+    );
+    let record = &controller.records[&1];
+    assert_eq!(record.state, State::Stopping);
+    assert_eq!(workflow::next_phase(record), Phase::ReleasePausedDisplay);
+
+    controller.consume(
+        &job,
+        json!({"ok":true,"application":target,"released":true}),
+        now,
+        &mut Vec::new(),
+    );
+    let record = &controller.records[&1];
+    assert!(record.paused_display_released);
+    assert_eq!(workflow::next_phase(record), Phase::AwaitLifecycleEnd);
+}
+
+#[test]
+fn quit_keeps_the_display_cleanup_open_on_a_stale_release_reply() {
+    use workflow::Phase;
+
+    let now = Instant::now();
+    let (mut controller, mut target, _) = retirement_cleanup_fixture(now);
+    let record = controller.records.get_mut(&1).unwrap();
+    record.lifecycle_end_fenced = true;
+    record.lifecycle_application_retirement = record::ApplicationRetirementState::Verified;
+    record.paused_display_possible = true;
+    target["generation"] = json!(2);
+    let job = workflow::Job {
+        record: 1,
+        phase: Phase::ReleasePausedDisplay,
+        call: call::Call::new("unused", json!({}), "unused".into(), 1_000),
+        deadline: now + Duration::from_secs(5),
+    };
+    controller.consume(
+        &job,
+        json!({"ok":true,"application":target,"released":true}),
+        now,
+        &mut Vec::new(),
+    );
+    let record = &controller.records[&1];
+    assert!(!record.paused_display_released);
+    assert_eq!(record.state, State::CleanupFailed);
+    assert_eq!(
+        record.cleanup_error,
+        Some("paused_display_release_unconfirmed")
+    );
+}

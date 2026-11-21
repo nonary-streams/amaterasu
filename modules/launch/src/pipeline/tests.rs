@@ -838,6 +838,7 @@ impl Harness {
                     Response::error("request_ended", "cancelled")
                 }
             }
+            Command::Log { .. } => Response::Ok,
             _ => panic!("unexpected runtime command"),
         })
     }

@@ -406,15 +406,16 @@ impl Controller {
             .map_or(MEDIA_CLOSED, Stream::drain)
     }
 
-    fn plan_allowlisted(&self, selection: &VideoPlanSelectionV2) -> bool {
+    fn plan_profile(
+        &self,
+        selection: &VideoPlanSelectionV2,
+    ) -> Option<&amaterasu_contracts::media_profile::VideoProfile> {
         let same = |a: &amaterasu_contracts::media_profile::FormatId,
                     b: amaterasu_media::EncoderFormatId| {
             a.namespace_id == b.namespace_id && a.value == b.value && a.schema == b.schema
         };
-        let Some(name) = selection.wire_name() else {
-            return false;
-        };
-        self.settings.extension_profiles.iter().any(|profile| {
+        let name = selection.wire_name()?;
+        self.settings.extension_profiles.iter().find(|profile| {
             u64::from(profile.wire_selector) == selection.base.offer_id
                 && same(&profile.codec, selection.base.codec)
                 && same(&profile.framing, selection.base.framing)
@@ -429,12 +430,16 @@ impl Controller {
         id: u64,
         selection: &VideoPlanSelectionV2,
     ) -> Result<VideoFramingLimits, Status> {
-        if !self.plan_allowlisted(selection) {
-            return Err(STATUS_INVALID_ARGUMENT);
-        }
+        let profile = self
+            .plan_profile(selection)
+            .ok_or(STATUS_INVALID_ARGUMENT)?;
+        let modern_fec = amaterasu_gamestream::sdp::pyrowave::is_profile(profile);
         self.owned(owner, id)
             .map_err(|_| MEDIA_CLOSED)?
-            .probe_video_plan(&selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?)
+            .probe_video_plan(
+                &selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?,
+                modern_fec,
+            )
             .map_err(|_| STATUS_INVALID_ARGUMENT)
     }
 
@@ -444,12 +449,16 @@ impl Controller {
         id: u64,
         selection: &VideoPlanSelectionV2,
     ) -> Result<VideoFramingLimits, Status> {
-        if !self.plan_allowlisted(selection) {
-            return Err(STATUS_INVALID_ARGUMENT);
-        }
+        let profile = self
+            .plan_profile(selection)
+            .ok_or(STATUS_INVALID_ARGUMENT)?;
+        let modern_fec = amaterasu_gamestream::sdp::pyrowave::is_profile(profile);
         self.owned_mut(owner, id)
             .ok_or(MEDIA_CLOSED)?
-            .prepare_video_plan(&selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?)
+            .prepare_video_plan(
+                &selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?,
+                modern_fec,
+            )
             .map_err(|_| STATUS_INVALID_ARGUMENT)
     }
 

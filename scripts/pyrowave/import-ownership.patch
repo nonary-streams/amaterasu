@@ -75,7 +75,7 @@
  		::CloseHandle(handle.handle);
 --- a/pyrowave_c.cpp
 +++ b/pyrowave_c.cpp
-@@ -1842,3 +1842,65 @@
+@@ -1842,3 +1842,74 @@
  	device->next_frame_context();
  }
  }
@@ -140,4 +140,13 @@
 +    auto result = pyrowave_encoder_encode_gpu_scaled_synchronous(encoder, nullptr, nullptr, &scaling, &rate);
 +    device->wait_idle();
 +    return result;
++}
++
++// Called under the encoder lock after readback of this submission. Its fence
++// covers both the scaled input read and the foreign-queue ownership release.
++extern "C" PYROWAVE_PUBLIC_API uint32_t
++pyrowave_amaterasu_frame_fence_signaled_v1(pyrowave_encoder encoder)
++{
++    return encoder && !encoder->pyro_device->cmd && encoder->queued_fence &&
++           encoder->queued_fence->wait_timeout(0) ? 1u : 0u;
 +}

@@ -71,7 +71,10 @@ impl Source {
                     byte.is_ascii_hexdigit()
                 }
             })
-            && self.reference_id == format!("shared-source-{}", self.identity)
+            && self
+                .reference_id
+                .strip_prefix("shared-source-")
+                .is_some_and(amaterasu_contracts::virtual_display::valid_identity)
             && crate::model::valid_name(&self.capture_provider)
             && self.width > 0
             && self.width <= 16384
@@ -127,6 +130,13 @@ impl Source {
             && self.reference_id == other.reference_id
             && self.capture_provider == other.capture_provider
             && self.width == other.width
+            && self.height == other.height
+            && self.refresh_millihz == other.refresh_millihz
+            && self.hdr_enabled == other.hdr_enabled
+    }
+
+    pub(super) fn same_display_mode(&self, other: &Self) -> bool {
+        self.width == other.width
             && self.height == other.height
             && self.refresh_millihz == other.refresh_millihz
             && self.hdr_enabled == other.hdr_enabled
@@ -268,7 +278,6 @@ pub(super) fn initialize_source(record: &mut Record) -> Result<(), &'static str>
         return Err("invalid_shared_source_reference");
     }
     record.shared_capture = Some(source);
-    record.shared_capture_attached = true;
     Ok(())
 }
 

@@ -129,9 +129,10 @@ pub fn resolve(path: &str) -> Option<Route> {
         ),
         // Enrolling or removing a publisher needs an administrator's own
         // session; `server::role_permits` refuses API tokens for these.
-        ("repositories", action @ ("add" | "refresh" | "remove")) => (
+        ("repositories", action @ ("preview" | "add" | "refresh" | "remove")) => (
             "amaterasu.management/1",
             match action {
+                "preview" => "repository_preview",
                 "add" => "repository_add",
                 "refresh" => "repository_refresh",
                 "remove" => "repository_remove",
@@ -941,6 +942,17 @@ mod tests {
     #[test]
     fn repository_changes_are_bounded_configuration_writes() {
         let key = "a".repeat(64);
+        let preview = resolve("/v1/repositories/preview").unwrap();
+        assert_eq!(preview.action, "repository_preview");
+        assert_eq!(preview.scope, Some("configuration.write"));
+        assert!(payload(preview, br#"{"location":"https://plugins.example.test"}"#).is_ok());
+        assert!(
+            payload(
+                preview,
+                br#"{"location":"https://plugins.example.test","approve":true}"#
+            )
+            .is_err()
+        );
         let add = resolve("/v1/repositories/add").unwrap();
         assert_eq!(add.service, "amaterasu.management/1");
         assert_eq!(add.action, "repository_add");
@@ -955,6 +967,10 @@ mod tests {
             body("https://plugins.example.test/repository").as_bytes(),
         );
         assert_eq!(accepted.unwrap()["action"], "repository_add");
+        let confirmation = format!(
+            r#"{{"id":"example-plugins","location":"https://plugins.example.test","fingerprint":"{key}"}}"#
+        );
+        assert!(payload(add, confirmation.as_bytes()).is_ok());
         for rejected in [
             body(&format!("https://plugins.example.test/{}", "p".repeat(256))),
             body("https://plugins.example.test/with space"),
@@ -2480,6 +2496,12 @@ mod tests {
         assert_eq!(status.scope, Some("session.read"));
         assert_eq!(stop.scope, Some("application.terminate"));
         assert!(payload(status, br#"{}"#).is_ok());
+        assert_eq!(
+            payload(status, br#"{"issues_only":true}"#).unwrap()["issues_only"],
+            true
+        );
+        assert!(payload(status, br#"{"issues_only":"true"}"#).is_err());
+        assert!(payload(status, br#"{"issues_only":true,"reference":"bad"}"#).is_err());
         let reference = "a".repeat(64);
         let revision = "b".repeat(64);
         let body =

@@ -1,6 +1,7 @@
 //! Configure the newly owned connector in the current KDE session, either
 //! beside the existing desktop or as its only enabled display.
 use super::{
+    connectors::{SysfsConnectors, can_be_physical_output},
     layout::Layout,
     restore::{Desktop, READBACK_INTERVAL, restore_layout},
 };
@@ -321,13 +322,19 @@ enum RemovalGuard {
 
 fn observe_removal_guard(output: &str) -> Result<(RemovalGuard, bool), String> {
     let configuration = query()?;
+    let connectors = SysfsConnectors::default();
     let mut observer =
         super::observer::Observer::open().ok_or("cannot observe surviving Wayland output")?;
-    classify_removal_guard(&configuration, output, |name| {
-        observer
-            .read(name)
-            .is_some_and(|seen| seen.width > 0 && seen.height > 0 && seen.refresh > 0)
-    })
+    classify_removal_guard(
+        &configuration,
+        output,
+        |name| {
+            observer
+                .read(name)
+                .is_some_and(|seen| seen.width > 0 && seen.height > 0 && seen.refresh > 0)
+        },
+        |name| connectors.physical_output_active(name),
+    )
 }
 
 /// Classifies the desktop from KScreen's output list and an independent
@@ -337,6 +344,7 @@ fn classify_removal_guard(
     configuration: &Value,
     output: &str,
     mut observed: impl FnMut(&str) -> bool,
+    mut physical_output_active: impl FnMut(&str) -> bool,
 ) -> Result<(RemovalGuard, bool), String> {
     let outputs = configuration["outputs"]
         .as_array()
@@ -347,7 +355,10 @@ fn classify_removal_guard(
         let Some(name) = candidate["name"].as_str().filter(|name| *name != output) else {
             continue;
         };
-        if observed(name) {
+        if !can_be_physical_output(name) {
+            continue;
+        }
+        if observed(name) && physical_output_active(name) {
             return Ok((RemovalGuard::Survivor, false));
         }
         awaiting_survivor = true;
@@ -1442,28 +1453,45 @@ mod tests {
             {"name":"Virtual-9","connected":true,"enabled":true}]});
         // The restored monitor is published: the stream output can go.
         assert_eq!(
-            classify_removal_guard(&desktop, "Virtual-9", |_| true).unwrap(),
+            classify_removal_guard(&desktop, "Virtual-9", |_| true, |_| true).unwrap(),
             (RemovalGuard::Survivor, false)
         );
         // KScreen lists the monitor before Wayland clients can see it. That is
         // a reason to look again, not proof that nothing survives.
         assert_eq!(
-            classify_removal_guard(&desktop, "Virtual-9", |name| name == "Virtual-9").unwrap(),
+            classify_removal_guard(&desktop, "Virtual-9", |name| name == "Virtual-9", |_| true)
+                .unwrap(),
             (RemovalGuard::OwnedOnly, true)
         );
         assert_eq!(
-            classify_removal_guard(&desktop, "Virtual-9", |_| false).unwrap(),
+            classify_removal_guard(&desktop, "Virtual-9", |_| false, |_| true).unwrap(),
             (RemovalGuard::Unobserved, true)
+        );
+        // A published virtual peer and a sleeping physical display cannot
+        // prove that the physical desktop has recovered.
+        let mut sleeping = desktop.clone();
+        sleeping["outputs"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"Virtual-10","connected":true,"enabled":true}));
+        assert_eq!(
+            classify_removal_guard(&sleeping, "Virtual-9", |_| true, |_| false).unwrap(),
+            (RemovalGuard::OwnedOnly, true)
+        );
+        sleeping["outputs"][0]["enabled"] = json!(false);
+        assert_eq!(
+            classify_removal_guard(&sleeping, "Virtual-9", |_| true, |_| true).unwrap(),
+            (RemovalGuard::OwnedOnly, false)
         );
         // A monitor that is off cannot guard and is not worth waiting for.
         let alone = json!({"outputs":[
             {"name":"HDMI-A-1","connected":true,"enabled":false},
             {"name":"Virtual-9","connected":true,"enabled":true}]});
         assert_eq!(
-            classify_removal_guard(&alone, "Virtual-9", |_| true).unwrap(),
+            classify_removal_guard(&alone, "Virtual-9", |_| true, |_| true).unwrap(),
             (RemovalGuard::OwnedOnly, false)
         );
-        assert!(classify_removal_guard(&json!({}), "Virtual-9", |_| true).is_err());
+        assert!(classify_removal_guard(&json!({}), "Virtual-9", |_| true, |_| true).is_err());
     }
 
     #[test]

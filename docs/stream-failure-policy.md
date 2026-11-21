@@ -56,11 +56,14 @@ event.
 | Best-effort detached command | Report executable lookup or spawn failures as warnings while the primary application continues. |
 | Warning query and history submission | Run after the launch response and use bounded best-effort calls; absence, rejection, or uncertain delivery cannot invalidate the successful stream. |
 | NVHTTP history-activity release (`ReleaseHistory`) | Failed, rejected, settled, or uncertain history releases are demoted to a warning and retried via an independently retained background queue keyed by exact `rtsp_operation` activity ID; pause, rejected resume, and cancel no longer destroy retained apps or delay later launches. |
+| NVHTTP RTSP stop verification (`rtsp_cleanup_unconfirmed`) | Record an advisory warning while retaining the ticket for cleanup verification. A Quit response still reports incomplete cleanup when retirement cannot be confirmed. |
 | NVHTTP pause verification (`VerifyPaused`) and resume policy/display `settled` | When RTSP is confirmed retired, `VerifyPaused` rejection/settlement keeps the application paused; `RefreshResumePolicy` settlement falls back to the cached/disabled Proton policy; resume display `settled` rejects only the resume without killing the retained app. |
 | NVHTTP initial Proton policy read (`ReadProtonPolicy`) | Rejection or settlement falls back to disabled Proton compatibility with a warning, matching `consume`. |
 | Frame limiter planning (`frame-limiter`) | Unavailable policy, context, or non-recovery backend during read-only planning demotes to a no-op `Planned` response with a lifecycle warning. |
 | Media transport audio config (`media-transport`) | Audio packet/channel/wire validation is skipped when `stream_audio` is `false`. |
 | Optional lifecycle participants (`session-lifecycle`) | `ParticipantSettings::optional` prevents unapproved optional providers from stalling `approvals_complete` and skips read-only `ResourcePlan` rejections without failing the stream. |
+| Optional extension and audio renegotiation probes (`stream-session`) | Rejected, timed-out or unconfirmed read-only probes leave the prepared session intact and report a warning. Unsettled broker operations remain bounded and retire independently; an unadmitted read-only probe is forgotten after the broker's 300-second admission recovery horizon. No format substitution is made. |
+| Batch-scoped input refusals and unsupported optional feedback (`stream-session`) | The affected input or optional feedback is dropped while the stream continues. The session records bounded advisory issues for distinct refusal reasons. |
 
 ## Remaining boundary
 

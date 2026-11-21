@@ -37,6 +37,19 @@ pub struct Incoming {
 pub struct Events {
     pub requests: Vec<Incoming>,
     pub closed: Vec<Closed>,
+    pub rejected_stream_requests: Vec<StreamRequestFailure>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamRequestFailure {
+    Http(u16),
+    Timeout,
+    ConnectionClosed,
+}
+
+enum ConnectionRequest {
+    Request(Request),
+    RejectedStream(u16),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,10 +293,21 @@ impl Server {
         let mut events = Events {
             requests: Vec::new(),
             closed: Vec::new(),
+            rejected_stream_requests: Vec::new(),
         };
         let now = Instant::now();
         for (id, connection) in &mut self.connections {
             if now >= connection.deadline {
+                if connection.has_pending_stream_request()
+                    && connection.tls.is_some()
+                    && connection
+                        .peer_certificate()
+                        .is_some_and(|certificate| verify(&certificate, None))
+                {
+                    events
+                        .rejected_stream_requests
+                        .push(StreamRequestFailure::Timeout);
+                }
                 events.closed.push(Closed {
                     id: *id,
                     response_delivered: false,
@@ -303,22 +327,57 @@ impl Server {
                 continue;
             }
             match connection.tick() {
-                Ok(Some(request)) => events.requests.push(Incoming {
+                Ok(Some(ConnectionRequest::Request(request))) => events.requests.push(Incoming {
                     id: *id,
                     request,
                     secure: connection.tls.is_some(),
                     remote: connection.remote,
                     peer_certificate: connection.peer_certificate(),
                 }),
-                Ok(None) if connection.finished => events.closed.push(Closed {
-                    id: *id,
-                    response_delivered: connection.response_delivered,
-                }),
+                Ok(Some(ConnectionRequest::RejectedStream(status))) => {
+                    if connection.tls.is_some()
+                        && connection
+                            .peer_certificate()
+                            .is_some_and(|certificate| verify(&certificate, None))
+                    {
+                        events
+                            .rejected_stream_requests
+                            .push(StreamRequestFailure::Http(status));
+                    }
+                }
+                Ok(None) if connection.finished => {
+                    if connection.has_pending_stream_request()
+                        && connection.tls.is_some()
+                        && connection
+                            .peer_certificate()
+                            .is_some_and(|certificate| verify(&certificate, None))
+                    {
+                        events
+                            .rejected_stream_requests
+                            .push(StreamRequestFailure::ConnectionClosed);
+                    }
+                    events.closed.push(Closed {
+                        id: *id,
+                        response_delivered: connection.response_delivered,
+                    });
+                }
                 Ok(None) => {}
-                Err(_) => events.closed.push(Closed {
-                    id: *id,
-                    response_delivered: false,
-                }),
+                Err(_) => {
+                    if connection.has_pending_stream_request()
+                        && connection.tls.is_some()
+                        && connection
+                            .peer_certificate()
+                            .is_some_and(|certificate| verify(&certificate, None))
+                    {
+                        events
+                            .rejected_stream_requests
+                            .push(StreamRequestFailure::ConnectionClosed);
+                    }
+                    events.closed.push(Closed {
+                        id: *id,
+                        response_delivered: false,
+                    });
+                }
             }
         }
         for closed in &events.closed {
@@ -559,7 +618,10 @@ struct Connection {
 }
 
 impl Connection {
-    fn tick(&mut self) -> io::Result<Option<Request>> {
+    fn has_pending_stream_request(&self) -> bool {
+        pending_stream_request(self.waiting, self.output.is_some(), &self.input)
+    }
+    fn tick(&mut self) -> io::Result<Option<ConnectionRequest>> {
         if self.tls.is_some() {
             self.tls_io()?;
         }
@@ -591,8 +653,12 @@ impl Connection {
             }
             Ok(length) => {
                 if self.input.len() + length > MAX_REQUEST {
+                    let available = MAX_REQUEST.saturating_sub(self.input.len());
+                    self.input
+                        .extend_from_slice(&buffer[..available.min(length)]);
+                    let stream_request = is_stream_request_line(&self.input);
                     self.respond(simple_reply(413, "request too large"));
-                    return Ok(None);
+                    return Ok(stream_request.then_some(ConnectionRequest::RejectedStream(413)));
                 }
                 self.input.extend_from_slice(&buffer[..length]);
             }
@@ -604,12 +670,13 @@ impl Connection {
                 self.input.clear();
                 self.waiting = true;
                 self.deadline = Instant::now() + ROUTE_TIMEOUT;
-                Ok(Some(request))
+                Ok(Some(ConnectionRequest::Request(request)))
             }
             Ok(None) => Ok(None),
             Err(status) => {
+                let stream_request = is_stream_request_line(&self.input);
                 self.respond(simple_reply(status, "invalid request"));
-                Ok(None)
+                Ok(stream_request.then_some(ConnectionRequest::RejectedStream(status)))
             }
         }
     }
@@ -733,6 +800,31 @@ impl Connection {
         }
         Ok(())
     }
+}
+
+fn is_stream_request_line(bytes: &[u8]) -> bool {
+    let Some(line) = bytes.split(|byte| *byte == b'\n').next() else {
+        return false;
+    };
+    let mut parts = line.split(|byte| *byte == b' ');
+    let Some(method) = parts.next() else {
+        return false;
+    };
+    let Some(target) = parts.next() else {
+        return false;
+    };
+    if method.is_empty() {
+        return false;
+    }
+    let path = target
+        .split(|byte| *byte == b'?' || *byte == b'#')
+        .next()
+        .unwrap_or_default();
+    matches!(path, b"/launch" | b"/resume")
+}
+
+fn pending_stream_request(waiting: bool, has_output: bool, input: &[u8]) -> bool {
+    !waiting && !has_output && input.contains(&b'\n') && is_stream_request_line(input)
 }
 
 struct BoundedWriter<'a> {
@@ -907,6 +999,46 @@ mod tests {
         ] {
             assert!(parse_request(bytes).is_err());
         }
+    }
+
+    #[test]
+    fn rejected_request_classification_uses_only_the_stream_route() {
+        assert!(is_stream_request_line(
+            b"POST /launch?rikey=secret HTTP/1.1\r\n"
+        ));
+        assert!(is_stream_request_line(b"GET /resume#bad HTTP/1.1\r\n"));
+        assert!(!is_stream_request_line(b"GET /applist HTTP/1.1\r\n"));
+        assert!(!is_stream_request_line(b"GET /launchother HTTP/1.1\r\n"));
+        assert!(!is_stream_request_line(b"GET"));
+        let partial = b"GET /launch?rikey=secret HTTP/1.1\r\nHost:";
+        assert!(pending_stream_request(false, false, partial));
+        assert!(!pending_stream_request(true, false, partial));
+        assert!(!pending_stream_request(false, true, partial));
+        assert!(!pending_stream_request(false, false, b"GET /launch"));
+    }
+
+    #[test]
+    fn untrusted_framing_rejection_is_not_added_to_stream_lifecycle() {
+        let settings = Settings {
+            enabled: true,
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            https_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Settings::default()
+        };
+        let mut server = Server::bind(&settings).unwrap();
+        let mut client = TcpStream::connect(server.http_address()).unwrap();
+        client
+            .write_all(b"GET /launch HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .unwrap();
+        for _ in 0..100 {
+            let events = server.tick();
+            assert!(events.rejected_stream_requests.is_empty());
+            if !events.closed.is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("rejected connection did not close");
     }
     #[test]
     fn real_socket_dispatches_one_request_and_closes_after_reply() {

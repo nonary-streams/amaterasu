@@ -1,5 +1,5 @@
 //! The launch owner's store: one lifecycle per stream.
-use super::{IssueDisposition, MAX_LIFECYCLE_ENTRIES, StreamIssue};
+use super::{IssueDisposition, MAX_LIFECYCLE_ENTRIES, PROVIDER_FALLBACK_CONFIRMED, StreamIssue};
 use crate::LogEmitter;
 use crate::stream_warnings::MAX_WARNINGS;
 use serde::{Deserialize, Serialize};
@@ -89,7 +89,13 @@ impl StreamLifecycle {
         self.committed = self.committed.saturating_add(1);
         match entry.issue.disposition {
             IssueDisposition::CriticalFailure => {
-                if outranks(&entry, self.root_cause.as_ref()) {
+                if self
+                    .entries
+                    .iter()
+                    .any(|candidate| demotion_recovers(&entry, candidate))
+                {
+                    self.recovered.push(entry.clone());
+                } else if outranks(&entry, self.root_cause.as_ref()) {
                     self.root_cause = Some(entry.clone());
                 }
             }
@@ -97,11 +103,10 @@ impl StreamLifecycle {
                 if entry.issue.disposition == IssueDisposition::DemotedWarning {
                     self.recover(&entry);
                 }
-                let repeated = self.warnings.iter().any(|existing| {
-                    existing.issue.code == entry.issue.code
-                        && existing.issue.layer == entry.issue.layer
-                        && existing.issue.phase == entry.issue.phase
-                });
+                let repeated = self
+                    .warnings
+                    .iter()
+                    .any(|existing| same_warning(existing, &entry));
                 if !repeated && self.warnings.len() < MAX_WARNINGS {
                     self.warnings.push(entry.clone());
                 }
@@ -116,6 +121,10 @@ impl StreamLifecycle {
         if self.entries.len() > MAX_LIFECYCLE_ENTRIES {
             self.entries.pop_front();
         }
+        // Recovery bookkeeping is needed only while its failure remains in
+        // the bounded entry history; an older root is tracked separately.
+        self.recovered
+            .retain(|recovered| self.entries.iter().any(|entry| entry.seq == recovered.seq));
     }
 
     /// A demoted issue says an earlier critical failure was recovered from
@@ -124,25 +133,21 @@ impl StreamLifecycle {
     /// layer, with its code as the reason). It stops being the root cause, and the next
     /// unrecovered failure, if any, takes its place.
     fn recover(&mut self, demotion: &LifecycleEntry) {
-        let recovers = |failure: &LifecycleEntry| {
-            let own_recovery = failure.publisher == demotion.publisher
-                && failure.issue.operation == demotion.issue.operation
-                && failure.issue.code == demotion.issue.code;
-            // A caller that fell back from a dependency's failure says so
-            // with `caused_by` that layer and the dependency's code.
-            let callers_fallback = failure.issue.is_origin()
-                && demotion.issue.caused_by == Some(failure.issue.layer)
-                && demotion.issue.reason == failure.issue.code;
-            failure.issue.is_critical()
-                && failure.seq < demotion.seq
-                && (own_recovery || callers_fallback)
-        };
-        if !self.root_cause.as_ref().is_some_and(recovers) {
+        let recovers = |failure: &LifecycleEntry| demotion_recovers(failure, demotion);
+        let root_recovered = self.root_cause.as_ref().is_some_and(recovers);
+        for failure in self.entries.iter().filter(|entry| recovers(entry)) {
+            if !self
+                .recovered
+                .iter()
+                .any(|recovered| recovered.seq == failure.seq)
+            {
+                self.recovered.push(failure.clone());
+            }
+        }
+        if !root_recovered {
             return;
         }
-        if let Some(root) = self.root_cause.take() {
-            self.recovered.push(root);
-        }
+        self.root_cause = None;
         let mut root: Option<&LifecycleEntry> = None;
         for failure in self
             .entries
@@ -176,15 +181,57 @@ impl StreamLifecycle {
     }
 }
 
+fn same_warning(left: &LifecycleEntry, right: &LifecycleEntry) -> bool {
+    let a = &left.issue;
+    let b = &right.issue;
+    left.publisher == right.publisher
+        && a.operation == b.operation
+        && a.layer == b.layer
+        && a.phase == b.phase
+        && a.code == b.code
+        && a.reason == b.reason
+        && a.disposition == b.disposition
+        && a.fallback == b.fallback
+        && a.caused_by == b.caused_by
+        && a.native_failure == b.native_failure
+        && a.os_error == b.os_error
+        && a.requested == b.requested
+        && a.effective == b.effective
+}
+
+fn demotion_recovers(failure: &LifecycleEntry, demotion: &LifecycleEntry) -> bool {
+    if !failure.issue.is_critical()
+        || demotion.issue.disposition != IssueDisposition::DemotedWarning
+    {
+        return false;
+    }
+    let own_recovery = failure.seq < demotion.seq
+        && failure.publisher == demotion.publisher
+        && failure.issue.operation == demotion.issue.operation
+        && failure.issue.layer == demotion.issue.layer
+        && failure.issue.code == demotion.issue.code;
+    let identified_attempt = demotion.issue.phase == PROVIDER_FALLBACK_CONFIRMED;
+    let callers_fallback = demotion.issue.caused_by == Some(failure.issue.layer)
+        && if identified_attempt {
+            failure.issue.operation == demotion.issue.operation
+        } else {
+            failure.issue.is_origin()
+                && demotion.issue.reason == failure.issue.code
+                && failure.seq < demotion.seq
+        };
+    own_recovery || callers_fallback
+}
+
 /// The root cause is the earliest failure that originated in its reporter.
-/// A caller's reaction to a dependency (`caused_by`) stands in only until the
-/// dependency's own report arrives. Commit order, not arrival, decides, so an
-/// earlier report filed late by a binding still wins.
+/// A direct observation at a native boundary is also evidence of the original
+/// failure. A downstream reaction stands in only until direct evidence arrives.
+/// Commit order breaks ties, even when an earlier report awaits a binding.
 fn outranks(entry: &LifecycleEntry, root: Option<&LifecycleEntry>) -> bool {
     let Some(root) = root else {
         return true;
     };
-    match (entry.issue.is_origin(), root.issue.is_origin()) {
+    let direct_evidence = |issue: &StreamIssue| issue.is_origin() || issue.native_failure.is_some();
+    match (direct_evidence(&entry.issue), direct_evidence(&root.issue)) {
         (true, false) => true,
         (false, true) => false,
         _ => entry.seq < root.seq,
@@ -322,6 +369,34 @@ impl StreamLifecycleStore {
         self.streams.get(key).map(StreamLifecycle::snapshot)
     }
 
+    /// Recent warnings and current root causes across all retained operations.
+    /// Each commit appears once even when it is also the pinned warning or root.
+    pub fn recent_issues(&self) -> (Vec<&LifecycleEntry>, bool) {
+        const LIMIT: usize = 32;
+        let mut by_sequence = BTreeMap::new();
+        let mut incomplete = self.gaps > 0;
+        for stream in self.streams.values() {
+            incomplete |= stream.audit_gap || stream.committed > stream.entries.len() as u64;
+            for entry in stream
+                .entries
+                .iter()
+                .filter(|entry| entry.issue.disposition != IssueDisposition::CriticalFailure)
+                .chain(stream.warnings.iter())
+                .chain(stream.root_cause.iter())
+            {
+                by_sequence.insert(entry.seq, entry);
+            }
+        }
+        for entry in &self.unattributed {
+            by_sequence.insert(entry.seq, entry);
+        }
+        incomplete |= by_sequence.len() > LIMIT;
+        (
+            by_sequence.into_values().rev().take(LIMIT).collect(),
+            incomplete,
+        )
+    }
+
     pub fn unattributed(&self) -> impl Iterator<Item = &LifecycleEntry> {
         self.unattributed.iter()
     }
@@ -414,4 +489,50 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream_lifecycle::LifecycleLayer;
+
+    #[test]
+    fn recovered_failure_bookkeeping_stays_bounded() {
+        let mut store = StreamLifecycleStore::new();
+        store.open("stream");
+        store.commit(
+            "owner",
+            StreamIssue::critical("stream", LifecycleLayer::Capture, "open", "root"),
+        );
+        for _ in 0..1000 {
+            store.commit(
+                "owner",
+                StreamIssue::critical("stream", LifecycleLayer::Audio, "open", "transient"),
+            );
+            store.commit(
+                "owner",
+                StreamIssue::demoted(
+                    "stream",
+                    LifecycleLayer::Audio,
+                    "recover",
+                    "transient",
+                    "retry_succeeded",
+                ),
+            );
+            let stream = store.stream("stream").unwrap();
+            assert_eq!(stream.root_cause().unwrap().issue.code, "root");
+            assert!(stream.recovered.len() <= MAX_LIFECYCLE_ENTRIES);
+        }
+        store.commit(
+            "owner",
+            StreamIssue::demoted(
+                "stream",
+                LifecycleLayer::Capture,
+                "recover",
+                "root",
+                "capture_reset",
+            ),
+        );
+        assert!(store.stream("stream").unwrap().healthy());
+    }
 }

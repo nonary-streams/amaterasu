@@ -8,9 +8,7 @@
 //! stream-report topic, where the runtime stamps this module as the reporter.
 use super::{Controller, Phase, Record, State, error};
 use crate::rpc;
-use amaterasu_module_sdk::stream_lifecycle::{
-    LifecycleLayer, StreamBinding, StreamIssue, StreamReport,
-};
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamBinding, StreamIssue};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 
 const OPEN_PHASE: &str = "open";
@@ -172,6 +170,16 @@ fn with_cause(issue: StreamIssue, cause: Option<Cause<'_>>) -> StreamIssue {
 }
 
 impl Controller {
+    #[track_caller]
+    pub(super) fn report_open_warning(&mut self, caller: &str, operation: &str, code: &str) {
+        if caller == self.settings.launch_owner {
+            self.stream_issues.push(
+                StreamIssue::advisory(operation, LifecycleLayer::Rtsp, OPEN_PHASE, code)
+                    .because(code),
+            );
+        }
+    }
+
     /// Report on the launch owner's topic. Off by default so a controller in
     /// a test sends only the commands that test scripts.
     pub fn enable_stream_issue_reports(&mut self) {
@@ -230,12 +238,7 @@ impl Controller {
         if record.owner != self.settings.launch_owner {
             return;
         }
-        for report in record.issues.drain() {
-            match report {
-                StreamReport::Issue(issue) => self.stream_issues.push(issue),
-                StreamReport::Binding(binding) => self.stream_issues.push_binding(binding),
-            }
-        }
+        record.issues.transfer_to(&mut self.stream_issues);
     }
 
     /// Publish what the controller and each launch-owned ticket recorded. A

@@ -33,14 +33,20 @@ namespace Amaterasu {
         if (disposed || !container.isConnected) return;
         if (!descriptor.placements?.includes(slot)) continue;
         const area = el("section", "plugin-surface");
-        container.append(area);
+        const section = slot === "settings"
+          ? pluginSettingsSection(descriptor.name, descriptor.default_expanded === true, area)
+          : null;
+        container.append(section ?? area);
         const child = new ExtensionPages(context.api);
         children.push(child);
         try {
           await child.discover();
           if (!disposed && area.isConnected) await child.mountSlot(descriptor.id, area, slot);
         } catch (error) {
-          if (!disposed) area.replaceChildren(errorPanel(error));
+          if (!disposed) {
+            if (section) section.open = true;
+            area.replaceChildren(errorPanel(error));
+          }
         }
       }
     }).catch((error) => { if (!disposed) container.replaceChildren(errorPanel(error)); });

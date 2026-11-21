@@ -208,6 +208,27 @@ const SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl Router {
+    pub(crate) fn record_protocol_rejection(
+        &mut self,
+        failure: crate::server::StreamRequestFailure,
+    ) {
+        match failure {
+            crate::server::StreamRequestFailure::Http(status) => {
+                self.launches.refuse_stream_request(
+                    status,
+                    "invalid http request",
+                    "request_parsing",
+                );
+            }
+            crate::server::StreamRequestFailure::Timeout => {
+                self.launches.record_transport_failure("request_timeout")
+            }
+            crate::server::StreamRequestFailure::ConnectionClosed => {
+                self.launches.record_transport_failure("connection_closed")
+            }
+        }
+    }
+
     pub fn new(config: RouterConfig, mut launches: LaunchController) -> Self {
         launches.set_device_name(&config.hostname);
         Self {
@@ -289,6 +310,10 @@ impl Router {
 
     pub fn management_launch_status(&self, reference: Option<&str>) -> Value {
         self.launches.management_status(reference)
+    }
+
+    pub fn management_stream_issues(&self) -> Value {
+        self.launches.management_issues()
     }
 
     pub fn management_stop_launch(
@@ -456,11 +481,16 @@ impl Router {
                 .map(|error| xml::error(503, error));
         }
         if request.method != "GET" || !request.body.is_empty() {
-            return Some(xml::error(405, "only bodyless GET requests are supported"));
+            return Some(self.pre_route_error(
+                &request,
+                &peer,
+                405,
+                "only bodyless GET requests are supported",
+            ));
         }
         let query = match Query::parse(&request.target) {
             Ok(query) => query,
-            Err(error) => return Some(xml::error(400, error)),
+            Err(error) => return Some(self.pre_route_error(&request, &peer, 400, error)),
         };
         let trusted = peer.trusted();
         if self.presentation.is_some()
@@ -504,7 +534,11 @@ impl Router {
                 if !trusted {
                     Some(xml::error(401, "authenticated paired TLS is required"))
                 } else if !peer.launch_allowed {
-                    Some(xml::error(403, "launch permission denied"))
+                    Some(self.launches.refuse_stream_request(
+                        403,
+                        "launch permission denied",
+                        "request_authorization",
+                    ))
                 } else {
                     let request = match streaming::launch_request(&query) {
                         Ok(request) => request,
@@ -514,14 +548,26 @@ impl Router {
                     };
                     let identity = match peer.identity() {
                         Ok(identity) => identity,
-                        Err(error) => return Some(xml::error(401, error)),
+                        Err(error) => {
+                            return Some(self.launches.refuse_stream_request(
+                                401,
+                                error,
+                                "stream_identity",
+                            ));
+                        }
                     };
                     let certificate_pem = match peer.peer_certificate.as_deref().and_then(|der| {
                         pem_rfc7468::encode_string("CERTIFICATE", pem_rfc7468::LineEnding::LF, der)
                             .ok()
                     }) {
                         Some(certificate_pem) => certificate_pem,
-                        None => return Some(xml::error(401, "client certificate is unavailable")),
+                        None => {
+                            return Some(self.launches.refuse_stream_request(
+                                401,
+                                "client certificate is unavailable",
+                                "stream_identity",
+                            ));
+                        }
                     };
                     self.queue(
                         Some(connection),
@@ -538,7 +584,10 @@ impl Router {
                         now,
                     )
                     .err()
-                    .map(|error| xml::error(503, error))
+                    .map(|error| {
+                        self.launches
+                            .refuse_stream_request(503, error, "launch_identity")
+                    })
                 }
             }
             "/cancel" => {
@@ -562,7 +611,11 @@ impl Router {
                     return Some(xml::error(401, "authenticated paired TLS is required"));
                 }
                 if !peer.launch_allowed {
-                    return Some(xml::error(403, "launch permission denied"));
+                    return Some(self.launches.refuse_stream_request(
+                        403,
+                        "launch permission denied",
+                        "request_authorization",
+                    ));
                 }
                 let request = match streaming::resume_request(&query) {
                     Ok(request) => request,
@@ -572,13 +625,25 @@ impl Router {
                 };
                 let identity = match peer.identity() {
                     Ok(identity) => identity,
-                    Err(error) => return Some(xml::error(401, error)),
+                    Err(error) => {
+                        return Some(self.launches.refuse_stream_request(
+                            401,
+                            error,
+                            "stream_identity",
+                        ));
+                    }
                 };
                 let certificate_pem = match peer.peer_certificate.as_deref().and_then(|der| {
                     pem_rfc7468::encode_string("CERTIFICATE", pem_rfc7468::LineEnding::LF, der).ok()
                 }) {
                     Some(certificate_pem) => certificate_pem,
-                    None => return Some(xml::error(401, "client certificate is unavailable")),
+                    None => {
+                        return Some(self.launches.refuse_stream_request(
+                            401,
+                            "client certificate is unavailable",
+                            "stream_identity",
+                        ));
+                    }
                 };
                 self.queue(
                     Some(connection),
@@ -592,10 +657,29 @@ impl Router {
                     now,
                 )
                 .err()
-                .map(|error| xml::error(503, error))
+                .map(|error| {
+                    self.launches
+                        .refuse_stream_request(503, error, "resume_identity")
+                })
             }
             "/unpair" => self.unpair(connection, &query, &peer, now),
             _ => Some(xml::error(404, "unknown Moonlight route")),
+        }
+    }
+
+    fn pre_route_error(
+        &mut self,
+        request: &Request,
+        peer: &RequestContext,
+        status: u16,
+        message: &str,
+    ) -> Reply {
+        let path = request.target.split(['?', '#']).next().unwrap_or_default();
+        if peer.trusted() && matches!(path, "/launch" | "/resume") {
+            self.launches
+                .refuse_stream_request(status, message, "request_parsing")
+        } else {
+            xml::error(status, message)
         }
     }
 
@@ -1038,6 +1122,11 @@ impl Router {
             .collect();
         for key in keys {
             let mut job = self.jobs.remove(&key).expect("selected connection job");
+            let stream_identity = matches!(&job.purpose, Purpose::LaunchIdentity { .. })
+                || matches!(&job.purpose, Purpose::PresentationIdentity { intent, .. } if *intent != amaterasu_module_sdk::session_presentation::DispatchIntent::Cancel);
+            if stream_identity {
+                self.launches.record_transport_failure("connection_closed");
+            }
             if !matches!(job.purpose, Purpose::Artwork { .. }) {
                 job.connection = None;
             }
@@ -1054,8 +1143,10 @@ impl Router {
             }
         }
         self.artwork_reservations.remove(&connection);
-        if let Some(presentation) = &mut self.presentation {
-            presentation.cancel(connection);
+        if let Some(presentation) = &mut self.presentation
+            && presentation.cancel(connection)
+        {
+            self.launches.record_transport_failure("connection_closed");
         }
     }
 
@@ -1135,7 +1226,9 @@ impl Router {
     ) -> Option<Job> {
         if matches!(job.call, Call::Uncertain { .. }) && now < job.deadline {
             if let Some(connection) = job.connection.take() {
-                replies.push((connection, xml::error(504, "request expired")));
+                let mut reply = xml::error(504, "request expired");
+                self.record_identity_failure(&job.purpose, &mut reply);
+                replies.push((connection, reply));
             }
             return Some(job);
         }
@@ -1146,12 +1239,32 @@ impl Router {
             self.abort_transcript(client, now);
         }
         if let Some(connection) = job.connection {
-            replies.push((connection, xml::error(504, "request expired")));
+            let mut reply = xml::error(504, "request expired");
+            self.record_identity_failure(&job.purpose, &mut reply);
+            replies.push((connection, reply));
         }
         if let Some(connection) = job.connection {
             self.artwork_reservations.remove(&connection);
         }
         None
+    }
+
+    fn record_identity_failure(&mut self, purpose: &Purpose, reply: &mut Reply) {
+        let stream_request = match purpose {
+            Purpose::LaunchIdentity { .. } => true,
+            Purpose::PresentationIdentity { intent, .. } => {
+                *intent != amaterasu_module_sdk::session_presentation::DispatchIntent::Cancel
+            }
+            _ => false,
+        };
+        if stream_request {
+            self.launches.record_request_failure(
+                reply,
+                reply.status,
+                "client identity request failed",
+                "stream_identity",
+            );
+        }
     }
 
     fn abort_transcript(&mut self, client: &str, now: Instant) {

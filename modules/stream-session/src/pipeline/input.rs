@@ -3,8 +3,8 @@ use amaterasu_gamestream::control::HostFeedback;
 use amaterasu_gamestream::control::{
     AbsoluteViewport, ControllerArrival, ControllerBattery, ControllerBatteryState,
     ControllerMotion, ControllerMotionType, ControllerTouch, ControllerTouchEvent, Input,
-    InputEvent, InputTranslator, MAX_CONTROLLER_SLOT, MouseButton, PenTouch, PointerDevice,
-    PointerEvent, ScrollAxis, TranslatedKeyState, TranslationError,
+    InputEvent, MAX_CONTROLLER_SLOT, MouseButton, PenTouch, PointerDevice, PointerEvent,
+    ScrollAxis, TranslatedKeyState, TranslationError,
 };
 use amaterasu_media::CaptureGeometry;
 use amaterasu_module_sdk::input::{
@@ -254,7 +254,7 @@ pub(super) fn configure_absolute_input(
         record.capture_geometry = None;
         record.touch_port = None;
         record.input_absolute_pointer = false;
-        record.input_translator = InputTranslator::default();
+        record.input_translator.set_absolute_viewport(None);
         return Ok(());
     };
     let geometry: CaptureGeometry =
@@ -270,7 +270,7 @@ pub(super) fn configure_absolute_input(
             Some(geometry)
         };
     record.input_absolute_pointer = false;
-    record.input_translator = InputTranslator::default();
+    record.input_translator.set_absolute_viewport(None);
     Ok(())
 }
 
@@ -454,8 +454,13 @@ fn report_input_queue_overflow(record: &Record, incoming: &Value) -> &'static st
     for event in &record.input_events {
         *counts.entry(input_event_kind(event)).or_default() += 1;
     }
+    let classes = counts
+        .iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     eprintln!(
-        "amaterasu input queue overflow queued={} inflight={} incoming={} kinds={counts:?}",
+        "Input queue full. {} events queued ({classes}), {} in flight. Incoming event: {}.",
         record.input_events.len(),
         record.input_inflight,
         input_event_kind(incoming),
@@ -719,9 +724,8 @@ pub(super) fn accept_acknowledged_input_batch(
 }
 
 /// Refusals scoped to one batch. The input lease survives them, so the
-/// session drops the refused events and keeps streaming; the input provider
-/// reports each refusal itself. A refusal that ends or never reached the
-/// lease stays fatal.
+/// session drops the refused events and keeps streaming. A refusal that ends
+/// or never reached the lease stays fatal.
 const BATCH_SCOPED_REFUSALS: [&str; 7] = [
     "invalid_sequence",
     "invalid_event",
@@ -740,10 +744,13 @@ pub(super) fn drop_refused_input_batch(
     payload: &Value,
 ) -> Result<(), &'static str> {
     let code = payload["error"]["code"].as_str().unwrap_or_default();
-    if !BATCH_SCOPED_REFUSALS.contains(&code)
-        || payload["recovery_required"] == true
-        || record.input_inflight == 0
-    {
+    let Some(refusal_index) = BATCH_SCOPED_REFUSALS
+        .iter()
+        .position(|candidate| *candidate == code)
+    else {
+        return Err("dependency_rejected");
+    };
+    if payload["recovery_required"] == true || record.input_inflight == 0 {
         return Err("dependency_rejected");
     }
     eprintln!(
@@ -764,6 +771,11 @@ pub(super) fn drop_refused_input_batch(
             .lifecycle_input_sequence
             .checked_add(1)
             .ok_or("lifecycle_sequence_exhausted")?;
+    }
+    let warning_bit = 1_u8 << refusal_index;
+    if record.input_batch_warning_mask & warning_bit == 0 {
+        record.input_batch_warning_mask |= warning_bit;
+        record.report_input_warning("input_batch", code, code);
     }
     Ok(())
 }
@@ -807,6 +819,14 @@ pub(super) fn accept_controller_batch_failure(
     record.unsupported_controls = record.unsupported_controls.saturating_add(1);
     record.input_inflight = 0;
     record.input_timing.acknowledge(true);
+    if !record.controller_warning_reported {
+        record.controller_warning_reported = true;
+        record.report_input_warning(
+            "input_batch",
+            "controller_unavailable",
+            "controller_unavailable",
+        );
+    }
     Ok(())
 }
 
@@ -1155,7 +1175,7 @@ pub(super) fn configure_translator(
 ) -> Result<(), &'static str> {
     record.input_absolute_pointer = absolute_pointer;
     let Some(geometry) = record.capture_geometry.filter(|_| absolute_pointer) else {
-        record.input_translator = InputTranslator::default();
+        record.input_translator.set_absolute_viewport(None);
         return Ok(());
     };
     let normalized = geometry
@@ -1175,7 +1195,7 @@ pub(super) fn configure_translator(
             || port.content_height < 2.0
         {
             record.input_absolute_pointer = false;
-            record.input_translator = InputTranslator::default();
+            record.input_translator.set_absolute_viewport(None);
             return Ok(());
         }
         let horizontal = f64::from(port.width) - 1.0;
@@ -1190,7 +1210,9 @@ pub(super) fn configure_translator(
             )
             .map_err(|_| "invalid_capture_geometry")?;
     }
-    record.input_translator = InputTranslator::new(Some(viewport));
+    record
+        .input_translator
+        .set_absolute_viewport(Some(viewport));
     Ok(())
 }
 

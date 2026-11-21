@@ -44,6 +44,7 @@ pub enum Phase {
     EndLifecycle,
     ReportApplicationRetired,
     LookupApplicationRetirement,
+    ReleasePausedDisplay,
     AwaitLifecycleEnd,
     VerifyPaused,
     VerifyResumeSession,
@@ -177,38 +178,6 @@ pub struct Job {
     pub deadline: Instant,
 }
 
-fn log_monitor_problem(
-    logger: Option<&amaterasu_module_sdk::LogEmitter>,
-    phase: Phase,
-    event: &str,
-) {
-    if let Some(logger) = logger {
-        let _ = logger.emit(
-            LogLevel::Warning,
-            "launch",
-            &format!("phase={phase:?} event={event}"),
-        );
-    }
-}
-
-fn log_proton_policy_fallback(
-    logger: Option<&amaterasu_module_sdk::LogEmitter>,
-    phase: Phase,
-    fallback: bool,
-    payload: &Value,
-) {
-    if let Some(logger) = logger {
-        let code = safe_rtsp_provider_code(&payload["code"]);
-        let _ = logger.emit(
-            LogLevel::Warning,
-            "launch",
-            &format!(
-                "phase={phase:?} event=optional_policy_unavailable fallback={fallback} code={code}"
-            ),
-        );
-    }
-}
-
 /// The `source` NVHTTP's own stream warnings carry.
 const NVHTTP_WARNING_SOURCE: &str = "amaterasu.nvhttp/1";
 
@@ -217,7 +186,6 @@ const NVHTTP_WARNING_SOURCE: &str = "amaterasu.nvhttp/1";
 #[track_caller]
 pub(super) fn add_stream_warning(
     record: &mut Record,
-    logger: Option<&amaterasu_module_sdk::LogEmitter>,
     warning: amaterasu_module_sdk::stream_warnings::StreamWarning,
 ) {
     if !warning.valid() || record.stream_warnings.contains(&warning) {
@@ -228,22 +196,16 @@ pub(super) fn add_stream_warning(
     if warning.source == NVHTTP_WARNING_SOURCE {
         record.record_warning(&warning);
     }
-    push_stream_warning(record, logger, warning);
+    push_stream_warning(record, warning);
 }
 
 /// Keep a stream warning whose lifecycle issue was already recorded.
 fn push_stream_warning(
     record: &mut Record,
-    logger: Option<&amaterasu_module_sdk::LogEmitter>,
     warning: amaterasu_module_sdk::stream_warnings::StreamWarning,
 ) {
     if !warning.valid() || record.stream_warnings.contains(&warning) {
         return;
-    }
-    if let Some(logger) = logger {
-        let message = json!({"event":"stream_warning", "stream":record.rtsp_operation,
-            "warning":warning});
-        let _ = logger.emit(LogLevel::Warning, "stream.warning", &message.to_string());
     }
     if record.stream_warnings.len() < amaterasu_module_sdk::stream_warnings::MAX_WARNINGS {
         record.stream_warnings.push(warning);
@@ -252,12 +214,9 @@ fn push_stream_warning(
     }
 }
 
-pub(super) fn add_request_warnings(
-    record: &mut Record,
-    logger: Option<&amaterasu_module_sdk::LogEmitter>,
-) {
+pub(super) fn add_request_warnings(record: &mut Record) {
     for warning in record.request.advisory_warnings.0.clone() {
-        add_stream_warning(record, logger, warning);
+        add_stream_warning(record, warning);
     }
 }
 
@@ -285,7 +244,6 @@ const MAX_HISTORY_RELEASE_ATTEMPTS: u8 = 8;
 #[track_caller]
 pub(super) fn demote_record_warning(
     record: &mut Record,
-    logger: Option<&amaterasu_module_sdk::LogEmitter>,
     dependency: LifecycleLayer,
     phase: &str,
     code: &str,
@@ -301,26 +259,43 @@ pub(super) fn demote_record_warning(
     )
     .because(reason)
     .caused_by(dependency);
-    push_stream_warning(
-        record,
-        logger,
-        issue.to_stream_warning("amaterasu.nvhttp/1"),
-    );
-    record.issues.push_logged(logger, issue);
+    push_stream_warning(record, issue.to_stream_warning("amaterasu.nvhttp/1"));
+    record.issues.push(issue);
 }
 
 impl Controller {
+    fn paused_display_timeout(&self, record: &Record) -> Option<u32> {
+        let application = match record.application_session {
+            Some(root) => self.records.get(&root)?,
+            None => record,
+        };
+        if !cfg!(target_os = "linux")
+            || application.desktop
+            || application.auxiliary.is_some()
+            || application.stop_on_stream_end
+        {
+            return None;
+        }
+        let policy = application
+            .display_policy_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("effective_overrides"))
+            .unwrap_or(&application.global_display_policy);
+        if policy["dd_config_revert_on_disconnect"] == true {
+            return None;
+        }
+        Some(
+            policy["dd_paused_virtual_display_timeout_secs"]
+                .as_u64()
+                .and_then(|timeout| u32::try_from(timeout).ok())
+                .unwrap_or(7200),
+        )
+    }
+
     #[track_caller]
-    fn demote_history_release(
-        logger: Option<&amaterasu_module_sdk::LogEmitter>,
-        record: &mut Record,
-        code: &str,
-        reason: &str,
-        now: Instant,
-    ) {
+    fn demote_history_release(record: &mut Record, code: &str, reason: &str, now: Instant) {
         demote_record_warning(
             record,
-            logger,
             LifecycleLayer::History,
             "release_history",
             code,
@@ -632,7 +607,7 @@ impl Controller {
             return;
         }
         if !phase.routine_monitor() {
-            self.log_phase(LogLevel::Debug, phase, "start");
+            self.log_phase(phase, "Started launch step");
         }
         let call = self.make_call(&mut record, phase);
         let deadline = if phase.optional_proton_policy_read()
@@ -796,7 +771,7 @@ impl Controller {
                 );
             }
             Outcome::Uncertain => {
-                self.log_phase(LogLevel::Warning, job.phase, "uncertain");
+                self.log_phase(job.phase, "The result of the launch step is still unknown");
                 if job.phase.status_read() {
                     self.status_read_lost(job, now, send, replies);
                     return;
@@ -833,7 +808,6 @@ impl Controller {
                     let rtsp_operation = record.rtsp_operation.clone();
                     record.cleanup_error = None;
                     Self::demote_history_release(
-                        self.logger.as_ref(),
                         record,
                         "history_release_unconfirmed",
                         "uncertain_broker_settlement",
@@ -872,6 +846,12 @@ impl Controller {
                     return;
                 }
                 match job.phase {
+                    Phase::ReleasePausedDisplay => {
+                        record.fail_cleanup("paused_display_release_unconfirmed");
+                        reply_failure(record, replies);
+                        self.finish_or_retain(job.record, now, replies);
+                        return;
+                    }
                     Phase::ReadLaunchEpoch
                     | Phase::PrepareLifecycle
                     | Phase::LookupLifecycle
@@ -923,6 +903,12 @@ impl Controller {
                     record.transport_only_cleanup = true;
                     record.stop_application_after_stream_retirement =
                         record.application_session.is_none() && record.stop_on_stream_end;
+                }
+                if entering_cleanup {
+                    record.record_failure_because(
+                        "broker_settlement_unconfirmed",
+                        "broker_settlement_unconfirmed",
+                    );
                 }
                 record.state = State::Stopping;
                 record.stage = Stage::Cleanup;
@@ -1278,6 +1264,11 @@ impl Controller {
                 json!({"operation":"lookup", "operation_id":record.application_retirement_operation()}),
                 5_000,
             ),
+            Phase::ReleasePausedDisplay => (
+                stream_service.as_str(),
+                json!({"action":"release_paused_display","application":record.lifecycle_session_target}),
+                5_000,
+            ),
             Phase::AwaitLifecycleEnd => (
                 lifecycle_service.as_str(),
                 json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-end",record.application_operation)}),
@@ -1549,6 +1540,16 @@ impl Controller {
                     .to_string()
             );
             payload["lifecycle_intent"] = json!(record.lifecycle_intent());
+            if record.capture_output == super::OWNED_DISPLAY_OUTPUT
+                && record.lifecycle_capture_mode.is_external()
+                && record.shared_capture.is_none()
+                && record.display_request.is_none()
+                && record.virtual_display_intent.is_none()
+                && let Some(timeout) = self.paused_display_timeout(record)
+            {
+                payload["paused_display_timeout_secs"] = timeout.into();
+                record.paused_display_possible = true;
+            }
             // Only stream-session's owned display uses this operation
             // reference. Exact-output joins carry their presentation lease.
             if record.lifecycle_capture_mode.is_external()
@@ -1645,16 +1646,11 @@ impl Controller {
         let reported_failure = job.phase.response_reported_failure(&payload);
         if !job.phase.routine_monitor() {
             self.log_phase(
-                if reported_failure {
-                    LogLevel::Warning
-                } else {
-                    LogLevel::Debug
-                },
                 job.phase,
                 if reported_failure {
-                    "provider_failure"
+                    "The provider reported a failure"
                 } else {
-                    "response"
+                    "Received the provider response"
                 },
             );
         }
@@ -1678,7 +1674,6 @@ impl Controller {
                         let fallback = record
                             .global_proton_dualsense_compatibility
                             .unwrap_or(false);
-                        log_proton_policy_fallback(logger.as_ref(), job.phase, fallback, &payload);
                         (fallback, Some(proton_policy_warning(&payload, fallback)))
                     }
                 };
@@ -1702,9 +1697,9 @@ impl Controller {
                         || self.retire_stream_key(record.request.remote_input_key)
                     {
                         candidate.apply(&mut record);
-                        add_request_warnings(&mut record, logger.as_ref());
+                        add_request_warnings(&mut record);
                         if let Some(warning) = warning {
-                            add_stream_warning(&mut record, logger.as_ref(), warning);
+                            add_stream_warning(&mut record, warning);
                         }
                         record.stage = Stage::ReserveHistory;
                     } else {
@@ -1897,6 +1892,22 @@ impl Controller {
             Phase::ReportApplicationRetired | Phase::LookupApplicationRetirement => {
                 observe_application_retirement(record, job.phase, &payload, now, replies);
             }
+            Phase::ReleasePausedDisplay => {
+                if payload["ok"] == true
+                    && payload["application"] == json!(record.lifecycle_session_target)
+                {
+                    match payload["released"].as_bool() {
+                        Some(true) => record.paused_display_released = true,
+                        Some(false) => record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL,
+                        None => record.fail_cleanup("paused_display_release_unconfirmed"),
+                    }
+                } else {
+                    record.fail_cleanup("paused_display_release_unconfirmed");
+                }
+                if record.state == State::CleanupFailed {
+                    reply_failure(record, replies);
+                }
+            }
             Phase::AwaitLifecycleEnd => {
                 let exact_receipt = payload["operation_id"]
                     == format!("{}-lifecycle-end", record.application_operation)
@@ -1939,7 +1950,14 @@ impl Controller {
                         // still running. Keep it owned and visible as paused,
                         // so it can be resumed or quit, instead of turning a
                         // missing confirmation into a record nothing can end.
-                        log_monitor_problem(logger.as_ref(), job.phase, "pause_unconfirmed");
+                        demote_record_warning(
+                            record,
+                            LifecycleLayer::SessionLifecycle,
+                            "verify_paused",
+                            "pause_unconfirmed",
+                            "lifecycle_snapshot_unconfirmed",
+                            "keep_paused_application",
+                        );
                         record.state = State::Paused;
                         record.stage = Stage::Live;
                         record.transport_only_cleanup = false;
@@ -1966,7 +1984,7 @@ impl Controller {
                     )
                 }) {
                     for warning in warnings {
-                        add_stream_warning(record, logger.as_ref(), warning);
+                        add_stream_warning(record, warning);
                     }
                 }
             }
@@ -2005,12 +2023,7 @@ impl Controller {
             Phase::ReadProtonPolicy => {
                 if record.state == State::Starting {
                     let value = proton_policy_response(&payload).unwrap_or_else(|_| {
-                        log_proton_policy_fallback(logger.as_ref(), job.phase, false, &payload);
-                        add_stream_warning(
-                            record,
-                            logger.as_ref(),
-                            proton_policy_warning(&payload, false),
-                        );
+                        add_stream_warning(record, proton_policy_warning(&payload, false));
                         false
                     });
                     record.global_proton_dualsense_compatibility = Some(value);
@@ -2214,6 +2227,9 @@ impl Controller {
                     Ok((launch_id, _, _)) => {
                         record.application_launch = Some(launch_id);
                         record.failure.get_or_insert("application_ended");
+                        if record.state == State::Starting {
+                            record.record_failure("application_ended");
+                        }
                         record.request_cleanup(None, now);
                     }
                     Err("launch_not_found") if job.phase == Phase::LookupApplication => {
@@ -2230,6 +2246,9 @@ impl Controller {
                         record
                             .failure
                             .get_or_insert("application_launch_unavailable");
+                        if record.state == State::Starting {
+                            record.record_failure("application_launch_unavailable");
+                        }
                         record.request_cleanup(None, now);
                     }
                     Err(code) => fail_record(record, code, now),
@@ -2287,6 +2306,12 @@ impl Controller {
                         safe_rtsp_provider_code(&payload["cleanup_error"]),
                     );
                     record.rtsp_ticket = Some(ticket);
+                    if record.state == State::Starting {
+                        record.record_failure_because(
+                            "rtsp_not_ready",
+                            safe_rtsp_provider_code(&payload["failure"]),
+                        );
+                    }
                     record.request_cleanup(None, now);
                 }
                 Err("ticket_not_found") if job.phase == Phase::LookupRtsp => {
@@ -2305,14 +2330,8 @@ impl Controller {
             },
             Phase::MonitorApplication => match application_response(record, &payload) {
                 Ok((_, "active", true)) => record.monitored(now),
-                Ok(_) => {
-                    log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
-                    record.request_cleanup(Some("application_ended"), now)
-                }
-                Err(code) => {
-                    log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
-                    fail_record(record, code, now)
-                }
+                Ok(_) => record.request_cleanup(Some("application_ended"), now),
+                Err(code) => fail_record(record, code, now),
             },
             Phase::MonitorRtsp => {
                 record.rtsp_stream_ending = payload["state"] == "closing"
@@ -2343,13 +2362,6 @@ impl Controller {
                     {
                         observe_authenticated_disconnect(record, &payload);
                         if payload["state"] == "failed" {
-                            eprintln!(
-                                "amaterasu launch observed RTSP failure={} stream_state={} cleanup_error={}",
-                                safe_rtsp_provider_code(&payload["failure"]),
-                                safe_rtsp_provider_code(&payload["stream_state"]),
-                                safe_rtsp_provider_code(&payload["cleanup_error"])
-                            );
-                            log_monitor_problem(logger.as_ref(), job.phase, "stream_failed");
                             record.record_failure_because(
                                 "rtsp_stream_failed",
                                 safe_rtsp_provider_code(&payload["failure"]),
@@ -2358,7 +2370,7 @@ impl Controller {
                             let _ = logger.emit(
                                 LogLevel::Info,
                                 "launch",
-                                "phase=MonitorRtsp event=closed",
+                                "The client stream connection closed.",
                             );
                         }
                         record.rtsp_requested = false;
@@ -2383,7 +2395,6 @@ impl Controller {
                         }
                     }
                     Ok(_) => {
-                        log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
                         if record.lifecycle_session_target.is_some() {
                             record.request_monitored_transport_cleanup(Some("stream_ended"), now);
                         } else {
@@ -2391,7 +2402,6 @@ impl Controller {
                         }
                     }
                     Err(code) => {
-                        log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
                         if record.lifecycle_session_target.is_some() {
                             record.request_monitored_transport_cleanup(Some(code), now);
                         } else {
@@ -2422,16 +2432,6 @@ impl Controller {
                 }
             }
             Phase::StopApplication | Phase::VerifyApplicationStopped => {
-                eprintln!(
-                    "amaterasu application cleanup verification response={:?} state={} cleanup={} budget={} expected_budget={:?} stop={} expected_stop={}",
-                    application_response(record, &payload),
-                    payload["launch"]["state"],
-                    payload["launch"]["cleanup_error"],
-                    payload["launch"]["cleanup_budget_ms"],
-                    record.application_cleanup_budget_ms,
-                    payload["launch"]["stop_on_stream_end"],
-                    record.stop_on_stream_end
-                );
                 if clean_application_terminal(record, &payload) {
                     record.lifecycle_retirement_launch = record.application_launch;
                     record.application_requested = false;
@@ -2476,7 +2476,6 @@ impl Controller {
                     let activity_id = record.rtsp_operation.clone();
                     let rtsp_operation = record.rtsp_operation.clone();
                     Self::demote_history_release(
-                        self.logger.as_ref(),
                         record,
                         "history_release_unconfirmed",
                         "unconfirmed_response",
@@ -2492,7 +2491,7 @@ impl Controller {
     }
 
     fn rejected(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
-        self.log_phase(LogLevel::Warning, job.phase, "rejected");
+        self.log_phase(job.phase, "The provider rejected the launch step");
         let record = self.records.get_mut(&job.record).expect("workflow record");
         if record.resume_abandoned && record.state != State::Stopping {
             reject_resume(record, replies);
@@ -2530,7 +2529,6 @@ impl Controller {
             {
                 demote_record_warning(
                     record,
-                    self.logger.as_ref(),
                     LifecycleLayer::SessionLifecycle,
                     "verify_paused",
                     "pause_unconfirmed",
@@ -2541,6 +2539,10 @@ impl Controller {
                 record.stage = Stage::Live;
                 record.transport_only_cleanup = false;
                 record.next_monitor = now;
+            }
+            Phase::ReleasePausedDisplay => {
+                record.fail_cleanup("paused_display_release_unconfirmed");
+                reply_failure(record, replies);
             }
             Phase::ReadLaunchEpoch
             | Phase::VerifyPaused
@@ -2590,7 +2592,6 @@ impl Controller {
             Phase::ReadProtonPolicy => {
                 demote_record_warning(
                     record,
-                    self.logger.as_ref(),
                     LifecycleLayer::Input,
                     "read_proton_policy",
                     "proton_policy_unavailable",
@@ -2606,7 +2607,6 @@ impl Controller {
                 let activity_id = record.rtsp_operation.clone();
                 let rtsp_operation = record.rtsp_operation.clone();
                 Self::demote_history_release(
-                    self.logger.as_ref(),
                     record,
                     "history_release_unavailable",
                     "broker_rejected",
@@ -2665,9 +2665,8 @@ impl Controller {
     }
 
     fn settled(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
-        self.log_phase(LogLevel::Warning, job.phase, "settled");
+        self.log_phase(job.phase, "The outstanding launch step settled");
         if job.phase == Phase::RefreshResumePolicy {
-            let logger = self.logger.clone();
             let Some(mut record) = self.records.remove(&job.record) else {
                 return;
             };
@@ -2685,7 +2684,6 @@ impl Controller {
                     .unwrap_or(false);
                 demote_record_warning(
                     &mut record,
-                    logger.as_ref(),
                     LifecycleLayer::Input,
                     "refresh_resume_policy",
                     "proton_policy_unavailable",
@@ -2712,7 +2710,7 @@ impl Controller {
                         || self.retire_stream_key(record.request.remote_input_key)
                     {
                         candidate.apply(&mut record);
-                        add_request_warnings(&mut record, logger.as_ref());
+                        add_request_warnings(&mut record);
                         record.stage = Stage::ReserveHistory;
                     } else {
                         reject_resume(&mut record, replies);
@@ -2759,7 +2757,6 @@ impl Controller {
             {
                 demote_record_warning(
                     record,
-                    self.logger.as_ref(),
                     LifecycleLayer::SessionLifecycle,
                     "verify_paused",
                     "pause_unconfirmed",
@@ -2770,6 +2767,11 @@ impl Controller {
                 record.stage = Stage::Live;
                 record.transport_only_cleanup = false;
                 record.next_monitor = now;
+            }
+            Phase::ReleasePausedDisplay => {
+                // The request is scoped to this application. Query the same
+                // release again inside the original cleanup deadline.
+                record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
             }
             Phase::ReadLaunchEpoch
             | Phase::RefreshResumePolicy
@@ -2811,7 +2813,6 @@ impl Controller {
                 let activity_id = record.rtsp_operation.clone();
                 let rtsp_operation = record.rtsp_operation.clone();
                 Self::demote_history_release(
-                    self.logger.as_ref(),
                     record,
                     "history_release_unavailable",
                     "broker_settled",
@@ -2824,7 +2825,6 @@ impl Controller {
             Phase::ReadProtonPolicy => {
                 demote_record_warning(
                     record,
-                    self.logger.as_ref(),
                     LifecycleLayer::Input,
                     "read_proton_policy",
                     "proton_policy_unavailable",
@@ -2928,7 +2928,17 @@ impl Controller {
                     record.fail_cleanup("application_cleanup_unconfirmed");
                     reply_failure(record, replies);
                 } else if now >= record.deadline {
-                    record.fail_cleanup("lifecycle_retirement_unconfirmed");
+                    let code = if !record.rtsp_requested
+                        && !record.application_requested
+                        && record.application_retirement_verified()
+                        && record.paused_display_possible
+                        && !record.paused_display_released
+                    {
+                        "paused_display_release_unconfirmed"
+                    } else {
+                        "lifecycle_retirement_unconfirmed"
+                    };
+                    record.fail_cleanup(code);
                     reply_failure(record, replies);
                 }
                 return;
@@ -2950,7 +2960,6 @@ impl Controller {
                         let activity_id = record.rtsp_operation.clone();
                         let rtsp_operation = record.rtsp_operation.clone();
                         Self::demote_history_release(
-                            self.logger.as_ref(),
                             record,
                             "history_release_unconfirmed",
                             error,
@@ -3118,6 +3127,7 @@ impl Phase {
             Self::EndLifecycle => "end-lifecycle",
             Self::ReportApplicationRetired => "report-application-retired",
             Self::LookupApplicationRetirement => "lookup-application-retirement",
+            Self::ReleasePausedDisplay => "release-paused-display",
             Self::AwaitLifecycleEnd => "await-lifecycle-end",
             Self::VerifyPaused => "verify-paused",
             Self::VerifyResumeSession => "verify-resume-session",
@@ -3337,6 +3347,9 @@ pub(super) fn next_phase(record: &Record) -> Phase {
                 } else {
                     Phase::LookupApplicationRetirement
                 };
+            }
+            if record.paused_display_possible && !record.paused_display_released {
+                return Phase::ReleasePausedDisplay;
             }
             if !record.lifecycle_end_complete {
                 return Phase::AwaitLifecycleEnd;

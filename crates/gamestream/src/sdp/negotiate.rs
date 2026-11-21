@@ -25,7 +25,8 @@ pub fn parse_profile_announce(
     if !offer.validate() {
         return Err(Error::Invalid("video profile offer"));
     }
-    parse_with(bytes, |attributes| {
+    let mut pyrowave_link_mbps = None;
+    let mut announce = parse_with(bytes, |attributes| {
         let selector = attributes
             .0
             .get("x-nv-vqos[0].bitStreamFormat")
@@ -77,6 +78,7 @@ pub fn parse_profile_announce(
             })
             .ok_or(Error::Unsupported("video profile format"))?
             .clone();
+        let pyrowave = super::pyrowave::is_profile(&profile);
         for attribute in profile
             .wire_attributes
             .iter()
@@ -95,9 +97,23 @@ pub fn parse_profile_announce(
             {
                 return Err(Error::Unsupported("video profile attribute"));
             }
+            if pyrowave && attribute.name == super::pyrowave::LINK_MBPS {
+                pyrowave_link_mbps = Some(bounded(
+                    syntax::decimal(actual).ok_or(Error::Invalid(super::pyrowave::LINK_MBPS))?,
+                    1,
+                    400_000,
+                    super::pyrowave::LINK_MBPS,
+                )?);
+            }
         }
         Ok(NegotiatedVideoFormat::Extension(profile))
-    })
+    })?;
+    if let (Some(link_mbps), Some(rate)) =
+        (pyrowave_link_mbps, announce.video.configured_bitrate_kbps)
+    {
+        announce.video.configured_bitrate_kbps = Some(rate.min(link_mbps * 800));
+    }
+    Ok(announce)
 }
 
 fn chroma_sampling(attributes: &mut Attributes<'_>) -> Result<ChromaSampling, Error> {

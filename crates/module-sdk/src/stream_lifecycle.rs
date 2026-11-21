@@ -18,13 +18,13 @@
 //!   publishes a [`StreamBinding`] from its own operation prefix to the stream,
 //!   and the store files the providers' reports, earlier or later, under it.
 //! - **State** is the [`StreamLifecycleStore`] the launch owner keeps: one
-//!   [`StreamLifecycle`] per stream, with the first critical failure kept as
-//!   the root cause and every demoted fallback kept as a warning.
+//!   [`StreamLifecycle`] per stream, with the first direct evidence of a
+//!   critical failure kept as the root cause and demoted fallbacks kept as warnings.
 //! - **Getters** are [`StreamLifecycleStore::snapshot`], which the owner serves
 //!   to management.
 //!
 //! An event is a notification, not a delivery guarantee. Each issue is also
-//! written to the reporter's log when it is queued, and a subscriber that
+//! offered to the reporter's log on its first publication attempt, and a subscriber that
 //! falls behind marks the affected streams `audit_gap` rather than presenting
 //! an incomplete record as complete.
 mod feed;
@@ -41,6 +41,7 @@ use crate::events::{Topic, publish_with};
 use crate::stream_warnings::{StreamWarning, WarningValue};
 use crate::{Command, LogEmitter, LogLevel, ModuleResult, Response, RuntimeClient};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::json;
 use std::collections::VecDeque;
 use std::panic::Location;
@@ -49,6 +50,9 @@ use std::panic::Location;
 /// needs the topic's `publish` grant; the launch owner holds its `subscribe`
 /// grant.
 pub const STREAM_REPORTS: Topic<StreamReport> = Topic::new("amaterasu.stream.report/1");
+/// Phase for a confirmed fallback whose operation names the exact failed attempt.
+/// Emit only after that attempt is retired or definitively held no resources.
+pub const PROVIDER_FALLBACK_CONFIRMED: &str = "provider_fallback_confirmed";
 
 /// One event on [`STREAM_REPORTS`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -73,6 +77,9 @@ impl StreamReport {
     ) -> ControlResult<()> {
         if !self.valid() {
             return Err(ControlError::Payload("invalid stream report".to_owned()));
+        }
+        if let Self::Issue(issue) = self {
+            issue.write_log_with(send);
         }
         publish_with(send, &STREAM_REPORTS, self)
     }
@@ -136,6 +143,7 @@ pub enum LifecycleLayer {
     DisplaySettings,
     VirtualDisplay,
     Capture,
+    FrameProcessing,
     EncodeVideo,
     Audio,
     AudioEncode,
@@ -163,6 +171,7 @@ impl LifecycleLayer {
             Self::DisplaySettings => "display_settings",
             Self::VirtualDisplay => "virtual_display",
             Self::Capture => "capture",
+            Self::FrameProcessing => "frame_processing",
             Self::EncodeVideo => "encode_video",
             Self::Audio => "audio",
             Self::AudioEncode => "audio_encode",
@@ -182,7 +191,7 @@ impl LifecycleLayer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueDisposition {
-    /// The stream cannot start or continue. The first one is the root cause.
+    /// The stream cannot start or continue. Direct evidence takes precedence over reactions.
     CriticalFailure,
     /// A failure that was not critical; the stream continued on `fallback`.
     DemotedWarning,
@@ -190,9 +199,69 @@ pub enum IssueDisposition {
     AdvisoryWarning,
 }
 
+/// The exact error observed at an authenticated native service boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeStreamFailure {
+    pub service: String,
+    pub call: String,
+    pub status: crate::abi::Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_generation: Option<u64>,
+}
+
+impl NativeStreamFailure {
+    fn valid(&self) -> bool {
+        self.service
+            .rsplit_once('/')
+            .is_some_and(|(name, version)| {
+                identifier(name, MAX_IDENTIFIER)
+                    && !version.is_empty()
+                    && version.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            && self.service.len() <= MAX_IDENTIFIER
+            && identifier(&self.call, MAX_LABEL)
+            && self.status != crate::abi::STATUS_OK
+            && self.capture_generation != Some(0)
+    }
+
+    fn status_name(&self) -> &'static str {
+        use crate::abi::{STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT, STATUS_UNAVAILABLE};
+        use amaterasu_media::{
+            MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED,
+        };
+        match self.status {
+            STATUS_INVALID_ARGUMENT => "STATUS_INVALID_ARGUMENT",
+            STATUS_INTERNAL_ERROR => "STATUS_INTERNAL_ERROR",
+            STATUS_UNAVAILABLE => "STATUS_UNAVAILABLE",
+            MEDIA_PENDING => "MEDIA_PENDING",
+            MEDIA_BUSY => "MEDIA_BUSY",
+            MEDIA_CLOSED => "MEDIA_CLOSED",
+            MEDIA_UNSUPPORTED => "MEDIA_UNSUPPORTED",
+            MEDIA_BACKEND_ERROR => "MEDIA_BACKEND_ERROR",
+            _ => "native status",
+        }
+    }
+}
+
+impl std::fmt::Display for NativeStreamFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "{} returned {} ({}) from {}.",
+            self.service,
+            self.status_name(),
+            self.status,
+            self.call
+        )?;
+        if let Some(generation) = self.capture_generation {
+            write!(out, " Capture offer generation {generation}.")?;
+        }
+        Ok(())
+    }
+}
+
 /// One reported failure or warning: a mutation of a stream's lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StreamIssue {
     /// Any operation ID the reporter holds for the stream: the launch owner's
     /// stream key, or an ID the owner derived from it (`<key>-…`, `<key>.…`).
@@ -212,16 +281,32 @@ pub struct StreamIssue {
     pub site: String,
     /// Set when this is the reporter's own reaction to a dependency's
     /// failure, such as a caller ending a stream because a provider refused.
-    /// The dependency reports its failure itself; this issue never outranks
-    /// that report as the root cause.
+    /// A reaction stands in for the root cause until the store has direct
+    /// evidence, either first-hand or observed at the dependency boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caused_by: Option<LifecycleLayer>,
+    /// Direct observation at the failing call, retained independently of later reactions.
+    #[serde(
+        default,
+        deserialize_with = "read_optional_native_failure",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub native_failure: Option<Box<NativeStreamFailure>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_error: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested: Option<WarningValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective: Option<WarningValue>,
+}
+
+fn read_optional_native_failure<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<NativeStreamFailure>>, D::Error> {
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value::<NativeStreamFailure>(value).ok())
+        .filter(NativeStreamFailure::valid)
+        .map(Box::new))
 }
 
 impl StreamIssue {
@@ -293,16 +378,23 @@ impl StreamIssue {
         fallback: Option<String>,
         site: &Location<'_>,
     ) -> Self {
+        let code = code.into();
+        let reason = if disposition == IssueDisposition::AdvisoryWarning {
+            String::new()
+        } else {
+            code.clone()
+        };
         Self {
             operation: operation.into(),
             layer,
             phase: phase.into(),
-            code: code.into(),
-            reason: String::new(),
+            code,
+            reason,
             disposition,
             fallback,
             site: format!("{}:{}", site.file(), site.line()),
             caused_by: None,
+            native_failure: None,
             os_error: None,
             requested: None,
             effective: None,
@@ -310,7 +402,10 @@ impl StreamIssue {
     }
 
     pub fn because(mut self, reason: impl Into<String>) -> Self {
-        self.reason = reason.into();
+        let reason = reason.into();
+        if !reason.is_empty() || self.disposition == IssueDisposition::AdvisoryWarning {
+            self.reason = reason;
+        }
         self
     }
 
@@ -324,6 +419,11 @@ impl StreamIssue {
     /// layer's failure.
     pub fn is_origin(&self) -> bool {
         self.caused_by.is_none()
+    }
+
+    pub fn with_native_failure(mut self, failure: NativeStreamFailure) -> Self {
+        self.native_failure = Some(Box::new(failure));
+        self
     }
 
     pub fn with_os_error(mut self, os_error: i32) -> Self {
@@ -358,6 +458,10 @@ impl StreamIssue {
                 .is_none_or(|fallback| identifier(fallback, MAX_IDENTIFIER))
             && (self.disposition != IssueDisposition::DemotedWarning || self.fallback.is_some())
             && bounded(&self.site, MAX_SITE)
+            && self
+                .native_failure
+                .as_deref()
+                .is_none_or(NativeStreamFailure::valid)
             && [&self.requested, &self.effective]
                 .into_iter()
                 .all(|value| match value {
@@ -392,24 +496,92 @@ impl StreamIssue {
         &self,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> ControlResult<()> {
-        if !self.valid() {
-            return Err(ControlError::Payload("invalid stream issue".to_owned()));
-        }
-        publish_with(send, &STREAM_REPORTS, &StreamReport::Issue(self.clone()))
+        StreamReport::Issue(self.clone()).report_with(send)
     }
 
-    /// Write this issue to the reporter's own log. This is the durable record
-    /// when the event cannot be delivered.
-    pub fn log(&self, logger: Option<&LogEmitter>) {
+    /// Describe the observed operation. A provider failure alone does not establish
+    /// the outcome of the whole stream.
+    pub fn description(&self) -> String {
+        use std::fmt::Write;
+        let words = |value: &str| value.replace('_', " ");
+        let summary = match self.code.as_str() {
+            "optional_client_features" => "Ignored unsupported optional client features".into(),
+            "refresh_hint_ignored" => "Ignored the inconsistent display refresh hint".into(),
+            "intra_refresh_unavailable" => "Intra-refresh is unavailable".into(),
+            "bandwidth_adjusted" => {
+                "Reduced the video bitrate to allow for audio and network overhead".into()
+            }
+            "compatibility_defaults" => {
+                "Used defaults for optional settings omitted by the client".into()
+            }
+            "invalid_optional_hints" => "Ignored invalid optional client hints".into(),
+            "audio_quality_default" => "Used the configured audio quality".into(),
+            "hevc_capability_hint_ignored" => "Ignored an unrecognized HEVC capability hint".into(),
+            _ => words(&self.code),
+        };
+        let mut message = format!("During {}: {summary}.", words(&self.phase));
+        if !self.reason.is_empty() && self.reason != self.code {
+            let _ = write!(message, " Reason: {}.", words(&self.reason));
+        }
+        if let Some(fallback) = &self.fallback {
+            let _ = write!(message, " Used {}.", words(fallback));
+        }
+        for (label, value) in [
+            ("Requested", &self.requested),
+            ("Effective", &self.effective),
+        ] {
+            if let Some(value) = value {
+                let value = match value {
+                    WarningValue::Boolean(value) => value.to_string(),
+                    WarningValue::Integer(value) => match self.code.as_str() {
+                        "bandwidth_adjusted" => format!("{value} kbps"),
+                        "refresh_hint_ignored" => format!("{} Hz", *value as f64 / 100.0),
+                        "optional_client_features" | "invalid_optional_hints" => {
+                            format!("0x{value:X}")
+                        }
+                        _ => value.to_string(),
+                    },
+                    WarningValue::Label(value) => words(value),
+                };
+                let _ = write!(message, " {label}: {value}.");
+            }
+        }
+        if let Some(error) = self.os_error {
+            let _ = write!(message, " OS error {error}.");
+        }
+        if let Some(failure) = &self.native_failure {
+            let _ = write!(message, " {failure}");
+        }
+        let _ = write!(message, " (Operation {})", self.operation);
+        message
+    }
+
+    fn write_log_with(&self, send: &mut impl FnMut(Command) -> ModuleResult<Response>) {
+        let (level, target) = self.log_target();
+        let _ = send(Command::Log {
+            level: level as u8,
+            target: target.into(),
+            message: self.description(),
+        });
+    }
+
+    /// Render the owner's own commit through its bounded log emitter.
+    fn log(&self, logger: Option<&LogEmitter>) {
         let Some(logger) = logger else {
             return;
         };
-        let (level, target) = match self.disposition {
+        if self.valid() {
+            let (level, target) = self.log_target();
+            let _ = logger.emit(level, target, &self.description());
+        }
+    }
+
+    fn log_target(&self) -> (LogLevel, &'static str) {
+        match self.disposition {
             IssueDisposition::CriticalFailure => (LogLevel::Error, "stream.lifecycle.failure"),
             IssueDisposition::DemotedWarning => (LogLevel::Warning, "stream.lifecycle.demoted"),
             IssueDisposition::AdvisoryWarning => (LogLevel::Warning, "stream.lifecycle.warning"),
-        };
-        let _ = logger.emit(level, target, &json!(self).to_string());
+        }
     }
 }
 
@@ -417,13 +589,19 @@ impl StreamIssue {
 /// record method with no runtime access. The layer flushes it from its tick.
 #[derive(Debug, Default)]
 pub struct StreamIssueOutbox {
-    issues: VecDeque<StreamReport>,
+    issues: VecDeque<PendingReport>,
     dropped: u64,
+}
+
+#[derive(Debug)]
+struct PendingReport {
+    report: StreamReport,
+    log_attempted: bool,
 }
 
 impl StreamIssueOutbox {
     /// Queue `issue`. When the outbox is full the oldest report is dropped
-    /// and counted; its log line, written by [`Self::push_logged`], remains.
+    /// and counted.
     pub fn push(&mut self, issue: StreamIssue) {
         self.push_report(StreamReport::Issue(issue));
     }
@@ -434,17 +612,18 @@ impl StreamIssueOutbox {
     }
 
     fn push_report(&mut self, report: StreamReport) {
+        self.push_pending(PendingReport {
+            report,
+            log_attempted: false,
+        });
+    }
+
+    fn push_pending(&mut self, pending: PendingReport) {
         if self.issues.len() >= MAX_OUTBOX_ISSUES {
             self.issues.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
-        self.issues.push_back(report);
-    }
-
-    /// Log `issue` now and queue it for publication.
-    pub fn push_logged(&mut self, logger: Option<&LogEmitter>, issue: StreamIssue) {
-        issue.log(logger);
-        self.push(issue);
+        self.issues.push_back(pending);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -462,7 +641,14 @@ impl StreamIssueOutbox {
 
     /// Hand every queued report to an owner that keeps the store itself.
     pub fn drain(&mut self) -> impl Iterator<Item = StreamReport> + '_ {
-        self.issues.drain(..)
+        self.issues.drain(..).map(|pending| pending.report)
+    }
+
+    /// Preserve delivery and logging progress when a record is retired.
+    pub fn transfer_to(&mut self, destination: &mut Self) {
+        for pending in self.issues.drain(..) {
+            destination.push_pending(pending);
+        }
     }
 
     /// Publish queued issues in order. An invalid issue is discarded and
@@ -473,13 +659,19 @@ impl StreamIssueOutbox {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> ControlResult<usize> {
         let mut published = 0;
-        while let Some(report) = self.issues.front() {
-            if !report.valid() {
+        while let Some(pending) = self.issues.front_mut() {
+            if !pending.report.valid() {
                 self.issues.pop_front();
                 self.dropped = self.dropped.saturating_add(1);
                 continue;
             }
-            report.report_with(send)?;
+            if !pending.log_attempted {
+                if let StreamReport::Issue(issue) = &pending.report {
+                    issue.write_log_with(send);
+                }
+                pending.log_attempted = true;
+            }
+            publish_with(send, &STREAM_REPORTS, &pending.report)?;
             self.issues.pop_front();
             published += 1;
         }
