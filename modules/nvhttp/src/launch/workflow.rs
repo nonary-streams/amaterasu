@@ -44,6 +44,7 @@ pub enum Phase {
     EndLifecycle,
     ReportApplicationRetired,
     LookupApplicationRetirement,
+    ReleasePausedDisplay,
     AwaitLifecycleEnd,
     VerifyPaused,
     VerifyResumeSession,
@@ -310,6 +311,34 @@ pub(super) fn demote_record_warning(
 }
 
 impl Controller {
+    fn paused_display_timeout(&self, record: &Record) -> Option<u32> {
+        let application = match record.application_session {
+            Some(root) => self.records.get(&root)?,
+            None => record,
+        };
+        if !cfg!(target_os = "linux")
+            || application.desktop
+            || application.auxiliary.is_some()
+            || application.stop_on_stream_end
+        {
+            return None;
+        }
+        let policy = application
+            .display_policy_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("effective_overrides"))
+            .unwrap_or(&application.global_display_policy);
+        if policy["dd_config_revert_on_disconnect"] == true {
+            return None;
+        }
+        Some(
+            policy["dd_paused_virtual_display_timeout_secs"]
+                .as_u64()
+                .and_then(|timeout| u32::try_from(timeout).ok())
+                .unwrap_or(7200),
+        )
+    }
+
     #[track_caller]
     fn demote_history_release(
         logger: Option<&amaterasu_module_sdk::LogEmitter>,
@@ -872,6 +901,12 @@ impl Controller {
                     return;
                 }
                 match job.phase {
+                    Phase::ReleasePausedDisplay => {
+                        record.fail_cleanup("paused_display_release_unconfirmed");
+                        reply_failure(record, replies);
+                        self.finish_or_retain(job.record, now, replies);
+                        return;
+                    }
                     Phase::ReadLaunchEpoch
                     | Phase::PrepareLifecycle
                     | Phase::LookupLifecycle
@@ -1278,6 +1313,11 @@ impl Controller {
                 json!({"operation":"lookup", "operation_id":record.application_retirement_operation()}),
                 5_000,
             ),
+            Phase::ReleasePausedDisplay => (
+                stream_service.as_str(),
+                json!({"action":"release_paused_display","application":record.lifecycle_session_target}),
+                5_000,
+            ),
             Phase::AwaitLifecycleEnd => (
                 lifecycle_service.as_str(),
                 json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-end",record.application_operation)}),
@@ -1549,6 +1589,16 @@ impl Controller {
                     .to_string()
             );
             payload["lifecycle_intent"] = json!(record.lifecycle_intent());
+            if record.capture_output == super::OWNED_DISPLAY_OUTPUT
+                && record.lifecycle_capture_mode.is_external()
+                && record.shared_capture.is_none()
+                && record.display_request.is_none()
+                && record.virtual_display_intent.is_none()
+                && let Some(timeout) = self.paused_display_timeout(record)
+            {
+                payload["paused_display_timeout_secs"] = timeout.into();
+                record.paused_display_possible = true;
+            }
             if record.lifecycle_capture_mode.is_external()
                 && let Some(application) = record.application_session
             {
@@ -1892,6 +1942,22 @@ impl Controller {
             }
             Phase::ReportApplicationRetired | Phase::LookupApplicationRetirement => {
                 observe_application_retirement(record, job.phase, &payload, now, replies);
+            }
+            Phase::ReleasePausedDisplay => {
+                if payload["ok"] == true
+                    && payload["application"] == json!(record.lifecycle_session_target)
+                {
+                    match payload["released"].as_bool() {
+                        Some(true) => record.paused_display_released = true,
+                        Some(false) => record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL,
+                        None => record.fail_cleanup("paused_display_release_unconfirmed"),
+                    }
+                } else {
+                    record.fail_cleanup("paused_display_release_unconfirmed");
+                }
+                if record.state == State::CleanupFailed {
+                    reply_failure(record, replies);
+                }
             }
             Phase::AwaitLifecycleEnd => {
                 let exact_receipt = payload["operation_id"]
@@ -2538,6 +2604,10 @@ impl Controller {
                 record.transport_only_cleanup = false;
                 record.next_monitor = now;
             }
+            Phase::ReleasePausedDisplay => {
+                record.fail_cleanup("paused_display_release_unconfirmed");
+                reply_failure(record, replies);
+            }
             Phase::ReadLaunchEpoch
             | Phase::VerifyPaused
             | Phase::VerifyResumeSession
@@ -2766,6 +2836,11 @@ impl Controller {
                 record.transport_only_cleanup = false;
                 record.next_monitor = now;
             }
+            Phase::ReleasePausedDisplay => {
+                // The request is scoped to this application. Query the same
+                // release again inside the original cleanup deadline.
+                record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
+            }
             Phase::ReadLaunchEpoch
             | Phase::RefreshResumePolicy
             | Phase::VerifyPaused
@@ -2923,7 +2998,17 @@ impl Controller {
                     record.fail_cleanup("application_cleanup_unconfirmed");
                     reply_failure(record, replies);
                 } else if now >= record.deadline {
-                    record.fail_cleanup("lifecycle_retirement_unconfirmed");
+                    let code = if !record.rtsp_requested
+                        && !record.application_requested
+                        && record.application_retirement_verified()
+                        && record.paused_display_possible
+                        && !record.paused_display_released
+                    {
+                        "paused_display_release_unconfirmed"
+                    } else {
+                        "lifecycle_retirement_unconfirmed"
+                    };
+                    record.fail_cleanup(code);
                     reply_failure(record, replies);
                 }
                 return;
@@ -3113,6 +3198,7 @@ impl Phase {
             Self::EndLifecycle => "end-lifecycle",
             Self::ReportApplicationRetired => "report-application-retired",
             Self::LookupApplicationRetirement => "lookup-application-retirement",
+            Self::ReleasePausedDisplay => "release-paused-display",
             Self::AwaitLifecycleEnd => "await-lifecycle-end",
             Self::VerifyPaused => "verify-paused",
             Self::VerifyResumeSession => "verify-resume-session",
@@ -3332,6 +3418,9 @@ pub(super) fn next_phase(record: &Record) -> Phase {
                 } else {
                     Phase::LookupApplicationRetirement
                 };
+            }
+            if record.paused_display_possible && !record.paused_display_released {
+                return Phase::ReleasePausedDisplay;
             }
             if !record.lifecycle_end_complete {
                 return Phase::AwaitLifecycleEnd;

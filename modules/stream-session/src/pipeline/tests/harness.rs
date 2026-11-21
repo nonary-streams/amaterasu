@@ -1553,9 +1553,10 @@ impl Broker {
                 json!({"ok":true,"monitors":monitors,"reference_owned":reference_owned,"parked":parked,"parked_outputs":parked_outputs})
             }
             "remove" => {
-                if payload["reference_id"]
-                    .as_str()
-                    .is_some_and(|reference| reference.starts_with("shared-source-"))
+                let reference = payload["reference_id"].as_str().expect("reference ID");
+                if reference.starts_with("shared-source-")
+                    && self.virtual_display_references.len() == 1
+                    && self.virtual_display_references.contains(reference)
                 {
                     assert!(
                         !self.allocations.iter().any(|((service, _), allocation)| {
@@ -1568,7 +1569,6 @@ impl Broker {
                 if self.virtual_display_remove_failure {
                     return error("cleanup_pending");
                 }
-                let reference = payload["reference_id"].as_str().expect("reference ID");
                 let released = self.virtual_display_references.remove(reference);
                 let reference_owned = self.virtual_display_references.contains(reference);
                 let removed = self.virtual_display_references.is_empty();

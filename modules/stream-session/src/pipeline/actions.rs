@@ -149,6 +149,13 @@ impl Pipeline {
                     rpc::complete(send, input.request, json!({"ok":true}));
                 }
             }
+            Operation::ReleasePausedDisplay { application } => self.release_paused_display(
+                input.request,
+                &input.owner,
+                application,
+                input.now,
+                send,
+            ),
             Operation::Prepare(config) => self.prepare(input, *config, send),
             Operation::Start {
                 session,

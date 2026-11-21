@@ -51,6 +51,7 @@ pub(super) fn phase_layer(phase: Phase) -> LifecycleLayer {
         ReadRtspRuntimeEpoch | OpenRtsp | LookupRtsp | MonitorRtsp | StopRtsp
         | VerifyRtspStopped => LifecycleLayer::Rtsp,
         VerifyBorrowedCapture => LifecycleLayer::Capture,
+        ReleasePausedDisplay => LifecycleLayer::VirtualDisplay,
         PrepareLifecycle
         | LookupLifecycle
         | BindApplication
@@ -175,6 +176,20 @@ impl Record {
         } else {
             issue.because(reason)
         };
+        self.issues.push(issue);
+    }
+
+    #[track_caller]
+    pub(super) fn record_cleanup_warning(&mut self, code: &str) {
+        let issue = self.attributed(
+            StreamIssue::advisory(
+                self.rtsp_operation.clone(),
+                LifecycleLayer::Nvhttp,
+                "unattributed",
+                code,
+            )
+            .because(code),
+        );
         self.issues.push(issue);
     }
 

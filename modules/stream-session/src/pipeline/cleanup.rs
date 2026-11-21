@@ -140,10 +140,15 @@ impl Pipeline {
                 if payload["error"]["code"] == "startup_reconciliation_pending" {
                     return true;
                 }
-                if super::virtual_display::absent(record, &payload) {
+                if super::virtual_display::owned_reference_released(record, &payload) {
                     record.shared_capture_attached = false;
                     record.virtual_display_attempted = false;
                     record.virtual_display_output = None;
+                    record.virtual_display_state = if payload["parked"] == true {
+                        "parked".into()
+                    } else {
+                        "released".into()
+                    };
                     if record.cleanup_error == Some("virtual_display_remove_unconfirmed") {
                         record.cleanup_error = None;
                     }
@@ -436,12 +441,12 @@ impl Pipeline {
     ) -> bool {
         let clean = record.attempted.is_empty()
             && record.restart_lifecycle_preparation.is_none()
-            && !record.shared_capture_attached
+            && (!record.shared_capture_attached || record.retains_paused_display())
             && record.uncertain.is_none()
             && record.journal_uncertain.is_none()
             && !record.input_attempted
             && record.input_lease.is_none()
-            && !record.virtual_display_attempted
+            && (!record.virtual_display_attempted || record.retains_paused_display())
             && !record.display_attempted
             && record.display_lease.is_none()
             && !record.virtual_display_reference_owned
@@ -451,7 +456,41 @@ impl Pipeline {
                 .as_ref()
                 .is_none_or(|start| start.lifecycle_target.is_none())
                 || record.lifecycle_consumers_retired());
-        if clean && self.journal.document.entries.contains_key(&record.id) {
+        if clean && record.retains_paused_display() && !self.journal.matches_record(record) {
+            // Only the display still needs crash recovery. Persist that
+            // fact before confirming retirement of the departing transport.
+            match self.journal.with_record(record) {
+                Ok(document) => {
+                    job.journal_resume = Some(Step::WaitDrain);
+                    job.journal_payload = Some(self.journal.set_payload(&document));
+                    job.journal_document = Some(document);
+                    job.journal_operation_id =
+                        Some(self.journal.op_id(self.sequence.saturating_add(1)));
+                    job.step = Step::PersistJournal;
+                    return true;
+                }
+                Err(code) => {
+                    record.paused_display = Some(super::paused_display::Hold::Releasing);
+                    record.cleanup_error = Some(code);
+                    record.state = State::CleanupFailed;
+                    if let Some(operation) = record.config.rtsp_operation_id.as_deref() {
+                        use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+                        record.issues.push(StreamIssue::advisory(
+                            operation,
+                            LifecycleLayer::StreamSession,
+                            "persist_journal",
+                            code,
+                        ));
+                    }
+                    self.reply(record, job, send);
+                    return false;
+                }
+            }
+        }
+        if clean
+            && !record.retains_paused_display()
+            && self.journal.document.entries.contains_key(&record.id)
+        {
             let document = self.journal.without_record(record.id);
             job.journal_resume = Some(Step::WaitDrain);
             job.journal_payload = Some(self.journal.set_payload(&document));
@@ -462,8 +501,14 @@ impl Pipeline {
         }
         record.state = if clean {
             record.cleanup_error = None;
+            if !record.retains_paused_display() {
+                record.paused_display = None;
+            }
             record.outcome
         } else {
+            if record.retains_paused_display() {
+                record.paused_display = Some(super::paused_display::Hold::Releasing);
+            }
             State::CleanupFailed
         };
         self.reply(record, job, send);

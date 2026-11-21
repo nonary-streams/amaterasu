@@ -379,7 +379,14 @@ impl Pipeline {
             let Some(step) = job.next_cleanup(record) else {
                 return self.finish_cleanup(record, job, send);
             };
-            job.step = step;
+            job.step = if step == Step::RemoveOwnedVirtualDisplay
+                && !self.shutdown_admission_closed()
+                && record.retain_disconnected_display(now)
+            {
+                job.next_cleanup(record).unwrap_or(Step::WaitDrain)
+            } else {
+                step
+            };
         }
         if job.step == Step::RumbleDrain {
             if record.rumble_pending.is_empty() {
@@ -448,9 +455,19 @@ impl Pipeline {
             job.step = Step::ReadFrozenProcessingSettings;
         }
         if job.step == Step::AcquireOutput
+            && record.shared_capture.is_none()
             && let Err(code) = super::shared_capture::initialize_source(record)
         {
             job.fail(record, code, now);
+            return true;
+        }
+        if job.step == Step::AcquireOutput
+            && !record.virtual_display_attempted
+            && record.config.shared_source_operation_id.is_none()
+            && record.config.borrowed_capture.is_none()
+            && let Some(previous) = self.select_paused_display(record)
+        {
+            job.retire_paused_display = Some(previous);
             return true;
         }
         if job.step == Step::AcquireOutput
@@ -469,6 +486,7 @@ impl Pipeline {
         }
         if job.step == Step::CreateOwnedVirtualDisplay {
             record.virtual_display_attempted = true;
+            record.shared_capture_attached = record.shared_capture.is_some();
         }
         if job.step == Step::ApplyDisplay {
             record.display_attempted = true;
@@ -1079,6 +1097,8 @@ impl Pipeline {
             if job.step == Step::CreateOwnedVirtualDisplay {
                 if payload["ok"] == true {
                     job.step = Step::FindOwnedVirtualDisplay;
+                } else if Self::fallback_from_paused_display(record, &payload) {
+                    job.step = Step::AcquireOutput;
                 } else if !matches!(
                     payload["error"]["code"].as_str(),
                     Some("startup_reconciliation_pending" | "busy")
@@ -1087,7 +1107,10 @@ impl Pipeline {
                 }
             } else {
                 match super::virtual_display::accept_ready(record, &payload) {
-                    Ok(true) => job.step = Step::AcquireOutput,
+                    Ok(true) => {
+                        Self::report_paused_display_fallback(record);
+                        job.step = Step::AcquireOutput;
+                    }
                     Ok(false) => {}
                     Err(code) => job.fail(record, code, now),
                 }

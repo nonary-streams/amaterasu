@@ -16,7 +16,9 @@ use crate::{
     scale::ScaleSetting,
     stream_issues,
 };
-use amaterasu_module_sdk::stream_lifecycle::{StreamIssueOutbox, StreamReport};
+use amaterasu_module_sdk::stream_lifecycle::{
+    LifecycleLayer, StreamIssue, StreamIssueOutbox, StreamReport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -545,6 +547,13 @@ impl Manager {
                             self.recovery_pending.remove(&key);
                             self.monitors.remove(&key);
                             if let Some(output) = parked_output {
+                                self.stream_issues.push(StreamIssue::demoted(
+                                    &key.1,
+                                    LifecycleLayer::VirtualDisplay,
+                                    "remove",
+                                    "desktop_handoff_unconfirmed",
+                                    "retain_desktop_recovery",
+                                ));
                                 self.parked.insert(key.clone(), output);
                             } else {
                                 self.parked.remove(&key);

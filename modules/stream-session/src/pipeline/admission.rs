@@ -35,6 +35,7 @@ impl Pipeline {
                 record.admission() == Admission::Ended
                     && entries.contains_key(&record.id)
                     && record.journal_uncertain.is_none()
+                    && record.paused_display.is_none()
                     && Some(record.id) != working
             })
             .map(|record| (record.retirement(), record.id))
@@ -74,6 +75,7 @@ impl Pipeline {
             .map(|record| record.id)
             .collect();
         pinned.extend(working);
+        pinned.extend(self.display_start_waiter.as_ref().map(|job| job.session));
         pinned.extend(self.recovery_ids.iter().copied());
         pinned.extend(self.recovery_queue.iter().copied());
         pinned.extend(self.deferred_journal_stops.iter().copied());

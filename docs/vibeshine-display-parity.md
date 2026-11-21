@@ -53,9 +53,10 @@ part of the outstanding restoration policy below.
 - Linux saves its layout before virtual hotplug, authenticates connector
   ownership through the broker, resolves an exact advertised mode, and retains
   parked recovery when safe removal cannot be established.
-- Teardown requires another independently observed active output before
-  retiring the last managed scanout. A released reference is distinct from
-  confirmed native removal.
+- Linux teardown requires an independently observed physical output before
+  unplugging a virtual display. KScreen and Wayland must expose the same
+  active output and DRM must report it connected, enabled and powered on.
+  A released reference is distinct from confirmed native removal.
 - Client display overrides retain precedence over ordinary resolution/refresh
   automation and remapping. Settings are frozen at admission rather than read
   opportunistically during a later module tick.
@@ -72,13 +73,13 @@ close them.
 
 | Area | Remaining behavior |
 | --- | --- |
-| Pause/disconnect restoration | `dd_config_revert_delay` (reference default 3000 ms), `dd_config_revert_on_disconnect` (false), and paused virtual-display timeout (7200 seconds) are stored and snapshotted without equivalent retained-source suspend/restore timers. Ending the existing lifecycle would also terminate the retained application and unrelated resources, so it is not a substitute. |
+| Pause/disconnect restoration | Resumable Linux games with restore on disconnect disabled retain the owned display until a compatible reconnect, configured inactivity expiry or Quit. The timeout defaults to 7200 seconds; zero holds until application end. Vibeshine's cancelable restore delay when restore on disconnect is enabled still needs runtime implementation. |
 | Retain versus remove | Reference default retains stable virtual identity after restoration. Full retained-source restore and optional remove-after-restore behavior still need a provider-neutral transaction. |
 | Retained private catalogs | Changing private preference or resolution on a paused source is rejected while preserving the application. Reference-equivalent idle-source retirement and recreation are not implemented; a retained reconfigure cannot change the driver's private allocation catalog. Linux reports private catalog capability as unsupported. |
 | Baseline management | Golden/current/previous selection, golden health and fallback, configured snapshot exclusions, helper-engine selection, and snapshot recovery hotkeys do not have complete equivalent runtime implementations. Saved physical baselines must also exclude managed virtual state using ownership evidence and preserve independently owned outputs. |
 | Windows scaling and topology | Nonzero virtual-display scaling is unsupported. Modern virtual-aware clone groups, desktop-image modes, dynamic refresh, and HDR activation on an initially inactive target still have explicit unsupported paths. |
 | Windows driver lifecycle | Driver adapter restart/recovery, pre-24H2 refresh restrictions, separate descriptor versus promoted refresh, and reference-equivalent HDR descriptor luminance remain incomplete. |
-| Linux recovery integration | Safe-removal guard observes Wayland publication rather than the selected capture provider. Monitor power event handling, manual unplug-all recovery, greeter snapshot adoption, and remembered scale across new connector allocations are not equivalent. |
+| Linux recovery integration | Safe removal checks Wayland publication and DRM connector state. It does not probe the selected capture provider. Monitor power event handling, manual unplug-all recovery, greeter snapshot adoption, and remembered scale across new connector allocations are not equivalent. |
 | Linux permanent displays | The Linux provider explicitly reports permanent-monitor runtime support as false. |
 | Linux physical topology limits | Physical clone layouts, new headless physical admission, and mixed physical/managed virtual inventories are safely rejected. An already-at-origin secondary cannot be made primary when the actual native primary is elsewhere until explicit primary intent is represented. |
 | Display Settings provider portability | The independent adjustment provider has a Linux implementation; its Windows backend remains unavailable. |

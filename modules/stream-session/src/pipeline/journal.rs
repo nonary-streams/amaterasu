@@ -166,8 +166,14 @@ impl Entry {
             providers: record.providers.clone(),
             record_id: record.id,
             owner: record.owner.clone(),
-            lifecycle_recovery: record.config.lifecycle_session_target.clone().map(
-                |session_target| LifecycleRecovery {
+            lifecycle_recovery: record
+                .config
+                .lifecycle_session_target
+                .clone()
+                .filter(|_| {
+                    !record.retains_paused_display() || !record.lifecycle_consumers_retired()
+                })
+                .map(|session_target| LifecycleRecovery {
                     version: 1,
                     session_target,
                     stream_target: record
@@ -192,8 +198,7 @@ impl Entry {
                             }
                         })
                     }),
-                },
-            ),
+                }),
             attempted_resources: record
                 .attempted
                 .iter()

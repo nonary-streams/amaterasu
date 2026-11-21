@@ -114,6 +114,35 @@ fn only_vibeshine_cards_contribute_connectors() {
 }
 
 #[test]
+fn desktop_guard_requires_a_powered_physical_drm_output() {
+    let sysfs = FakeSysfs::new();
+    sysfs.card(1, "pci/gpu", "nvidia", &["HDMI-A-1"]);
+    sysfs.card(2, "faux/vibeshine", "faux_driver", &["Virtual-1"]);
+    let inventory = SysfsConnectors::new(sysfs.root());
+    let physical = sysfs.root().join("card1-HDMI-A-1");
+    sysfs.status(1, "HDMI-A-1", "connected");
+    fs::write(physical.join("enabled"), "enabled\n").unwrap();
+    fs::write(physical.join("dpms"), "Off\n").unwrap();
+    assert!(!inventory.physical_output_active("HDMI-A-1"));
+
+    fs::write(physical.join("dpms"), "On\n").unwrap();
+    assert!(inventory.physical_output_active("HDMI-A-1"));
+    fs::write(physical.join("enabled"), "disabled\n").unwrap();
+    assert!(!inventory.physical_output_active("HDMI-A-1"));
+    fs::write(physical.join("enabled"), "enabled\n").unwrap();
+
+    let virtual_output = sysfs.root().join("card2-Virtual-1");
+    sysfs.status(2, "Virtual-1", "connected");
+    fs::write(virtual_output.join("enabled"), "enabled\n").unwrap();
+    fs::write(virtual_output.join("dpms"), "On\n").unwrap();
+    assert!(!inventory.physical_output_active("Virtual-1"));
+
+    sysfs.card(3, "pci/second-gpu", "i915", &["HDMI-A-1"]);
+    sysfs.status(3, "HDMI-A-1", "connected");
+    assert!(!inventory.physical_output_active("HDMI-A-1"));
+}
+
+#[test]
 fn malformed_entries_are_ignored_and_missing_sysfs_fails_closed() {
     let sysfs = FakeSysfs::new();
     sysfs.card(

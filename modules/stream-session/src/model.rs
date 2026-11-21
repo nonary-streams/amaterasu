@@ -570,6 +570,13 @@ pub struct PrepareConfig {
     pub lifecycle_session_target: Option<amaterasu_extension_api::LifecycleTarget>,
     #[serde(default)]
     pub lifecycle_capture_mode: amaterasu_extension_api::CaptureBindingMode,
+    /// The application principal authenticated by the transport admitter.
+    #[serde(default)]
+    pub application_owner: Option<String>,
+    /// Hold a game display across authenticated disconnects. Zero permits
+    /// retention until application end without an inactivity deadline.
+    #[serde(default)]
+    pub paused_display_timeout_secs: Option<u32>,
     /// Prelaunch History reservation, bound to the signed RTSP operation.
     #[serde(default)]
     pub history_activity_id: Option<String>,
@@ -650,6 +657,23 @@ impl PrepareConfig {
         }
         if self.lifecycle_capture_mode.is_external() && self.lifecycle_session_target.is_none() {
             return Err("invalid_lifecycle_identity");
+        }
+        if self.application_owner.as_deref().is_some_and(|owner| {
+            !valid_name(owner)
+                || !self.lifecycle_capture_mode.is_external()
+                || self.lifecycle_session_target.is_none()
+        }) {
+            return Err("invalid_application_display_owner");
+        }
+        if self.paused_display_timeout_secs.is_some_and(|timeout| {
+            timeout > i32::MAX as u32
+                || !self.lifecycle_capture_mode.is_external()
+                || self.application_owner.is_none()
+                || self.borrowed_capture.is_some()
+                || self.virtual_display_intent.is_some()
+                || self.display_request.is_some()
+        }) {
+            return Err("invalid_paused_display_policy");
         }
         if let Some(target) = &self.lifecycle_session_target {
             match target {
@@ -1676,6 +1700,11 @@ impl VideoConfiguration {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    /// End the display hold of an exact application lifecycle after its
+    /// transports have drained. This does not stop other applications.
+    ReleasePausedDisplay {
+        application: amaterasu_extension_api::LifecycleTarget,
+    },
     ReserveHistoryActivity {
         activity_id: String,
         rtsp_operation_id: String,

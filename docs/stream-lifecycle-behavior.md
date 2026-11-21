@@ -60,8 +60,56 @@ removal remains pending until the provider observes disappearance. A safely
 parked display may release active stream admission while retaining its durable
 native recovery record and reporting the actual parked output.
 The same removal guard applies when an intermediate setup layout fails to
-restore: an observed surviving output permits unplugging the idle display,
-while all unconfirmed snapshots remain retained for recovery.
+restore. On Linux an enabled output published by KScreen and Wayland must also
+match an unambiguous, connected, enabled and powered-on physical DRM connector.
+The provider retains any unconfirmed snapshots for recovery.
+
+### Linux physical-output handoff review
+
+Codex reviewed the Linux virtual-display worker, KScreen/Wayland observation,
+DRM connector check and parked-output reporting. On disconnect or Quit, RTSP
+drains the stream through stream-session. The virtual-display worker attempts
+desktop restoration and verifies the physical replacement immediately before
+calling the connector broker. Disconnect, timeout and uncertain readback keep
+the existing cleanup ownership. A safely parked connector releases its stream
+reference with a bounded lifecycle warning, and the provider retries using the
+saved desktop state. The RTSP reply still derives from the stream retirement
+proof, and media negotiation does not depend on the display guard.
+
+The Linux virtual-display suite exercises powered-off and ambiguous physical
+connectors, virtual peers, delayed readback, parking, later recovery and
+restart ownership. The 175 enabled tests and Clippy passed. Physical scanout
+and Moonlight playback require live verification.
+
+### Linux game display pause and resume review
+
+Codex reviewed the NVHTTP Open/Quit workflow, the RTSP prepare payload, and
+stream-session's display reference and cleanup journal. NVHTTP supplies the
+paused display policy for resumable games using an owned Linux display with
+restore on disconnect disabled. RTSP binds it to the admitted application
+session and authenticated Open caller. An authenticated disconnect drains the
+original capture, input and transport. Stream-session reduces the journal to
+the display reference before confirming the old transport's retirement.
+
+Resume acquires a distinct reference on the same display when the application,
+geometry, refresh and source dynamic range match. It starts fresh capture and
+keeps the old reference until the new transport is active. A changed mode or
+an explicit provider refusal before any effect retires the old hold before
+allocating a compatible display. This wait shares the original startup budget.
+An uncertain provider reply retains the exact reference for normal cleanup.
+The negotiated client media format and PLAY admission checks apply to either
+source. A fallback warning is published once the replacement display is ready.
+
+Quit fences the exact application, drains its transports, verifies the
+application stopped, and confirms release of the paused display before
+completing. Only the authenticated application principal can request release.
+An unconfirmed release is a cleanup warning and yields incomplete
+Quit. Inactivity expiry releases just the display. Restart recovers the exact
+display reference without replaying the retired transport. Regression tests
+cover reconnect, failed reconnect and retry, changed timing, provider refusal,
+expiry, restart cleanup and stale Quit replies. This change spans the NVHTTP,
+RTSP and stream-session components, which ship together. Real Moonlight
+playback and physical scanout require live verification.
 
 ## Preparation and restart
 

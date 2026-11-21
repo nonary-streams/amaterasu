@@ -666,6 +666,9 @@ pub struct Open {
     pub lifecycle_settings_revision: Option<String>,
     #[serde(default)]
     pub lifecycle_intent: Option<String>,
+    /// Application-owned Linux display retention selected by NVHTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_display_timeout_secs: Option<u32>,
     /// Version-1 owner-bound original NVHTTP operation for an external source.
     #[serde(default)]
     pub shared_source_operation_id: Option<String>,
@@ -822,6 +825,17 @@ impl Open {
             .is_some_and(|epoch| !valid_runtime_epoch(epoch))
         {
             return Err("invalid_runtime_epoch");
+        }
+        if self.paused_display_timeout_secs.is_some_and(|timeout| {
+            timeout > i32::MAX as u32
+                || !self.lifecycle_capture_mode.is_external()
+                || self.lifecycle_session_target.is_none()
+                || self.borrowed_capture.is_some()
+                || self.capture.output != "amaterasu-owned-display"
+                || self.display_request.is_some()
+                || self.virtual_display_intent.is_some()
+        }) {
+            return Err("invalid_paused_display_policy");
         }
         if let Some(source) = &self.borrowed_capture
             && (source.validate().is_err()
@@ -1302,6 +1316,9 @@ impl Open {
         if let Some(session) = &self.lifecycle_session_target {
             payload["lifecycle_session_target"] = serde_json::json!(session);
             payload["lifecycle_capture_mode"] = serde_json::json!(self.lifecycle_capture_mode);
+        }
+        if let Some(timeout) = self.paused_display_timeout_secs {
+            payload["paused_display_timeout_secs"] = timeout.into();
         }
         payload
     }
@@ -1940,6 +1957,30 @@ mod tests {
 
     fn open() -> Open {
         serde_json::from_value(open_json()).unwrap()
+    }
+
+    #[test]
+    fn display_pause_policy_is_forwarded_only_for_an_owned_application_display() {
+        let mut input = open_json();
+        input["capture"]["output"] = json!("amaterasu-owned-display");
+        input["lifecycle_session_target"] =
+            json!({"kind":"session","host_epoch":"epoch","session_id":"app","generation":1});
+        input["lifecycle_capture_mode"] = json!("external");
+        input["lifecycle_settings_revision"] = json!("7");
+        input["lifecycle_intent"] = json!("resume");
+        input["paused_display_timeout_secs"] = json!(7200);
+        let open: Open = serde_json::from_value(input.clone()).unwrap();
+        open.validate(false).unwrap();
+        assert_eq!(
+            open.prepare("stream", None)["paused_display_timeout_secs"],
+            7200
+        );
+        input["capture"]["output"] = json!("physical-display");
+        let physical: Open = serde_json::from_value(input).unwrap();
+        assert_eq!(
+            physical.validate(false),
+            Err("invalid_paused_display_policy")
+        );
     }
 
     #[test]

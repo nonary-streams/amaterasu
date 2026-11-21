@@ -1903,6 +1903,12 @@ fn manager_reports_a_parked_output_gone_after_the_worker_retires_it() {
         true
     );
     assert!(broker.connected(&output).unwrap());
+    let reports: Vec<_> = manager.drain_stream_issues().collect();
+    assert!(matches!(
+        reports.as_slice(),
+        [amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue)]
+            if issue.operation == FIRST && issue.code == "desktop_handoff_unconfirmed"
+    ));
     let revision = manager.topology_revision;
 
     // Nobody calls the provider again. It notices the monitor by itself.

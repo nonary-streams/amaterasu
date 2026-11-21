@@ -13,6 +13,7 @@ mod input_timing;
 mod journal;
 mod lifecycle;
 mod lifecycle_issues;
+mod paused_display;
 mod quiescence;
 mod record;
 mod responses;
@@ -144,6 +145,7 @@ pub struct Pipeline {
     service: String,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
+    display_start_waiter: Option<Job>,
     sequence: u64,
     started: Instant,
     live_status_epoch: Option<String>,
@@ -185,6 +187,7 @@ impl Pipeline {
             service,
             records: BTreeMap::new(),
             job: None,
+            display_start_waiter: None,
             sequence: 0,
             started: Instant::now(),
             live_status_epoch: None,
@@ -379,6 +382,7 @@ impl Pipeline {
             && self.journal.document.entries.is_empty()
             && self.recovery_queue.is_empty()
             && self.job.is_none()
+            && self.display_start_waiter.is_none()
             && !self.history_activities.has_active_reservations()
             && self.records.values().all(|record| {
                 record.state.terminal()
@@ -551,6 +555,18 @@ impl Pipeline {
         self.progress_host_metrics(now, send);
         self.progress_session_effects(now, send);
         self.tray_activity.progress(now, send);
+        if self.job.is_none()
+            && let Some(mut start) = self.display_start_waiter.take()
+        {
+            if self.shutdown_admission_closed() {
+                let record = self
+                    .records
+                    .get_mut(&start.session)
+                    .expect("saved display startup");
+                start.fail(record, "host_stopping", now);
+            }
+            self.job = Some(start);
+        }
         if let Some(mut job) = self.job.take() {
             let session = job.session;
             let mut record = self
@@ -561,7 +577,15 @@ impl Pipeline {
             let retain = self.advance(&mut record, &mut job, now, send, &mut operations);
             self.records.insert(record.id, record);
             if retain {
-                self.job = Some(job);
+                if let Some(predecessor) = job.retire_paused_display.take() {
+                    let deadline = job.deadline;
+                    self.display_start_waiter = Some(job);
+                    self.begin_paused_display_release(predecessor, now);
+                    let release = self.job.as_mut().expect("display retirement was scheduled");
+                    release.deadline = release.deadline.min(deadline);
+                } else {
+                    self.job = Some(job);
+                }
             } else if self.recovery_ids.contains(&session) {
                 if !self.journal.document.entries.contains_key(&session) {
                     self.recovery_ids.remove(&session);
@@ -631,6 +655,10 @@ impl Pipeline {
                 job.step = step;
             }
             self.job = Some(job);
+            return Ok(());
+        }
+        if let Some(id) = self.paused_display_due(now) {
+            self.begin_paused_display_release(id, now);
             return Ok(());
         }
         if self.background_turn && self.schedule_control(now) {
