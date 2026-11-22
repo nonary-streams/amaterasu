@@ -1,6 +1,8 @@
 /* Shared painted finishes for console controls and the web extension UI SDK. */
 :root {
   --ink-swipe: url("./ink-swipe.svg");
+  --ink-secondary: url("./ink-secondary.svg");
+  --ink-heading: url("./ink-heading.svg");
   --ink-seal: url("./ink-seal.svg");
 }
 
@@ -23,7 +25,7 @@
 }
 
 .button.outline {
-  border-color: var(--strong);
+  border-color: color-mix(in srgb, var(--fg) 76%, var(--line));
   border-radius: 3px;
 }
 
@@ -46,12 +48,84 @@
   line-height: 1.35;
 }
 
-.plugin-dialog {
-  border-color: var(--strong);
+@media (forced-colors: none) {
+  dialog.confirmation, .plugin-dialog, .amaterasu-banner, .amaterasu-blossom-panel {
+    border-image: url("./paper-frame.svg") 9 / 6px stretch;
+  }
 }
 
-.plugin-dialog > h2::after {
-  height: 5px;
+dialog.confirmation, .plugin-dialog, .amaterasu-blossom-panel {
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--strong);
+  border-radius: 5px;
+}
+
+dialog.confirmation, .plugin-dialog {
+  isolation: isolate;
+  background: linear-gradient(var(--paper-glaze), var(--paper-glaze)),
+    var(--paper-image) center / 415px auto repeat, var(--panel);
+}
+
+dialog.confirmation, .plugin-dialog:has(.plugin-dialog-content:empty) {
+  max-inline-size: 29rem;
+  padding: 1rem 1.25rem .95rem clamp(3.6rem, 18%, 6rem);
+  text-align: center;
+}
+
+dialog.confirmation::after, .plugin-dialog::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: .3rem auto auto 0;
+  width: min(20%, 5.5rem);
+  height: min(8.5rem, calc(100% - .6rem));
+  background: var(--sprig-image) left bottom / contain no-repeat;
+  opacity: 1;
+  pointer-events: none;
+}
+
+.plugin-dialog:has(.plugin-dialog-content:not(:empty))::after {
+  display: none;
+}
+
+dialog.confirmation h2, .plugin-dialog > h2 {
+  margin: 0;
+  font: 400 clamp(1.45rem, 2.3vw, 1.9rem)/1.25 var(--font-brush);
+}
+
+.plugin-dialog > h2::after { content: none; }
+
+dialog > .button.dialog-close {
+  position: absolute;
+  inset: .25rem .25rem auto auto;
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  min-height: 2rem;
+  padding: 0;
+  font-size: 0;
+}
+
+.dialog-close::before { content: "×" / ""; font: 400 1.3rem/1 system-ui; }
+dialog:has(.dialog-close) > h2 { padding-inline-end: 1rem; }
+
+dialog.confirmation .actions, .plugin-dialog:has(.plugin-dialog-content:empty) .actions {
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: .6rem;
+  margin: .8rem 0 0;
+}
+
+dialog.confirmation > p, .plugin-dialog:has(.plugin-dialog-content:empty) > p {
+  margin: .45rem 0 0;
+}
+
+.plugin-dialog-content:empty { display: none; }
+
+@media (forced-colors: active) {
+  dialog.confirmation, .plugin-dialog { background: Canvas; }
+  dialog.confirmation::after, .plugin-dialog::after { display: none; }
 }
 
 .plugin-ui-table th {
@@ -276,20 +350,26 @@
 
 @media (forced-colors: none) {
   @supports (mask-image: url("./ink-swipe.svg")) {
-    /* Let the dry bristles show beyond a fully painted area under the label. */
     .button:is(.primary, .secondary):not(.catalog-override-choice, .icon-button)::before,
-    .plugin-ui-card[data-appearance="brush"] > h2::before,
-    .plugin-tablist > .plugin-tab[aria-selected="true"]::before {
-      mask:
-        var(--ink-swipe) center / 100% 100% no-repeat,
-        linear-gradient(to right, #000 calc(100% - 6px), transparent) center /
-          calc(100% - 22px) calc(100% - 14px) no-repeat;
-    }
-
-    .button:is(.primary, .secondary):not(.catalog-override-choice, .icon-button)::before,
-    .plugin-ui-card[data-appearance="brush"] > h2::before,
     .plugin-tablist > .plugin-tab[aria-selected="true"]::before {
       inset: 0;
+      mask: var(--ink-swipe) center / 100% 100% no-repeat;
+    }
+
+    .button.secondary:not(.catalog-override-choice, .icon-button)::before {
+      mask-image: var(--ink-secondary);
+    }
+
+    .plugin-ui-card[data-appearance="brush"] > h2 {
+      padding-inline: .85rem 3.3rem;
+      font-family: var(--font-brush);
+      font-weight: 400;
+    }
+
+    .plugin-ui-card[data-appearance="brush"] > h2::before {
+      inset: 0;
+      background: linear-gradient(to right, var(--accent) 3%, var(--ink-button) 6%);
+      mask: var(--ink-heading) center / 100% 100% no-repeat;
     }
 
     .plugin-feedback-progressbar[value]::-webkit-progress-value {

@@ -71,7 +71,8 @@ test("the signed UI loads local scalable artwork and the brush font from its own
     }
   }
   for (const name of ["sun-crest.svg", "scroll-masthead.svg", "scroll-foothills.svg",
-    "scroll-blossoms.svg", "ink-seal.svg", "ink-swipe.svg", "okami-botanical.svg"]) {
+    "scroll-blossoms.svg", "scroll-panel.svg", "cherry-sprig.svg", "cherry-trail.svg", "ink-heading.svg",
+    "paper-frame.svg", "ink-secondary.svg", "ink-seal.svg", "ink-swipe.svg", "okami-botanical.svg"]) {
     assert.ok(assets.has(name), `no stylesheet references ${name}`);
     const svg = readPublic(name).toString();
     assert.match(svg, /<svg\s[^>]*viewBox=/, name);

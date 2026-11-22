@@ -209,7 +209,7 @@
       button("Outline", "outline"), button("Ghost", "ghost"));
     const states = element("div", "showcase-actions showcase-button-states");
     for (const [label, state] of [["Default", "default"], ["Hover", "hover"], ["Active", "active"], ["Unavailable", "disabled"]]) {
-      const sample = button(label, "outline", undefined, state === "disabled");
+      const sample = button(label, state === "disabled" ? "secondary" : "outline", undefined, state === "disabled");
       sample.dataset.state = state;
       states.append(sample);
     }

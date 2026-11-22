@@ -13,6 +13,7 @@
   --paper-image: url("./washi-paper.webp");
   --landscape-image: url("./scroll-foothills.svg");
   --ornament-image: url("./scroll-blossoms.svg");
+  --sprig-image: url("./cherry-sprig.svg");
 }
 
 :root, [data-theme="dark"] {
@@ -94,11 +95,13 @@ h1, h2, h3, .brand { font-family: var(--font-display); }
   content: "";
   position: absolute;
   z-index: -1;
-  inset: 0 0 0 53%;
+  inset: 0;
   pointer-events: none;
-  background: var(--landscape-image) right bottom / contain no-repeat;
+  background:
+    url("./cherry-trail.svg") left bottom / auto min(31%, 3.8rem) no-repeat,
+    url("./scroll-panel.svg") right bottom / 100% 100% no-repeat;
   filter: var(--landscape-filter);
-  mask-image: linear-gradient(to right, transparent, black 28%);
+
 }
 
 .amaterasu-blossom-panel {
@@ -109,10 +112,9 @@ h1, h2, h3, .brand { font-family: var(--font-display); }
   content: "";
   position: absolute;
   z-index: -1;
-  inset: auto 0 0 auto;
-  width: min(48%, 140px);
-  aspect-ratio: 2;
-  background: var(--ornament-image) right bottom / contain no-repeat;
+  inset: .3rem auto .3rem 0;
+  width: min(22%, 5.5rem);
+  background: var(--sprig-image) left center / contain no-repeat;
   filter: var(--landscape-filter);
   pointer-events: none;
 }

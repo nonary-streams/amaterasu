@@ -4,7 +4,8 @@
   --drawer-top: 68px;
   display: block;
   min-height: 100vh;
-  background: color-mix(in srgb, var(--panel) 46%, var(--bg));
+  background: linear-gradient(var(--paper-glaze), var(--paper-glaze)),
+    var(--paper-image) 0 0 / 415px auto repeat, var(--bg);
 }
 
 .console-masthead {
@@ -13,7 +14,7 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  min-height: clamp(76px, 6.5vw, 104px);
+  min-height: clamp(76px, 8vw, 132px);
   padding: 12px max(var(--shell-gutter), calc((100% - var(--shell-width)) / 2 + var(--shell-gutter)));
   border-bottom: 1px solid var(--line);
 }
@@ -116,12 +117,12 @@
 }
 
 .console-shell .sidebar-bottom {
-  flex: 0 0 clamp(42px, 4.5vw, 72px);
+  flex: 0 0 clamp(66px, 8.8vw, 128px);
   margin: 0;
   padding: 0;
   border: 0;
   border-radius: inherit;
-  background: url("./scroll-foothills.svg") center bottom / 100% 100% no-repeat;
+  background: url("./scroll-foothills.svg") center bottom / 100% auto no-repeat;
   filter: var(--landscape-filter);
   pointer-events: none;
 }
@@ -340,7 +341,7 @@
   }
 
   .console-shell .sidebar-navigation { padding: .5rem .5rem .25rem; }
-  .console-shell .sidebar-bottom { flex-basis: 4rem; }
+  .console-shell .sidebar-bottom { flex-basis: 7rem; }
 
   .console-shell .nav-heading {
     padding-inline: .375rem;
@@ -476,6 +477,10 @@
   .console-masthead::before { inset-inline-start: 70%; }
 }
 
+@media (max-height: 740px) {
+  .console-shell .sidebar-bottom { flex-basis: 3rem; }
+}
+
 @media (forced-colors: active) {
   .console-shell, .console-masthead, .console-shell .sidebar { background: Canvas; }
   .console-masthead::before, .console-shell .sidebar-bottom { display: none; }
@@ -486,3 +491,90 @@
   }
   .console-shell .navigation .nav-item.selected::before { display: none; }
 }
+
+/* Keep category navigation and the current editor together on wide screens. */
+.console-shell .settings-layout {
+  grid-template-columns: minmax(150px, 185px) minmax(0, 1fr);
+  gap: clamp(20px, 3vw, 48px);
+  max-width: 1180px;
+}
+.settings-navigation .settings-nav {
+  padding-inline-end: 12px;
+  border-inline-end: 1px solid var(--line);
+}
+.settings-category-heading h2 { margin: 0; }
+.settings-area-everyday .panel { margin: 0; padding: 0; overflow: hidden; }
+.settings-area-everyday .panel > h2 {
+  margin: 0;
+  padding: 15px 22px;
+  border-bottom: 1px solid var(--line);
+  line-height: 1.4;
+  font-family: inherit;
+  font-size: 1rem;
+  font-weight: 650;
+  background: var(--subtle);
+}
+.everyday-form { display: grid; gap: 16px; }
+.everyday-form .field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(140px, 38%);
+  grid-template-areas: "label control" "hint control";
+  gap: 4px 24px;
+  align-items: center;
+  margin: 0;
+  padding: 18px 22px;
+}
+.everyday-form .field + .field { border-top: 1px solid var(--line); }
+.everyday-form .field-label { grid-area: label; font-weight: 600; }
+.everyday-form .field small { grid-area: hint; color: var(--secondary); }
+.everyday-form .field :is(input, select) { grid-area: control; min-width: 0; }
+.everyday-form .field input[type=checkbox] { justify-self: end; width: 20px; height: 20px; }
+.everyday-form .actions { justify-content: flex-end; flex-wrap: wrap; }
+.settings-unavailable {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px;
+  padding: 12px 0; border-bottom: 1px solid var(--line);
+}
+.settings-unavailable .button { margin-inline-start: auto; }
+@media (max-width: 900px) {
+  .console-shell .settings-layout { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+  .console-shell .settings-navigation { position: static; }
+  .console-shell .settings-navigation > .field { display: flex; margin: 0; }
+  .console-shell .settings-nav { display: none; }
+}
+@media (max-width: 600px) {
+  .everyday-form .field { grid-template-columns: minmax(0, 1fr); grid-template-areas: "label" "hint" "control"; padding: 16px; }
+  .everyday-form .field input { margin-block-start: 6px; }
+  .everyday-form .field:has(input[type=checkbox]) { grid-template-columns: 1fr auto; grid-template-areas: "label control" "hint control"; }
+  .settings-area-everyday .panel > h2 { padding-inline: 16px; }
+}
+
+.console-shell .settings-heading {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: clamp(16px, 2vw, 28px);
+}
+.settings-heading h1 { margin: 0; }
+.settings-navigation > input[type=search] { width: 100%; margin: 0 0 12px; }
+@media (max-width: 900px) {
+  .console-shell .settings-navigation {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 10px;
+    align-items: end;
+  }
+  .settings-navigation > input[type=search] { margin: 0; }
+  .settings-navigation > .field > .field-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    clip-path: inset(50%);
+    overflow: hidden;
+  }
+}
+.settings-area-contributions:not(:empty) { margin-block-start: 22px; }
+
+.settings-area-featured-plugins:not(:empty) { display: grid; gap: 16px; margin-block-start: 16px; }
+.everyday-more-options { margin: 12px 0 18px; border-top: 1px solid var(--line); }
+.everyday-more-options > summary { padding: 14px 0; color: var(--secondary); cursor: pointer; }
+.settings-area-featured-plugins .settings-form { max-width: none; }

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" viewBox="0 0 72 72" fill="none">
+  <title>Fine ink border with rounded corners</title>
+  <path stroke="#85735e" stroke-width="1.3" d="M8 2.6C4.1 2.6 2.7 3.9 2.5 7.8L2.2 35l.6 29c0 3.5 1.7 5.4 5.2 5.5l31.4-.2 24.1.3c4.4 0 5.8-1.6 5.9-5.5l-.1-28.6.2-27.3c0-3.6-1.9-5.5-5.7-5.6L35.3 3 8 2.6Z"/>
+  <path stroke="#a48e72" opacity=".54" stroke-width=".65" d="M2 21l.1-13q.1-5.8 6.6-6l13 .2M50 70.3l14-.1q6 .1 6.1-6.2l.1-9"/>
+</svg>
