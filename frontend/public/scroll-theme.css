@@ -8,6 +8,7 @@
 
 :root {
   --font-brush: "Kaushan Script", "Segoe Print", cursive;
+  --masthead-image: url("./scroll-masthead.webp");
   --crest-image: url("./sun-crest.svg");
   --brush-image: url("./ink-swipe.svg");
   --paper-image: url("./washi-paper.webp");
@@ -18,6 +19,7 @@
 
 :root, [data-theme="dark"] {
   --paper-glaze: rgb(35 32 29 / .965);
+  --masthead-mask: linear-gradient(to right, transparent 21%, #000 43%);
   --landscape-filter: brightness(.87) saturate(.87);
   --ornament-opacity: .86;
   --paper-surface: color-mix(in srgb, var(--panel) 91%, transparent);
@@ -25,6 +27,7 @@
 
 [data-theme="light"] {
   --paper-glaze: rgb(240 232 220 / .76);
+  --masthead-mask: none;
   --landscape-filter: none;
   --ornament-opacity: 1;
   --paper-surface: color-mix(in srgb, var(--panel) 57%, transparent);
@@ -113,7 +116,7 @@ h1, h2, h3, .brand { font-family: var(--font-display); }
   position: absolute;
   z-index: -1;
   inset: .3rem auto .3rem 0;
-  width: min(22%, 5.5rem);
+  width: min(16%, 3.8rem);
   background: var(--sprig-image) left center / contain no-repeat;
   filter: var(--landscape-filter);
   pointer-events: none;
@@ -133,8 +136,8 @@ h1, h2, h3, .brand { font-family: var(--font-display); }
   display: flex;
   flex-direction: column;
   justify-content: center;
-  min-height: clamp(88px, 8.1vw, 132px);
-  padding: 16px clamp(18px, 4.5vw, 80px);
+  min-height: calc(min(100vw, 1720px) * 182 / 2172);
+  padding: 16px max(clamp(18px, 4.5vw, 80px), calc((100% - 1720px) / 2 + 40px));
   color: var(--fg);
   background: transparent;
   border: 0;
@@ -145,7 +148,10 @@ h1, h2, h3, .brand { font-family: var(--font-display); }
   position: absolute;
   z-index: -1;
   inset: 0;
-  background: url("./scroll-masthead.svg") center bottom / min(100%, 1720px) 100% no-repeat;
+  max-width: 1720px;
+  margin-inline: auto;
+  background: var(--masthead-image) center / cover no-repeat;
+  mask-image: var(--masthead-mask);
   filter: var(--landscape-filter);
   pointer-events: none;
 }
@@ -206,20 +212,35 @@ h1, h2, h3, .brand { font-family: var(--font-display); }
 .login-card .field { margin-bottom: 16px; }
 .login-card .link-button { font-size: .84rem; }
 
+@media (max-width: 800px) {
+  .login-intro {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-content: center;
+    min-height: 76px;
+    padding: 12px 16px;
+  }
+  .login-intro > * { grid-column: 1; }
+  .login-intro::after {
+    grid-column: 2;
+    inset: 0 -16px 0 6px;
+    mask-image: linear-gradient(to right, transparent, black min(16px, 8%));
+    background-size: auto 100%;
+    background-position: 87% center;
+  }
+  .login-intro-copy h1 { font-size: .7rem; }
+}
+
 @media (max-width: 640px) {
   .amaterasu-banner { padding-bottom: 72px; }
   .amaterasu-banner > * { max-width: none; }
   .amaterasu-banner::after { inset: auto 0 0 25%; height: 70px; }
   .console-columns::after { width: 105px; }
-  .login-intro { min-height: 76px; padding: 12px 16px; }
-  .login-intro::after {
-    left: 54%;
-    background-position: right bottom;
-    background-size: auto 100%;
-    mask-image: linear-gradient(to right, transparent, black 20%);
-  }
-  .login-intro-copy h1 { font-size: .7rem; }
   .login-side { align-content: start; padding-bottom: 90px; }
+}
+
+@media (max-width: 360px) {
+  .login-intro .brand { font-size: 1.35rem; }
 }
 
 @media (forced-colors: active) {

@@ -20,7 +20,7 @@ await Promise.all(
     "ink-summary.css",
     "console-shell.css",
     "overview-scroll.css",
-    "scroll-masthead.svg",
+    "scroll-masthead.webp",
     "scroll-foothills.svg",
     "scroll-blossoms.svg",
     "ink-swipe.svg",

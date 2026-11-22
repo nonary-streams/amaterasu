@@ -772,7 +772,7 @@ namespace Amaterasu {
         dialog.remove();
         resolve(accepted);
       };
-      const cancel = button("Cancel", () => finish(false), "outline");
+      const cancel = button("Cancel", () => finish(false), "secondary");
       dialog.append(
         el("h2", "", title),
         el("p", "muted", description),

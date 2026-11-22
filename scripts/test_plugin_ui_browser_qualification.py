@@ -41,7 +41,7 @@ THEME_ASSETS = (
     "overview-scroll.css",
     "ink-components.css",
     "ink-summary.css",
-    "scroll-masthead.svg",
+    "scroll-masthead.webp",
     "scroll-foothills.svg",
     "scroll-blossoms.svg",
     "ink-swipe.svg",

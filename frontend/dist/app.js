@@ -6287,7 +6287,7 @@ var Amaterasu;
                 dialog.remove();
                 resolve(accepted);
             };
-            const cancel = Amaterasu.button("Cancel", () => finish(false), "outline");
+            const cancel = Amaterasu.button("Cancel", () => finish(false), "secondary");
             dialog.append(Amaterasu.el("h2", "", title), Amaterasu.el("p", "muted", description), Amaterasu.el("div", "actions", cancel, Amaterasu.button(label, () => finish(true), "primary")));
             dialog.append(Amaterasu.button("Close", () => finish(false), "ghost dialog-close"));
             dialog.addEventListener("cancel", (event) => {
@@ -23447,7 +23447,7 @@ var Amaterasu;
                 actions.className = "actions plugin-dialog-actions";
                 const cancelButton = document.createElement("button");
                 cancelButton.type = "button";
-                cancelButton.className = actionNodes.length ? "button outline" : "button secondary";
+                cancelButton.className = "button secondary";
                 cancelButton.append(cancelLabel);
                 actions.append(cancelButton, ...actionNodes);
                 element.append(actions);

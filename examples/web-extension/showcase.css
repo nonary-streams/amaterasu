@@ -155,13 +155,14 @@
   justify-items: center;
   text-align: center;
   gap: .5rem;
-  padding: .8rem .65rem .8rem max(21%, 2.5rem);
+  padding: .8rem clamp(1.5rem, 13%, 3.25rem);
   border-color: var(--line);
   border-radius: var(--control-radius);
 }
 .showcase-dialog-preview > h3 { margin: 0; font: 400 1.3rem/1.25 var(--font-brush); }
 .showcase-dialog-preview > p { margin: 0; }
 .showcase-dialog-actions { justify-content: center; }
+.showcase-dialog-actions > .plugin-action { width: auto; max-width: 100%; }
 .showcase-tooltip-preview.plugin-tooltip {
   position: relative;
   inset: auto;

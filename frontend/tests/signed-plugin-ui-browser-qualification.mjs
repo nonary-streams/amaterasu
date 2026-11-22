@@ -203,7 +203,7 @@ try {
 
   await wait("!!document.querySelector('input[name=username]')", "sign-in form");
   check(await evaluate(`getComputedStyle(document.querySelector('.login-intro'), '::after')
-    .backgroundImage.includes('scroll-masthead.svg') &&
+    .backgroundImage.includes('scroll-masthead.webp') &&
     getComputedStyle(document.querySelector('.login-side'), '::before').backgroundImage.includes('scroll-foothills.svg')`),
   "sign-in artwork was not applied by the signed stylesheet");
   await evaluate(`(() => {
@@ -316,7 +316,7 @@ try {
     const foothills = getComputedStyle(document.querySelector('.overview-status'), '::after');
     const blossoms = getComputedStyle(document.querySelector('.overview-activity-panel'), '::after');
     const brush = getComputedStyle(document.querySelector('.navigation .nav-item.selected'), '::before');
-    return mountains.content !== 'none' && mountains.backgroundImage.includes('scroll-masthead.svg') &&
+    return mountains.content !== 'none' && mountains.backgroundImage.includes('scroll-masthead.webp') &&
       crest.backgroundImage.includes('sun-crest.svg') &&
       foothills.content !== 'none' && foothills.backgroundImage.includes('scroll-foothills.svg') &&
       blossoms.content !== 'none' && blossoms.backgroundImage.includes('scroll-blossoms.svg') &&
@@ -683,15 +683,25 @@ try {
 
   await debuggerClient.command("Page.navigate", { url: "about:blank" }, sessionId);
   await wait("location.href === 'about:blank'", "blank page before changing pixel density");
-  themeResponses.delete("scroll-masthead.svg");
+  themeResponses.delete("scroll-masthead.webp");
   await setDesktopViewport(1920, 1080, 2);
   await debuggerClient.command("Page.navigate", { url: `${options.origin}/#overview` }, sessionId);
   await wait(`(() => {
     const hero = document.querySelector('.console-masthead');
     return window.devicePixelRatio === 2 && window.innerWidth === 1920 && window.innerHeight === 1080 &&
-      hero && getComputedStyle(hero, '::before').backgroundImage.includes('scroll-masthead.svg');
-  })()`, "signed vector masthead at 3840 by 2160 physical pixels");
-  await verifyThemeAssets(options.themeAssets.filter(({ name }) => name === "scroll-masthead.svg"));
+      hero && getComputedStyle(hero, '::before').backgroundImage.includes('scroll-masthead.webp');
+  })()`, "signed illustrated masthead at 3840 by 2160 physical pixels");
+  await verifyThemeAssets(options.themeAssets.filter(({ name }) => name === "scroll-masthead.webp"));
+
+  check(await evaluate(`(async () => {
+    const header = document.querySelector('.console-masthead');
+    const art = getComputedStyle(header, '::before');
+    const image = new Image();
+    image.src = new URL('scroll-masthead.webp', document.baseURI);
+    await image.decode();
+    return image.naturalWidth >= parseFloat(art.width) * devicePixelRatio &&
+      image.naturalHeight >= parseFloat(art.height) * devicePixelRatio;
+  })()`), "masthead image has enough source pixels for the high-density header");
 
   console.log(`Verified signed UI primitives asset at ${primitives.path}: same-origin digest route, matching signed bytes, JavaScript content type, and restrictive host CSP.`);
   console.log("Verified dialog keyboard focus/escape, tabs keyboard navigation, semantic layout, live feedback, locale updates, feature fallback, and page-abort cleanup.");

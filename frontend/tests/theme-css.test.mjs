@@ -70,7 +70,7 @@ test("the signed UI loads local scalable artwork and the brush font from its own
       assets.add(name);
     }
   }
-  for (const name of ["sun-crest.svg", "scroll-masthead.svg", "scroll-foothills.svg",
+  for (const name of ["sun-crest.svg", "scroll-foothills.svg",
     "scroll-blossoms.svg", "scroll-panel.svg", "cherry-sprig.svg", "cherry-trail.svg", "ink-heading.svg",
     "paper-frame.svg", "ink-secondary.svg", "ink-seal.svg", "ink-swipe.svg", "okami-botanical.svg"]) {
     assert.ok(assets.has(name), `no stylesheet references ${name}`);
@@ -78,7 +78,10 @@ test("the signed UI loads local scalable artwork and the brush font from its own
     assert.match(svg, /<svg\s[^>]*viewBox=/, name);
     assert.doesNotMatch(svg, /<image\b/, `embedded bitmap in ${name}`);
   }
-  assert.ok(assets.has("kaushan-script.woff2") && assets.has("washi-paper.webp"));
+  assert.ok(assets.has("kaushan-script.woff2"));
   assert.equal(readPublic("kaushan-script.woff2").toString("ascii", 0, 4), "wOF2");
-  assert.equal(readPublic("washi-paper.webp").toString("ascii", 8, 12), "WEBP");
+  for (const name of ["washi-paper.webp", "scroll-masthead.webp"]) {
+    assert.ok(assets.has(name));
+    assert.equal(readPublic(name).toString("ascii", 8, 12), "WEBP");
+  }
 });

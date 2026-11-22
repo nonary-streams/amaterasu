@@ -14,7 +14,7 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  min-height: clamp(76px, 8vw, 132px);
+  min-height: calc(min(100vw, var(--shell-width)) * 182 / 2172);
   padding: 12px max(var(--shell-gutter), calc((100% - var(--shell-width)) / 2 + var(--shell-gutter)));
   border-bottom: 1px solid var(--line);
 }
@@ -26,7 +26,8 @@
   inset: 0;
   max-width: var(--shell-width);
   margin-inline: auto;
-  background: url("./scroll-masthead.svg") right bottom / 100% 100% no-repeat;
+  background: var(--masthead-image) center / cover no-repeat;
+  mask-image: var(--masthead-mask);
   filter: var(--landscape-filter);
   pointer-events: none;
 }
@@ -313,7 +314,6 @@
   }
 
   .console-masthead {
-    min-height: clamp(8.25rem, calc(var(--shell-width) * .0917), 11.5rem);
     padding-block: .875rem;
   }
 
@@ -407,10 +407,14 @@
   }
 
   .console-masthead::before {
-    inset-inline-start: clamp(250px, 54%, 345px);
+    position: static;
+    order: 1;
+    flex: 1 1 0;
+    align-self: stretch;
+    margin: -6px calc(-1 * var(--shell-gutter)) -6px 0;
+    mask-image: linear-gradient(to right, transparent, black min(16px, 8%));
     background-size: auto 100%;
-    mask-image: linear-gradient(to right, transparent, #000 25%);
-    opacity: .7;
+    background-position: 87% center;
   }
 
   .console-masthead .brand {
@@ -474,7 +478,11 @@
 
 @media (max-width: 390px) {
   .console-masthead .brand-symbol { display: none; }
-  .console-masthead::before { inset-inline-start: 70%; }
+}
+
+@media (max-width: 340px) {
+  .console-masthead { gap: 6px; }
+  .console-masthead .brand { font-size: 20px; }
 }
 
 @media (max-height: 740px) {

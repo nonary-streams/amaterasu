@@ -69,7 +69,7 @@ dialog.confirmation, .plugin-dialog {
 
 dialog.confirmation, .plugin-dialog:has(.plugin-dialog-content:empty) {
   max-inline-size: 29rem;
-  padding: 1rem 1.25rem .95rem clamp(3.6rem, 18%, 6rem);
+  padding: 1rem clamp(2.8rem, 14vw, 5rem) .95rem;
   text-align: center;
 }
 
@@ -78,7 +78,7 @@ dialog.confirmation::after, .plugin-dialog::after {
   position: absolute;
   z-index: -1;
   inset: .3rem auto auto 0;
-  width: min(20%, 5.5rem);
+  width: min(16%, 4.5rem);
   height: min(8.5rem, calc(100% - .6rem));
   background: var(--sprig-image) left bottom / contain no-repeat;
   opacity: 1;
@@ -108,7 +108,7 @@ dialog > .button.dialog-close {
 }
 
 .dialog-close::before { content: "×" / ""; font: 400 1.3rem/1 system-ui; }
-dialog:has(.dialog-close) > h2 { padding-inline-end: 1rem; }
+
 
 dialog.confirmation .actions, .plugin-dialog:has(.plugin-dialog-content:empty) .actions {
   justify-content: center;

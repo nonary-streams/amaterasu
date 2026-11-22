@@ -120,7 +120,7 @@ namespace Amaterasu {
         actions.className = "actions plugin-dialog-actions";
         const cancelButton = document.createElement("button");
         cancelButton.type = "button";
-        cancelButton.className = actionNodes.length ? "button outline" : "button secondary";
+        cancelButton.className = "button secondary";
         cancelButton.append(cancelLabel);
         actions.append(cancelButton, ...actionNodes);
         element.append(actions);

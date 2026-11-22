@@ -354,7 +354,7 @@
     }));
     const dialogPreview = element("div", "amaterasu-blossom-panel showcase-dialog-preview");
     const dialogActions = element("div", "showcase-actions showcase-dialog-actions");
-    dialogActions.append(button("Cancel", "outline", () => actionStatus.setMessage("Action cancelled.")),
+    dialogActions.append(button("Cancel", "secondary", () => actionStatus.setMessage("Action cancelled.")),
       button("Open dialog", "primary", () => dialog.open()));
     dialogPreview.append(element("h3", "", "Confirm changes"),
       element("p", "", "Apply these sample settings?"), dialogActions, dialog.element);
