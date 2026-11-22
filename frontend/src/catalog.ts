@@ -2056,7 +2056,23 @@ namespace Amaterasu {
     const detached = el("textarea");
     detached.name = "detached";
     detached.rows = 3;
-    detached.value = executableLaunch?.detached?.join("\n") ?? "";
+    const helpers = executableLaunch?.detached ?? [];
+    const detachedJson = input("detached_json", "1", "checkbox");
+    detachedJson.checked = helpers.some(helper => typeof helper !== "string" || helper.trim() !== helper);
+    detached.value = detachedJson.checked ? JSON.stringify(helpers, null, 2) : helpers.join("\n");
+    detachedJson.addEventListener("change", () => {
+      try {
+        const commands = parseDetachedCommands(detached.value, !detachedJson.checked);
+        if (!detachedJson.checked && commands.some(command => typeof command !== "string" || command.trim() !== command))
+          throw new Error("Per-command settings and surrounding whitespace require JSON format.");
+        detached.value = detachedJson.checked ? JSON.stringify(commands, null, 2) : commands.join("\n");
+      } catch (error) {
+        detachedJson.checked = !detachedJson.checked;
+        detached.setCustomValidity(error instanceof Error ? error.message : "Invalid detached commands.");
+        detached.reportValidity();
+        detached.setCustomValidity("");
+      }
+    });
     const preparation = input(
       "preparation",
       JSON.stringify(preparedLaunch?.preparation ?? []),
@@ -2136,7 +2152,8 @@ namespace Amaterasu {
       field("Run with administrator privileges", elevated, "Windows uses an available elevated user token. Other platforms keep the host's normal launch identity."),
       field("Wait for all processes", waitAll, "Keep the app active while its process group is running."),
       field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."),
-      field("Detached commands", detached, "One ordered command per line; up to 16."),
+      field("Detached commands", detached, "Enter up to 16 commands, one per line or as a JSON array."),
+      field("Use JSON for per-command settings", detachedJson),
     );
     const executable = el(
       "div",
@@ -2149,7 +2166,7 @@ namespace Amaterasu {
       processPolicy,
     );
     const sharedLaunchOptions = el("div", "form-grid", field("Working directory", directory, "Optional absolute path."), preparation);
-    const pathField = field("Absolute application path", path);
+    const pathField = field("Application path", path, "Executable entries also accept a command on PATH.");
     const steamIdField = field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
     const steamInstallDirField = field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
     const steamChooserStatus = el("p", "muted");

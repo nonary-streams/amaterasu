@@ -102,8 +102,13 @@ fn package_selection_status_with_running(package_root: &str, mut running: Value)
             .map(str::to_owned)
     {
         let root = Path::new(package_root);
-        if let Some(modules) = running_package_modules(root, &digest) {
+        if let Some(manifest) = running_manifest(root, &digest)
+            && let Some(modules) = running_package_modules(&manifest)
+        {
             running["modules"] = modules;
+            if let Some(services) = declared_services(&manifest.components) {
+                running["declared_services"] = json!(services);
+            }
         }
         if let Some(source) = running_package_source(root, &digest) {
             running["source"] = source;
@@ -143,8 +148,26 @@ pub(crate) fn running_manifest(root: &Path, digest: &str) -> Option<ReleaseManif
     serde_json::from_slice(&raw).ok()
 }
 
-fn running_package_modules(root: &Path, digest: &str) -> Option<Value> {
-    let manifest = running_manifest(root, digest)?;
+/// Omit the inventory if incomplete. An empty, verified list means no service
+/// was declared. A declaration is independent of a provider's runtime health.
+fn declared_services(components: &[ComponentManifest]) -> Option<std::collections::BTreeSet<&str>> {
+    let mut services = std::collections::BTreeSet::new();
+    for name in components
+        .iter()
+        .flat_map(|component| &component.requested.provide)
+    {
+        if !is_plain_text(name) {
+            return None;
+        }
+        services.insert(name.as_str());
+        if services.len() > 256 {
+            return None;
+        }
+    }
+    Some(services)
+}
+
+fn running_package_modules(manifest: &ReleaseManifest) -> Option<Value> {
     let modules: Vec<_> = manifest
         .components
         .iter()
@@ -444,16 +467,17 @@ mod tests {
         let directory = amaterasu_package::package_directory(&root, &digest).unwrap();
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("manifest.json"), &raw).unwrap();
-        let modules = running_package_modules(&root, &digest).unwrap();
+        let manifest = running_manifest(&root, &digest).unwrap();
+        let modules = running_package_modules(&manifest).unwrap();
         assert_eq!(modules[1]["id"], "amaterasu.display");
         assert_eq!(modules[2]["id"], "amaterasu.frame-limiter");
         assert!(modules[0].get("file").is_none());
         assert!(
-            running_package_modules(&root, &"f".repeat(64)).is_none(),
+            running_manifest(&root, &"f".repeat(64)).is_none(),
             "a persisted active digest is never a substitute for the host's running digest"
         );
         std::fs::write(directory.join("manifest.json"), b"{}").unwrap();
-        assert!(running_package_modules(&root, &digest).is_none());
+        assert!(running_manifest(&root, &digest).is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -525,6 +549,10 @@ mod tests {
         let status = selection_status(root.to_str().unwrap(), Some(&digest));
         assert_eq!(status["ok"], true);
         assert_eq!(status["active"], digest.as_str());
+        assert_eq!(
+            status["running"]["declared_services"],
+            json!(["amaterasu.display/1", "example.overlay/1"])
+        );
         assert_eq!(status["running"]["digest"], digest.as_str());
         assert_eq!(status["running"]["modules"].as_array().unwrap().len(), 3);
         assert_eq!(

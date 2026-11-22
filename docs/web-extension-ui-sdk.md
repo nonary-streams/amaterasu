@@ -463,6 +463,13 @@ surfaces and owns no product-specific renderer. Each mount gets an independent
 lifecycle; closing one surface does not retire another. Page and slot mounts
 support `setDirty(boolean)` and `setBusy(boolean)` for navigation guards.
 
+A signed `settings` placement adds a section below the host controls in
+Everyday Settings. Use `mountSettings` for frequently used controls and a
+`page` placement with `mount` for a full workspace under Extensions. A plugin
+can declare both placements. Host-scoped schema settings also have a generated
+editor under Settings → Plugin settings. A signed settings section can claim
+its own provider to supply that editor directly.
+
 `sdk.canCall(alias)` reports whether the signed declaration and local approvals
 make that alias available to the current account. It does not grant authority.
 Calls are bound to the current signed digest and cancelled with the mount signal.

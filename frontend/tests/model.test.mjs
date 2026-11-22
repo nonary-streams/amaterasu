@@ -176,9 +176,9 @@ test("global preparation editor validates bounded native command steps", () => {
   const valid = [
     {
       run: {
-        executable: "/opt/tools/prepare",
+        executable: "/opt/tools/prepare.cmd",
         args: ["--safe", "é"],
-        environment: { MODE: "safe" },
+        environment: { MODE: "safe", mode: "custom" },
         cwd: "/opt/tools",
         timeout_ms: 30000,
       },
@@ -191,12 +191,10 @@ test("global preparation editor validates bounded native command steps", () => {
     "{}",
     JSON.stringify(Array(9).fill({ run: { executable: "/bin/true" } })),
     JSON.stringify([{ run: { executable: "relative.exe" } }]),
-    JSON.stringify([{ run: { executable: "/bin/tool.cmd" } }]),
     JSON.stringify([{ run: { executable: "/bin/tool", cwd: "relative" } }]),
     JSON.stringify([{ run: { executable: "/bin/tool", timeout_ms: 0 } }]),
     JSON.stringify([{ run: { executable: "/bin/tool", unsupported: true } }]),
     JSON.stringify([{ run: { executable: "/bin/tool", args: Array(65).fill("x") } }]),
-    JSON.stringify([{ run: { executable: "/bin/tool", environment: { PATH: "a", Path: "b" } } }]),
     JSON.stringify([{ run: { executable: "/bin/tool", environment: { "BAD-KEY": "x" } } }]),
   ]) assert.throws(() => parse(value));
 });
@@ -465,6 +463,14 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
   for (const value of ["-1", "301", "1.5", "NaN"]) {
     assert.throws(() => model.parseExitTimeout(value));
   }
+  const mixed = ["first", { command: "helper", cwd: "/games", environment: { MODE: "play" }, stdout: "/logs/helper" }];
+  const form = new FormData();
+  form.set("kind", "executable");
+  form.set("path", "game");
+  form.set("detached_json", "1");
+  form.set("detached", JSON.stringify(mixed));
+  assert.deepEqual(ordinary(model.entryFromForm(form).launch.detached), mixed);
+  assert.throws(() => model.parseDetachedCommands('[{"command":"helper","elevated":true}]', true));
   assert.throws(() => model.parseDetachedCommands(Array(17).fill("run").join("\n")));
   assert.throws(() => model.parseDetachedCommands("bad\tcommand"));
   assert.throws(() => model.parseDetachedCommands("é".repeat(1025)));

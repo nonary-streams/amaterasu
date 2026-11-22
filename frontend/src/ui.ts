@@ -449,6 +449,13 @@ namespace Amaterasu {
     return box;
   }
 
+  export function optionalSettingsError(name: string, error: unknown, retry: () => void, fallback = error): HTMLElement {
+    if (error instanceof ApiError && error.code === "service_unavailable")
+      return el("div", "settings-unavailable", el("strong", "", name),
+        el("span", "muted", "Unavailable on this host"), button("Try again", retry, "secondary"));
+    return errorPanel(fallback, retry);
+  }
+
   export function badge(text: TextValue, tone = ""): HTMLElement {
     return el("span", `badge ${tone}`, text);
   }
@@ -765,7 +772,7 @@ namespace Amaterasu {
         dialog.remove();
         resolve(accepted);
       };
-      const cancel = button("Cancel", () => finish(false));
+      const cancel = button("Cancel", () => finish(false), "outline");
       dialog.append(
         el("h2", "", title),
         el("p", "muted", description),
@@ -773,9 +780,10 @@ namespace Amaterasu {
           "div",
           "actions",
           cancel,
-          button(label, () => finish(true), "danger"),
+          button(label, () => finish(true), "primary"),
         ),
       );
+      dialog.append(button("Close", () => finish(false), "ghost dialog-close"));
       dialog.addEventListener("cancel", (event) => {
         event.preventDefault();
         finish(false);

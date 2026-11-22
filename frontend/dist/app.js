@@ -432,15 +432,30 @@ var Amaterasu;
         return value;
     }
     Amaterasu.parseSteamInstallDir = parseSteamInstallDir;
-    function parseDetachedCommands(value) {
-        const commands = value
-            .split(/\r?\n/)
-            .map((command) => command.trim())
-            .filter(Boolean);
-        if (commands.length > 16 ||
-            commands.some((command) => new TextEncoder().encode(command).length > 2048 ||
-                /[\u0000-\u001f\u007f]/.test(command))) {
-            throw new Error("Enter up to 16 detached commands, each at most 2048 bytes without control characters.");
+    function parseDetachedCommands(value, jsonFormat = false) {
+        const commands = jsonFormat
+            ? JSON.parse(value.trim() || "[]")
+            : value.split(/\r?\n/).map(command => command.trim()).filter(Boolean);
+        if (!Array.isArray(commands) || commands.length > 16)
+            throw new Error("Enter up to 16 detached commands.");
+        for (const item of commands) {
+            let command = item;
+            if (typeof item === "object" && item !== null && !Array.isArray(item)) {
+                if (Object.keys(item).some(key => !["command", "environment", "cwd", "working_directory", "stdout", "stderr"].includes(key)) ||
+                    ("cwd" in item && "working_directory" in item))
+                    throw new Error("Detached command contains unsupported or conflicting settings.");
+                for (const path of [item.cwd, item.working_directory, item.stdout, item.stderr]) {
+                    if (path != null && (typeof path !== "string" || !isAbsolutePreparationPath(path) ||
+                        new TextEncoder().encode(path).length > 1024 || /[\u0000-\u001f\u007f-\u009f]/.test(path)))
+                        throw new Error("Detached command paths must be absolute and at most 1024 bytes.");
+                }
+                if (item.environment !== undefined)
+                    validateCommandEnvironment(item.environment);
+                command = item.command;
+            }
+            if (typeof command !== "string" || !command.length || new TextEncoder().encode(command).length > 2048 ||
+                /[\u0000-\u001f\u007f-\u009f]/.test(command))
+                throw new Error("Each detached command needs printable command text of at most 2048 bytes.");
         }
         return commands;
     }
@@ -492,9 +507,8 @@ var Amaterasu;
         if (typeof command.executable !== "string" ||
             !isAbsolutePreparationPath(command.executable) ||
             new TextEncoder().encode(command.executable).length > 1024 ||
-            command.executable.includes("\0") ||
-            /\.(bat|cmd)$/i.test(command.executable))
-            throw new Error("Preparation executable must be a native absolute path of at most 1024 bytes; batch files need an explicit interpreter.");
+            command.executable.includes("\0"))
+            throw new Error("Preparation executable must be a native absolute path of at most 1024 bytes.");
         if (command.cwd != null &&
             (typeof command.cwd !== "string" ||
                 !isAbsolutePreparationPath(command.cwd) ||
@@ -514,28 +528,26 @@ var Amaterasu;
             command.timeout_ms < 1 ||
             command.timeout_ms > 30000))
             throw new Error("Preparation timeout must be a whole number from 1 to 30000 milliseconds.");
-        if (command.environment !== undefined) {
-            const environment = command.environment;
-            if (environment === null || Array.isArray(environment) || typeof environment !== "object")
-                throw new Error("Preparation environment must be a JSON object.");
-            const entries = Object.entries(environment);
-            const foldedNames = new Set();
-            let totalBytes = 0;
-            for (const [key, rawValue] of entries) {
-                if (key.length === 0 ||
-                    new TextEncoder().encode(key).length > 128 ||
-                    !/^[A-Za-z0-9_]+$/.test(key) ||
-                    typeof rawValue !== "string" ||
-                    new TextEncoder().encode(rawValue).length > 1024 ||
-                    rawValue.includes("\0") ||
-                    foldedNames.has(key.toUpperCase()))
-                    throw new Error("Preparation environment names and values exceed their limits or are invalid.");
-                foldedNames.add(key.toUpperCase());
-                totalBytes += new TextEncoder().encode(key).length + new TextEncoder().encode(rawValue).length;
-            }
-            if (entries.length > 32 || totalBytes > 4096)
-                throw new Error("Preparation environment exceeds the 32 variable and 4096 byte limits.");
+        if (command.environment !== undefined)
+            validateCommandEnvironment(command.environment);
+    }
+    function validateCommandEnvironment(environment) {
+        if (environment === null || Array.isArray(environment) || typeof environment !== "object")
+            throw new Error("Command environment must be a JSON object.");
+        const entries = Object.entries(environment);
+        let totalBytes = 0;
+        for (const [key, rawValue] of entries) {
+            if (key.length === 0 ||
+                new TextEncoder().encode(key).length > 128 ||
+                !/^[A-Za-z0-9_]+$/.test(key) ||
+                typeof rawValue !== "string" ||
+                new TextEncoder().encode(rawValue).length > 1024 ||
+                rawValue.includes("\0"))
+                throw new Error("Command environment names and values exceed their limits or are invalid.");
+            totalBytes += new TextEncoder().encode(key).length + new TextEncoder().encode(rawValue).length;
         }
+        if (entries.length > 32 || totalBytes > 4096)
+            throw new Error("Command environment exceeds the 32 variable and 4096 byte limits.");
     }
     function isAbsolutePreparationPath(value) {
         return value.startsWith("/") ||
@@ -609,7 +621,7 @@ var Amaterasu;
                 ...(prefer10BitSdr === null ? {} : { prefer_10bit_sdr: prefer10BitSdr }),
             };
         const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
-        const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
+        const detached = kind === "executable" ? parseDetachedCommands(text("detached"), data.has("detached_json")) : [];
         const preparation = kind !== "application" ? parsePreparation(text("preparation")) : [];
         if (preparation.length + rawPreparation.length > 8)
             throw new Error("An application can contain at most 8 preparation steps.");
@@ -6007,6 +6019,12 @@ var Amaterasu;
         return box;
     }
     Amaterasu.errorPanel = errorPanel;
+    function optionalSettingsError(name, error, retry, fallback = error) {
+        if (error instanceof Amaterasu.ApiError && error.code === "service_unavailable")
+            return el("div", "settings-unavailable", el("strong", "", name), el("span", "muted", "Unavailable on this host"), button("Try again", retry, "secondary"));
+        return errorPanel(fallback, retry);
+    }
+    Amaterasu.optionalSettingsError = optionalSettingsError;
     function badge(text, tone = "") {
         return el("span", `badge ${tone}`, text);
     }
@@ -6269,8 +6287,9 @@ var Amaterasu;
                 dialog.remove();
                 resolve(accepted);
             };
-            const cancel = Amaterasu.button("Cancel", () => finish(false));
-            dialog.append(Amaterasu.el("h2", "", title), Amaterasu.el("p", "muted", description), Amaterasu.el("div", "actions", cancel, Amaterasu.button(label, () => finish(true), "danger")));
+            const cancel = Amaterasu.button("Cancel", () => finish(false), "outline");
+            dialog.append(Amaterasu.el("h2", "", title), Amaterasu.el("p", "muted", description), Amaterasu.el("div", "actions", cancel, Amaterasu.button(label, () => finish(true), "primary")));
+            dialog.append(Amaterasu.button("Close", () => finish(false), "ghost dialog-close"));
             dialog.addEventListener("cancel", (event) => {
                 event.preventDefault();
                 finish(false);
@@ -8741,7 +8760,24 @@ var Amaterasu;
         const detached = Amaterasu.el("textarea");
         detached.name = "detached";
         detached.rows = 3;
-        detached.value = executableLaunch?.detached?.join("\n") ?? "";
+        const helpers = executableLaunch?.detached ?? [];
+        const detachedJson = Amaterasu.input("detached_json", "1", "checkbox");
+        detachedJson.checked = helpers.some(helper => typeof helper !== "string" || helper.trim() !== helper);
+        detached.value = detachedJson.checked ? JSON.stringify(helpers, null, 2) : helpers.join("\n");
+        detachedJson.addEventListener("change", () => {
+            try {
+                const commands = Amaterasu.parseDetachedCommands(detached.value, !detachedJson.checked);
+                if (!detachedJson.checked && commands.some(command => typeof command !== "string" || command.trim() !== command))
+                    throw new Error("Per-command settings and surrounding whitespace require JSON format.");
+                detached.value = detachedJson.checked ? JSON.stringify(commands, null, 2) : commands.join("\n");
+            }
+            catch (error) {
+                detachedJson.checked = !detachedJson.checked;
+                detached.setCustomValidity(error instanceof Error ? error.message : "Invalid detached commands.");
+                detached.reportValidity();
+                detached.setCustomValidity("");
+            }
+        });
         const preparation = Amaterasu.input("preparation", JSON.stringify(preparedLaunch?.preparation ?? []), "hidden");
         const rawPreparation = Amaterasu.input("prep_cmd", JSON.stringify(entry?.prep_cmd ?? []), "hidden");
         const fec = Amaterasu.input("fec_percentage", entry?.config_overrides?.fec_percentage?.toString() ?? "", "number");
@@ -8782,10 +8818,10 @@ var Amaterasu;
         fullscreenTimeout.max = "300";
         fullscreenTimeout.step = "1";
         fullscreenTimeout.required = true;
-        const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Run with administrator privileges", elevated, "Windows uses an available elevated user token. Other platforms keep the host's normal launch identity."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "One ordered command per line; up to 16."));
+        const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Run with administrator privileges", elevated, "Windows uses an available elevated user token. Other platforms keep the host's normal launch identity."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "Enter up to 16 commands, one per line or as a JSON array."), Amaterasu.field("Use JSON for per-command settings", detachedJson));
         const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), processPolicy);
         const sharedLaunchOptions = Amaterasu.el("div", "form-grid", Amaterasu.field("Working directory", directory, "Optional absolute path."), preparation);
-        const pathField = Amaterasu.field("Absolute application path", path);
+        const pathField = Amaterasu.field("Application path", path, "Executable entries also accept a command on PATH.");
         const steamIdField = Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
         const steamInstallDirField = Amaterasu.field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
         const steamChooserStatus = Amaterasu.el("p", "muted");
@@ -9778,6 +9814,86 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    Amaterasu.everydayPluginOptions = new Map([
+        ["amaterasu.frame-limiter", new Set(["frame_limiter_enable", "frame_limiter_fps_limit", "frame_limiter_auto_virtual_framegen"])],
+        ["amaterasu.rtx-hdr", new Set(["rtx_hdr_scope", "rtx_hdr_enable", "rtx_hdr_peak_brightness"])],
+    ]);
+    function everydayDisplaySettings(policy) {
+        const controls = new Map();
+        function choice(key, title, help, options) {
+            const control = Amaterasu.el("select");
+            control.name = key;
+            for (const [value, text] of Object.entries({ "": "Host default", ...options })) {
+                const option = Amaterasu.el("option", "", text);
+                option.value = value;
+                control.append(option);
+            }
+            control.value = String(policy[key] ?? "");
+            controls.set(key, control);
+            return Amaterasu.field(title, control, help);
+        }
+        function manualValue(mode, key, title, placeholder, pattern) {
+            const select = controls.get(mode);
+            const control = Amaterasu.input(key, String(policy[key] ?? ""));
+            control.placeholder = placeholder;
+            control.pattern = pattern;
+            const isResolution = key === "dd_manual_resolution";
+            control.maxLength = isResolution ? 32 : 64;
+            const validate = () => {
+                const value = control.value;
+                const inRange = isResolution
+                    ? value.split(/[x×]/).every(size => Number(size) > 0 && Number(size) <= 0xffffffff)
+                    : Number(value) > 0 && Number(value) <= 1000;
+                control.setCustomValidity(value && !inRange ? (isResolution
+                    ? "Enter a positive width and height, such as 2560x1440."
+                    : "Enter a refresh rate greater than zero and up to 1000 Hz.") : "");
+            };
+            control.addEventListener("input", validate);
+            validate();
+            const row = Amaterasu.field(title, control);
+            const update = () => {
+                row.hidden = select.value !== "manual";
+                if (row.hidden) {
+                    control.value = String(policy[key] ?? "");
+                    validate();
+                }
+                control.disabled = row.hidden;
+                control.required = !row.hidden;
+            };
+            update();
+            select.addEventListener("change", update);
+            controls.set(key, control);
+            return row;
+        }
+        const node = Amaterasu.panel("Display", choice("virtual_display_mode", "Streaming display", "Choose the screen Moonlight uses for new streams.", {
+            disabled: "Physical display", per_client: "Virtual display per client", shared: "Shared virtual display",
+        }), choice("dd_configuration_option", "Display preparation", "Choose which displays stay active while streaming.", {
+            disabled: "Leave displays as they are", verify_only: "Verify the display", ensure_active: "Activate the streaming display",
+            ensure_primary: "Make it the primary display", ensure_only_display: "Use only the streaming display",
+        }), choice("dd_resolution_option", "Resolution", "Set the host display size when a stream starts.", {
+            auto: "Match the client", disabled: "Keep the current resolution", manual: "Custom resolution",
+        }), manualValue("dd_resolution_option", "dd_manual_resolution", "Custom resolution (width × height)", "2560x1440", "[0-9]+[x×][0-9]+"), choice("dd_refresh_rate_option", "Refresh rate", "Set the host display refresh rate for the stream.", {
+            auto: "Match the client", prefer_highest: "Highest available", disabled: "Keep the current refresh rate", manual: "Custom refresh rate",
+        }), manualValue("dd_refresh_rate_option", "dd_manual_refresh_rate", "Custom refresh rate (Hz)", "119.88", "[0-9]+(\\.[0-9]+)?"), choice("dd_hdr_option", "Display HDR", "Let the host switch HDR to match the stream, or keep the current display state.", {
+            auto: "Match the stream", disabled: "Keep the current HDR state",
+        }));
+        node.setAttribute("data-settings-owner", "amaterasu.display");
+        function changes() {
+            const patch = {};
+            if (node.inert)
+                return patch;
+            for (const [key, control] of controls) {
+                if (!control.disabled && control.value !== String(policy[key] ?? ""))
+                    patch[key] = control.value || null;
+            }
+            return patch;
+        }
+        return { node, changes };
+    }
+    Amaterasu.everydayDisplaySettings = everydayDisplaySettings;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function markHostSettingsOwner(owner, node) {
         node.setAttribute("data-settings-owner", owner);
         return node;
@@ -9944,6 +10060,7 @@ var Amaterasu;
         return keys.length === Object.keys(rightObject).length &&
             keys.every((key) => Object.hasOwn(rightObject, key) && sameConfigurationValue(leftObject[key], rightObject[key]));
     }
+    Amaterasu.sameConfigurationValue = sameConfigurationValue;
     async function saveRegisteredConfiguration(api, current, values) {
         const expectedValues = { ...current.values, ...values };
         const confirms = (reply) => reply.revision === current.revision + 1 &&
@@ -10286,6 +10403,31 @@ var Amaterasu;
         return saved;
     }
     Amaterasu.saveNvhttpHostSettings = saveNvhttpHostSettings;
+    async function saveEverydaySettings(api, current, values) {
+        const persisted = new Set(["port", "stream_audio", "upnp", "audio_sink_capture_only",
+            "install_steam_audio_drivers", "nvenc_spatial_aq", "lan_encryption_mode", "wan_encryption_mode"]);
+        const expected = Object.fromEntries(Object.entries(current).filter(([key]) => key.startsWith("configured_") || persisted.has(key)));
+        Object.assign(expected, {
+            configured_hostname: values.hostname,
+            configured_max_bitrate: values.max_bitrate,
+            configured_fec_percentage: values.fec_percentage,
+            stream_audio: values.stream_audio,
+        });
+        if (values.display_policy) {
+            expected.configured_display_policy = sparseDisplayPolicy({
+                ...current.configured_display_policy, ...values.display_policy,
+            });
+        }
+        const confirm = (reply) => {
+            if (reply.revision !== current.revision + 1 || !Object.entries(expected).every(([key, value]) => sameConfigurationValue(reply[key], value)))
+                throw new Error("The host could not confirm these changes. Reload the saved values to review them.");
+        };
+        confirm(parseNvhttpSettingsReply(await api.post("nvhttp/settings_update", {
+            ...values, port: current.port, expected_revision: current.revision,
+        })));
+        confirm(parseNvhttpSettingsReply(await api.post("nvhttp/settings")));
+    }
+    Amaterasu.saveEverydaySettings = saveEverydaySettings;
     async function saveNvhttpAudioSettings(api, current, streamAudio, audioSink) {
         if (!Number.isSafeInteger(current.revision) || current.revision < 0 || current.revision >= Number.MAX_SAFE_INTEGER ||
             typeof current.configured_hostname !== "string" || current.configured_hostname.length > 128 ||
@@ -12362,6 +12504,9 @@ var Amaterasu;
         return { merged, overlaps };
     }
     function renderSettings(context) {
+        const everydayArea = Amaterasu.el("div", "settings-area-everyday");
+        const featuredPluginArea = Amaterasu.el("div", "settings-area-featured-plugins");
+        const everydayLoads = new NvhttpSettingsLoadGate();
         const area = Amaterasu.el("div", "settings-area-registered");
         const sessionExtensionsArea = Amaterasu.el("div", "settings-area-session-extensions");
         const registeredLoads = new RegisteredConfigurationLoadGate();
@@ -12383,7 +12528,7 @@ var Amaterasu;
         let activePlayniteListEditors = [];
         const inputArea = Amaterasu.el("div", "settings-area-input");
         const inputLoads = new InputPolicyLoadGate();
-        const metricsArea = Amaterasu.el("div", "settings-area-metrics");
+        const signedSettingsArea = Amaterasu.el("div", "settings-area-contributions");
         const updaterArea = Amaterasu.el("div", "settings-area-updater");
         const systemTrayArea = Amaterasu.el("div", "settings-area-tray");
         const pairingArea = Amaterasu.el("div", "settings-area-pairing");
@@ -12427,13 +12572,79 @@ var Amaterasu;
         });
         const managementArea = Amaterasu.el("div", "settings-area-management");
         const csrfArea = Amaterasu.el("div", "settings-area-csrf");
+        let serviceInventory;
+        const optionalReads = new WeakMap();
+        function loadOptional(service, target, editor) {
+            serviceInventory ??= context.api.post("package-selection/status")
+                .then(({ ok, running }) => {
+                const services = running?.declared_services;
+                return ok === true && running?.available === true && Array.isArray(services) && services.length <= 256 &&
+                    services.every(name => typeof name === "string") ? new Set(services) : null;
+            }).catch(() => null);
+            const reading = serviceInventory;
+            optionalReads.set(target, reading);
+            void reading.then(services => {
+                if (!target.isConnected || reading !== optionalReads.get(target))
+                    return;
+                if (services && !services.has(service))
+                    target.replaceChildren();
+                else
+                    editor();
+            });
+        }
+        let discoveringSections = false;
+        let customProviders;
+        let loadRemainingPlugins;
+        function loadPluginSections() {
+            if (discoveringSections || customProviders)
+                return;
+            discoveringSections = true;
+            Amaterasu.renderExtensionSlot(context, signedSettingsArea, "settings", providers => {
+                discoveringSections = false;
+                customProviders = providers;
+                Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, providers, {
+                    area: featuredPluginArea, options: Amaterasu.everydayPluginOptions,
+                    onRemainingReady(load) {
+                        loadRemainingPlugins = load;
+                        if (loadedCategories.has("plugins"))
+                            load();
+                    },
+                });
+            });
+        }
         const categories = [
-            { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, sessionExtensionsArea, hostLoggingArea, updaterArea, systemTrayArea] },
-            { id: "streaming", label: "Streaming", description: "Configure the host, capture, input, and session reporting.", areas: [hostArea, pipewireArea, inputArea, metricsArea] },
-            { id: "integrations", label: "Integrations", description: "Manage application providers and library imports.", areas: [steamArea, lutrisArea, playniteArea] },
-            { id: "devices", label: "Devices", description: "Manage paired client settings.", areas: [pairingArea] },
-            { id: "access", label: "Access & security", description: "Configure session lifetimes and management access.", areas: [authArea, managementArea, csrfArea] },
+            { id: "everyday", label: "Everyday Settings", description: "Applications and paired devices can override your stream preferences.", areas: [everydayArea, featuredPluginArea, signedSettingsArea], load: () => {
+                    void loadEveryday();
+                    if (!customProviders)
+                        loadPluginSections();
+                } },
+            { id: "streaming", label: "Streaming", description: "Capture, encoding, audio, and input.", areas: [hostArea, pipewireArea, inputArea], load: () => {
+                    void loadHost();
+                    loadOptional("amaterasu.capture-pipewire/1", pipewireArea, loadPipewireChooser);
+                    void loadInput();
+                } },
+            { id: "devices", label: "Devices", description: "Manage paired clients and their overrides.", areas: [pairingArea], load: loadPairing },
+            { id: "integrations", label: "Integrations", description: "Choose which game libraries appear in Moonlight.", areas: [steamArea, lutrisArea, playniteArea], load: () => {
+                    loadOptional("amaterasu.steam/1", steamArea, loadSteam);
+                    loadOptional("amaterasu.lutris/1", lutrisArea, loadLutris);
+                    loadOptional("amaterasu.playnite/1", playniteArea, loadPlaynite);
+                } },
+            { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, hostLoggingArea, updaterArea, systemTrayArea], load: () => {
+                    void load();
+                    loadOptional("amaterasu.host-configuration/1", hostLoggingArea, loadHostLogging);
+                    loadOptional("amaterasu.updater/1", updaterArea, () => Amaterasu.renderUpdaterSettings(context, updaterArea));
+                    loadOptional("amaterasu.system-tray/1", systemTrayArea, () => Amaterasu.renderSystemTraySettings(context, systemTrayArea));
+                } },
+            { id: "access", label: "Access & security", description: "Configure session lifetimes and management access.", areas: [authArea, managementArea, csrfArea], load: () => {
+                    void loadAuth();
+                    managementArea.replaceChildren();
+                    csrfArea.replaceChildren();
+                    Amaterasu.renderManagementPolicy(context, managementArea);
+                    Amaterasu.renderCsrfPolicy(context, csrfArea);
+                } },
+            { id: "plugins", label: "Plugin settings", description: "Preferences provided by the plugins on this host.", areas: [sessionExtensionsArea], load: () => { loadPluginSections(); loadRemainingPlugins?.(); } },
         ];
+        const loadedCategories = new Set();
         let selectedCategory = context.initialSettingsCategory ?? categories[0].id;
         const categoryContent = Amaterasu.el("div", "settings-content");
         categoryContent.id = "settings-category-content";
@@ -12470,10 +12681,11 @@ var Amaterasu;
             categoryContent.append(...category.areas);
         }
         function selectCategory(id) {
-            if (!categories.some((category) => category.id === id))
+            const category = categories.find(item => item.id === id);
+            if (!category)
                 return;
-            selectedCategory = id;
-            context.replaceSettingsCategory?.(id);
+            selectedCategory = category.id;
+            context.replaceSettingsCategory?.(category.id);
             search.value = "";
             updateCategoryDisplay();
         }
@@ -12502,9 +12714,13 @@ var Amaterasu;
             restoreSearchDisclosures();
             let matches = 0;
             for (const category of categories) {
+                if ((query || category === selected) && !loadedCategories.has(category.id)) {
+                    loadedCategories.add(category.id);
+                    category.load();
+                }
                 for (const area of category.areas) {
                     const fields = typeof area.querySelectorAll === "function"
-                        ? Array.from(area.querySelectorAll(".field")) : [];
+                        ? Array.from(area.querySelectorAll(".field, .session-extension-option")) : [];
                     let fieldMatches = 0;
                     for (const wrapper of fields) {
                         const controls = Array.from(wrapper.querySelectorAll("input, select, textarea"));
@@ -12526,7 +12742,7 @@ var Amaterasu;
                     const visible = query
                         ? fieldMatches > 0 || settingsSearchMatches(query, category.label, title) ||
                             (!fields.length && settingsSearchMatches(query, area.textContent ?? ""))
-                        : category.id === selected.id;
+                        : category.id === selected.id || (selected.id === "plugins" && area === featuredPluginArea);
                     area.hidden = !visible;
                     if (visible)
                         matches++;
@@ -12554,29 +12770,28 @@ var Amaterasu;
         }, true);
         search.addEventListener("input", updateCategoryDisplay);
         categoryPicker.addEventListener("change", () => selectCategory(categoryPicker.value));
-        const settingsNavigation = Amaterasu.el("div", "settings-navigation", Amaterasu.field("Category", categoryPicker), categoryNavigation);
+        const settingsNavigation = Amaterasu.el("div", "settings-navigation", search, Amaterasu.field("Category", categoryPicker), categoryNavigation);
         const refreshSettings = Amaterasu.button("Refresh", () => {
-            void load();
-            void loadAuth();
-            void loadHostLogging();
-            void loadHost();
-            void loadPipewireChooser();
-            void loadSteam();
-            void loadLutris();
-            void loadPlaynite();
-            void loadInput();
-            Amaterasu.renderExtensionSlot(context, metricsArea, "settings", owners => {
-                if (typeof Amaterasu.renderSessionExtensionSettings === "function")
-                    Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, owners);
-            });
-            Amaterasu.renderUpdaterSettings(context, updaterArea);
-            Amaterasu.renderSystemTraySettings(context, systemTrayArea);
-            void loadPairing();
+            if (Amaterasu.extensionSlotDirty(signedSettingsArea)) {
+                context.notify("Finish editing the plugin settings before refreshing.");
+                return;
+            }
+            serviceInventory = undefined;
+            if (search.value.trim() || selectedCategory === "everyday" || selectedCategory === "plugins") {
+                customProviders = undefined;
+                loadRemainingPlugins = undefined;
+                discoveringSections = false;
+            }
+            if (search.value.trim())
+                loadedCategories.clear();
+            else
+                loadedCategories.delete(selectedCategory);
+            updateCategoryDisplay();
         });
         const dirtyNotice = Amaterasu.badge("Unsaved changes", "accent");
         dirtyNotice.hidden = true;
         dirtyNotice.setAttribute("role", "status");
-        context.content.append(Amaterasu.sectionHeading("Settings", "Configure your host, streaming, integrations, and access.", refreshSettings), Amaterasu.el("div", "settings-tools", search, dirtyNotice), Amaterasu.el("div", "settings-layout", settingsNavigation, categoryContent));
+        context.content.append(Amaterasu.el("header", "page-heading settings-heading", Amaterasu.el("h1", "", "Settings"), Amaterasu.el("div", "actions", dirtyNotice, refreshSettings)), Amaterasu.el("div", "settings-layout", settingsNavigation, categoryContent));
         if (context.registerDraftGuard) {
             drafts = Amaterasu.trackDrafts(categoryContent, updateDraftStatus);
             context.registerDraftGuard(() => clientSaveBusy || pendingProviderDrafts.size > 0 || (drafts?.isDirty() ?? false), () => {
@@ -12593,9 +12808,6 @@ var Amaterasu;
                 drafts?.dispose();
             });
         }
-        Amaterasu.renderManagementPolicy(context, managementArea);
-        Amaterasu.renderCsrfPolicy(context, csrfArea);
-        updateCategoryDisplay();
         if (typeof MutationObserver !== "undefined") {
             const observer = new MutationObserver(() => {
                 if (!context.content.isConnected) {
@@ -12611,6 +12823,89 @@ var Amaterasu;
         }
         let pipewireGeneration = 0;
         let pipewireOperation = 0;
+        async function loadEveryday() {
+            everydayArea.replaceChildren(Amaterasu.el("p", "muted", "Loading settings…"));
+            try {
+                const loaded = await everydayLoads.read(context.api);
+                if (!loaded || !everydayArea.isConnected)
+                    return;
+                const settings = loaded.settings;
+                if (typeof settings.stream_audio !== "boolean" ||
+                    !(settings.configured_max_bitrate === null || Number.isSafeInteger(settings.configured_max_bitrate)))
+                    throw new Error("The host returned invalid stream preferences.");
+                const display = settings.configured_display_policy && Amaterasu.everydayDisplaySettings(settings.configured_display_policy);
+                const hostname = Amaterasu.input("everyday_hostname", settings.configured_hostname);
+                hostname.maxLength = 128;
+                hostname.placeholder = settings.hostname;
+                const bitrate = Amaterasu.input("everyday_bitrate", String(settings.configured_max_bitrate ?? ""), "number");
+                bitrate.placeholder = "No host limit";
+                bitrate.step = "1";
+                const recovery = Amaterasu.input("everyday_fec", String(settings.configured_fec_percentage ?? ""), "number");
+                recovery.min = "1";
+                recovery.max = "255";
+                recovery.placeholder = String(settings.effective_fec_percentage);
+                const audio = Amaterasu.input("everyday_audio", "", "checkbox");
+                audio.checked = settings.stream_audio;
+                const save = Amaterasu.el("button", "button primary", "Save changes");
+                save.type = "submit";
+                const canWrite = context.api.allows("configuration.write");
+                save.disabled = true;
+                const status = Amaterasu.el("div");
+                status.setAttribute("role", "status");
+                const form = Amaterasu.el("form", "everyday-form", display?.node, Amaterasu.panel("Stream preferences", Amaterasu.field("Maximum bitrate (kbps)", bitrate, "Leave blank to let the client choose. A positive limit applies to new streams."), Amaterasu.field("Packet recovery (%)", recovery, "Extra recovery data helps with packet loss on Wi-Fi. Leave blank to use the host default."), Amaterasu.field("Stream audio", audio, "Include sound from this host in future streams.")), Amaterasu.panel("Connection", Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC’s name.")), Amaterasu.el("div", "actions", save, status));
+                if (canWrite) {
+                    const checkChanges = () => {
+                        save.disabled = !Object.keys(display?.changes() ?? {}).length && hostname.value === settings.configured_hostname &&
+                            bitrate.value === String(settings.configured_max_bitrate ?? "") &&
+                            recovery.value === String(settings.configured_fec_percentage ?? "") &&
+                            audio.checked === settings.stream_audio;
+                    };
+                    form.addEventListener("input", checkChanges);
+                    form.addEventListener("change", checkChanges);
+                }
+                else {
+                    setSettingsFormDisabled(form, true);
+                    status.append(Amaterasu.el("p", "muted", "These settings are read-only for this account."));
+                }
+                form.addEventListener("submit", event => {
+                    event.preventDefault();
+                    if (!form.reportValidity() || save.disabled)
+                        return;
+                    void Amaterasu.runAction(save, status, async () => {
+                        const patch = display?.changes();
+                        const values = { ...(patch && Object.keys(patch).length ? { display_policy: patch } : {}),
+                            hostname: hostname.value, max_bitrate: parseMaxBitrate(bitrate.value),
+                            fec_percentage: parseGlobalFecPercentage(recovery.value), stream_audio: audio.checked };
+                        if (values.max_bitrate !== null && values.max_bitrate > 0 && values.max_bitrate < 100)
+                            throw new Error("Use at least 100 kbps, or leave the limit blank.");
+                        setSettingsFormDisabled(form, true);
+                        try {
+                            await saveEverydaySettings(context.api, settings, values);
+                        }
+                        catch (error) {
+                            if (form.isConnected) {
+                                setSettingsFormDisabled(form, false);
+                                for (const control of form.querySelectorAll("label[hidden] input"))
+                                    control.disabled = true;
+                                status.replaceChildren(Amaterasu.errorPanel(error), Amaterasu.button("Reload saved values", loadEveryday, "secondary"));
+                            }
+                            return;
+                        }
+                        if (!form.isConnected)
+                            return;
+                        context.notify("Everyday settings saved.");
+                        if (loadedCategories.has("streaming") && !drafts?.isDirty(hostArea))
+                            void loadHost();
+                        await loadEveryday();
+                    });
+                });
+                everydayArea.replaceChildren(form);
+            }
+            catch (error) {
+                if (everydayArea.isConnected)
+                    everydayArea.replaceChildren(Amaterasu.errorPanel(error, loadEveryday));
+            }
+        }
         async function loadPipewireChooser() {
             const generation = ++pipewireGeneration;
             pipewireOperation += 1;
@@ -12849,9 +13144,9 @@ var Amaterasu;
                 });
                 hostLoggingArea.replaceChildren(Amaterasu.panel("Host logging", form));
             }
-            catch {
+            catch (error) {
                 if (context.content.isConnected)
-                    hostLoggingArea.replaceChildren(Amaterasu.errorPanel(new Error("Host logging policy could not be loaded. Try again."), loadHostLogging));
+                    hostLoggingArea.replaceChildren(Amaterasu.optionalSettingsError("Host logging", error, loadHostLogging, new Error("Host logging policy could not be loaded. Try again.")));
             }
         }
         async function loadSteam(draftValues, draftNotice) {
@@ -13017,7 +13312,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (context.content.isConnected)
-                    steamArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadSteam(draftValues, draftNotice); }));
+                    steamArea.replaceChildren(Amaterasu.optionalSettingsError("Steam", error, () => { void loadSteam(draftValues, draftNotice); }));
             }
         }
         async function loadLutris(draftValues, draftNotice) {
@@ -13202,7 +13497,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (context.content.isConnected)
-                    lutrisArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadLutris(draftValues, draftNotice); }));
+                    lutrisArea.replaceChildren(Amaterasu.optionalSettingsError("Lutris", error, () => { void loadLutris(draftValues, draftNotice); }));
             }
         }
         async function loadPlaynite(draftValues, draftNotice) {
@@ -13464,7 +13759,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (context.content.isConnected)
-                    playniteArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadPlaynite(draftValues, draftNotice); }));
+                    playniteArea.replaceChildren(Amaterasu.optionalSettingsError("Playnite", error, () => { void loadPlaynite(draftValues, draftNotice); }));
             }
         }
         async function loadInput() {
@@ -13670,7 +13965,10 @@ var Amaterasu;
                 automaticOutput.value = "";
                 outputName.append(automaticOutput);
                 let outputDiscoveryIssue = null;
-                if (settings.capture_provider && context.api.allows("media.read")) {
+                if (settings.capture_provider === "pipewire") {
+                    outputDiscoveryIssue = "Use the PipeWire source chooser to select a monitor or window.";
+                }
+                else if (settings.capture_provider && context.api.allows("media.read")) {
                     try {
                         const discovered = await context.api.post(`media/${settings.capture_provider}_outputs`);
                         if (!context.content.isConnected || !hostLoads.isCurrent(generation))
@@ -13960,6 +14258,8 @@ var Amaterasu;
                         hostLoads.invalidate();
                         try {
                             await saveNvhttpHostSettings(context.api, settings, values);
+                            if (loadedCategories.has("everyday") && !drafts?.isDirty(everydayArea))
+                                void loadEveryday();
                             context.notify(settingsTextMessage("Host settings saved and read back. Future-stream options apply to new streams; check active listener status below."));
                             await loadHost();
                         }
@@ -13972,7 +14272,11 @@ var Amaterasu;
                     });
                 });
                 if (hostLoads.isCurrent(generation))
-                    hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form), renderNvhttpAudioSettings(context, settings, audioEndpoints, audioDiscoveryIssue, loadHost));
+                    hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form), renderNvhttpAudioSettings(context, settings, audioEndpoints, audioDiscoveryIssue, async () => {
+                        if (loadedCategories.has("everyday") && !drafts?.isDirty(everydayArea))
+                            void loadEveryday();
+                        await loadHost();
+                    }));
             }
             catch (error) {
                 if (context.content.isConnected && (generation === null || hostLoads.isCurrent(generation)))
@@ -14081,24 +14385,7 @@ var Amaterasu;
                     : Amaterasu.errorPanel(error, load));
             }
         }
-        if (typeof Amaterasu.renderSessionExtensionSettings === "function")
-            Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea);
-        void load();
-        void loadAuth();
-        void loadHostLogging();
-        void loadHost();
-        void loadPipewireChooser();
-        void loadSteam();
-        void loadLutris();
-        void loadPlaynite();
-        void loadInput();
-        Amaterasu.renderExtensionSlot(context, metricsArea, "settings", owners => {
-            if (typeof Amaterasu.renderSessionExtensionSettings === "function")
-                Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, owners);
-        });
-        Amaterasu.renderUpdaterSettings(context, updaterArea);
-        Amaterasu.renderSystemTraySettings(context, systemTrayArea);
-        void loadPairing();
+        updateCategoryDisplay();
     }
     Amaterasu.renderSettings = renderSettings;
 })(Amaterasu || (Amaterasu = {}));
@@ -18206,7 +18493,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (isCurrent())
-                    container.replaceChildren(Amaterasu.errorPanel(error, load));
+                    container.replaceChildren(Amaterasu.optionalSettingsError("Software updates", error, load));
             }
         };
         void load();
@@ -18307,7 +18594,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (isCurrent())
-                    container.replaceChildren(Amaterasu.errorPanel(error, load));
+                    container.replaceChildren(Amaterasu.optionalSettingsError("System tray", error, load));
             }
         };
         void load();
@@ -18344,6 +18631,14 @@ var Amaterasu;
         const parts = [Object.hasOwn(issueMessages, issue.code) ? issueMessages[issue.code] : words(issue.code) + "."];
         if (typeof issue.reason === "string" && issue.reason && issue.reason !== issue.code)
             parts.push("Reason: " + words(issue.reason) + ".");
+        if (issue.native_failure && typeof issue.native_failure === "object" && !Array.isArray(issue.native_failure)) {
+            const failure = fields(issue.native_failure);
+            if (typeof failure.service === "string" && typeof failure.call === "string" && Number.isSafeInteger(failure.status)) {
+                parts.push(`${failure.service} returned native status ${failure.status} from ${failure.call}.`);
+                if (Number.isSafeInteger(failure.capture_generation))
+                    parts.push(`Capture offer generation ${failure.capture_generation}.`);
+            }
+        }
         if (typeof issue.fallback === "string")
             parts.push("Used " + words(issue.fallback) + ".");
         for (const [name, label] of [["requested", "Requested"], ["effective", "Effective"], ["os_error", "OS error"]]) {
@@ -18395,7 +18690,8 @@ var Amaterasu;
                 !["critical_failure", "advisory_warning", "demoted_warning"].includes(String(issue.disposition)))
                 throw new Error("Invalid stream issue identity.");
             const key = JSON.stringify([issue.operation, entry.publisher, issue.layer, issue.phase, issue.disposition,
-                issue.code, issue.reason, issue.caused_by, issue.fallback, issue.requested, issue.effective, issue.os_error]);
+                issue.code, issue.reason, issue.caused_by, issue.fallback, issue.requested, issue.effective, issue.os_error,
+                issue.native_failure]);
             const previous = alerts.get(key);
             alerts.set(key, { key, occurrences: (previous?.occurrences ?? 0) + 1, message: issueText(issue), source: entry.publisher, operation: issue.operation, title: issue.disposition === "critical_failure" ? "Failure" : "Warning", at: Math.max(previous?.at ?? 0, Number(entry.at_ms)) });
         }
@@ -23282,6 +23578,14 @@ var Amaterasu;
                     nativeClose(returnValue);
                 });
                 extensionUiDialogCloseFromParent.set(element, closeFromParent);
+                if (!contentNodes.length) {
+                    const closeButton = document.createElement("button");
+                    closeButton.type = "button";
+                    closeButton.className = "button ghost dialog-close";
+                    closeButton.append(extensionUiDialogTextNode("Close"));
+                    closeButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
+                    element.append(closeButton);
+                }
                 cancelButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
                 element.addEventListener("cancel", onCancel, { signal: controller.signal });
                 element.addEventListener("keydown", onKeyDown, { signal: controller.signal });
@@ -23824,68 +24128,91 @@ var Amaterasu;
 var Amaterasu;
 (function (Amaterasu) {
     const extensionSlotDisposers = new WeakMap();
+    const extensionSlotDrafts = new WeakMap();
+    function extensionSlotDirty(container) {
+        return extensionSlotDrafts.get(container)?.() ?? false;
+    }
+    Amaterasu.extensionSlotDirty = extensionSlotDirty;
     function renderExtensionSlot(context, container, slot, onOwners) {
         extensionSlotDisposers.get(container)?.();
         container.replaceChildren();
         const children = [];
-        let owners = new Set();
+        const owners = new Set();
         let disposed = false;
+        const isDirty = () => children.some(child => child.isDirty());
+        extensionSlotDrafts.set(container, isDirty);
+        const discovery = new Amaterasu.ExtensionPages(context.api);
+        let unregister;
         const dispose = () => {
             if (disposed)
                 return;
             disposed = true;
+            extensionSlotDrafts.delete(container);
             observer.disconnect();
             for (const child of children)
                 child.dispose();
-            discovery.dispose();
+            discovery.reset();
+            unregister?.();
         };
         extensionSlotDisposers.set(container, dispose);
+        const claimOwners = () => {
+            if (slot === "settings")
+                Amaterasu.claimModuleSettings(context, owners);
+        };
         const observer = new MutationObserver(() => {
             if (!container.isConnected)
                 dispose();
-            else if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function")
-                Amaterasu.claimModuleSettings(context, owners);
+            else
+                claimOwners();
         });
         observer.observe(document.body, { childList: true, subtree: true });
-        context.registerDraftGuard?.(() => children.some(child => child.isDirty()), dispose);
-        const discovery = new Amaterasu.ExtensionPages(context.api);
-        void discovery.discover().then(async (descriptors) => {
+        unregister = context.registerDraftGuard?.(isDirty, dispose);
+        void discovery.discover().then(descriptors => {
             if (disposed || !container.isConnected)
                 return;
-            owners = new Set(descriptors.filter(entry => entry.placements?.includes(slot)).flatMap(entry => {
-                const owner = entry.settings_owner ?? entry.settings_provider;
-                return owner ? [owner] : [];
-            }));
-            onOwners?.(owners);
-            if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function")
-                Amaterasu.claimModuleSettings(context, owners);
-            for (const descriptor of descriptors) {
-                if (disposed || !container.isConnected)
-                    return;
-                if (!descriptor.placements?.includes(slot))
-                    continue;
+            const entries = descriptors.filter(entry => entry.placements?.includes(slot));
+            onOwners?.(new Set(entries.flatMap(entry => entry.settings_provider ? [entry.settings_provider] : [])));
+            for (const descriptor of entries) {
                 const area = Amaterasu.el("section", "plugin-surface");
                 const section = slot === "settings"
                     ? Amaterasu.pluginSettingsSection(descriptor.name, descriptor.default_expanded === true, area)
                     : null;
                 container.append(section ?? area);
-                const child = new Amaterasu.ExtensionPages(context.api);
+                const child = discovery.createSurface();
                 children.push(child);
-                try {
-                    await child.discover();
-                    if (!disposed && area.isConnected)
+                const mount = async () => {
+                    try {
+                        area.replaceChildren();
                         await child.mountSlot(descriptor.id, area, slot);
-                }
-                catch (error) {
-                    if (!disposed) {
+                        if (disposed || !area.isConnected)
+                            return;
+                        const owner = descriptor.settings_owner ?? descriptor.settings_provider;
+                        if (owner)
+                            owners.add(owner);
+                        claimOwners();
+                    }
+                    catch (error) {
+                        if (disposed || !area.isConnected)
+                            return;
+                        child.dispose();
                         if (section)
                             section.open = true;
-                        area.replaceChildren(Amaterasu.errorPanel(error));
+                        area.replaceChildren(Amaterasu.errorPanel(error, mount));
+                        if (slot === "settings" && descriptor.settings_provider) {
+                            const fallback = Amaterasu.el("div");
+                            area.append(fallback);
+                            Amaterasu.renderSessionExtensionSettings(context, fallback, { kind: "host" }, descriptor.settings_provider);
+                        }
                     }
-                }
+                };
+                void mount();
             }
-        }).catch((error) => { if (!disposed)
-            container.replaceChildren(Amaterasu.errorPanel(error)); });
+        }).catch(error => {
+            if (disposed)
+                return;
+            onOwners?.(new Set());
+            container.replaceChildren(Amaterasu.errorPanel(error, () => renderExtensionSlot(context, container, slot, onOwners)));
+        });
     }
     Amaterasu.renderExtensionSlot = renderExtensionSlot;
     function loadExtensionStylesheet(id, digest, path, signal) {
@@ -24000,13 +24327,17 @@ var Amaterasu;
             this.dispose();
             this.descriptors.clear();
         }
+        createSurface() {
+            const child = new ExtensionPages(this.api);
+            child.descriptors = new Map(this.descriptors);
+            return child;
+        }
         mountApplication(id, container, application) {
             if (typeof application.id !== "string" || !/^app-[0-9a-f]{16}$/.test(application.id) ||
                 application.id === "app-0000000000000000" || typeof application.name !== "string" ||
                 !application.name || application.name.length > 512 || /[\u0000-\u001f\u007f-\u009f]/u.test(application.name))
                 throw new Error("Invalid application context.");
-            const child = new ExtensionPages(this.api);
-            child.descriptors = new Map(this.descriptors);
+            const child = this.createSurface();
             let dirty = false;
             let busy = false;
             const state = (kind, value) => {
@@ -24653,7 +24984,7 @@ var Amaterasu;
         renderSessionExtensionSettings(context, area, scope, provider);
     }
     Amaterasu.showSessionExtensionSettings = showSessionExtensionSettings;
-    function renderSessionExtensionSettings(context, area, scope = { kind: "host" }, provider, excluded = new Set()) {
+    function renderSessionExtensionSettings(context, area, scope = { kind: "host" }, provider, excluded = new Set(), everyday) {
         const renderer = {};
         settingsRenderers.set(area, renderer);
         let generation = 0;
@@ -24681,18 +25012,48 @@ var Amaterasu;
                         throw new Error("Too many extensions.");
                 } while (after);
                 const scopedDescriptors = descriptors.filter((descriptor) => !excluded.has(descriptor.provider) && (!provider || descriptor.provider === provider) && Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
-                const settings = await Promise.all(scopedDescriptors.map((descriptor) => context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope })));
-                if (settingsRenderers.get(area) !== renderer || current !== generation || !context.content.isConnected || !area.isConnected)
+                const isCurrent = () => settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected;
+                if (!isCurrent())
                     return;
                 const panels = [];
-                scopedDescriptors.forEach((descriptor, index) => {
-                    const document = settings[index];
-                    if (!document || !Array.isArray(descriptor.options))
-                        throw new Error("Invalid extension settings response.");
+                const everydayPanels = [];
+                const remaining = [];
+                for (const descriptor of scopedDescriptors) {
+                    const title = descriptor.display_name || descriptor.provider;
+                    const body = Amaterasu.el("div", "", Amaterasu.el("p", "muted", "Loading settings…"));
+                    const featured = everyday && scope.kind === "host" ? everyday.options.get(descriptor.provider) : undefined;
+                    const hasFeatured = !!featured && descriptor.options.some(option => featured.has(option.id) && option.allowed_scopes.includes(scope.kind));
+                    const section = scope.kind === "host" && !provider
+                        ? pluginSettingsSection(title, hasFeatured || descriptor.default_expanded === true, body) : null;
+                    (hasFeatured ? everydayPanels : panels).push(section ?? Amaterasu.panel(Amaterasu.literalText(title), body));
+                    let providerLoad = 0;
+                    const loadProvider = async (confirmed) => {
+                        if (!isCurrent())
+                            return;
+                        const request = ++providerLoad;
+                        try {
+                            const document = confirmed ?? await context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope });
+                            if (!isCurrent() || !body.isConnected || request !== providerLoad)
+                                return;
+                            body.replaceChildren(renderForm(descriptor, document, loadProvider, hasFeatured ? featured : undefined));
+                        }
+                        catch (error) {
+                            if (!isCurrent() || !body.isConnected || request !== providerLoad)
+                                return;
+                            if (section)
+                                section.open = true;
+                            body.replaceChildren(Amaterasu.errorPanel(error, () => loadProvider()));
+                        }
+                    };
+                    if (everyday && !hasFeatured)
+                        remaining.push(() => void loadProvider());
+                    else
+                        void loadProvider();
+                }
+                function renderForm(descriptor, document, reload, featured) {
                     const options = descriptor.options.filter((option) => option.allowed_scopes.includes(scope.kind));
-                    if (!options.length)
-                        return;
                     const form = Amaterasu.el("form", "settings-form");
+                    const more = Amaterasu.el("details", "everyday-more-options", Amaterasu.el("summary", "", "More settings"));
                     const editors = new Map();
                     for (const option of options) {
                         const effective = document.effective[option.id];
@@ -24722,45 +25083,78 @@ var Amaterasu;
                         if (option.help)
                             group.append(Amaterasu.el("small", "muted", Amaterasu.literalText(option.help)));
                         group.append(Amaterasu.el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
-                        form.append(group);
+                        group.disabled = !context.api.allows("configuration.write");
+                        (featured && !featured.has(option.id) ? more : form).append(group);
                         editors.set(option.id, { inherit, editor });
                     }
                     const status = Amaterasu.el("div");
                     const save = Amaterasu.el("button", "button primary", "Save settings");
                     save.type = "submit";
                     save.disabled = !context.api.allows("configuration.write");
+                    if (featured && options.some(option => !featured.has(option.id)))
+                        form.append(more);
                     form.append(status, save);
                     form.addEventListener("submit", (event) => {
                         event.preventDefault();
                         void Amaterasu.runAction(save, status, async () => {
                             const values = { ...document.values };
                             for (const [id, entry] of editors) {
-                                if (entry.inherit?.checked)
+                                if (entry.inherit?.checked) {
                                     delete values[id];
-                                else
-                                    values[id] = entry.editor.value();
+                                    continue;
+                                }
+                                const next = entry.editor.value();
+                                if (featured && Amaterasu.sameConfigurationValue(next, document.effective[id].value))
+                                    continue;
+                                values[id] = next;
                             }
-                            await context.api.post("session-extensions/settings_update", { provider: descriptor.provider, scope, expected_revision: document.revision, values });
-                            context.notify("Plugin settings saved. Application to an active session or stream is not confirmed.");
-                            await load();
+                            if (featured && Amaterasu.sameConfigurationValue(values, document.values))
+                                return;
+                            form.inert = true;
+                            try {
+                                const result = await context.api.post("session-extensions/settings_update", {
+                                    provider: descriptor.provider, scope, expected_revision: document.revision, values,
+                                });
+                                let confirmed;
+                                if (featured) {
+                                    confirmed = await context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope });
+                                    if (!Number.isSafeInteger(result.revision) || result.revision <= document.revision ||
+                                        confirmed.revision !== result.revision || !Amaterasu.sameConfigurationValue(confirmed.values, values))
+                                        throw new Error("The plugin could not confirm these changes. Reload its saved settings to review them.");
+                                }
+                                context.notify("Plugin settings saved. Application to an active session or stream is not confirmed.");
+                                await reload(confirmed);
+                            }
+                            finally {
+                                form.inert = false;
+                            }
                         });
                     });
-                    panels.push(Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || "Plugin settings"), form));
-                });
+                    return form;
+                }
                 for (const descriptor of descriptors) {
                     if (scope.kind !== "host" || (provider && descriptor.provider !== provider))
                         continue;
-                    if (!Array.isArray(descriptor.actions))
-                        throw new Error("Invalid extension actions response.");
+                    if (!Array.isArray(descriptor.actions)) {
+                        panels.push(Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || descriptor.provider), Amaterasu.errorPanel(new Error("Invalid extension actions response."))));
+                        continue;
+                    }
                     const actions = descriptor.actions.filter((action) => Array.isArray(action.allowed_targets) && action.allowed_targets.includes("host") && ["read_only", "host_mutation"].includes(action.execution));
                     if (actions.length)
                         panels.push(Amaterasu.panel(`${descriptor.provider} actions`, ...actions.map((action) => Amaterasu.renderExtensionAction(context, action))));
                 }
-                area.replaceChildren(...(panels.length ? panels : [Amaterasu.el("p", "muted", "No plugin settings are available for this scope.")]));
+                everyday?.area.replaceChildren(...everydayPanels);
+                everyday?.onRemainingReady(() => { for (const read of remaining.splice(0))
+                    read(); });
+                area.replaceChildren(...(panels.length || everydayPanels.length ? panels : [Amaterasu.el("p", "muted", "No plugin settings are available for this scope.")]));
             }
             catch (error) {
-                if (settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected)
-                    area.replaceChildren(Amaterasu.errorPanel(error, load));
+                if (settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected) {
+                    const retry = Amaterasu.errorPanel(error, load);
+                    if (everyday)
+                        everyday.area.replaceChildren(retry);
+                    area.replaceChildren(...(everyday ? [] : [retry]));
+                }
             }
         }
         void load();
@@ -25369,7 +25763,7 @@ var Amaterasu;
             const value = Amaterasu.libraryRouteFromAddress(fragment) ?? (fragment === "updates" ? "plugins" : fragment);
             const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value);
             const settingsCategory = value.startsWith("settings/") &&
-                ["general", "streaming", "integrations", "devices", "access"].includes(value.slice(9)) &&
+                ["everyday", "general", "streaming", "integrations", "devices", "access", "plugins"].includes(value.slice(9)) &&
                 this.pageAvailable("settings");
             const pluginsView = value.startsWith("plugins/") &&
                 Amaterasu.pluginsViewFromAddress(value.slice(8)) !== null &&
@@ -25570,7 +25964,7 @@ var Amaterasu;
                     extensionsNav.append(item);
                     this.navigation.set(page, item);
                 }
-                extensionsHeading.hidden = entries.length === 0;
+                extensionsHeading.hidden = this.extensionPageNames.size === 0;
                 if (location.hash.startsWith("#extension/"))
                     this.renderRequestedPage();
             }).catch(() => {

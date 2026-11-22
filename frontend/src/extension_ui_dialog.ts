@@ -234,6 +234,14 @@ namespace Amaterasu {
           nativeClose(returnValue);
         }) as typeof element.close;
         extensionUiDialogCloseFromParent.set(element, closeFromParent);
+        if (!contentNodes.length) {
+          const closeButton = document.createElement("button");
+          closeButton.type = "button";
+          closeButton.className = "button ghost dialog-close";
+          closeButton.append(extensionUiDialogTextNode("Close"));
+          closeButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
+          element.append(closeButton);
+        }
         cancelButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
         element.addEventListener("cancel", onCancel, { signal: controller.signal });
         element.addEventListener("keydown", onKeyDown, { signal: controller.signal });

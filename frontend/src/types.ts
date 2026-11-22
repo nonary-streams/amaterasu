@@ -11,7 +11,7 @@ namespace Amaterasu {
     | "accounts"
     | "tokens"
     | "maintenance";
-  export type SettingsCategory = "general" | "streaming" | "integrations" | "devices" | "access";
+  export type SettingsCategory = "everyday" | "plugins" | "general" | "streaming" | "integrations" | "devices" | "access";
   /// The Modules page's views. The page keeps the `plugins` address it had
   /// under its former name.
   export type PluginsView = "overview" | "modules" | "drivers" | "repositories";
@@ -27,6 +27,14 @@ namespace Amaterasu {
     scopes: string[];
     expires_at: number;
   }
+  export type DetachedCommand = string | {
+    command: string;
+    environment?: Record<string, string>;
+    cwd?: string | null;
+    working_directory?: string | null;
+    stdout?: string | null;
+    stderr?: string | null;
+  };
   export type Launch =
     | { kind: "application"; path: string }
     | {
@@ -37,7 +45,7 @@ namespace Amaterasu {
         auto_detach?: boolean | null;
         wait_all?: boolean | null;
         exit_timeout_seconds?: number | null;
-        detached?: string[];
+        detached?: DetachedCommand[];
         preparation?: PreparationStep[];
       }
     | { kind: "playnite"; game_id: string; exit_timeout_seconds: number }

@@ -31,6 +31,7 @@
     "src/management-policy.ts",
     "src/csrf-policy.ts",
     "src/client_directory.ts",
+    "src/everyday_settings.ts",
     "src/settings.ts",
     "src/rtx_hdr.ts",
     "src/integrations.ts",

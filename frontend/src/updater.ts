@@ -321,7 +321,7 @@ namespace Amaterasu {
         );
       } catch (error) {
         if (isCurrent())
-          container.replaceChildren(errorPanel(error, load));
+          container.replaceChildren(optionalSettingsError("Software updates", error, load));
       }
     };
 

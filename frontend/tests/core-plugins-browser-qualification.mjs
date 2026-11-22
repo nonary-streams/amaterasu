@@ -66,13 +66,14 @@ try {
     await evaluate(consoleSource);
     const frame = JSON.parse(readFileSync(join(sdkRoot, 'modules/frame-limiter/metadata/linux.json'), 'utf8')).descriptor;
     const displayUi = JSON.parse(readFileSync(join(sdkRoot, 'modules/display/ui/ui.json'), 'utf8'));
+    const frameUi = JSON.parse(readFileSync(join(sdkRoot, 'modules/frame-limiter/ui/ui.json'), 'utf8'));
     await evaluate(`(async()=>{
     window.frameDescriptor=${JSON.stringify(frame)};window.readOnly=false;window.calls=[];window.writes=[];window.notifications=0;
     window.hostState={ok:true,revision:7,configured_output_name:'screen-a',configured_display_policy:{dd_configuration_option:'verify_only',adapter_pnp_id:'keep-adapter'}};
     window.entry={name:'Game',launch:{kind:'executable',program:'/game'},preparation:[{command:'keep'}],config_overrides:{fec_percentage:20,display_policy:{dd_configuration_option:'verify_only'}}};window.entryRevision=10;
     window.documents={host:{revision:1,values:{}},application:{revision:1,values:{}}};
-    const descriptors=[{id:'display',name:'Display',digest:'a'.repeat(64),sdk_version:1,entrypoint:'display.js',settings_owner:'amaterasu.display',placements:['page','settings','application'],methods:${JSON.stringify(displayUi.methods.map(({ alias }) => ({ alias })))}},
-      {id:'frame-limiter',name:'Frame limiting',digest:'b'.repeat(64),sdk_version:1,entrypoint:'settings.js',settings_provider:'amaterasu.frame-limiter',placements:['settings','application'],methods:[]}];
+    const descriptors=[{id:'display',name:'Display',digest:'a'.repeat(64),sdk_version:1,entrypoint:'display.js',settings_owner:'amaterasu.display',default_expanded:${displayUi.default_expanded === true},placements:['page','settings','application'],methods:${JSON.stringify(displayUi.methods.map(({ alias }) => ({ alias })))}},
+      {id:'frame-limiter',name:'Frame limiting',digest:'b'.repeat(64),sdk_version:1,entrypoint:'settings.js',settings_provider:'amaterasu.frame-limiter',default_expanded:${frameUi.default_expanded === true},placements:['settings','application'],methods:[]}];
     window.api={allows:scope=>!readOnly||!scope.endsWith('.write'),async post(route,payload={}){
       calls.push([route,payload]);
       if(route==='extensions/list')return{extensions:descriptors.map(descriptor=>({...descriptor,methods:descriptor.methods.filter(method=>!readOnly||!method.alias.includes('update'))}))};
@@ -102,9 +103,11 @@ try {
         await new Promise(resolve => setTimeout(resolve, 20));
     } throw Error(`Timed out: ${expression}; DOM: ${await evaluate("document.body.innerText")}`); };
     await until(`document.querySelector('#host-plugins input[type=range][max="1000"]')`);
-    assert.deepEqual(await evaluate(`[...document.querySelectorAll('#host-plugins details > summary')].map(node => node.textContent)`),
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll('#host-plugins > details > summary')].map(node => node.textContent)`),
         ['Display', 'Frame limiting']);
-    await evaluate(`document.querySelectorAll('#host-plugins details > summary').forEach(summary => summary.click())`);
+    assert.equal(await evaluate(`document.querySelectorAll('#host-plugins > details[open]').length`), 2);
+    assert.equal(await evaluate(`document.querySelectorAll('#host-plugins details details:not([open])').length`), 2);
+    assert.equal(await evaluate(`[...document.querySelectorAll('#host-plugins input')].find(node => node.labels?.[0]?.textContent.includes('Manual resolution')).checkVisibility()`), false);
     assert.equal(await evaluate(`document.querySelector('#host-plugins input[type=range]').checkVisibility()`), true);
     assert.equal(await evaluate(`getComputedStyle(document.querySelector('#legacy-display')).display==='none'`), true, 'signed ownership replaces legacy controls');
     assert.match(await evaluate(`document.querySelector('#sections').textContent`), /amaterasu.display/);
@@ -117,7 +120,7 @@ try {
       control.closest('details').querySelector('summary').click();
     }`);
     await until(`documents.host.values.frame_limiter_fps_limit===59.94`);
-    await evaluate(`document.querySelector('#host-plugins details:not([open]) > summary').click()`);
+    await evaluate(`document.querySelector('#host-plugins > details:not([open]) > summary').click()`);
     assert.equal(await evaluate(`document.querySelector('#host-plugins input[type=range][max="1000"]').value`), '59.94');
     await until(`[...document.querySelectorAll('#host-plugins select')].some(node=>node.labels?.[0]?.textContent.includes('Display preparation'))`);
     await evaluate(`{const control=[...document.querySelectorAll('#host-plugins select')].find(node=>node.labels?.[0]?.textContent.includes('Display preparation'));control.value='ensure_primary';control.dispatchEvent(new Event('change',{bubbles:true}));}`);

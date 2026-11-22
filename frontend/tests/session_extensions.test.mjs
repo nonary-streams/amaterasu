@@ -7,7 +7,7 @@ import ts from "typescript";
 const plain = value => JSON.parse(JSON.stringify(value));
 const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 
-function fixture(scope, write = true, values = { enabled: false }, provider, fullControls = false) {
+function fixture(scope, write = true, values = { enabled: false }, provider, fullControls = false, brokenPeer = false, everyday = false) {
   class Element {
     children = [];
     listeners = {};
@@ -34,6 +34,7 @@ function fixture(scope, write = true, values = { enabled: false }, provider, ful
     { id: "installation", label: "Installation", help: "", definition: { type: "string", default: "" }, allowed_scopes: ["host"], apply_policy: "next_session" },
   ] };
   const runtime = vm.createContext({ structuredClone, Amaterasu: {
+    sameConfigurationValue: (a, b) => JSON.stringify(a) === JSON.stringify(b),
     literalText: value => ({ kind: "literal", value }),
     el: element,
     input: () => element("input"),
@@ -64,12 +65,16 @@ function fixture(scope, write = true, values = { enabled: false }, provider, ful
   Object.assign(runtime, runtime.Amaterasu);
   vm.runInContext(ts.transpile(readFileSync(new URL("../src/session_extensions.ts", import.meta.url), "utf8"),
     { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), runtime);
-  const area = element("area");
+  const area = element("area"), featured = element("area");
+  let loadRemaining, saved;
   const context = { content: { isConnected: true }, notify(message) { notifications.push(message); }, api: {
     allows: () => write,
     async post(route, payload) {
       calls.push([route, plain(payload)]);
-      if (route.endsWith("/list")) return { items: [descriptor], next: null, revision: 3 };
+      if (route.endsWith("/list")) return { items: brokenPeer ? [{ ...descriptor, provider: "example.offline" }, descriptor] : [descriptor], next: null, revision: 3 };
+      if (route.endsWith("/settings_get") && payload.provider === "example.offline") throw Error("Provider unavailable");
+      if (everyday && route.endsWith("/settings_update")) saved = payload.values;
+      if (everyday && saved && route.endsWith("/settings_get")) return { revision: 8, values: saved, effective: { enabled: { value: saved.enabled }, installation: { value: "" } } };
       if (route.endsWith("/settings_get")) return { revision: fullControls && calls.some(([route]) => route.endsWith("/settings_update")) ? 8 : 7, values, effective: {
         enabled: { value: false, source: scope }, installation: { value: "", source: null },
       } };
@@ -77,9 +82,48 @@ function fixture(scope, write = true, values = { enabled: false }, provider, ful
     },
   } };
   if (fullControls) runtime.Amaterasu.renderApplicationPluginOverrides(context, area, scope.id, undefined, true);
-  else runtime.Amaterasu.renderSessionExtensionSettings(context, area, scope, provider);
-  return { area, calls, nodes, editors, pending, errors, notifications, descriptor };
+  else runtime.Amaterasu.renderSessionExtensionSettings(context, area, scope, provider, new Set(), everyday ? {
+    area: featured, options: new Map([["example.pacing", new Set(["enabled"])]]), onRemainingReady(load) { loadRemaining = load; },
+  } : undefined);
+  return { area, featured, loadRemaining: () => loadRemaining(), calls, nodes, editors, pending, errors, notifications, descriptor };
 }
+
+test("a failed provider leaves peer settings editable and saving reloads only the healthy provider", async () => {
+  const env = fixture({ kind: "host" }, true, {}, undefined, false, true);
+  await settle();
+  assert.ok(env.nodes.some(node => node.tag === "error"));
+  assert.equal(env.editors.length, 2);
+  env.editors[0].value = () => true;
+  env.nodes.find(node => node.tag === "form").listeners.submit({ preventDefault() {} });
+  await Promise.all(env.pending);
+  assert.deepEqual(env.calls.filter(([route]) => route.endsWith("/settings_get")).map(([, data]) => data.provider),
+    ["example.offline", "example.pacing", "example.pacing"]);
+});
+
+test("Everyday shows selected plugin controls, defers peers, and preserves inherited and unknown fields", async () => {
+  const env = fixture({ kind: "host" }, true, { retained: "keep" }, undefined, false, true, true);
+  await settle();
+  assert.equal(env.featured.children[0].open, true);
+  const form = env.nodes.find(node => node.tag === "form");
+  const more = form.children.find(node => node.className === "everyday-more-options");
+  assert.equal(more.children.filter(node => node.tag === "fieldset").length, 1);
+  form.listeners.submit({ preventDefault() {} });
+  await Promise.all(env.pending);
+  assert.equal(env.calls.filter(([route]) => route.endsWith("/settings_update")).length, 0);
+  assert.equal(env.calls.some(([, data]) => data.provider === "example.offline"), false);
+  env.editors[0].value = () => true;
+  form.listeners.submit({ preventDefault() {} });
+  await Promise.all(env.pending);
+  assert.deepEqual(env.calls.find(([route]) => route.endsWith("/settings_update"))[1], {
+    provider: "example.pacing", scope: { kind: "host" }, expected_revision: 7, values: { retained: "keep", enabled: true },
+  });
+  assert.deepEqual(env.errors, []);
+  assert.equal(env.notifications.length, 1);
+  env.loadRemaining();
+  env.loadRemaining();
+  await settle();
+  assert.equal(env.calls.filter(([, data]) => data.provider === "example.offline").length, 1);
+});
 
 test("application cards use global values without inheritance switches and save only edits", async () => {
   const env = fixture({ kind: "application", id: "app-0000000000000001" }, true, {}, undefined, true);
@@ -150,8 +194,9 @@ test("editing default host values saves them without a second inheritance checkb
   const saved = env.calls.find(([route]) => route.endsWith("/settings_update"))[1];
   assert.equal(saved.values.enabled, true);
   assert.equal(saved.values.installation, "");
-  const panel = env.nodes.find(node => node.tag === "panel");
-  assert.equal(panel.children[0].value, "Pacing controls");
+  const section = env.nodes.find(node => node.tag === "details");
+  assert.equal(section.open, false);
+  assert.equal(section.children[0].children[0].value, "Pacing controls");
   const legend = env.nodes.find(node => node.tag === "legend");
   assert.deepEqual(plain(legend.children[0]), { kind: "literal", value: "Enabled" });
 });

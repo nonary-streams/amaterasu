@@ -191,7 +191,7 @@ namespace Amaterasu {
     return reply as unknown as Configuration;
   }
 
-  function sameConfigurationValue(left: unknown, right: unknown): boolean {
+  export function sameConfigurationValue(left: unknown, right: unknown): boolean {
     if (left === right) return true;
     if (Array.isArray(left) && Array.isArray(right))
       return left.length === right.length && left.every((value, index) => sameConfigurationValue(value, right[index]));
@@ -552,6 +552,43 @@ namespace Amaterasu {
     if (!confirms(saved))
       throw new Error("Moonlight host settings could not be confirmed after saving. Refresh and check the current values.");
     return saved;
+  }
+
+  type EverydayPreferences = {
+    display_policy?: Record<string, string | null>;
+    hostname: string;
+    max_bitrate: number | null;
+    fec_percentage: number | null;
+    stream_audio: boolean;
+  };
+
+  export async function saveEverydaySettings(
+    api: Pick<Api, "post">, current: NvhttpSettings, values: EverydayPreferences,
+  ): Promise<void> {
+    const persisted = new Set(["port", "stream_audio", "upnp", "audio_sink_capture_only",
+      "install_steam_audio_drivers", "nvenc_spatial_aq", "lan_encryption_mode", "wan_encryption_mode"]);
+    const expected = Object.fromEntries(Object.entries(current).filter(([key]) =>
+      key.startsWith("configured_") || persisted.has(key)));
+    Object.assign(expected, {
+      configured_hostname: values.hostname,
+      configured_max_bitrate: values.max_bitrate,
+      configured_fec_percentage: values.fec_percentage,
+      stream_audio: values.stream_audio,
+    });
+    if (values.display_policy) {
+      expected.configured_display_policy = sparseDisplayPolicy({
+        ...current.configured_display_policy, ...values.display_policy,
+      });
+    }
+    const confirm = (reply: NvhttpSettings): void => {
+      if (reply.revision !== current.revision + 1 || !Object.entries(expected).every(([key, value]) =>
+        sameConfigurationValue(reply[key as keyof NvhttpSettings], value)))
+        throw new Error("The host could not confirm these changes. Reload the saved values to review them.");
+    };
+    confirm(parseNvhttpSettingsReply(await api.post("nvhttp/settings_update", {
+      ...values, port: current.port, expected_revision: current.revision,
+    })));
+    confirm(parseNvhttpSettingsReply(await api.post("nvhttp/settings")));
   }
 
   export async function saveNvhttpAudioSettings(
@@ -2999,6 +3036,9 @@ namespace Amaterasu {
   }
 
   export function renderSettings(context: PageContext): void {
+    const everydayArea = el("div", "settings-area-everyday");
+    const featuredPluginArea = el("div", "settings-area-featured-plugins");
+    const everydayLoads = new NvhttpSettingsLoadGate();
     const area = el("div", "settings-area-registered");
     const sessionExtensionsArea = el("div", "settings-area-session-extensions");
     const registeredLoads = new RegisteredConfigurationLoadGate();
@@ -3020,7 +3060,7 @@ namespace Amaterasu {
     let activePlayniteListEditors: AccessibleListEditor<string>[] = [];
     const inputArea = el("div", "settings-area-input");
     const inputLoads = new InputPolicyLoadGate();
-    const metricsArea = el("div", "settings-area-metrics");
+    const signedSettingsArea = el("div", "settings-area-contributions");
     const updaterArea = el("div", "settings-area-updater");
     const systemTrayArea = el("div", "settings-area-tray");
     const pairingArea = el("div", "settings-area-pairing");
@@ -3067,13 +3107,73 @@ namespace Amaterasu {
     });
     const managementArea = el("div", "settings-area-management");
     const csrfArea = el("div", "settings-area-csrf");
+    let serviceInventory: Promise<ReadonlySet<string> | null> | undefined;
+    const optionalReads = new WeakMap<HTMLElement, Promise<ReadonlySet<string> | null>>();
+    function loadOptional(service: string, target: HTMLElement, editor: () => void): void {
+      serviceInventory ??= context.api.post<{ ok?: boolean; running?: { available?: boolean; declared_services?: unknown } }>("package-selection/status")
+        .then(({ ok, running }) => {
+          const services = running?.declared_services;
+          return ok === true && running?.available === true && Array.isArray(services) && services.length <= 256 &&
+            services.every(name => typeof name === "string") ? new Set<string>(services) : null;
+        }).catch(() => null);
+      const reading = serviceInventory;
+      optionalReads.set(target, reading);
+      void reading.then(services => {
+        if (!target.isConnected || reading !== optionalReads.get(target)) return;
+        if (services && !services.has(service)) target.replaceChildren();
+        else editor();
+      });
+    }
+    let discoveringSections = false;
+    let customProviders: ReadonlySet<string> | undefined;
+    let loadRemainingPlugins: (() => void) | undefined;
+    function loadPluginSections(): void {
+      if (discoveringSections || customProviders) return;
+      discoveringSections = true;
+      renderExtensionSlot(context, signedSettingsArea, "settings", providers => {
+        discoveringSections = false;
+        customProviders = providers;
+        renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, providers, {
+          area: featuredPluginArea, options: everydayPluginOptions,
+          onRemainingReady(load) {
+            loadRemainingPlugins = load;
+            if (loadedCategories.has("plugins")) load();
+          },
+        });
+      });
+    }
     const categories = [
-      { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, sessionExtensionsArea, hostLoggingArea, updaterArea, systemTrayArea] },
-      { id: "streaming", label: "Streaming", description: "Configure the host, capture, input, and session reporting.", areas: [hostArea, pipewireArea, inputArea, metricsArea] },
-      { id: "integrations", label: "Integrations", description: "Manage application providers and library imports.", areas: [steamArea, lutrisArea, playniteArea] },
-      { id: "devices", label: "Devices", description: "Manage paired client settings.", areas: [pairingArea] },
-      { id: "access", label: "Access & security", description: "Configure session lifetimes and management access.", areas: [authArea, managementArea, csrfArea] },
-    ];
+      { id: "everyday", label: "Everyday Settings", description: "Applications and paired devices can override your stream preferences.", areas: [everydayArea, featuredPluginArea, signedSettingsArea], load: () => {
+        void loadEveryday();
+        if (!customProviders) loadPluginSections();
+      } },
+      { id: "streaming", label: "Streaming", description: "Capture, encoding, audio, and input.", areas: [hostArea, pipewireArea, inputArea], load: () => {
+        void loadHost();
+        loadOptional("amaterasu.capture-pipewire/1", pipewireArea, loadPipewireChooser);
+        void loadInput();
+      } },
+      { id: "devices", label: "Devices", description: "Manage paired clients and their overrides.", areas: [pairingArea], load: loadPairing },
+      { id: "integrations", label: "Integrations", description: "Choose which game libraries appear in Moonlight.", areas: [steamArea, lutrisArea, playniteArea], load: () => {
+        loadOptional("amaterasu.steam/1", steamArea, loadSteam);
+        loadOptional("amaterasu.lutris/1", lutrisArea, loadLutris);
+        loadOptional("amaterasu.playnite/1", playniteArea, loadPlaynite);
+      } },
+      { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, hostLoggingArea, updaterArea, systemTrayArea], load: () => {
+        void load();
+        loadOptional("amaterasu.host-configuration/1", hostLoggingArea, loadHostLogging);
+        loadOptional("amaterasu.updater/1", updaterArea, () => renderUpdaterSettings(context, updaterArea));
+        loadOptional("amaterasu.system-tray/1", systemTrayArea, () => renderSystemTraySettings(context, systemTrayArea));
+      } },
+      { id: "access", label: "Access & security", description: "Configure session lifetimes and management access.", areas: [authArea, managementArea, csrfArea], load: () => {
+        void loadAuth();
+        managementArea.replaceChildren();
+        csrfArea.replaceChildren();
+        renderManagementPolicy(context, managementArea);
+        renderCsrfPolicy(context, csrfArea);
+      } },
+      { id: "plugins", label: "Plugin settings", description: "Preferences provided by the plugins on this host.", areas: [sessionExtensionsArea], load: () => { loadPluginSections(); loadRemainingPlugins?.(); } },
+    ] satisfies { id: SettingsCategory; label: string; description: string; areas: HTMLElement[]; load: () => void }[];
+    const loadedCategories = new Set<SettingsCategory>();
     let selectedCategory = context.initialSettingsCategory ?? categories[0]!.id;
     const categoryContent = el("div", "settings-content");
     categoryContent.id = "settings-category-content";
@@ -3110,9 +3210,10 @@ namespace Amaterasu {
       categoryContent.append(...category.areas);
     }
     function selectCategory(id: string): void {
-      if (!categories.some((category) => category.id === id)) return;
-      selectedCategory = id;
-      context.replaceSettingsCategory?.(id as SettingsCategory);
+      const category = categories.find(item => item.id === id);
+      if (!category) return;
+      selectedCategory = category.id;
+      context.replaceSettingsCategory?.(category.id);
       search.value = "";
       updateCategoryDisplay();
     }
@@ -3140,10 +3241,14 @@ namespace Amaterasu {
       restoreSearchDisclosures();
       let matches = 0;
       for (const category of categories) {
+        if ((query || category === selected) && !loadedCategories.has(category.id)) {
+          loadedCategories.add(category.id);
+          category.load();
+        }
         for (const area of category.areas) {
           // Fields stay in their original forms so saves and unsaved drafts retain their semantics.
           const fields = typeof area.querySelectorAll === "function"
-            ? Array.from(area.querySelectorAll<HTMLElement>(".field")) : [];
+            ? Array.from(area.querySelectorAll<HTMLElement>(".field, .session-extension-option")) : [];
           let fieldMatches = 0;
           for (const wrapper of fields) {
             const controls = Array.from(wrapper.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input, select, textarea"));
@@ -3163,7 +3268,7 @@ namespace Amaterasu {
           const visible = query
             ? fieldMatches > 0 || settingsSearchMatches(query, category.label, title) ||
               (!fields.length && settingsSearchMatches(query, area.textContent ?? ""))
-            : category.id === selected.id;
+            : category.id === selected.id || (selected.id === "plugins" && area === featuredPluginArea);
           area.hidden = !visible;
           if (visible) matches++;
         }
@@ -3190,31 +3295,27 @@ namespace Amaterasu {
     }, true);
     search.addEventListener("input", updateCategoryDisplay);
     categoryPicker.addEventListener("change", () => selectCategory(categoryPicker.value));
-    const settingsNavigation = el("div", "settings-navigation", field("Category", categoryPicker), categoryNavigation);
+    const settingsNavigation = el("div", "settings-navigation", search, field("Category", categoryPicker), categoryNavigation);
     const refreshSettings = button("Refresh", () => {
-      void load();
-      void loadAuth();
-      void loadHostLogging();
-      void loadHost();
-      void loadPipewireChooser();
-      void loadSteam();
-      void loadLutris();
-      void loadPlaynite();
-      void loadInput();
-      renderExtensionSlot(context, metricsArea, "settings", owners => {
-        if (typeof Amaterasu.renderSessionExtensionSettings === "function")
-          Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, {kind:"host"}, undefined, owners);
-      });
-      renderUpdaterSettings(context, updaterArea);
-      renderSystemTraySettings(context, systemTrayArea);
-      void loadPairing();
+      if (extensionSlotDirty(signedSettingsArea)) {
+        context.notify("Finish editing the plugin settings before refreshing.");
+        return;
+      }
+      serviceInventory = undefined;
+      if (search.value.trim() || selectedCategory === "everyday" || selectedCategory === "plugins") {
+        customProviders = undefined;
+        loadRemainingPlugins = undefined;
+        discoveringSections = false;
+      }
+      if (search.value.trim()) loadedCategories.clear();
+      else loadedCategories.delete(selectedCategory);
+      updateCategoryDisplay();
     });
     const dirtyNotice = badge("Unsaved changes", "accent");
     dirtyNotice.hidden = true;
     dirtyNotice.setAttribute("role", "status");
     context.content.append(
-      sectionHeading("Settings", "Configure your host, streaming, integrations, and access.", refreshSettings),
-      el("div", "settings-tools", search, dirtyNotice),
+      el("header", "page-heading settings-heading", el("h1", "", "Settings"), el("div", "actions", dirtyNotice, refreshSettings)),
       el("div", "settings-layout", settingsNavigation, categoryContent),
     );
     if (context.registerDraftGuard) {
@@ -3232,9 +3333,7 @@ namespace Amaterasu {
         drafts?.dispose();
       });
     }
-    renderManagementPolicy(context, managementArea);
-    renderCsrfPolicy(context, csrfArea);
-    updateCategoryDisplay();
+
     if (typeof MutationObserver !== "undefined") {
       const observer = new MutationObserver(() => {
         if (!context.content.isConnected) {
@@ -3249,6 +3348,88 @@ namespace Amaterasu {
     }
     let pipewireGeneration = 0;
     let pipewireOperation = 0;
+    async function loadEveryday(): Promise<void> {
+      everydayArea.replaceChildren(el("p", "muted", "Loading settings…"));
+      try {
+        const loaded = await everydayLoads.read(context.api);
+        if (!loaded || !everydayArea.isConnected) return;
+        const settings = loaded.settings;
+        if (typeof settings.stream_audio !== "boolean" ||
+            !(settings.configured_max_bitrate === null || Number.isSafeInteger(settings.configured_max_bitrate)))
+          throw new Error("The host returned invalid stream preferences.");
+        const display = settings.configured_display_policy && everydayDisplaySettings(settings.configured_display_policy);
+        const hostname = input("everyday_hostname", settings.configured_hostname);
+        hostname.maxLength = 128;
+        hostname.placeholder = settings.hostname;
+        const bitrate = input("everyday_bitrate", String(settings.configured_max_bitrate ?? ""), "number");
+        bitrate.placeholder = "No host limit";
+        bitrate.step = "1";
+        const recovery = input("everyday_fec", String(settings.configured_fec_percentage ?? ""), "number");
+        recovery.min = "1";
+        recovery.max = "255";
+        recovery.placeholder = String(settings.effective_fec_percentage);
+        const audio = input("everyday_audio", "", "checkbox");
+        audio.checked = settings.stream_audio;
+        const save = el("button", "button primary", "Save changes");
+        save.type = "submit";
+        const canWrite = context.api.allows("configuration.write");
+        save.disabled = true;
+        const status = el("div");
+        status.setAttribute("role", "status");
+        const form = el("form", "everyday-form",
+          display?.node,
+          panel("Stream preferences",
+            field("Maximum bitrate (kbps)", bitrate, "Leave blank to let the client choose. A positive limit applies to new streams."),
+            field("Packet recovery (%)", recovery, "Extra recovery data helps with packet loss on Wi-Fi. Leave blank to use the host default."),
+            field("Stream audio", audio, "Include sound from this host in future streams.")),
+          panel("Connection", field("Name shown to Moonlight", hostname, "Leave blank to use this PC’s name.")),
+          el("div", "actions", save, status));
+        if (canWrite) {
+          const checkChanges = () => {
+            save.disabled = !Object.keys(display?.changes() ?? {}).length && hostname.value === settings.configured_hostname &&
+              bitrate.value === String(settings.configured_max_bitrate ?? "") &&
+              recovery.value === String(settings.configured_fec_percentage ?? "") &&
+              audio.checked === settings.stream_audio;
+          };
+          form.addEventListener("input", checkChanges);
+          form.addEventListener("change", checkChanges);
+        } else {
+          setSettingsFormDisabled(form, true);
+          status.append(el("p", "muted", "These settings are read-only for this account."));
+        }
+        form.addEventListener("submit", event => {
+          event.preventDefault();
+          if (!form.reportValidity() || save.disabled) return;
+          void runAction(save, status, async () => {
+            const patch = display?.changes();
+            const values = { ...(patch && Object.keys(patch).length ? { display_policy: patch } : {}),
+              hostname: hostname.value, max_bitrate: parseMaxBitrate(bitrate.value),
+              fec_percentage: parseGlobalFecPercentage(recovery.value), stream_audio: audio.checked };
+            if (values.max_bitrate !== null && values.max_bitrate > 0 && values.max_bitrate < 100)
+              throw new Error("Use at least 100 kbps, or leave the limit blank.");
+            setSettingsFormDisabled(form, true);
+            try {
+              await saveEverydaySettings(context.api, settings, values);
+            } catch (error) {
+              if (form.isConnected) {
+                setSettingsFormDisabled(form, false);
+                for (const control of form.querySelectorAll<HTMLInputElement>("label[hidden] input")) control.disabled = true;
+                status.replaceChildren(errorPanel(error), button("Reload saved values", loadEveryday, "secondary"));
+              }
+              return;
+            }
+            if (!form.isConnected) return;
+            context.notify("Everyday settings saved.");
+            if (loadedCategories.has("streaming") && !drafts?.isDirty(hostArea)) void loadHost();
+            await loadEveryday();
+          });
+        });
+        everydayArea.replaceChildren(form);
+      } catch (error) {
+        if (everydayArea.isConnected) everydayArea.replaceChildren(errorPanel(error, loadEveryday));
+      }
+    }
+
     async function loadPipewireChooser(): Promise<void> {
       const generation = ++pipewireGeneration;
       pipewireOperation += 1;
@@ -3512,9 +3693,9 @@ namespace Amaterasu {
           });
         });
         hostLoggingArea.replaceChildren(panel("Host logging", form));
-      } catch {
+      } catch (error) {
         if (context.content.isConnected)
-          hostLoggingArea.replaceChildren(errorPanel(new Error("Host logging policy could not be loaded. Try again."), loadHostLogging));
+          hostLoggingArea.replaceChildren(optionalSettingsError("Host logging", error, loadHostLogging, new Error("Host logging policy could not be loaded. Try again.")));
       }
     }
     async function loadSteam(
@@ -3738,7 +3919,7 @@ namespace Amaterasu {
         void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
       } catch (error) {
         if (context.content.isConnected)
-          steamArea.replaceChildren(errorPanel(error, () => { void loadSteam(draftValues, draftNotice); }));
+          steamArea.replaceChildren(optionalSettingsError("Steam", error, () => { void loadSteam(draftValues, draftNotice); }));
       }
     }
     async function loadLutris(
@@ -3953,7 +4134,7 @@ namespace Amaterasu {
         }
       } catch (error) {
         if (context.content.isConnected)
-          lutrisArea.replaceChildren(errorPanel(error, () => { void loadLutris(draftValues, draftNotice); }));
+          lutrisArea.replaceChildren(optionalSettingsError("Lutris", error, () => { void loadLutris(draftValues, draftNotice); }));
       }
     }
     async function loadPlaynite(
@@ -4360,7 +4541,7 @@ namespace Amaterasu {
         }
       } catch (error) {
         if (context.content.isConnected)
-          playniteArea.replaceChildren(errorPanel(error, () => { void loadPlaynite(draftValues, draftNotice); }));
+          playniteArea.replaceChildren(optionalSettingsError("Playnite", error, () => { void loadPlaynite(draftValues, draftNotice); }));
       }
     }
     async function loadInput(): Promise<void> {
@@ -4715,7 +4896,9 @@ namespace Amaterasu {
         automaticOutput.value = "";
         outputName.append(automaticOutput);
         let outputDiscoveryIssue: string | null = null;
-        if (settings.capture_provider && context.api.allows("media.read")) {
+        if (settings.capture_provider === "pipewire") {
+          outputDiscoveryIssue = "Use the PipeWire source chooser to select a monitor or window.";
+        } else if (settings.capture_provider && context.api.allows("media.read")) {
           try {
             const discovered = await context.api.post<{
               outputs: Array<{ id: string; device_name: string; attached: boolean }>;
@@ -5134,6 +5317,7 @@ namespace Amaterasu {
             hostLoads.invalidate();
             try {
               await saveNvhttpHostSettings(context.api, settings, values);
+              if (loadedCategories.has("everyday") && !drafts?.isDirty(everydayArea)) void loadEveryday();
               context.notify(settingsTextMessage("Host settings saved and read back. Future-stream options apply to new streams; check active listener status below."));
               await loadHost();
             } catch (error) {
@@ -5151,7 +5335,10 @@ namespace Amaterasu {
         if (hostLoads.isCurrent(generation))
           hostArea.replaceChildren(
             panel("Moonlight host settings", form),
-            renderNvhttpAudioSettings(context, settings, audioEndpoints, audioDiscoveryIssue, loadHost),
+            renderNvhttpAudioSettings(context, settings, audioEndpoints, audioDiscoveryIssue, async () => {
+              if (loadedCategories.has("everyday") && !drafts?.isDirty(everydayArea)) void loadEveryday();
+              await loadHost();
+            }),
           );
       } catch (error) {
         if (context.content.isConnected && (generation === null || hostLoads.isCurrent(generation)))
@@ -5275,23 +5462,6 @@ namespace Amaterasu {
         );
       }
     }
-    if (typeof Amaterasu.renderSessionExtensionSettings === "function")
-      Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea);
-    void load();
-    void loadAuth();
-    void loadHostLogging();
-    void loadHost();
-    void loadPipewireChooser();
-    void loadSteam();
-    void loadLutris();
-    void loadPlaynite();
-    void loadInput();
-    renderExtensionSlot(context, metricsArea, "settings", owners => {
-        if (typeof Amaterasu.renderSessionExtensionSettings === "function")
-          Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, {kind:"host"}, undefined, owners);
-      });
-    renderUpdaterSettings(context, updaterArea);
-    renderSystemTraySettings(context, systemTrayArea);
-    void loadPairing();
+    updateCategoryDisplay();
   }
 }

@@ -156,7 +156,7 @@ const sources = [
   "src/types.ts", "src/model.ts", "src/api.ts", "src/ui.ts",
   "src/list_editor.ts", "src/steam_exclusion_picker.ts", "src/settings.ts",
 ];
-function fixture() {
+function fixture({ declaredServices, category = "integrations" } = {}) {
   const document = {
     createElement(name) {
       if (name === "input") return new HTMLInputElement();
@@ -233,6 +233,8 @@ function fixture() {
     allows(scope) { return permissions.has(scope); },
     async post(route, body = {}) {
       calls.push([route, ordinary(body)]);
+      if (route === "package-selection/status" && declaredServices)
+        return { ok: true, running: { available: true, declared_services: declaredServices } };
       const match = /^(steam|lutris|playnite)\/(settings|settings_update|status|list|refresh)$/.exec(route);
       if (!match) throw new Error(`unavailable route: ${route}`);
       const [, provider, operation] = match;
@@ -265,7 +267,7 @@ function fixture() {
   let draftGuard = null;
   const notices = [];
   context.Amaterasu.renderSettings({
-    content, api, initialSettingsCategory: "integrations",
+    content, api, initialSettingsCategory: category,
     notify(message) { notices.push(message); },
     registerDraftGuard(isDirty, dispose) { draftGuard = { isDirty, dispose }; },
   });
@@ -284,6 +286,17 @@ function buttonNamed(form, label) {
   return form.querySelectorAll("button").find(button => button.textContent === label);
 }
 function submit(form) { form.fire("submit", { preventDefault() { this.defaultPrevented = true; } }); }
+
+test("Everyday opens without probing library providers and Integrations loads only declared services", async () => {
+  const f = fixture({ declaredServices: ["amaterasu.steam/1"], category: "everyday" });
+  await tick();
+  assert.equal(f.calls.some(([route]) => /^(steam|lutris|playnite)\//.test(route)), false);
+  buttonNamed(f.content, "Integrations").click();
+  await tick();
+  assert.ok(formFor(f, "steam"));
+  assert.equal(f.calls.some(([route]) => /^(lutris|playnite)\//.test(route)), false);
+  assert.equal(f.calls.filter(([route]) => route === "package-selection/status").length, 1);
+});
 
 // Mount and submit the actual provider settings forms; exercise the same save functions and API routes as the app.
 test("Steam picker cancel, revisioned save, legacy retention, and conflict draft rebasing", async () => {
