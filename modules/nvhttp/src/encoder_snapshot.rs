@@ -21,8 +21,8 @@ const SCM_AV1_MAIN10: u32 = 0x0002_0000;
 /// zero as none. This is the luma rate Sunshine reports for HEVC hosts.
 const HEVC_MAX_LUMA_PIXELS: u64 = 1_869_449_984;
 
-/// Compatibility limit for software providers without a declared mode.
-pub const LEGACY_SOFTWARE_MODE_LIMIT: ModeLimit = ModeLimit {
+/// Higher software modes merit a performance advisory before playback.
+const SOFTWARE_ADVISORY_THRESHOLD: ModeLimit = ModeLimit {
     width: 1920,
     height: 1080,
     fps: 60,
@@ -59,6 +59,7 @@ pub struct CodecOffer {
     pub ten_bit_formats: Vec<VideoStreamFormat>,
     /// Bound shared by every offered codec with a finite provider limit.
     pub mode_limit: Option<ModeLimit>,
+    pub warn_software_performance: bool,
 }
 
 /// Values serverinfo advertises for the host's video codecs.
@@ -214,6 +215,7 @@ impl EncoderSnapshot {
         let mut codecs = Vec::new();
         let mut ten_bit_formats = Vec::new();
         let mut exceeds_provider_limit = false;
+        let mut warn_software_performance = false;
         let mut mode_limit: Option<ModeLimit> = None;
         for codec in [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264] {
             let mut entries = candidates.iter().filter(|entry| {
@@ -260,6 +262,8 @@ impl EncoderSnapshot {
                         }
                     }
                 }
+                warn_software_performance |=
+                    !entry.hardware && !SOFTWARE_ADVISORY_THRESHOLD.supports(mode);
                 if let Some(limit) = entry.mode_limit {
                     mode_limit = Some(mode_limit.map_or(limit, |current| current.intersect(limit)));
                 }
@@ -269,7 +273,7 @@ impl EncoderSnapshot {
         }
         if codecs.is_empty() {
             return Err(if exceeds_provider_limit {
-                "no hardware encoder for this stream mode"
+                "stream mode exceeds selected encoder capabilities"
             } else {
                 "no video encoder is available"
             });
@@ -278,6 +282,7 @@ impl EncoderSnapshot {
             codecs,
             ten_bit_formats,
             mode_limit,
+            warn_software_performance,
         })
     }
 
@@ -301,16 +306,14 @@ fn encoder_priority(entry: &&EncoderEntry) -> (bool, u128) {
     (entry.hardware, size)
 }
 
-/// Use the conservative H.264 offer until enumeration completes.
-pub fn unknown_encoders_offer(mode: StreamMode) -> Result<CodecOffer, &'static str> {
-    if !LEGACY_SOFTWARE_MODE_LIMIT.supports(mode) {
-        return Err("encoder capabilities are not known yet");
-    }
-    Ok(CodecOffer {
+/// Baseline offer until enumeration completes. Exact media setup is still required.
+pub fn unknown_encoders_offer() -> CodecOffer {
+    CodecOffer {
         codecs: vec![VideoCodec::H264],
         ten_bit_formats: Vec::new(),
-        mode_limit: Some(LEGACY_SOFTWARE_MODE_LIMIT),
-    })
+        mode_limit: None,
+        warn_software_performance: false,
+    }
 }
 
 fn encoder_entry(encoder: &Value) -> Result<EncoderEntry, &'static str> {
@@ -345,7 +348,7 @@ fn encoder_entry(encoder: &Value) -> Result<EncoderEntry, &'static str> {
             _ => None,
         },
         hardware,
-        mode_limit: mode_limit.or_else(|| (!hardware).then_some(LEGACY_SOFTWARE_MODE_LIMIT)),
+        mode_limit,
         yuv444: encoder["yuv444"].as_bool().unwrap_or(false),
         yuv444_10bit: encoder["yuv444_10bit"].as_bool().unwrap_or(false),
         hdr10: encoder["hdr10"].as_bool().unwrap_or(false),

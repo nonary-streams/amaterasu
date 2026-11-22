@@ -159,18 +159,6 @@ fn validate_metadata(query: &Query) -> Result<Vec<StreamWarning>, StreamQueryErr
             .client_id()
             .map_err(|message| StreamQueryError::field(message, "uniqueid"))?;
     }
-    if let Some(uuid) = query.get("uuid")
-        && (uuid.is_empty()
-            || uuid.len() > 64
-            || !uuid
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
-    {
-        return Err(StreamQueryError::field(
-            "invalid request identifier",
-            "uuid",
-        ));
-    }
     // SOPS and VRR are advisory; accepting them does not mutate host display policy.
     let mut warnings = Vec::new();
     for field in [
@@ -442,7 +430,6 @@ mod tests {
             "environment=attacker",
             "catalog_owner=attacker",
             "uniqueid=invalid%20client",
-            "uuid=invalid%20request",
             "localAudioPlayMode=2",
             "continuousAudio=true",
             "surroundAudioInfo=6",
@@ -470,7 +457,7 @@ mod tests {
     fn parses_required_authority_and_normal_moonlight_metadata() {
         let request = parse(concat!(
             "appid=7&mode=1920x1080x60&rikey=00112233445566778899aabbccddeeff",
-            "&rikeyid=-2147483648&uniqueid=ignored-for-authority&uuid=ticket",
+            "&rikeyid=-2147483648&uniqueid=ignored-for-authority&uuid=session_1",
             "&additionalStates=1&sops=0&hdrMode=0&clientHdrCapVersion=0",
             "&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=0",
             "&clientHdrCapDisplayData=&localAudioPlayMode=0&surroundAudioInfo=196610",

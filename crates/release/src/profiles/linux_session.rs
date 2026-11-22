@@ -1215,8 +1215,8 @@ fn nvhttp_settings(options: &LinuxSessionOptions) -> Value {
     })
 }
 
-/// The profile permits up to 3840×2160 at 120 Hz. Encoder capability limits
-/// can narrow the negotiated offer.
+/// The profile permits up to 3840×2160 at 120 Hz. Each selected encoder may
+/// publish tighter mode bounds for its codec.
 fn streaming_settings(options: &LinuxSessionOptions) -> Value {
     json!({
         "capture": {

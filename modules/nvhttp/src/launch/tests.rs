@@ -46,7 +46,7 @@ fn encoders(entries: Vec<Value>) -> EncoderSnapshot {
     EncoderSnapshot::parse(&json!({"ok":true,"enabled":true,"encoders":entries})).unwrap()
 }
 
-/// A hardware H.264 encoder: launches above the software limit offer H.264.
+/// A hardware H.264 encoder with no provider-specific mode limit.
 fn hardware_h264() -> EncoderSnapshot {
     encoders(vec![encoder_entry("test.hardware.h264", "h264", true)])
 }
@@ -518,10 +518,16 @@ fn malformed_paired_physical_mode_rejects_before_launch_and_absent_inherits_stre
 }
 
 #[test]
-fn settings_reject_unsupported_packetization_before_launch() {
-    let mut invalid = config();
-    invalid.profile.fec_percentage = 0;
-    assert_eq!(invalid.validate().unwrap_err(), "invalid_streaming_profile");
+fn launch_passes_fec_options_to_the_selected_stream_path() {
+    let now = Instant::now();
+    let mut streaming = config();
+    streaming.profile.max_fec_blocks = 5;
+    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(31), peer(31), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    assert_eq!(opened_rtsp_payload(&broker)["profile"]["max_fec_blocks"], 5);
 }
 
 #[test]
@@ -6049,67 +6055,103 @@ fn hardware_encoders_offer_every_codec_to_rtsp_up_to_the_profile_maximum() {
 }
 
 #[test]
-fn software_only_launches_above_full_hd_sixty_are_refused_before_any_effect() {
+fn empty_encoder_inventory_is_refused_before_any_effect() {
     let now = Instant::now();
-    for (snapshot, message) in [
-        (
-            Some(encoders(vec![encoder_entry(
-                "amaterasu.software.x264",
-                "h264",
-                false,
-            )])),
-            "no hardware encoder for this stream mode",
-        ),
-        (None, "encoder capabilities are not known yet"),
-        (Some(encoders(vec![])), "no video encoder is available"),
-    ] {
-        let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
-        if let Some(snapshot) = snapshot {
-            controller.set_encoder_snapshot(snapshot);
-        }
+    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    controller.set_encoder_snapshot(encoders(vec![]));
+    let reply = controller
+        .launch(10, uhd_request(62), peer(62), now)
+        .expect("immediate refusal");
+    assert_eq!(reply.status, 503);
+    assert!(
+        String::from_utf8(reply.body)
+            .unwrap()
+            .contains("no video encoder is available")
+    );
+    assert!(controller.records.is_empty());
+}
+
+#[test]
+fn scoped_encoder_replaces_unavailable_startup_selection_before_rtsp() {
+    let software = amaterasu_module_sdk::EncoderBackend::Software;
+    for app_override in [false, true] {
+        let now = Instant::now();
+        let mut controller =
+            Controller::new(Some(uhd_profile(EncoderSelection::Backend(software)))).unwrap();
+        controller.set_encoder_snapshot(hardware_h264());
         let mut broker = Broker::default();
-        let reply = controller
-            .launch(10, uhd_request(62), peer(62), now)
-            .expect("immediate refusal");
-        assert_eq!(reply.status, 503);
-        assert!(String::from_utf8(reply.body).unwrap().contains(message));
-        assert!(controller.records.is_empty());
+        if app_override {
+            broker.application_input_overrides = Some(json!({"encoder":"auto"}));
+        } else {
+            controller.set_software_encoder_options(SoftwareEncoderOptions {
+                encoder: Some(amaterasu_module_sdk::EncoderBackend::Auto),
+                ..Default::default()
+            });
+        }
         assert!(
             controller
-                .poll(now, &mut |command| broker.send(command))
-                .is_empty()
+                .launch(10, uhd_request(62), peer(62), now)
+                .is_none()
         );
-        assert!(broker.commands.is_empty());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+        assert_eq!(opened_rtsp_payload(&broker)["capture"]["encoder"], "auto");
     }
 }
 
 #[test]
-fn software_codecs_keep_negotiation_within_the_software_limit() {
+fn unavailable_application_encoder_is_recorded_before_launching_the_app() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
-    controller.set_encoder_snapshot(encoders(vec![
-        encoder_entry("amaterasu.hardware.nvenc-cuda.hevc", "hevc", true),
-        encoder_entry("amaterasu.software.x264", "h264", false),
-    ]));
+    controller.set_encoder_snapshot(hardware_h264());
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({"encoder":"software"})),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(62), peer(62), now).is_none());
+    let id = *controller.records.keys().next().unwrap();
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 503);
+    assert!(
+        !broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "launch_export"))
+    );
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+    let lifecycle = lifecycle_of(&controller, id);
+    let root = lifecycle.root_cause().unwrap();
+    assert_eq!(root.issue.code, "no_video_encoder_is_available");
+    assert_eq!(root.issue.phase, "preflight_application");
+}
+
+#[test]
+fn software_720p90_warns_and_opens_rtsp_at_the_requested_mode() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    controller.set_encoder_snapshot(encoders(vec![encoder_entry(
+        "amaterasu.software.x264",
+        "h264",
+        false,
+    )]));
     let mut broker = Broker::default();
-    let full_hd = LaunchRequest {
-        hdr: false,
-        width: 1920,
-        height: 1080,
-        fps: 60,
+    let requested = LaunchRequest {
+        fps: 90,
         ..request(63)
     };
-    assert!(controller.launch(10, full_hd, peer(63), now).is_none());
-    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    assert!(controller.launch(10, requested, peer(63), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
     let open = opened_rtsp_payload(&broker);
-    assert_eq!(open["profile"]["codecs"], json!(["hevc", "h264"]));
-    assert_eq!(
-        (
-            &open["negotiation_bounds"]["max_width"],
-            &open["negotiation_bounds"]["max_height"],
-            &open["negotiation_bounds"]["max_fps"],
-        ),
-        (&json!(1920), &json!(1080), &json!(60))
+    assert_eq!(open["profile"]["width"], 1280);
+    assert_eq!(open["profile"]["height"], 720);
+    assert_eq!(open["profile"]["fps"], 90);
+    assert_eq!(open["negotiation_bounds"]["max_fps"], 120);
+    let record = controller.records.values().next().unwrap();
+    assert!(
+        record
+            .stream_warnings
+            .iter()
+            .any(|warning| warning.code == "software_encoder_performance")
     );
 }
 
@@ -6177,8 +6219,8 @@ fn scoped_software_selection_uses_the_frozen_snapshot_to_constrain_codec_negotia
     let open = opened_rtsp_payload(&broker);
     assert_eq!(open["capture"]["encoder"], "software");
     assert!(open["profile"].get("codecs").is_none());
-    assert_eq!(open["negotiation_bounds"]["max_width"], 1920);
-    assert_eq!(open["negotiation_bounds"]["max_fps"], 60);
+    assert_eq!(open["negotiation_bounds"]["max_width"], 3840);
+    assert_eq!(open["negotiation_bounds"]["max_fps"], 120);
 }
 
 #[test]
@@ -6837,17 +6879,4 @@ fn replacement_software_encoder_launches_with_its_published_mode_limit() {
     assert_eq!(open["negotiation_bounds"]["max_width"], 3840);
     assert_eq!(open["negotiation_bounds"]["max_height"], 2160);
     assert_eq!(open["negotiation_bounds"]["max_fps"], 120);
-}
-
-#[test]
-fn launch_passes_fec_options_to_the_selected_stream_path() {
-    let now = Instant::now();
-    let mut streaming = config();
-    streaming.profile.max_fec_blocks = 5;
-    let mut controller = Controller::new(Some(streaming)).unwrap();
-    let mut broker = Broker::default();
-    assert!(controller.launch(10, request(31), peer(31), now).is_none());
-    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(reply.status, 200);
-    assert_eq!(opened_rtsp_payload(&broker)["profile"]["max_fec_blocks"], 5);
 }

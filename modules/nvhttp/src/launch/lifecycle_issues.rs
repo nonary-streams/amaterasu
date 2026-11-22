@@ -137,6 +137,11 @@ impl Record {
     /// stream stays its root cause.
     #[track_caller]
     pub(super) fn record_failure(&mut self, code: &str) {
+        let code = if code.contains(' ') {
+            super::rejection_code(code)
+        } else {
+            code.to_owned()
+        };
         let issue = self.attributed(StreamIssue::critical(
             self.rtsp_operation.clone(),
             LifecycleLayer::Nvhttp,

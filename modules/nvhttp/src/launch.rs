@@ -32,7 +32,7 @@ mod tests {
 }
 
 use crate::encoder_snapshot::{
-    CodecAdvertisement, CodecOffer, EncoderSnapshot, StreamMode, unknown_encoders_offer,
+    CodecAdvertisement, EncoderSnapshot, StreamMode, unknown_encoders_offer,
 };
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use crate::wire::{ClientConfigOverrides, Reply, xml};
@@ -666,15 +666,15 @@ pub struct StreamProfile {
 
 impl StreamProfile {
     fn validate(&self) -> Result<(), &'static str> {
-        if self.packet_size == 0
-            || u32::try_from(self.packet_size).is_err()
-            || !(16..=8192).contains(&self.max_width)
+        if !(16..=8192).contains(&self.max_width)
             || !(16..=8192).contains(&self.max_height)
             || !self.max_width.is_multiple_of(2)
             || !self.max_height.is_multiple_of(2)
             || !(1..=1000).contains(&self.max_fps)
             || !(100..=1_000_000).contains(&self.bitrate_kbps)
             || self.max_reference_frames > 1
+            || self.packet_size == 0
+            || u32::try_from(self.packet_size).is_err()
             || !matches!(self.packet_ms, 5 | 10)
             || !(6_000..=512_000).contains(&self.audio_bitrate)
         {
@@ -958,22 +958,35 @@ impl Controller {
         )
     }
 
-    /// The codecs this launch may negotiate, or the reason no encoder can
-    /// serve the requested mode. This runs before any launch state exists.
-    fn codec_offer(
+    /// Check the effective selector before replacing a live transport. Desktop
+    /// and auxiliary streams have no application override.
+    fn check_configured_encoder(
         &self,
         config: &StreamingConfig,
         request: &LaunchRequest,
-    ) -> Result<CodecOffer, &'static str> {
-        let mode = StreamMode {
-            width: request.width,
-            height: request.height,
-            fps: request.fps,
+        peer: &PeerIdentity,
+        retained: Option<&Record>,
+    ) -> Result<(), &'static str> {
+        let backend = peer
+            .client_software_encoder
+            .encoder
+            .or_else(|| retained?.application_preflight_overrides.as_ref()?.encoder)
+            .or(self.software_encoder.encoder);
+        let selection = backend
+            .map(EncoderSelection::Backend)
+            .unwrap_or_else(|| config.capture.encoder.clone());
+        // The presentation owner reserves app ID zero for auxiliary streams.
+        let hdr = if request.app_id == 0 {
+            request.hdr
+        } else {
+            workflow::resolve_requested_hdr(
+                request.hdr,
+                peer,
+                retained.and_then(|record| record.application_display_overrides.as_ref()),
+                &self.global_display_policy,
+            )
         };
-        match &self.encoder_snapshot {
-            Some(snapshot) => snapshot.offer(config.capture.encoder.clone(), mode),
-            None => unknown_encoders_offer(mode),
-        }
+        offer_for_request(self.encoder_snapshot.as_ref(), selection, request, hdr).map(|_| ())
     }
 
     pub(crate) fn desktop_enabled(&self) -> bool {
@@ -1483,10 +1496,26 @@ impl Controller {
                 }
             }
         }
-        let video_codec_offer = match self.codec_offer(config, &request) {
-            Ok(offer) => offer,
-            Err(message) => return Some(private_error(503, message)),
+        // A game can replace the startup selector during catalog preflight.
+        // Until then only reject a mode no eligible encoder could support.
+        let check = if desktop {
+            self.check_configured_encoder(config, &request, &peer, None)
+        } else {
+            let selection = peer
+                .client_software_encoder
+                .encoder
+                .unwrap_or(amaterasu_module_sdk::EncoderBackend::Auto);
+            offer_for_request(
+                self.encoder_snapshot.as_ref(),
+                EncoderSelection::Backend(selection),
+                &request,
+                false,
+            )
+            .map(|_| ())
         };
+        if let Err(message) = check {
+            return Some(private_error(503, message));
+        }
 
         let id = match self.allocate_id() {
             Ok(id) => id,
@@ -1534,7 +1563,6 @@ impl Controller {
         record.desktop = desktop;
         record.response_kind = response;
         record.source_capture_context = source_capture_context;
-        record.video_codec_offer = video_codec_offer;
         record.encoder_snapshot = self.encoder_snapshot.clone();
         record.global_display_revision = self.global_display_revision;
         record.global_software_encoder = self.software_encoder.clone();
@@ -1761,13 +1789,13 @@ impl Controller {
         if !peer.paired() {
             return Some(private_error(401, "authenticated paired TLS is required"));
         }
-        let retained = self.records.values().any(|record| {
+        let retained = self.records.values().find(|record| {
             record.lifecycle_required
                 && record.state == State::Paused
                 && record.request.app_id == request.app_id
                 && record.application_session.is_none()
         });
-        if !retained && (!config.desktop.enabled || request.app_id != DESKTOP_APP_ID) {
+        if retained.is_none() && (!config.desktop.enabled || request.app_id != DESKTOP_APP_ID) {
             return Some(private_error(404, "Desktop session is unavailable"));
         }
         if !self.output_settings_ready {
@@ -1788,7 +1816,7 @@ impl Controller {
             return Some(private_error(409, "Desktop resume is already in progress"));
         }
         // Refuse before tearing down the live session the resume would replace.
-        if let Err(message) = self.codec_offer(config, &request) {
+        if let Err(message) = self.check_configured_encoder(config, &request, peer, retained) {
             return Some(private_error(503, message));
         }
         if self.records.values().any(|record| {
@@ -1805,17 +1833,8 @@ impl Controller {
                 "launch key conflicts with an existing request",
             ));
         }
-        if retained {
-            let root = self
-                .records
-                .values()
-                .find(|record| {
-                    record.lifecycle_required
-                        && record.state == State::Paused
-                        && record.request.app_id == request.app_id
-                        && record.application_session.is_none()
-                })
-                .expect("retained session remains available");
+        if let Some(root) = retained {
+            let root_id = root.id;
             let private_catalog = shared_session::requested_resolution_only(&root.peer);
             let requested_private = shared_session::requested_resolution_only(peer);
             if private_catalog || requested_private {
@@ -1842,23 +1861,12 @@ impl Controller {
                 Err(_) => return Some(private_error(503, "resume capacity exhausted")),
             };
             let operation = operation_id(&self.nonce, id, "rtsp");
-            let root = self
-                .records
-                .values()
-                .find(|record| {
-                    record.lifecycle_required
-                        && record.state == State::Paused
-                        && record.request.app_id == request.app_id
-                        && record.application_session.is_none()
-                })
-                .expect("retained session remains available")
-                .id;
-            if self.queue_previous_source_retirement(root).is_err() {
+            if self.queue_previous_source_retirement(root_id).is_err() {
                 return Some(private_error(503, "source observation capacity exhausted"));
             }
             let record = self
                 .records
-                .get_mut(&root)
+                .get_mut(&root_id)
                 .expect("retained session remains available");
             record.rtsp_operation = operation;
             record.authenticated_client_disconnected = false;
@@ -2497,6 +2505,25 @@ fn cancel_reply() -> Reply {
 
 fn valid_label(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn offer_for_request(
+    snapshot: Option<&EncoderSnapshot>,
+    selection: EncoderSelection,
+    request: &LaunchRequest,
+    hdr: bool,
+) -> Result<crate::encoder_snapshot::CodecOffer, &'static str> {
+    let mode = StreamMode {
+        width: request.width,
+        height: request.height,
+        fps: request.fps,
+    };
+    match snapshot {
+        Some(snapshot) if hdr => snapshot.hdr_offer(selection, mode),
+        Some(snapshot) => snapshot.offer(selection, mode),
+        None if hdr => Err("HDR encoder capabilities are not known yet"),
+        None => Ok(unknown_encoders_offer()),
+    }
 }
 
 fn valid_device_name(value: &str) -> bool {

@@ -122,7 +122,7 @@ impl Controller {
             }
         }
         let config = self.config.as_ref().expect("validated configuration");
-        self.codec_offer(config, request)
+        self.check_configured_encoder(config, request, peer, Some(root))
             .map_err(|message| private_error(503, message))?;
         Ok(())
     }

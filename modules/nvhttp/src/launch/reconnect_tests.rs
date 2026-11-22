@@ -66,7 +66,10 @@ fn reconnect_wait_is_bounded_and_connection_close_cancels_admission() {
     controller.connection_closed(90, now);
     assert!(controller.deferred_launch.is_none());
     let status = controller.management_status(None);
-    assert_eq!(status["recent_refusals"][0]["root_cause"]["issue"]["code"], "connection_closed");
+    assert_eq!(
+        status["recent_refusals"][0]["root_cause"]["issue"]["code"],
+        "connection_closed"
+    );
 }
 
 #[test]
@@ -81,6 +84,19 @@ fn unhealthy_reconnect_does_not_modify_the_predecessor_or_consume_the_wait_slot(
             .status,
         400
     );
+    assert!(controller.deferred_launch.is_none());
+    assert!(controller.records.values().next().unwrap().state == State::Ready);
+}
+
+#[test]
+fn reconnect_keeps_live_transport_when_selected_encoder_cannot_serve_hdr() {
+    let (mut controller, _broker, now) = one_client_application();
+    let mut request = request(3);
+    request.hdr = true;
+    let reply = controller
+        .resume(90, request, &peer(1), now)
+        .expect("HDR unavailable");
+    assert_eq!(reply.status, 503);
     assert!(controller.deferred_launch.is_none());
     assert!(controller.records.values().next().unwrap().state == State::Ready);
 }

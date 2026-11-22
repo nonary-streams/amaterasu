@@ -97,46 +97,28 @@ fn automatic_selection_offers_every_codec_in_moonlight_preference_order() {
         offer.codecs,
         [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264]
     );
-    assert_eq!(offer.mode_limit, None);
+    assert!(offer.mode_limit.is_none());
 }
 
 #[test]
-fn software_only_codecs_are_limited_to_full_hd_at_sixty_frames() {
-    let mixed = snapshot(vec![
-        encoder("nvenc-hevc", "hevc", true),
-        encoder("x264", "h264", false),
-    ]);
-    let small = mixed.offer(AUTO, FULL_HD_60).unwrap();
-    assert_eq!(small.codecs, [VideoCodec::Hevc, VideoCodec::H264]);
-    assert_eq!(small.mode_limit, Some(FULL_HD_60));
-    let large = mixed.offer(AUTO, UHD_120).unwrap();
-    assert_eq!(large.codecs, [VideoCodec::Hevc]);
-    assert_eq!(large.mode_limit, None);
-
+fn software_performance_is_advisory_and_published_limits_are_enforced() {
     let software = snapshot(vec![encoder("x264", "h264", false)]);
-    for mode in [
-        UHD_120,
-        StreamMode {
-            fps: 61,
-            ..FULL_HD_60
-        },
-        StreamMode {
-            width: 1922,
-            ..FULL_HD_60
-        },
-        StreamMode {
-            height: 1082,
-            ..FULL_HD_60
-        },
-    ] {
-        assert_eq!(
-            software.offer(AUTO, mode),
-            Err("no hardware encoder for this stream mode")
-        );
-    }
+    let high = software.offer(AUTO, UHD_120).unwrap();
+    assert_eq!(high.codecs, [VideoCodec::H264]);
+    assert!(high.mode_limit.is_none());
+    assert!(high.warn_software_performance);
+    assert!(
+        !software
+            .offer(AUTO, FULL_HD_60)
+            .unwrap()
+            .warn_software_performance
+    );
+
+    let mut limited = encoder("limited", "h264", false);
+    limited["mode_limit"] = json!({"width":1920,"height":1080,"fps":60});
     assert_eq!(
-        software.offer(AUTO, FULL_HD_60).unwrap().codecs,
-        [VideoCodec::H264]
+        snapshot(vec![limited]).offer(AUTO, UHD_120),
+        Err("stream mode exceeds selected encoder capabilities")
     );
 }
 
@@ -147,7 +129,7 @@ fn numeric_selection_offers_only_the_selected_encoder_codec() {
     assert_eq!(pinned(0).unwrap().codecs, [VideoCodec::H264]);
     assert_eq!(pinned(1).unwrap().codecs, [VideoCodec::Hevc]);
     assert_eq!(pinned(2).unwrap().codecs, [VideoCodec::Av1]);
-    assert_eq!(pinned(3), Err("no hardware encoder for this stream mode"));
+    assert_eq!(pinned(3).unwrap().codecs, [VideoCodec::H264]);
     assert_eq!(pinned(4), Err("no video encoder is available"));
     assert_eq!(
         EncoderSnapshot::default().offer(AUTO, FULL_HD_60),
@@ -156,16 +138,8 @@ fn numeric_selection_offers_only_the_selected_encoder_codec() {
 }
 
 #[test]
-fn unknown_encoders_offer_only_software_h264() {
-    assert_eq!(
-        unknown_encoders_offer(FULL_HD_60),
-        Ok(CodecOffer {
-            codecs: vec![VideoCodec::H264],
-            ten_bit_formats: Vec::new(),
-            mode_limit: Some(FULL_HD_60),
-        })
-    );
-    assert!(unknown_encoders_offer(UHD_120).is_err());
+fn unknown_encoders_offer_only_baseline_h264() {
+    assert_eq!(unknown_encoders_offer().codecs, [VideoCodec::H264]);
 }
 
 #[test]
@@ -186,10 +160,12 @@ fn sdk_identity_selection_pins_the_exact_encoder_and_software_filters_hardware()
     let software = EncoderSelection::Backend(EncoderBackend::Software);
     let offer = snapshot.offer(software.clone(), FULL_HD_60).unwrap();
     assert_eq!(offer.codecs, [VideoCodec::H264]);
-    assert_eq!(offer.mode_limit, Some(FULL_HD_60));
-    assert_eq!(
-        snapshot.offer(software, UHD_120),
-        Err("no hardware encoder for this stream mode")
+    assert!(offer.mode_limit.is_none());
+    assert!(
+        snapshot
+            .offer(software, UHD_120)
+            .unwrap()
+            .warn_software_performance
     );
 }
 

@@ -38,9 +38,9 @@ can expose the same action to publish its encoder catalog.
 An enumeration entry may include a `mode_limit` object with positive integer
 `width`, `height`, and `fps`. This uses the SDK's `encode::ModeLimit` schema.
 NVHTTP filters codec offers against those bounds and limits RTSP to a mode
-supported by every offered codec. Entries without a declared limit use the
-legacy 1920×1080 at 60 FPS ceiling for software encoders. Exact configuration
-probes and encoder Open still determine whether a configuration works.
+supported by every offered codec. Entries without a provider limit inherit the configured host profile bounds.
+A software codec offered above 1920×1080 or 60 FPS produces a performance advisory. Exact configuration probes
+and the encoder's Open still decide whether the selected configuration works.
 
 For standard HEVC and AV1, an encoder entry can declare `sdr10: true` and
 `hdr10: true` independently. Each declares support for ten-bit 4:2:0 at that

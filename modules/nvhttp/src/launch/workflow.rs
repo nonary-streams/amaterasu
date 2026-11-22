@@ -1380,6 +1380,28 @@ impl Controller {
                 )
             }
             Phase::OpenRtsp => {
+                if record.video_codec_offer.warn_software_performance {
+                    add_stream_warning(
+                        record,
+                        amaterasu_module_sdk::stream_warnings::StreamWarning {
+                            code: "software_encoder_performance".into(),
+                            source: NVHTTP_WARNING_SOURCE.into(),
+                            reason: "software_encoding_may_miss_frame_deadlines".into(),
+                            os_error: None,
+                            requested: Some(
+                                amaterasu_module_sdk::stream_warnings::WarningValue::Label(
+                                    format!(
+                                        "{}x{}x{}",
+                                        record.request.width,
+                                        record.request.height,
+                                        record.request.fps
+                                    ),
+                                ),
+                            ),
+                            effective: None,
+                        },
+                    );
+                }
                 record.rtsp_requested = true;
                 let config = self.config.as_ref().expect("enabled streaming config");
                 let capture = json!({
@@ -3519,27 +3541,38 @@ fn effective_hdr_request(record: &Record) -> bool {
     if record.auxiliary.is_some() {
         return record.request.hdr;
     }
-    let client = application_display_overrides(Some(&record.peer.client_display_overrides));
+    resolve_requested_hdr(
+        record.request.hdr,
+        &record.peer,
+        record.application_display_overrides.as_ref(),
+        &record.global_display_policy,
+    )
+}
+
+pub(super) fn resolve_requested_hdr(
+    requested: bool,
+    peer: &super::PeerIdentity,
+    application: Option<&Value>,
+    global: &Value,
+) -> bool {
+    let client = application_display_overrides(Some(&peer.client_display_overrides));
     let override_value = client
         .get("dd_hdr_request_override")
         .and_then(Value::as_str)
         .or_else(|| {
-            record
-                .application_display_overrides
-                .as_ref()
+            application
                 .and_then(|overrides| overrides.get("dd_hdr_request_override"))
                 .and_then(Value::as_str)
         })
         .or_else(|| {
-            record
-                .global_display_policy
+            global
                 .get("dd_hdr_request_override")
                 .and_then(Value::as_str)
         });
     match override_value {
         Some("force_on") => true,
         Some("force_off") => false,
-        _ => record.request.hdr,
+        _ => requested,
     }
 }
 
@@ -4285,21 +4318,12 @@ pub(super) fn project_application_policy(
     if let Some(backend) = record.effective_software_encoder.encoder {
         record.selected_encoder = amaterasu_module_sdk::EncoderSelection::Backend(backend);
     }
-    let mode = crate::encoder_snapshot::StreamMode {
-        width: record.request.width,
-        height: record.request.height,
-        fps: record.request.fps,
-    };
-    record.video_codec_offer = match &record.encoder_snapshot {
-        Some(snapshot) if effective_hdr_request(record) => {
-            snapshot.hdr_offer(record.selected_encoder.clone(), mode)?
-        }
-        Some(snapshot) => snapshot.offer(record.selected_encoder.clone(), mode)?,
-        None if effective_hdr_request(record) => {
-            return Err("HDR encoder capabilities are not known yet");
-        }
-        None => crate::encoder_snapshot::unknown_encoders_offer(mode)?,
-    };
+    record.video_codec_offer = super::offer_for_request(
+        record.encoder_snapshot.as_ref(),
+        record.selected_encoder.clone(),
+        &record.request,
+        effective_hdr_request(record),
+    )?;
     record.scoped_ds4_back_as_touchpad_click = record
         .peer
         .client_ds4_back_as_touchpad_click
@@ -4554,7 +4578,7 @@ pub(super) struct ApplicationConfigOverrides {
     display_policy: Option<Value>,
     sw_preset: Option<String>,
     sw_tune: Option<String>,
-    encoder: Option<amaterasu_module_sdk::EncoderBackend>,
+    pub(super) encoder: Option<amaterasu_module_sdk::EncoderBackend>,
     min_threads: Option<i32>,
     dd_mode_remapping: Option<Value>,
     dd_resolution_option: Option<String>,
