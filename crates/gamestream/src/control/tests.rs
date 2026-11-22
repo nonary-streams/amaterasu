@@ -389,7 +389,7 @@ fn unknown_input_is_preserved_and_invalid_fields_are_rejected() {
         client(0x206, &bytes),
         Ok(Message::Input(Input::Unsupported {
             magic: 0xdeadbeef,
-            payload: &[7]
+            payload: (&[7][..]).into()
         }))
     );
     assert_eq!(
@@ -419,7 +419,10 @@ fn unknown_input_is_preserved_and_invalid_fields_are_rejected() {
 #[test]
 fn text_requires_bounded_complete_utf8() {
     let (_, bytes) = fixture("text");
-    assert_eq!(client(0x206, &bytes), Ok(Message::Input(Input::Text("😀"))));
+    assert_eq!(
+        client(0x206, &bytes),
+        Ok(Message::Input(Input::Text("😀".into())))
+    );
     let mut broken = bytes.clone();
     broken[8] = 0xff;
     assert_eq!(client(0x206, &broken), Err(DecodeError::InvalidText));

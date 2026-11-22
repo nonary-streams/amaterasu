@@ -99,6 +99,7 @@ fn module(controller: Controller<FakeBackend>) -> crate::CaptureModule {
         controller,
         _factory: factory,
         _preflight_factory: preflight_factory,
+        _frame_fit_factory: None,
         epoch: Instant::now(),
         pending_opens: Vec::new(),
         polled_request: None,

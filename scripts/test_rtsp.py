@@ -166,10 +166,11 @@ class PeerDiscovery:
         deadline = time.monotonic() + 0.2
         while time.monotonic() < deadline:
             metrics = console.request(SOURCE, {"action": "status"})
-            for medium in ("video", "audio"):
-                assert metrics[medium]["opened"] == baseline[medium]["opened"], metrics
+            assert metrics["video"]["opened"] == baseline["video"]["opened"] + 1, metrics
+            assert metrics["video"]["fragments"] == baseline["video"]["fragments"], metrics
+            assert metrics["audio"]["opened"] == baseline["audio"]["opened"], metrics
             time.sleep(0.005)
-        # Video starts after PLAY/control; only now may both capture providers open.
+        # The warmed video source can deliver only after both lanes are selected.
         self.send("video")
 
     def close(self):
@@ -206,8 +207,9 @@ def exercise(console, oracle, directory, discovery=False):
             for token in association.tokens.values():
                 assert token.decode() not in public_status, "status exposed a discovery token"
         metrics = console.request(SOURCE, {"action": "status"})
-        for kind in ("video", "audio"):
-            assert metrics[kind]["opened"] == baseline[kind]["opened"], metrics
+        assert metrics["video"]["opened"] == baseline["video"]["opened"] + 1, metrics
+        assert metrics["video"]["fragments"] == baseline["video"]["fragments"], metrics
+        assert metrics["audio"]["opened"] == baseline["audio"]["opened"], metrics
         # Control starts after PLAY, matching the real client's connection order.
         control = start_client(oracle, directory, {"control_local": f"127.0.0.1:{ports['control']}"}, key, ports["connect_data"])
         try:
@@ -272,22 +274,31 @@ def main():
         settings = bootstrap["policy"]["settings"]
         settings["amaterasu.rtsp"] = {"enabled": True, "bind": "127.0.0.1:0", "allowed_principals": ["amaterasu.console"]}
         settings["amaterasu.audio-encode"] = {"enabled": True}
-        settings["amaterasu.stream-session"] = {"enabled": True, "allowed_principals": ["amaterasu.rtsp"]}
+        # The probe includes only the frame-limiter policy service.
+        settings["amaterasu.frame-limiter"] = {}
+        settings["amaterasu.stream-session"] = {
+            "enabled": True, "allowed_principals": ["amaterasu.rtsp"], "lifecycle_admitters": ["amaterasu.rtsp"],
+        }
         for component in ("media-transport", "control-transport"):
             settings[f"amaterasu.{component}"] = {"enabled": True, "allowed_principals": ["amaterasu.stream-session"]}
         bootstrap_path.write_text(json.dumps(bootstrap))
         package = directory / "package"
         run(harness.publisher, "pack-stream-probe", harness.root, harness.artifacts, package, "1")
         harness.stage(package)
-        console = Console(harness)
+        console = Console(harness, environment=os.environ | {"XDG_DATA_HOME": str(directory / "xdg-data")})
         try:
+            deadline = time.monotonic() + 60
+            while not any(line.startswith("Development worker ready: pid=") for line in console.errors):
+                assert console.process.poll() is None, "signed host exited before worker readiness: " + "".join(console.errors)
+                assert time.monotonic() < deadline, "signed host worker readiness timed out: " + "".join(console.errors)
+                time.sleep(0.05)
             exercise(console, oracle, directory)
             exercise(console, oracle, directory, discovery=True)
             exercise_mismatch(console)
             console.eof()
         finally:
             console.close()
-    print("Passed: signed encrypted RTSP negotiation and cross-connection replay protection; fixed and token-discovered UDP destinations, rejected malformed/wrong-lane pings and audio rebinding, no capture before both destinations and authenticated control, actual Opus/encrypted UDP with synthetic capture, confirmed TEARDOWN cleanup and unsupported ANNOUNCE rollback. Public launch and hardware/client qualification remain open.")
+    print("Passed: signed encrypted RTSP negotiation and cross-connection replay protection; fixed and token-discovered UDP destinations, rejection of malformed/wrong-lane pings and audio rebinding, pre-PLAY video warmup without media delivery before both destinations and authenticated control, actual Opus/encrypted UDP with synthetic capture, confirmed TEARDOWN cleanup and unsupported ANNOUNCE rollback. Public launch and hardware/client qualification remain open.")
 
 
 if __name__ == "__main__":

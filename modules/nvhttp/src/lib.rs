@@ -17,7 +17,6 @@ mod server;
 mod settings;
 mod tls;
 mod upnp;
-mod upnp_ipv6;
 mod wire;
 
 pub use product_settings::{default_document, validate_document};
@@ -234,7 +233,7 @@ struct NvhttpModule {
     warm: WarmIdentity,
     product_settings: ProductSettings,
     network_settings: NetworkSettings,
-    upnp_lifecycle: upnp::UpnpLifecycle,
+    router_mapping: Option<amaterasu_module_sdk::router_mapping::RouterMapping>,
     management_exposure: upnp::ManagementExposure,
     encoder_refresh: encoder_refresh::EncoderRefresh,
     next_listener_rebind: Instant,
@@ -260,6 +259,7 @@ impl ManagedModule for NvhttpModule {
             .enabled
             .then(|| amaterasu_module_sdk::network::Network::from_settings(&runtime, &payload))
             .transpose()?;
+        let mut video_provider = settings.video_provider.clone();
         let (server, router, identity) = if settings.enabled {
             let identity = tls::Identity::bind(&runtime, !settings.protocol_handlers.is_empty())?;
             let server = server::Server::bind_with_network(
@@ -284,6 +284,16 @@ impl ManagedModule for NvhttpModule {
             launches.set_session_lifecycle_capture_mode(settings.session_lifecycle_capture_mode);
             if let Some(composition) = runtime.processing_composition()? {
                 launches.select_processing_services(&composition)?;
+                if let Some(consumer) = &composition.frame_consumer {
+                    video_provider =
+                        amaterasu_module_sdk::processing_composition::require_contract(
+                            consumer,
+                            amaterasu_module_sdk::video::CONTRACT,
+                            1,
+                            0,
+                        )?
+                        .into();
+                }
             }
             let mut router = wire::Router::new(
                 wire::RouterConfig {
@@ -354,6 +364,23 @@ impl ManagedModule for NvhttpModule {
         let discovery_ipv6 = network
             .as_ref()
             .map(|network| discovery_ipv6::DiscoveryIpv6::start(network.clone(), log_emitter));
+        let router_mapping = server.as_ref().and_then(|_| {
+            settings
+                .router_mapping_provider
+                .as_deref()
+                .and_then(|service| {
+                    amaterasu_module_sdk::router_mapping::RouterMapping::bind(&runtime, service)
+                        .inspect_err(|_| {
+                            let _ = runtime.log(
+                                LogLevel::Warning,
+                                "nvhttp.router-mapping",
+                                "selected router mapping provider unavailable",
+                            );
+                        })
+                        .ok()
+                })
+        });
+        let encoder_refresh = encoder_refresh::EncoderRefresh::new(video_provider);
         Ok(Self {
             package_barrier_registered,
             runtime,
@@ -369,9 +396,9 @@ impl ManagedModule for NvhttpModule {
             warm: WarmIdentity::new(),
             product_settings,
             network_settings: NetworkSettings::default(),
-            upnp_lifecycle: upnp::UpnpLifecycle::new(network),
+            router_mapping,
             management_exposure: upnp::ManagementExposure::default(),
-            encoder_refresh: encoder_refresh::EncoderRefresh::default(),
+            encoder_refresh,
             next_listener_rebind: Instant::now(),
             listener_rebind_delay: Duration::from_secs(1),
             audio_driver_install: audio_driver_install::AudioDriverInstallSync::default(),
@@ -387,10 +414,9 @@ impl ManagedModule for NvhttpModule {
         if let Some(discovery) = &mut self.discovery_ipv6 {
             discovery.stop();
         }
-        let deadline = Instant::now()
-            .checked_add(Duration::from_millis(remaining_ms))
-            .ok_or("nvhttp shutdown deadline exceeds monotonic clock bounds")?;
-        self.upnp_lifecycle.prepare_shutdown(deadline);
+        if let Some(provider) = &mut self.router_mapping {
+            provider.prepare_shutdown(remaining_ms)?;
+        }
         Ok(())
     }
 
@@ -412,7 +438,10 @@ impl ManagedModule for NvhttpModule {
         }
         let router_ready = self.router.as_mut().is_none_or(wire::Router::quiesce);
         let exposure_ready = self.management_exposure.quiesce(&self.runtime);
-        let upnp_ready = self.upnp_lifecycle.poll_shutdown()?;
+        let upnp_ready = match &mut self.router_mapping {
+            Some(provider) => provider.poll_shutdown()?,
+            None => true,
+        };
         let discovery_ready = self
             .discovery
             .as_mut()
@@ -594,8 +623,20 @@ impl ManagedModule for NvhttpModule {
             self.management_exposure.snapshot(),
             self.product_settings.effective_address_family() == settings::AddressFamily::Both,
         );
-        self.upnp_lifecycle.update(desired_upnp_mappings);
-        let upnp_status = self.upnp_lifecycle.status().clone();
+        use amaterasu_module_sdk::router_mapping::Status as MappingStatus;
+        let upnp_status = match &mut self.router_mapping {
+            Some(provider) => provider
+                .update(&desired_upnp_mappings)
+                .unwrap_or_else(|error| MappingStatus {
+                    status: "error".into(),
+                    error: Some(error),
+                }),
+            None if desired_upnp_mappings.enabled => MappingStatus {
+                status: "error".into(),
+                error: Some("router mapping provider unavailable".into()),
+            },
+            None => MappingStatus::default(),
+        };
         self.product_settings
             .set_upnp_runtime_status(upnp_status.status, upnp_status.error);
         self.product_settings.flush_completion(&self.runtime);
@@ -1077,7 +1118,7 @@ fn complete_control(
 
 impl Drop for NvhttpModule {
     fn drop(&mut self) {
-        self.upnp_lifecycle.shutdown();
+        drop(self.router_mapping.take());
         if let (Some(server), Some(router)) = (&mut self.server, &mut self.router) {
             for id in server.close_all() {
                 router.cancel(id, &self.runtime);

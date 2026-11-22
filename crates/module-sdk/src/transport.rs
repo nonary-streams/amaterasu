@@ -9,6 +9,32 @@ use amaterasu_media::{ControlTransportApi, MediaTransportApi, MediaTransportApiV
 pub const MEDIA_CONTRACT: &str = "amaterasu.media-transport.native/1";
 pub const CONTROL_CONTRACT: &str = "amaterasu.control-transport.native/1";
 
+/// Optional `audio_packet_sizing` input to the media transport `/1` Open operation.
+/// The caller sends the unframed, constant-size packet length and sets the legacy
+/// `audio.wire_payload_bytes` field to zero. The provider returns the effective
+/// `audio.wire_payload_bytes` in Open, Lookup and Status replies for that stream.
+/// When standard audio is disabled, the caller passes zero and the provider may
+/// return zero or its required inactive configuration value. Custom audio uses
+/// the separately negotiated audio profile instead of this field.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioPacketSizing {
+    pub encoded_packet_bytes: u32,
+}
+
+impl AudioPacketSizing {
+    /// Decode an effective wire length under the shared media memory bound.
+    pub fn effective_wire_payload_bytes(
+        reply: &serde_json::Value,
+        stream_audio: bool,
+    ) -> Option<usize> {
+        let bytes = reply["audio"]["wire_payload_bytes"].as_u64()?;
+        (bytes >= u64::from(stream_audio)
+            && bytes <= amaterasu_media::MAX_ENCODED_AUDIO_BYTES as u64)
+            .then_some(bytes as usize)
+    }
+}
+
 /// # Safety
 /// The factory implements the media transport interface and remains live through all bindings.
 pub unsafe fn register_media(
@@ -70,3 +96,6 @@ pub unsafe fn bind_control(runtime: &RuntimeClient, service: &str) -> ModuleResu
         )
     }
 }
+
+mod control_codec;
+pub use control_codec::{ControlCodec, bind_control_codec, control};

@@ -27,9 +27,9 @@ use super::remote_sessions::{BLACK_CAPTURE, LINUX_COMPONENT as REMOTE_SESSION, R
 use super::{
     APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_KMS, CAPTURE_PIPEWIRE, CAPTURE_VKMS,
     CATALOG, CONFIGURATION, CONTROL_TRANSPORT, ComponentDefinition, ENCODE, HOST_METRICS, INPUT,
-    LAUNCH, LIBRARY, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NETWORK, NVHTTP, PAIRING, RTSP, RUNTIME,
-    RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO, VIRTUAL_DISPLAY,
-    names,
+    LAUNCH, LIBRARY, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NETWORK, NVHTTP, PAIRING, ROUTER_MAPPING,
+    RTSP, RUNTIME, RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO,
+    VIRTUAL_DISPLAY, names,
 };
 pub use legacy_rtx::compose_rtx_hdr_destination;
 
@@ -234,6 +234,7 @@ const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-kms/1",
         "amaterasu.capture-pipewire/1",
         "amaterasu.capture-vkms/1",
+        "amaterasu.cpu-frame-fit/1",
         "amaterasu.encode/1",
     ],
     dependencies: &[
@@ -379,6 +380,7 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
     dependencies: &[
         "amaterasu.remote-session",
         "amaterasu.network",
+        ROUTER_MAPPING.id,
         RUNTIME_ID,
         "amaterasu.configuration",
         "amaterasu.pairing",
@@ -550,6 +552,7 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
 pub const COMPONENTS: &[ComponentDefinition] = &[
     RUNTIME,
     NETWORK,
+    ROUTER_MAPPING,
     STATE,
     SESSION,
     CONFIGURATION,
@@ -630,6 +633,7 @@ with_rtx_control!(RTX_HDR_STREAM_SESSION, LINUX_SESSION_STREAM_SESSION);
 pub const RTX_HDR_COMPONENTS: &[ComponentDefinition] = &[
     RUNTIME,
     NETWORK,
+    ROUTER_MAPPING,
     STATE,
     SESSION,
     CONFIGURATION,
@@ -685,6 +689,7 @@ const EXTENSION_ACTIONS: ComponentDefinition = ComponentDefinition {
 pub const EXTENSION_COMPONENTS: &[ComponentDefinition] = &[
     RUNTIME,
     NETWORK,
+    ROUTER_MAPPING,
     STATE,
     SESSION,
     CONFIGURATION,
@@ -1080,7 +1085,7 @@ fn settings(
     // The portal owns the explicit user-consent prompt. Capture remains
     // disabled until selected in the portal; video processing is separately
     // enabled through the profile option.
-    let video_settings = if options.enable_virtual_screen_capture {
+    let mut video_settings = if options.enable_virtual_screen_capture {
         json!({
             "enabled": options.enable_capture,
             "capture_providers": ["kms", "pipewire"],
@@ -1097,8 +1102,11 @@ fn settings(
             json!({"runtime_directory": runtime_directory}),
         );
     }
+    video_settings["cpu_frame_fit_service"] = json!("amaterasu.cpu-frame-fit/1");
+    video_settings["cpu_frame_fit_capture"] = json!("pipewire");
     insert(VIDEO_COMPONENT_ID, video_settings);
     let mut capture_settings = portal_capture_settings();
+    capture_settings["frame_fit_enabled"] = json!(true);
     if options.enable_virtual_display {
         capture_settings["allow_named_outputs"] = json!(true);
     }
@@ -1207,11 +1215,8 @@ fn nvhttp_settings(options: &LinuxSessionOptions) -> Value {
     })
 }
 
-/// Streams reach 3840x2160 at 120 Hz when a hardware encoder serves the
-/// negotiated codec. NVHTTP refuses a launch above 1920x1080 at 60 Hz that only
-/// a software encoder could serve: software x264 cannot sustain the host
-/// desktop's own 3024x1890 at 90 Hz, and such requests are refused instead of
-/// silently degraded.
+/// The profile permits up to 3840×2160 at 120 Hz. Encoder capability limits
+/// can narrow the negotiated offer.
 fn streaming_settings(options: &LinuxSessionOptions) -> Value {
     json!({
         "capture": {

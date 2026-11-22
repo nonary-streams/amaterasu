@@ -1,4 +1,38 @@
 use super::*;
+
+#[test]
+fn nvhttp_profiles_ship_the_default_router_mapping_provider() {
+    for profile in [
+        PackageProfile::StreamProbe,
+        PackageProfile::SoftwareProbe,
+        PackageProfile::LinuxProbe,
+        PackageProfile::DesktopStreamSmoke,
+        PackageProfile::LinuxSession,
+        PackageProfile::LinuxSessionRtxHdr,
+        PackageProfile::LinuxSessionExtensions,
+        PackageProfile::Platform,
+        PackageProfile::ExtensionExample,
+    ] {
+        let components = profile.components();
+        let nvhttp = components
+            .iter()
+            .find(|entry| entry.id == NVHTTP.id)
+            .unwrap();
+        let router = components
+            .iter()
+            .find(|entry| entry.id == ROUTER_MAPPING.id)
+            .unwrap();
+        assert!(nvhttp.dependencies.contains(&router.id));
+        assert!(nvhttp.native_uses.contains(&"amaterasu.router-mapping/1"));
+        assert!(
+            router
+                .native_provides
+                .contains(&"amaterasu.router-mapping/1")
+        );
+        assert!(router.dependencies.contains(&NETWORK.id));
+        assert!(router.native_uses.contains(&"amaterasu.network/1"));
+    }
+}
 use amaterasu_contracts::{Command, Response};
 use amaterasu_runtime::Broker;
 

@@ -1,157 +1,10 @@
 use super::{DecodeError, be16, be32, constant, exact, le16, le32};
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Input<'a> {
-    Keyboard {
-        pressed: bool,
-        key_code: u16,
-        modifiers: u8,
-        flags: u8,
-    },
-    RelativeMouse {
-        x: i16,
-        y: i16,
-    },
-    AbsoluteMouse {
-        x: u16,
-        y: u16,
-        reference_width: u32,
-        reference_height: u32,
-    },
-    MouseButton {
-        pressed: bool,
-        button: u8,
-    },
-    VerticalScroll {
-        amount: i16,
-    },
-    HorizontalScroll {
-        amount: i16,
-    },
-    Text(&'a str),
-    Controller(ControllerState),
-    ControllerArrival(ControllerArrival),
-    ControllerTouch(ControllerTouch),
-    ControllerMotion(ControllerMotion),
-    ControllerBattery(ControllerBattery),
-    PenTouch(PenTouch),
-    EnableHaptics {
-        enabled: bool,
-    },
-    Unsupported {
-        magic: u32,
-        payload: &'a [u8],
-    },
-}
-
-/// Authenticated Moonlight pen/touch payload. Floating fields remain as their
-/// little-endian IEEE-754 bits so malformed values can be rejected at ingress.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PenTouch {
-    pub device: PointerDevice,
-    pub event: PointerEvent,
-    pub pointer_id: u32,
-    pub x: u32,
-    pub y: u32,
-    pub pressure: u32,
-    pub contact_major: u32,
-    pub contact_minor: u32,
-    pub rotation: u16,
-    pub tool: Option<u8>,
-    pub buttons: Option<u8>,
-    pub tilt: Option<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PointerDevice {
-    Touch,
-    Pen,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PointerEvent {
-    Down,
-    Up,
-    Move,
-    Cancel,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ControllerState {
-    pub number: u16,
-    pub active_mask: u16,
-    pub buttons: u32,
-    pub left_trigger: u8,
-    pub right_trigger: u8,
-    pub left_x: i16,
-    pub left_y: i16,
-    pub right_x: i16,
-    pub right_y: i16,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ControllerArrival {
-    pub number: u8,
-    pub controller_type: u8,
-    pub capabilities: u16,
-    pub supported_buttons: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ControllerTouch {
-    pub number: u8,
-    pub touchpad_index: u8,
-    pub event: ControllerTouchEvent,
-    pub pointer_id: u32,
-    pub x: u32,
-    pub y: u32,
-    pub pressure: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControllerTouchEvent {
-    Hover,
-    Down,
-    Up,
-    Move,
-    Cancel,
-    ButtonOnly,
-    HoverLeave,
-    CancelAll,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ControllerMotion {
-    pub number: u8,
-    pub motion_type: ControllerMotionType,
-    pub x: u32,
-    pub y: u32,
-    pub z: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControllerMotionType {
-    Accel,
-    Gyro,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ControllerBattery {
-    pub number: u8,
-    pub state: ControllerBatteryState,
-    pub percentage: Option<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControllerBatteryState {
-    Unknown,
-    NotPresent,
-    Discharging,
-    Charging,
-    NotCharging,
-    Full,
-}
+pub use amaterasu_contracts::control::{
+    ControllerArrival, ControllerBattery, ControllerBatteryState, ControllerMotion,
+    ControllerMotionType, ControllerState, ControllerTouch, ControllerTouchEvent, Input, PenTouch,
+    PointerDevice, PointerEvent,
+};
 
 pub(super) fn decode(bytes: &[u8]) -> Result<Input<'_>, DecodeError> {
     if bytes.len() < 8 || be32(bytes, 0) as usize != bytes.len() - 4 {
@@ -212,7 +65,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Input<'_>, DecodeError> {
         0x55000002 | 0x55000003 => pen_touch(magic, body).map(Input::PenTouch),
         _ => Ok(Input::Unsupported {
             magic,
-            payload: body,
+            payload: body.into(),
         }),
     }
 }
@@ -425,7 +278,7 @@ fn text(body: &[u8]) -> Result<Input<'_>, DecodeError> {
     if text.contains('\0') {
         return Err(DecodeError::InvalidText);
     }
-    Ok(Input::Text(text))
+    Ok(Input::Text(text.into()))
 }
 
 fn controller(body: &[u8]) -> Result<ControllerState, DecodeError> {

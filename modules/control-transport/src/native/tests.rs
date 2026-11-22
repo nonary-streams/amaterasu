@@ -109,3 +109,75 @@ fn native_handles_copy_owner_observe_shutdown_and_release_exactly_once() {
     }
     assert_eq!(Arc::strong_count(&controller), 1);
 }
+
+#[test]
+fn semantic_control_tail_decodes_idr_and_owns_hdr_wire_bytes() {
+    let mut event = None;
+    unsafe extern "C" fn receive_event(context: *mut c_void, json: BorrowedBytes) {
+        let output = unsafe { &mut *context.cast::<Option<serde_json::Value>>() };
+        *output = Some(serde_json::from_slice(unsafe { json.read().unwrap() }).unwrap());
+    }
+    let body = [0, 0];
+    let request = ControlMessage {
+        message_type: 0x0302,
+        channel: 0,
+        delivery: CONTROL_RELIABLE,
+        reserved: 0,
+        data: body.as_ptr(),
+        len: 2,
+        sequence: 42,
+    };
+    let status = unsafe {
+        decode_client(
+            std::ptr::null_mut(),
+            &request,
+            ReplySink {
+                context: (&mut event as *mut Option<serde_json::Value>).cast(),
+                write: receive_event,
+            },
+        )
+    };
+    assert_eq!(status, STATUS_OK);
+    assert_eq!(event, Some(serde_json::json!({"type":"request_idr"})));
+
+    struct Framed {
+        kind: u32,
+        channel: u32,
+        payload: Vec<u8>,
+    }
+
+    unsafe extern "C" fn receive_frame(
+        context: *mut c_void,
+        message: *const ControlMessage,
+    ) -> Status {
+        let output = unsafe { &mut *context.cast::<Option<Framed>>() };
+        let message = unsafe { &*message };
+        *output = Some(Framed {
+            kind: message.message_type,
+            channel: message.channel,
+            payload: unsafe { message.bytes().unwrap() }.to_vec(),
+        });
+        STATUS_OK
+    }
+    let mut fields = [0; 12];
+    fields[0] = 0x1234;
+    let hdr = amaterasu_module_sdk::transport::control::HostControl::HdrMetadata { fields };
+    let json = serde_json::to_vec(&hdr).unwrap();
+    let mut framed: Option<Framed> = None;
+    let status = unsafe {
+        encode_host(
+            std::ptr::null_mut(),
+            BorrowedBytes::new(&json),
+            ControlMessageSink {
+                context: (&mut framed as *mut Option<Framed>).cast(),
+                write: Some(receive_frame),
+            },
+        )
+    };
+    assert_eq!(status, STATUS_OK);
+    let framed = framed.unwrap();
+    assert_eq!((framed.kind, framed.channel), (0x010e, 0));
+    assert_eq!(&framed.payload[..3], &[1, 0x34, 0x12]);
+    assert_eq!(framed.payload.len(), 27);
+    assert!(framed.payload[3..].iter().all(|byte| *byte == 0));
+}

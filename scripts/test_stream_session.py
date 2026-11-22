@@ -269,6 +269,9 @@ def main():
         bootstrap = json.loads(bootstrap_path.read_text())
         settings = bootstrap["policy"]["settings"]
         settings["amaterasu.audio-encode"] = {"enabled": True}
+        # The probe includes only the frame-limiter policy service. The
+        # extension registry and Linux lifecycle coordinator are absent.
+        settings["amaterasu.frame-limiter"] = {}
         settings["amaterasu.management"] = {"enabled": True, "bind": "127.0.0.1:0"}
         settings["amaterasu.stream-session"] = {"enabled": True, "allowed_principals": ["amaterasu.console"]}
         for component in ("media-transport", "control-transport"):
@@ -277,7 +280,7 @@ def main():
         package = directory / "package"
         run(harness.publisher, "pack-stream-probe", harness.root, harness.artifacts, package, "1")
         harness.stage(package)
-        console = Console(harness)
+        console = Console(harness, environment=os.environ | {"XDG_DATA_HOME": str(directory / "xdg-data")})
         try:
             deadline = time.monotonic() + 60
             while not any(line.startswith("Development worker ready: pid=") for line in console.errors):

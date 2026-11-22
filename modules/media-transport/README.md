@@ -44,7 +44,8 @@ The action and all fields are strict. Open fields:
 | `discovery` | Optional `{video_ping_payload,audio_ping_payload}`; both are distinct 16-character unpadded base64url strings |
 | `video_bind`, `audio_bind` | Optional local socket addresses, normally port zero |
 | `video` | Optional `{codec:"h264",packet_size:1024,fec_percentage:20,min_parity_shards:2,max_fec_blocks:1,max_batch_size_kb:64}`; `codecs:["h264","hevc","av1"]` replaces `codec` with an offer that the first video packet resolves |
-| `audio` | Required `{packet_ms:5\|10,channels:2,wire_payload_bytes:N,ssrc:0}`; `ssrc` defaults to zero |
+| `audio` | Required `{packet_ms:5\|10,channels:2\|6\|8,wire_payload_bytes:N,ssrc:0}`; `ssrc` defaults to zero |
+| `audio_packet_sizing` | Optional SDK `transport::AudioPacketSizing` with the encoder's `encoded_packet_bytes`. Set `audio.wire_payload_bytes` to zero when supplying it. |
 | `stream_audio` | Optional boolean, defaults to `true`; `false` keeps the negotiated audio lane but rejects audio payloads while accepting its EOS marker |
 | `ping_timeout_ms` | Optional discovery timeout in milliseconds, 0–2147483647; defaults to 10000 |
 | `encryption` | Optional `{key_hex:32 hexadecimal characters,key_id:u32,video:bool,audio:bool,permit_legacy_audio_iv_wrap:false}` |
@@ -55,8 +56,8 @@ with another 16 RTP bytes and, when encrypted, 32 encryption-prefix bytes.
 FEC settings are validated by the shared packetizer; `max_fec_blocks:1` is the
 safe legacy default. A negotiated modern client may explicitly select up to
 four blocks. FEC-disabled configurations must satisfy the packetizer's own
-zero-parity requirements. Audio uses the established stereo 48 kHz 4-data/2-parity
-profile. Surround and alternative channel mappings are unsupported.
+zero-parity requirements. Audio uses the GameStream 48 kHz, four-data-shard,
+two-parity-shard profile with stereo and standard 5.1 or 7.1 channel layouts.
 
 `video.max_batch_size_kb` defaults to 64 and accepts integer values from 0 to
 64. Zero means automatic and resolves to 64 KiB. The supported explicit values
@@ -71,8 +72,11 @@ for CBC. For plaintext it equals the complete CBR Opus packet length.
 For CBC it is `(plaintext_length / 16 + 1) * 16`, including PKCS7 padding.
 For example, the baseline encoder's stereo 128 kbps, 10 ms CBR packet is 160
 bytes and encrypts to 176 bytes. The encoder reports actual `packet_bytes`;
-consumers must use that value instead of assuming all codec modes have the same
-length. Variable length input is rejected before encryption. Arbitrary padding
+`stream-session` supplies that value as `audio_packet_sizing` and pins the
+effective wire length returned by the selected provider. It supplies zero
+encoded bytes when standard audio is disabled. A caller that already owns a
+wire contract can still omit `audio_packet_sizing` and provide its exact
+`wire_payload_bytes`. Variable length input is rejected before encryption. Arbitrary padding
 of Opus or ciphertext is never used to force a length match.
 
 Fixed mode requires both destination ports and omits `discovery`. It remains

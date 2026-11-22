@@ -6,12 +6,15 @@ rust-version.workspace = true
 
 [dependencies]
 amaterasu-media.workspace = true
+amaterasu-module-sdk.workspace = true
 amaterasu-network-policy.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
 str0m = { version = "=0.24.1", default-features = false, features = ["aws-lc-rs"] }
 
 [dev-dependencies]
+amaterasu-module-sdk = { workspace = true, features = ["network-test-support"] }
+amaterasu-network-sockets.workspace = true
 serde_json.workspace = true
 
 [lints]

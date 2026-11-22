@@ -193,6 +193,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "cc",
  "getrandom 0.3.4",
+ "pkg-config",
  "serde",
  "serde_json",
 ]
@@ -743,7 +744,6 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-network-policy",
  "amaterasu-runtime",
- "amaterasu-upnp",
  "base64 0.22.1",
  "getrandom 0.3.4",
  "httparse",
@@ -1084,6 +1084,7 @@ name = "amaterasu-upnp"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "serde_json",
  "xmltree",
 ]
 
@@ -1095,9 +1096,7 @@ dependencies = [
  "amaterasu-media",
  "amaterasu-module-sdk",
  "amaterasu-runtime",
- "cc",
  "getrandom 0.3.4",
- "pkg-config",
  "serde",
  "serde_json",
 ]
@@ -1131,7 +1130,9 @@ name = "amaterasu-webrtc-transport"
 version = "0.1.0"
 dependencies = [
  "amaterasu-media",
+ "amaterasu-module-sdk",
  "amaterasu-network-policy",
+ "amaterasu-network-sockets",
  "getrandom 0.3.4",
  "serde_json",
  "sha2",

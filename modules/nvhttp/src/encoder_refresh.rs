@@ -1,21 +1,22 @@
 //! Keeps the encoder capability snapshot current with bounded, idle-only
-//! enumerate calls to `amaterasu.encode/1`.
+//! catalog reads from the selected video service.
 //!
-//! Enumeration may open a short-lived probe session on a hardware encoder, so
-//! it runs at startup and then rarely, never while a stream is active. A
-//! failed refresh keeps the last good snapshot and retries with backoff.
+//! Video refreshes its selected encoder while idle. A failed catalog read
+//! keeps the last good snapshot and retries with backoff.
 use crate::encoder_snapshot::EncoderSnapshot;
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
-const ENCODE_SERVICE: &str = "amaterasu.encode/1";
+#[cfg(test)]
+const VIDEO_SERVICE: &str = amaterasu_module_sdk::video::DEFAULT_CONTROL_SERVICE;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 pub struct EncoderRefresh {
+    service: String,
     pending: Option<Pending>,
     sequence: u64,
     next_refresh: Instant,
@@ -29,9 +30,17 @@ enum Pending {
     Releasing { child: u64, payload: Option<Value> },
 }
 
+#[cfg(test)]
 impl Default for EncoderRefresh {
     fn default() -> Self {
+        Self::new(VIDEO_SERVICE.into())
+    }
+}
+
+impl EncoderRefresh {
+    pub fn new(service: String) -> Self {
         Self {
+            service,
             pending: None,
             sequence: 0,
             next_refresh: Instant::now(),
@@ -39,9 +48,7 @@ impl Default for EncoderRefresh {
             update: None,
         }
     }
-}
 
-impl EncoderRefresh {
     /// Advance an outstanding call, or start one when due and no stream is
     /// active. Failures never fail the module: they keep the last snapshot
     /// and schedule a retry, or retry a pending release on the next tick.
@@ -70,8 +77,8 @@ impl EncoderRefresh {
 
     fn submit(&mut self, runtime: &RuntimeClient, operation_id: String) -> Option<Pending> {
         let response = runtime.send(Command::Request {
-            service: ENCODE_SERVICE.into(),
-            payload: json!({"action":"enumerate"}),
+            service: self.service.clone(),
+            payload: json!({"action":amaterasu_module_sdk::encode::SELECTED_ENCODER_CATALOG_ACTION}),
             timeout_ms: REQUEST_TIMEOUT.as_millis() as u64,
             operation_id,
             parent: None,

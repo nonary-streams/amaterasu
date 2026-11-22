@@ -1,7 +1,7 @@
 use super::*;
 use amaterasu_gamestream::video::{VideoConfig, VideoPacketizer};
 use amaterasu_module_sdk::media_abi::*;
-use amaterasu_module_sdk::video_framing::{self, FramingProvider, OwnedFramePlan};
+use amaterasu_module_sdk::video_framing::{self, FramingProvider, OwnedFramePlan, WireBudget};
 
 const SERVICE: &str = "example.video-framing/1";
 struct First;
@@ -25,6 +25,35 @@ fn make_plan(principal: &str, bytes: &[u8], marker: u8) -> Result<OwnedFramePlan
     })
 }
 impl FramingProvider for First {
+    fn supports_wire_budget(&self, _: EncoderFormatId, _: EncoderFormatId) -> bool {
+        true
+    }
+
+    fn probe(
+        &self,
+        principal: &str,
+        _: EncoderFormatId,
+        _: EncoderFormatId,
+        _: &VideoFramingLimits,
+    ) -> Result<(), Status> {
+        (principal == "consumer")
+            .then_some(())
+            .ok_or(STATUS_INVALID_ARGUMENT)
+    }
+
+    fn encoder_bitrate(
+        &self,
+        _: &str,
+        _: EncoderFormatId,
+        _: EncoderFormatId,
+        _: &VideoFramingLimits,
+        budget: WireBudget,
+    ) -> Result<u32, Status> {
+        (budget.fps == 60 && budget.audio_payload_bps == 128_000)
+            .then_some(10_000_000)
+            .ok_or(MEDIA_UNSUPPORTED)
+    }
+
     fn plan(
         &self,
         principal: &str,
@@ -36,6 +65,35 @@ impl FramingProvider for First {
     }
 }
 impl FramingProvider for Second {
+    fn supports_wire_budget(&self, _: EncoderFormatId, _: EncoderFormatId) -> bool {
+        true
+    }
+
+    fn probe(
+        &self,
+        principal: &str,
+        _: EncoderFormatId,
+        _: EncoderFormatId,
+        _: &VideoFramingLimits,
+    ) -> Result<(), Status> {
+        (principal == "consumer")
+            .then_some(())
+            .ok_or(STATUS_INVALID_ARGUMENT)
+    }
+
+    fn encoder_bitrate(
+        &self,
+        _: &str,
+        _: EncoderFormatId,
+        _: EncoderFormatId,
+        _: &VideoFramingLimits,
+        budget: WireBudget,
+    ) -> Result<u32, Status> {
+        (budget.fps == 60 && budget.audio_payload_bps == 128_000)
+            .then_some(20_000_000)
+            .ok_or(MEDIA_UNSUPPORTED)
+    }
+
     fn plan(
         &self,
         principal: &str,
@@ -161,6 +219,35 @@ fn exercise<P: FramingProvider>(provider_impl: P, marker: u8) {
             fec_policy_flags: 0,
             reserved: 0,
         };
+        video_framing::probe_encoder_bitrate(&consumer, SERVICE, id, id, &limits).unwrap();
+        let budget = WireBudget {
+            wire_kbps: 40_000,
+            fps: 60,
+            audio_payload_bps: 128_000,
+        };
+        assert_eq!(
+            video_framing::plan_encoder_bitrate(&consumer, SERVICE, id, id, &limits, budget)
+                .unwrap(),
+            u32::from(marker) * 10_000_000,
+        );
+        assert!(
+            video_framing::plan_encoder_bitrate(&intruder, SERVICE, id, id, &limits, budget)
+                .is_err()
+        );
+        assert!(
+            video_framing::plan_encoder_bitrate(
+                &consumer,
+                SERVICE,
+                id,
+                id,
+                &limits,
+                WireBudget {
+                    wire_kbps: 1,
+                    ..budget
+                }
+            )
+            .is_err()
+        );
         let mut output = Output {
             busy: true,
             seen: Vec::new(),

@@ -29,6 +29,7 @@ pub(crate) fn request(video: &UdpSocket, audio: &UdpSocket, encrypted: bool) -> 
             wire_payload_bytes: if encrypted { 16 } else { 4 },
             ssrc: 0,
         },
+        audio_packet_sizing: None,
         stream_audio: true,
         ping_timeout_ms: 10_000,
         encryption: encrypted.then(|| Encryption {

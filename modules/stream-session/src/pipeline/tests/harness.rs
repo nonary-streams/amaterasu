@@ -1195,6 +1195,20 @@ impl Broker {
             if self.fail_open.as_deref() == Some(service) {
                 return error("backend_failed");
             }
+            if service == "amaterasu.media-transport/1"
+                && call.payload["video"]["max_fec_blocks"]
+                    .as_u64()
+                    .is_some_and(|blocks| blocks > 4)
+            {
+                return error("invalid_video_configuration");
+            }
+            if service == "amaterasu.media-transport/1"
+                && call.payload["audio_packet_sizing"]["encoded_packet_bytes"]
+                    .as_u64()
+                    .is_some_and(|bytes| bytes > 1275)
+            {
+                return error("invalid_audio_configuration");
+            }
             let key = call.payload[if action == "create" {
                 "key"
             } else {
@@ -1213,7 +1227,10 @@ impl Broker {
                     Allocation {
                         id: self.next,
                         key: key.clone(),
-                        state: if service == "amaterasu.media-transport/1" {
+                        state: if matches!(
+                            service,
+                            "amaterasu.media-transport/1" | "vendor.media-delivery/1"
+                        ) {
                             "sending".into()
                         } else {
                             "preparing".into()
@@ -1270,7 +1287,11 @@ impl Broker {
             allocation.request["audio_profile"] = call.payload["audio_profile"].clone();
             return json!({"ok":true,"stream":id,"audio_profile":call.payload["audio_profile"]});
         }
-        if service == "amaterasu.media-transport/1" && action == "configure_video_format" {
+        if matches!(
+            service,
+            "amaterasu.media-transport/1" | "vendor.media-delivery/1"
+        ) && action == "configure_video_format"
+        {
             let allocation = self.allocations.get_mut(&key).unwrap();
             allocation.request["video_stream_format"] = call.payload["video_stream_format"].clone();
             allocation.request["video"]["codec"] =
@@ -1339,7 +1360,12 @@ impl Broker {
         if action == "status" && service == "amaterasu.control-transport/1" {
             return json!({"ok":true,"streams":[{"stream":if self.control_status_wrong_stream {id+1} else {id},"authenticated":self.authenticated && self.control_failure.is_none(),"state":if self.control_failure.is_some() {"failed"} else if self.authenticated {"active"} else {"awaiting_authentication"},"failure":self.control_failure}]});
         }
-        if action == "status" && service == "amaterasu.media-transport/1" {
+        if action == "status"
+            && matches!(
+                service,
+                "amaterasu.media-transport/1" | "vendor.media-delivery/1"
+            )
+        {
             let mut metadata = self.metadata(service, &self.allocations[&key]);
             let status = metadata.as_object_mut().expect("media metadata");
             status.remove("ok");
@@ -1826,7 +1852,7 @@ impl Broker {
             "vendor.audio-processor/1" => json!({"ok":true,"stream":id,
                 "audio_profile":allocation.request["audio_profile"],
                 "native_contract":allocation.request["required_native_contract"]}),
-            "amaterasu.media-transport/1" => {
+            "amaterasu.media-transport/1" | "vendor.media-delivery/1" => {
                 let request = &allocation.request;
                 let video: crate::model::VideoWire =
                     serde_json::from_value(request["video"].clone())
@@ -1840,6 +1866,22 @@ impl Broker {
                     "video_encrypted":request["encryption"]["video"].as_bool().unwrap_or(false),
                     "audio_encrypted":request["encryption"]["audio"].as_bool().unwrap_or(false),
                     "permit_legacy_audio_iv_wrap":request["encryption"]["permit_legacy_audio_iv_wrap"].as_bool().unwrap_or(false)});
+                if let Some(bytes) = request["audio_packet_sizing"]["encoded_packet_bytes"].as_u64()
+                {
+                    metadata["audio"]["wire_payload_bytes"] =
+                        json!(if service == "vendor.media-delivery/1" {
+                            bytes + 37
+                        } else if request["stream_audio"] == false
+                            || request["encryption"]["audio"] == true
+                        {
+                            (bytes / 16 + 1) * 16
+                        } else {
+                            bytes
+                        });
+                }
+                if service == "vendor.media-delivery/1" {
+                    metadata["native_contract"] = request["required_native_contract"].clone();
+                }
                 if request["audio_profile"].is_object() {
                     metadata["audio_profile"] = request["audio_profile"].clone();
                 }
@@ -1944,11 +1986,13 @@ pub struct PlaneState {
     pub observed_video_sequence_gaps: u64,
     pub feedback: Vec<amaterasu_gamestream::control::HostFeedback>,
     pub feedback_queue_full: usize,
+    pub feedback_unsupported: bool,
     pub contribution_queue: Vec<amaterasu_gamestream::control::HostFeedbackMessage>,
     pub contributions_sent: Vec<amaterasu_gamestream::control::HostFeedbackMessage>,
     pub contribution_busy: bool,
     pub rumble_commands: Vec<crate::plane::RumbleCommand>,
     pub rumble_error: bool,
+    pub rumble_unsupported: bool,
     pub rumble_busy: bool,
     pub timeline: Rc<RefCell<Vec<&'static str>>>,
 }
@@ -2004,6 +2048,9 @@ impl Drive for FakePlane {
     }
     fn send_rumble(&mut self, _command: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
         let mut state = self.0.borrow_mut();
+        if state.rumble_unsupported {
+            return Err("control_rumble_unsupported");
+        }
         if state.rumble_error {
             return Err("native_stream_closed");
         }
@@ -2034,6 +2081,9 @@ impl Drive for FakePlane {
         feedback: amaterasu_gamestream::control::HostFeedback,
     ) -> Result<crate::plane::FeedbackEnqueueOutcome, crate::plane::FeedbackEnqueueError> {
         let mut state = self.0.borrow_mut();
+        if state.feedback_unsupported {
+            return Err(crate::plane::FeedbackEnqueueError::Unsupported);
+        }
         if state.feedback_queue_full > 0 {
             state.feedback_queue_full -= 1;
             return Err(crate::plane::FeedbackEnqueueError::QueueFull);
@@ -2089,7 +2139,9 @@ pub struct Harness {
     pub plane: Rc<RefCell<PlaneState>>,
     pub real_transport: Option<Rc<RefCell<crate::plane::test_support::TransportState>>>,
     pub now: u64,
+    pub control_codec_available: bool,
     pub extension_probe_limits: Option<amaterasu_media::VideoFramingLimits>,
+    pub extension_encoder_bitrate: Option<u32>,
 }
 impl Harness {
     pub fn new() -> Self {
@@ -2117,7 +2169,9 @@ impl Harness {
             plane: Rc::new(RefCell::new(plane_state)),
             real_transport: None,
             now: 0,
+            control_codec_available: true,
             extension_probe_limits: None,
+            extension_encoder_bitrate: None,
         }
     }
     pub fn with_restart_state(document: Value, revision: u64) -> Self {
@@ -2145,23 +2199,37 @@ impl Harness {
         let broker = RefCell::new(&mut self.broker);
         let real_transport = self.real_transport.clone();
         let probe_limits = self.extension_probe_limits;
+        let encoder_bitrate = self.extension_encoder_bitrate;
         self.pipeline
             .tick_with_direct(
                 self.now,
                 &mut |command| broker.borrow_mut().send(command),
-                &mut |_, _, route| {
-                    if route.is_some() {
-                        state.borrow_mut().planned_planes += 1;
-                    }
-                    if let Some(transport) = &real_transport {
-                        Ok(Box::new(QueuePlane(
-                            crate::plane::test_support::TestPlane::new(transport.clone()),
-                        )))
-                    } else {
-                        Ok(Box::new(FakePlane(state.clone())))
-                    }
+                NativeOperations {
+                    factory: &mut |_, _, route| {
+                        if route.is_some() {
+                            state.borrow_mut().planned_planes += 1;
+                        }
+                        if let Some(transport) = &real_transport {
+                            Ok(Box::new(QueuePlane(
+                                crate::plane::test_support::TestPlane::new(transport.clone()),
+                            )))
+                        } else {
+                            Ok(Box::new(FakePlane(state.clone())))
+                        }
+                    },
+                    probe: &mut |route, _, _| {
+                        if route.wire_budget_required && encoder_bitrate.is_none() {
+                            return Err("video_wire_budget_probe_failed");
+                        }
+                        probe_limits.ok_or("unsupported")
+                    },
+                    probe_control: &|_| {
+                        self.control_codec_available
+                            .then_some(())
+                            .ok_or("control_codec_unavailable")
+                    },
                 },
-                &mut |_, _, _| probe_limits.ok_or("unsupported"),
+                &mut |_, _, _, _| encoder_bitrate.ok_or("invalid_extension_wire_budget"),
                 &mut |service, payload| broker.borrow_mut().direct(service, payload),
             )
             .unwrap();

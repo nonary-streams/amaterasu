@@ -2,7 +2,14 @@
 
 `actions.rs` validates and authorizes public operations and owns their idempotency rules. `record.rs` retains caller identity, immutable prepare configuration, resolved endpoint metadata and component handles. `workflow.rs` defines the bounded child-operation sequence. `lifecycle.rs` advances preparation, activation and graceful draining; `cleanup.rs` owns rollback and release confirmation. `responses.rs` validates provider acknowledgements. `rpc.rs` retains broker request identity across transport failures. The native plane owns only bindings and copied media, never provider allocation lifetime.
 
-Preparation creates a session-service record, opens the genuine CBR Opus encoder, derives the fixed audio wire length from its reported packet size (CBC PKCS7 adds a complete padding block when already aligned), then opens media and control transports. It returns bound ports with a bounded prepared deadline. Starting checks live authenticated control status first; an early request returns `control_not_authenticated` and retains the prepared allocation for retry. The caller must still meet the prepared deadline.
+Preparation creates a session-service record, opens the selected audio encoder,
+then opens the media and control transports. For standard audio, the selected
+media transport derives its wire length from the encoder's reported packet
+size. The media transport validates packetization and FEC before opening its
+resources. Preparation pins the effective transport metadata and returns bound
+ports with a bounded deadline. Starting checks live authenticated control status
+first. An early request returns `control_not_authenticated` and retains the
+prepared allocation for retry within its original deadline.
 
 Media preparation accepts either the existing pair of fixed nonzero destination ports or a strict pair of distinct 16-character base64url discovery payloads with both ports omitted. The latter opens the UDP sockets before RTSP negotiation but does not authorize a destination from RTSP client-port placeholders. Media status retains only readiness and learned source ports; bearer payloads never enter public responses. After PLAY is armed, background work requires authenticated control and both healthy media lanes before acquiring leases or opening capture. It polls within the original prepared deadline, including when only one lane has arrived.
 

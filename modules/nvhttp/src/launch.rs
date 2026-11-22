@@ -666,7 +666,9 @@ pub struct StreamProfile {
 
 impl StreamProfile {
     fn validate(&self) -> Result<(), &'static str> {
-        if !(16..=8192).contains(&self.max_width)
+        if self.packet_size == 0
+            || u32::try_from(self.packet_size).is_err()
+            || !(16..=8192).contains(&self.max_width)
             || !(16..=8192).contains(&self.max_height)
             || !self.max_width.is_multiple_of(2)
             || !self.max_height.is_multiple_of(2)
@@ -678,17 +680,6 @@ impl StreamProfile {
         {
             return Err("invalid_streaming_profile");
         }
-        // Framing and FEC limits do not depend on the codec.
-        amaterasu_gamestream::video::VideoPacketizer::new(
-            amaterasu_gamestream::video::VideoConfig {
-                packet_size: self.packet_size,
-                fec_percentage: self.fec_percentage,
-                min_parity_shards: self.min_parity_shards,
-                max_fec_blocks: self.max_fec_blocks,
-                encrypted: false,
-            },
-        )
-        .map_err(|_| "invalid_streaming_profile")?;
         Ok(())
     }
 

@@ -16,6 +16,7 @@ pub struct Settings {
     /// Separately approved physical/existing desktop output capture. The old
     /// named-output approval remains restricted to managed Virtual-N outputs.
     pub allow_desktop_outputs: bool,
+    pub frame_fit_enabled: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +30,7 @@ impl Default for Settings {
             remember_source: false,
             allow_named_outputs: false,
             allow_desktop_outputs: false,
+            frame_fit_enabled: false,
         }
     }
 }

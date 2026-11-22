@@ -156,5 +156,6 @@ pub fn settings() -> Settings {
         remember_source: false,
         allow_named_outputs: false,
         allow_desktop_outputs: false,
+        frame_fit_enabled: false,
     }
 }

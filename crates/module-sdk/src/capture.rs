@@ -38,6 +38,21 @@ pub use selector::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector}
 pub use source_format::{SourceCaptureContext, SourceFormat};
 pub use subscription::{CaptureNotice, CaptureNotifications, CaptureSubscription};
 
+/// Verify the selected capture provider accepted the required delivery mode.
+///
+/// A request for constant-rate capture includes `"constant_rate": true` in
+/// its version-1 open payload. The selected provider must echo that value in
+/// a successful reply only when the returned stream implements that mode.
+pub fn confirm_constant_rate(
+    required: bool,
+    reply: &serde_json::Value,
+) -> Result<(), &'static str> {
+    if required && reply["constant_rate"].as_bool() != Some(true) {
+        return Err("capture_constant_rate_unconfirmed");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwapRequest {
     pub preferred_provider: Option<String>,

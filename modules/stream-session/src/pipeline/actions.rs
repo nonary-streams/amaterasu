@@ -10,20 +10,22 @@ enum StartMode {
     BeforePlay,
 }
 
+#[cfg(test)]
 pub(super) struct RequestCaller {
     pub(super) principal: String,
     pub(super) approved_api: bool,
 }
 
-struct Incoming {
-    request: u64,
-    owner: String,
-    approved_api: bool,
-    now: u64,
-    remaining: u64,
+pub(super) struct Incoming {
+    pub(super) request: u64,
+    pub(super) owner: String,
+    pub(super) approved_api: bool,
+    pub(super) now: u64,
+    pub(super) remaining: u64,
 }
 
 impl Pipeline {
+    #[cfg(test)]
     pub(super) fn receive(
         &mut self,
         request: u64,
@@ -33,10 +35,30 @@ impl Pipeline {
         remaining: u64,
         send: &mut Send<'_>,
     ) {
-        let RequestCaller {
-            principal: owner,
-            approved_api,
-        } = caller;
+        self.receive_with_bitrate_planner(
+            Incoming {
+                request,
+                owner: caller.principal,
+                approved_api: caller.approved_api,
+                now,
+                remaining,
+            },
+            operation,
+            send,
+            &mut |_, _, _, _| Err("invalid_extension_wire_budget"),
+        );
+    }
+
+    pub(super) fn receive_with_bitrate_planner(
+        &mut self,
+        input: Incoming,
+        operation: Operation,
+        send: &mut Send<'_>,
+        plan_bitrate: &mut BitratePlanner<'_>,
+    ) {
+        let Incoming {
+            request, ref owner, ..
+        } = input;
         let opens_session = matches!(
             &operation,
             Operation::Prepare(_)
@@ -44,12 +66,12 @@ impl Pipeline {
                 | Operation::StartWhenAuthenticated { .. }
         );
         if opens_session && self.shutdown_admission_closed() {
-            self.report_open_rejection(&owner, &operation, "host_stopping");
+            self.report_open_rejection(owner, &operation, "host_stopping");
             rpc::complete(send, request, error("host_stopping"));
             return;
         }
         if opens_session && !self.admission_ready() {
-            self.report_open_rejection(&owner, &operation, "restart_recovery_unconfirmed");
+            self.report_open_rejection(owner, &operation, "restart_recovery_unconfirmed");
             rpc::complete(send, request, error("restart_recovery_unconfirmed"));
             return;
         }
@@ -58,19 +80,12 @@ impl Pipeline {
             Operation::Prepare(_)
                 | Operation::Start { .. }
                 | Operation::StartWhenAuthenticated { .. }
-        ) && let Err(code) = self.authorize_open(&owner)
+        ) && let Err(code) = self.authorize_open(owner)
         {
-            self.report_open_rejection(&owner, &operation, code);
+            self.report_open_rejection(owner, &operation, code);
             rpc::complete(send, request, error(code));
             return;
         }
-        let input = Incoming {
-            request,
-            owner,
-            approved_api,
-            now,
-            remaining,
-        };
         match operation {
             Operation::ReserveHistoryActivity {
                 activity_id,
@@ -163,7 +178,14 @@ impl Pipeline {
             Operation::Start {
                 session,
                 configuration,
-            } => self.start(input, session, configuration, StartMode::Immediate, send),
+            } => self.start(
+                input,
+                session,
+                configuration,
+                StartMode::Immediate,
+                send,
+                plan_bitrate,
+            ),
             Operation::StartWhenAuthenticated {
                 session,
                 configuration,
@@ -178,6 +200,7 @@ impl Pipeline {
                     StartMode::WhenAuthenticated
                 },
                 send,
+                plan_bitrate,
             ),
             Operation::ReconfigureAudio { session, audio } => {
                 self.reconfigure_audio(input, session, *audio, send)
@@ -472,6 +495,7 @@ impl Pipeline {
         mut configuration: StartConfig,
         mode: StartMode,
         send: &mut Send<'_>,
+        plan_bitrate: &mut BitratePlanner<'_>,
     ) {
         let Incoming {
             request,
@@ -523,7 +547,7 @@ impl Pipeline {
             rpc::complete(send, request, error("invalid_extension_wire_budget"));
             return;
         }
-        if let Err(code) = resolve_extension_start(record, &mut configuration) {
+        if let Err(code) = resolve_extension_start(record, &mut configuration, Some(plan_bitrate)) {
             record.report_request_warning("start", code);
             rpc::complete(send, request, error(code));
             return;
@@ -847,6 +871,7 @@ fn unix_time_millis() -> i64 {
 fn resolve_extension_start(
     record: &Record,
     configuration: &mut StartConfig,
+    plan_bitrate: Option<&mut BitratePlanner<'_>>,
 ) -> Result<(), &'static str> {
     let Some(profile) = configuration.configuration.extension_profile.as_ref() else {
         return Ok(());
@@ -871,8 +896,7 @@ fn resolve_extension_start(
     // The client selects its color mode in ANNOUNCE, after the offer
     // probe. Video checks the selected encoder with the final config.
     expected.color_mode = configuration.configuration.color_mode;
-    let pyrowave = amaterasu_gamestream::sdp::pyrowave::is_profile(profile);
-    if pyrowave && (100_000..=expected.bitrate).contains(&configuration.configuration.bitrate) {
+    if (100_000..=expected.bitrate).contains(&configuration.configuration.bitrate) {
         expected.bitrate = configuration.configuration.bitrate;
     }
     if configuration.configuration != expected
@@ -882,30 +906,34 @@ fn resolve_extension_start(
     {
         return Err("extension_configuration_mismatch");
     }
-    configuration.source_id = Some(route.source_id);
-    configuration.encoder_provider = Some(route.encoder_provider.clone());
-    configuration.encoder = route.encoder.clone();
-    if let Some(wire_kbps) = configuration.extension_wire_bitrate_kbps.take() {
-        let audio_bps = if record.config.stream_audio {
-            record.config.audio.bitrate
+    if let Some(wire_kbps) = configuration.extension_wire_bitrate_kbps {
+        let bitrate = if let Some(accepted) = record.start.as_ref() {
+            if accepted.extension_wire_bitrate_kbps != Some(wire_kbps) {
+                return Err("start_conflict");
+            }
+            accepted.configuration.bitrate
         } else {
-            0
-        };
-        let Some(bitrate) = (wire_kbps <= 1_000_000 && pyrowave)
-            .then(|| {
-                amaterasu_gamestream::sdp::pyrowave::encoder_bitrate_bps(
-                    wire_kbps,
-                    configuration.configuration.fps,
-                    audio_bps,
-                    limits,
-                )
-            })
-            .flatten()
-        else {
-            return Err("invalid_extension_wire_budget");
+            let budget = amaterasu_module_sdk::video_framing::WireBudget {
+                wire_kbps,
+                fps: configuration.configuration.fps,
+                audio_payload_bps: if record.config.stream_audio {
+                    record.config.audio.bitrate
+                } else {
+                    0
+                },
+            };
+            plan_bitrate.ok_or("invalid_extension_wire_budget")?(
+                &route.framer_service,
+                profile,
+                limits,
+                budget,
+            )?
         };
         configuration.configuration.bitrate = bitrate;
     }
+    configuration.source_id = Some(route.source_id);
+    configuration.encoder_provider = Some(route.encoder_provider.clone());
+    configuration.encoder = route.encoder.clone();
     Ok(())
 }
 
@@ -922,7 +950,7 @@ fn validate_stop_configuration(
     // RTSP repeats the negotiated fields; stream-session owns the native
     // encoder fields added to a start that actually used the extension.
     if start.source_id.is_some() && start.configuration.extension_profile.is_some() {
-        resolve_extension_start(record, configuration)?;
+        resolve_extension_start(record, configuration, None)?;
     }
     configuration.configuration.normalize_codec()?;
     if start != configuration {

@@ -1,4 +1,5 @@
 //! Test-only managed peer for Chromium loopback qualification.
+use amaterasu_module_sdk::network::Network;
 use amaterasu_webrtc_transport::{BrowserSessionSet, OwnerContext, SessionEvent};
 use std::io::{self, BufRead, Write};
 use std::net::Ipv4Addr;
@@ -6,7 +7,8 @@ use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let owner = OwnerContext::from_verified_id(&"a".repeat(64))?;
-    let mut sessions = BrowserSessionSet::new(Ipv4Addr::LOCALHOST.into(), false)?;
+    let mut sessions =
+        BrowserSessionSet::new(Network::test_provider(), Ipv4Addr::LOCALHOST.into(), false)?;
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line)?;
     let offer: serde_json::Value = serde_json::from_str(&line)?;

@@ -231,6 +231,8 @@ impl Controller {
                 "ok": true, "stream": id,
                 "state": stream.video_state(),
                 "packet_boundaries": true, "supports_packet_boundaries": true,
+                "startup_frame_readiness": true,
+                "startup_frame_ready": stream.video_state() == "running",
                 "fixture": true, "decodable_video": stream.sustain_ms != 0
             }),
             Kind::Audio => json!({

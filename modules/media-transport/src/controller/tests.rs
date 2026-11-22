@@ -288,6 +288,39 @@ fn open_normalizes_batch_sizes_without_reducing_the_shared_pass_budget() {
 }
 
 #[test]
+fn derives_audio_wire_size_and_refuses_unsupported_fec_before_allocating() {
+    let (video, audio) = receivers();
+    for (encrypted, expected_wire_bytes) in [(false, 160), (true, 176)] {
+        let mut controller = controller();
+        let mut request = request(&video, &audio, encrypted);
+        request.operation_id = Some("provider-sizing".into());
+        request.audio.wire_payload_bytes = 0;
+        request.audio_packet_sizing = Some(amaterasu_module_sdk::transport::AudioPacketSizing {
+            encoded_packet_bytes: 160,
+        });
+        request.video.max_fec_blocks = 5;
+        assert_eq!(
+            controller
+                .handle("owner", Operation::Open(request.clone()))
+                .err(),
+            Some("invalid_video_configuration")
+        );
+        assert!(controller.streams.is_empty());
+        request.video.max_fec_blocks = 4;
+        let opened = controller
+            .handle("owner", Operation::Open(request.clone()))
+            .unwrap()
+            .payload;
+        let retried = controller
+            .handle("owner", Operation::Open(request))
+            .unwrap()
+            .payload;
+        assert_eq!(opened["audio"]["wire_payload_bytes"], expected_wire_bytes);
+        assert_eq!(retried, opened);
+    }
+}
+
+#[test]
 fn impossible_audio_wire_lengths_and_mapped_destinations_fail_before_open() {
     let (video, audio) = receivers();
     for encrypted in [false, true] {

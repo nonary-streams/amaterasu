@@ -1,15 +1,17 @@
 use super::record::{Record, State};
-use amaterasu_gamestream::control::HostFeedback;
 use amaterasu_gamestream::control::{
-    AbsoluteViewport, ControllerArrival, ControllerBattery, ControllerBatteryState,
-    ControllerMotion, ControllerMotionType, ControllerTouch, ControllerTouchEvent, Input,
-    InputEvent, MAX_CONTROLLER_SLOT, MouseButton, PenTouch, PointerDevice, PointerEvent,
-    ScrollAxis, TranslatedKeyState, TranslationError,
+    AbsoluteViewport, InputEvent, MouseButton, ScrollAxis, TranslatedKeyState, TranslationError,
 };
 use amaterasu_media::CaptureGeometry;
 use amaterasu_module_sdk::input::{
     InputBatchCapabilities, InputBatchOutcome, InputRequest, MAX_BATCH_EVENTS,
     decode_batch_outcome, lease_from_reply,
+};
+use amaterasu_module_sdk::transport::control::{
+    ControllerArrival, ControllerBattery, ControllerBatteryState, ControllerMotion,
+    ControllerMotionType, ControllerTouch, ControllerTouchEvent, HostFeedback,
+    HostFeedbackDelivery, HostFeedbackMessage, Input, MAX_CONTROLLER_SLOT, PenTouch, PointerDevice,
+    PointerEvent,
 };
 use serde_json::{Value, json};
 
@@ -129,6 +131,7 @@ pub(super) fn accept_feedback_peek(
         return Err("feedback_plane_unavailable");
     };
     let mut last_accepted = None;
+    let mut feedback_unsupported = false;
     let mut previous = 0;
     for event in events {
         let sequence = event
@@ -153,10 +156,10 @@ pub(super) fn accept_feedback_peek(
                     return None;
                 }
                 let message_type = agreement.as_ref()?.message_type(&item)?;
-                Some(amaterasu_gamestream::control::HostFeedbackMessage {
+                Some(HostFeedbackMessage {
                     message_type,
                     channel: 0,
-                    delivery: amaterasu_gamestream::control::HostFeedbackDelivery::Reliable,
+                    delivery: HostFeedbackDelivery::Reliable,
                     payload: item.payload,
                 })
             });
@@ -170,7 +173,10 @@ pub(super) fn accept_feedback_peek(
                         crate::plane::FeedbackEnqueueError::QueueFull
                         | crate::plane::FeedbackEnqueueError::Stopped,
                     ) => break,
-                    Err(crate::plane::FeedbackEnqueueError::Invalid(_)) => {
+                    Err(
+                        crate::plane::FeedbackEnqueueError::Invalid
+                        | crate::plane::FeedbackEnqueueError::Unsupported,
+                    ) => {
                         return Err("invalid_feedback_response");
                     }
                 }
@@ -195,12 +201,20 @@ pub(super) fn accept_feedback_peek(
             | Ok(crate::plane::FeedbackEnqueueOutcome::DroppedBestEffort) => {
                 last_accepted = Some(sequence);
             }
+            Err(crate::plane::FeedbackEnqueueError::Unsupported) => {
+                feedback_unsupported = true;
+                last_accepted = Some(sequence);
+            }
             Err(crate::plane::FeedbackEnqueueError::QueueFull) => break,
             Err(crate::plane::FeedbackEnqueueError::Stopped) => break,
-            Err(crate::plane::FeedbackEnqueueError::Invalid(_)) => {
+            Err(crate::plane::FeedbackEnqueueError::Invalid) => {
                 return Err("invalid_feedback_response");
             }
         }
+    }
+    if feedback_unsupported && !record.control_feedback_warning_reported {
+        record.control_feedback_warning_reported = true;
+        record.report_control_feedback_fallback();
     }
     if let Some(through_sequence) = last_accepted {
         record.feedback_ack_through = Some(through_sequence);

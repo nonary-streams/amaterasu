@@ -2,7 +2,9 @@
 //!
 //! The embedding owner authenticates signaling, selects and binds the local
 //! address, drives the clock and datagrams, and tears down its media sources.
-//! This crate does not authorize peers or own sockets or capture devices.
+//! `BrowserTransport` handles protocol state without sockets. For managed
+//! sessions, `BrowserSessionSet` owns UDP handles from the selected Network
+//! SDK provider. The embedding owner supplies verified peer identity.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

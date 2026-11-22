@@ -87,7 +87,7 @@ fn startup_enumeration_publishes_one_snapshot_and_then_waits() {
     assert!(matches!(
         &commands[0],
         Command::Request { service, payload, .. }
-            if service == ENCODE_SERVICE && payload == &json!({"action":"enumerate"})
+            if service == VIDEO_SERVICE && payload == &json!({"action":amaterasu_module_sdk::encode::SELECTED_ENCODER_CATALOG_ACTION})
     ));
     assert!(matches!(commands[3], Command::ReleaseResult { request: 9 }));
 }
@@ -119,4 +119,24 @@ fn a_failed_enumeration_publishes_nothing_and_backs_off() {
     assert_eq!(refresh.retry_delay, INITIAL_RETRY_DELAY * 2);
     refresh.tick(&runtime, false);
     assert_eq!(state.lock().unwrap().commands.len(), 3);
+}
+
+#[test]
+fn selected_video_service_supplies_the_encoder_snapshot() {
+    let state = Arc::new(Mutex::new(Endpoint {
+        result: enumerated(),
+        ..Endpoint::default()
+    }));
+    let runtime = runtime(&state);
+    let mut refresh = EncoderRefresh::new("vendor.video/1".into());
+    refresh.tick(&runtime, false);
+    refresh.tick(&runtime, false);
+    assert!(refresh.take_update().is_some());
+    let commands = &state.lock().unwrap().commands;
+    assert!(matches!(
+        &commands[0],
+        Command::Request { service, payload, .. }
+            if service == "vendor.video/1"
+                && payload["action"] == amaterasu_module_sdk::encode::SELECTED_ENCODER_CATALOG_ACTION
+    ));
 }

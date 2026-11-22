@@ -203,6 +203,8 @@ pub struct ExtensionRoute {
     pub video_unit_service: String,
     pub framer_service: String,
     pub plan_transport_service: String,
+    #[serde(default)]
+    pub wire_budget_required: bool,
 }
 impl ExtensionRoute {
     fn valid(&self) -> bool {
@@ -942,8 +944,7 @@ impl AudioWire {
             (8, 10, 0x63f) if self.layout == "7.1" => 450000..=2048000,
             _ => return Err("invalid_audio_configuration"),
         };
-        let packet_bytes = (u64::from(self.bitrate) * u64::from(self.packet_ms)).div_ceil(8000);
-        if !bitrate_range.contains(&self.bitrate) || !(1..=1275).contains(&packet_bytes) {
+        if !bitrate_range.contains(&self.bitrate) {
             return Err("invalid_audio_configuration");
         }
         Ok(())
@@ -1026,23 +1027,6 @@ impl VideoWire {
         {
             return Err("invalid_video_configuration");
         }
-        // Framing and FEC limits do not depend on the codec.
-        let codec = match self.offered_codecs()[0] {
-            amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
-            amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
-            amaterasu_media::VideoCodec::Av1 => amaterasu_gamestream::video::VideoCodec::Av1,
-        };
-        amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
-            amaterasu_gamestream::video::VideoConfig {
-                packet_size: self.packet_size,
-                fec_percentage: self.fec_percentage,
-                min_parity_shards: self.min_parity_shards,
-                max_fec_blocks: self.max_fec_blocks,
-                encrypted: false,
-            },
-            codec,
-        )
-        .map_err(|_| "invalid_video_configuration")?;
         Ok(())
     }
 }
@@ -1548,9 +1532,6 @@ impl StartConfig {
         {
             return Err("owned_display_requires_pipewire");
         }
-        if self.constant_rate && self.capture_provider != CaptureProvider::Wgc {
-            return Err("constant_rate_requires_wgc");
-        }
         if (self.source_id.is_none() && !valid_label(&self.output, 512))
             || (!self.audio_endpoint.is_empty() && !valid_label(&self.audio_endpoint, 4096))
             || !self.configuration.valid()
@@ -1951,7 +1932,7 @@ mod tests {
             "pipewire"
         );
         start.constant_rate = true;
-        assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));
+        assert!(start.validate(false).is_ok());
     }
 
     #[test]
@@ -1966,7 +1947,7 @@ mod tests {
             "x11"
         );
         start.constant_rate = true;
-        assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));
+        assert!(start.validate(false).is_ok());
     }
 
     #[test]
@@ -1981,7 +1962,7 @@ mod tests {
             "kms"
         );
         start.constant_rate = true;
-        assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));
+        assert!(start.validate(false).is_ok());
     }
 
     #[test]
@@ -2517,28 +2498,17 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_wire_audio_video_and_invalid_secrets_fail_before_allocation() {
-        for (field, value) in [
-            ("audio", json!({"packet_ms":20})),
-            ("audio", json!({"packet_ms":0})),
-            ("audio", json!({"bitrate":5999})),
-            ("audio", json!({"bitrate":512001})),
-            ("video", json!({"packet_size":0})),
-            ("video", json!({"packet_size":65535})),
-            ("video", json!({"max_fec_blocks":0})),
-            ("video", json!({"max_fec_blocks":5})),
+    fn unsupported_wire_audio_and_invalid_secrets_fail_before_allocation() {
+        for value in [
+            json!({"packet_ms":20}),
+            json!({"packet_ms":0}),
+            json!({"bitrate":5999}),
+            json!({"bitrate":512001}),
         ] {
             let mut config = prepare_json();
-            config[field] = value;
+            config["audio"] = value;
             let config: PrepareConfig = serde_json::from_value(config).unwrap();
-            assert_eq!(
-                config.validate(false),
-                Err(if field == "audio" {
-                    "invalid_audio_configuration"
-                } else {
-                    "invalid_video_configuration"
-                })
-            );
+            assert_eq!(config.validate(false), Err("invalid_audio_configuration"));
         }
         for key in [
             "",

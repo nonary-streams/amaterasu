@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).parent))
 from local_full_update import (  # noqa: E402
     CATALOG_DOMAIN, compiled_from, core_package, drift, foreign_artifacts,
-    missing_backend_features, sign_core_bundle,
+    missing_backend_features, sign_core_bundle, source_state,
 )
 
 
@@ -74,6 +75,38 @@ class DriftTests(unittest.TestCase):
         manifest = self.manifest()
         manifest["components"].append({"id": "three", "sha256": "f" * 64})
         self.assertIn("three", drift(self.PROVENANCE, manifest, "c" * 64)[0])
+
+
+class SourceStateTests(unittest.TestCase):
+    def test_dirty_submodule_sources_change_recorded_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            module = tree / "encoder"
+            module.mkdir()
+
+            def git(checkout, *arguments):
+                subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Source Fixture",
+                                "-c", "user.email=fixture@example.test", *arguments],
+                               check=True, capture_output=True)
+
+            git(module, "init")
+            source = module / "lib.rs"
+            source.write_text("pub const VERSION: u8 = 1;\n")
+            git(module, "add", "lib.rs")
+            git(module, "commit", "-m", "Encoder fixture")
+            git(tree, "init")
+            (tree / ".gitmodules").write_text('[submodule "encoder"]\n\tpath = encoder\n\turl = ./encoder\n')
+            git(tree, "add", ".gitmodules", "encoder")
+            git(tree, "commit", "-m", "Core fixture")
+
+            before = source_state(tree)
+            source.write_text("pub const VERSION: u8 = 2;\n")
+            tracked = source_state(tree)
+            (module / "helper.rs").write_text("pub const LIMIT: u8 = 8;\n")
+            untracked = source_state(tree)
+            self.assertEqual(before["submodules"], untracked["submodules"])
+            self.assertNotEqual(before["uncommitted_sha256"], tracked["uncommitted_sha256"])
+            self.assertNotEqual(tracked["uncommitted_sha256"], untracked["uncommitted_sha256"])
 
 
 class CoreBundleTests(unittest.TestCase):

@@ -97,7 +97,7 @@ fn automatic_selection_offers_every_codec_in_moonlight_preference_order() {
         offer.codecs,
         [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264]
     );
-    assert!(!offer.software_limited);
+    assert_eq!(offer.mode_limit, None);
 }
 
 #[test]
@@ -108,10 +108,10 @@ fn software_only_codecs_are_limited_to_full_hd_at_sixty_frames() {
     ]);
     let small = mixed.offer(AUTO, FULL_HD_60).unwrap();
     assert_eq!(small.codecs, [VideoCodec::Hevc, VideoCodec::H264]);
-    assert!(small.software_limited);
+    assert_eq!(small.mode_limit, Some(FULL_HD_60));
     let large = mixed.offer(AUTO, UHD_120).unwrap();
     assert_eq!(large.codecs, [VideoCodec::Hevc]);
-    assert!(!large.software_limited);
+    assert_eq!(large.mode_limit, None);
 
     let software = snapshot(vec![encoder("x264", "h264", false)]);
     for mode in [
@@ -161,7 +161,7 @@ fn unknown_encoders_offer_only_software_h264() {
         unknown_encoders_offer(FULL_HD_60),
         Ok(CodecOffer {
             codecs: vec![VideoCodec::H264],
-            software_limited: true,
+            mode_limit: Some(FULL_HD_60),
         })
     );
     assert!(unknown_encoders_offer(UHD_120).is_err());
@@ -185,7 +185,7 @@ fn sdk_identity_selection_pins_the_exact_encoder_and_software_filters_hardware()
     let software = EncoderSelection::Backend(EncoderBackend::Software);
     let offer = snapshot.offer(software.clone(), FULL_HD_60).unwrap();
     assert_eq!(offer.codecs, [VideoCodec::H264]);
-    assert!(offer.software_limited);
+    assert_eq!(offer.mode_limit, Some(FULL_HD_60));
     assert_eq!(
         snapshot.offer(software, UHD_120),
         Err("no hardware encoder for this stream mode")
@@ -254,4 +254,22 @@ fn transport_extensions_add_only_explicit_extension_bits() {
         "transport_extensions":[{"codec_mode_mask":256}]}))
         .is_err()
     );
+}
+
+#[test]
+fn replacement_encoder_modes_bound_admission_and_the_offer() {
+    let snapshot = EncoderSnapshot::parse(&serde_json::json!({
+        "ok":true,"enabled":true,"encoders":[
+            {"codec":"h264","hardware":false,"mode_limit":{"width":3840,"height":2160,"fps":120}},
+            {"codec":"av1","hardware":true,"mode_limit":{"width":1920,"height":1080,"fps":60}}
+        ]
+    }))
+    .unwrap();
+
+    let large = snapshot.offer(AUTO, UHD_120).unwrap();
+    assert_eq!(large.codecs, [VideoCodec::H264]);
+    assert_eq!(large.mode_limit, Some(UHD_120));
+    let small = snapshot.offer(AUTO, FULL_HD_60).unwrap();
+    assert_eq!(small.codecs, [VideoCodec::Av1, VideoCodec::H264]);
+    assert_eq!(small.mode_limit, Some(FULL_HD_60));
 }

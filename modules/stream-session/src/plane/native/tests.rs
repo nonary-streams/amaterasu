@@ -1,4 +1,5 @@
 use super::*;
+use amaterasu_gamestream::control::encode_host_feedback;
 use amaterasu_module_sdk::{Command, Response};
 
 #[test]
@@ -32,6 +33,8 @@ struct Provider {
     timing_received: u64,
     presentation_received: u64,
     audio_unit_busy: bool,
+    alternate_control_protocol: bool,
+    unsupported_control_feedback: bool,
     audio_units: Vec<(AudioFormatId, Vec<u8>, Vec<u8>)>,
     processor_pending: bool,
     processor_draining: bool,
@@ -49,7 +52,7 @@ struct Host {
     encoder: AudioEncoderApi,
     media: MediaTransportApi,
     timed_media: Option<Box<MediaTransportApiV1_1>>,
-    control: ControlTransportApi,
+    control: ControlTransportApiV1_1,
     released: Vec<u64>,
     bindings: Vec<String>,
     reject_capture: bool,
@@ -97,10 +100,20 @@ impl Host {
                 submit_audio,
                 drain,
             },
-            control: ControlTransportApi {
-                base: prefix::<ControlTransportApi>(context),
-                send: send_control,
-                receive: control,
+            control: ControlTransportApiV1_1 {
+                v1_0: ControlTransportApi {
+                    base: NativeInterface {
+                        header: AbiHeader {
+                            minor: 1,
+                            ..AbiHeader::of::<ControlTransportApiV1_1>()
+                        },
+                        ..prefix::<ControlTransportApiV1_1>(context)
+                    },
+                    send: send_control,
+                    receive: control,
+                },
+                decode_client: alternate_decode_client,
+                encode_host: alternate_encode_host,
             },
             released: Vec::new(),
             bindings: Vec::new(),
@@ -211,7 +224,7 @@ fn bind_service(host: &mut Host, service: String) -> Response {
                     }),
             )
         } else if service == host.services.control_transport {
-            (5, &host.control.base as *const _ as usize)
+            (5, &host.control.v1_0.base as *const _ as usize)
         } else {
             panic!("unexpected service {service}");
         };
@@ -505,11 +518,16 @@ unsafe extern "C" fn control(context: *mut c_void, _: u64, sink: ControlMessageS
     if !provider.pending_control {
         return MEDIA_PENDING;
     }
-    let bytes = [1_u8];
+    let (message_type, channel, delivery, bytes): (u32, u32, u32, &[u8]) =
+        if provider.alternate_control_protocol {
+            (0xff42, 5, CONTROL_UNRELIABLE, b"refresh")
+        } else {
+            (0x200, 0, CONTROL_RELIABLE, &[1])
+        };
     let message = ControlMessage {
-        message_type: 0x200,
-        channel: 0,
-        delivery: CONTROL_RELIABLE,
+        message_type,
+        channel,
+        delivery,
         reserved: 0,
         data: bytes.as_ptr(),
         len: bytes.len(),
@@ -1013,4 +1031,99 @@ fn backpressure_declines_the_native_callback_without_consuming_its_event() {
         backend.control(false).unwrap_err(),
         "native_delivery_failed_control"
     );
+}
+
+unsafe extern "C" fn alternate_decode_client(
+    context: *mut c_void,
+    message: *const ControlMessage,
+    reply: ReplySink,
+) -> Status {
+    // SAFETY: this test provider and raw message remain live through this call.
+    let provider = unsafe { &*context.cast::<Provider>() };
+    let message = unsafe { &*message };
+    if !provider.alternate_control_protocol
+        || message.message_type != 0xff42
+        || message.channel != 5
+        || message.delivery != CONTROL_UNRELIABLE
+        || unsafe { message.bytes() } != Ok(b"refresh")
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    unsafe { reply.send(br#"{"type":"request_idr"}"#) };
+    STATUS_OK
+}
+
+unsafe extern "C" fn alternate_encode_host(
+    context: *mut c_void,
+    event: BorrowedBytes,
+    sink: ControlMessageSink,
+) -> Status {
+    // SAFETY: this test provider and semantic event remain live through this call.
+    let provider = unsafe { &*context.cast::<Provider>() };
+    let event: HostControl = match serde_json::from_slice(unsafe { event.read().unwrap() }) {
+        Ok(event) => event,
+        Err(_) => return STATUS_INVALID_ARGUMENT,
+    };
+    if provider.unsupported_control_feedback {
+        return MEDIA_UNSUPPORTED;
+    }
+    let (message_type, channel, payload): (u32, u32, &[u8]) = match event {
+        HostControl::Feedback(HostFeedback::Rumble { controller: 7, .. })
+            if provider.alternate_control_protocol =>
+        {
+            (0xff43, 7, b"rumble-seven")
+        }
+        HostControl::HdrMetadata { .. } => (0x010e, 0, b"hdr"),
+        _ => return STATUS_INVALID_ARGUMENT,
+    };
+    let message = ControlMessage {
+        message_type,
+        channel,
+        delivery: CONTROL_RELIABLE,
+        reserved: 0,
+        data: payload.as_ptr(),
+        len: payload.len(),
+        sequence: 0,
+    };
+    unsafe { sink.write.unwrap()(sink.context, &message) }
+}
+
+#[test]
+fn replacement_control_provider_owns_input_and_feedback_wire_formats() {
+    let mut host = Host::new();
+    host.services.control_transport = "example.control/1".into();
+    host.provider.alternate_control_protocol = true;
+    host.provider.pending_control = true;
+    let services = host.services.clone();
+    let mut backend = NativeBackend::new(&host.runtime(), handles(), &services).unwrap();
+    let record = backend.control(true).unwrap().unwrap();
+    assert_eq!(record.sequence, 12);
+    assert_eq!(
+        backend.decode_control(&record),
+        Ok(ClientControl::RequestIdr)
+    );
+    assert!(
+        backend
+            .send_rumble(RumbleCommand {
+                slot: 7,
+                low_frequency: 0x1234,
+                high_frequency: 0xabcd,
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        host.provider.sent_control,
+        [(50, 0xff43, 7, CONTROL_RELIABLE, b"rumble-seven".to_vec())]
+    );
+    host.provider.unsupported_control_feedback = true;
+    let zero = RumbleCommand {
+        slot: 7,
+        low_frequency: 0,
+        high_frequency: 0,
+    };
+    assert_eq!(
+        backend.send_rumble(zero),
+        Err("control_rumble_stop_unconfirmed")
+    );
+    assert_eq!(host.provider.sent_control.len(), 1);
 }

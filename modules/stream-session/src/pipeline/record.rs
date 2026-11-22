@@ -8,6 +8,7 @@ use crate::{
 use amaterasu_gamestream::control::InputTranslator;
 use amaterasu_media::CaptureGeometry;
 use amaterasu_module_sdk::lifecycle_ledger::{Admission, Owner, Retirement};
+use amaterasu_module_sdk::transport::AudioPacketSizing;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -265,6 +266,7 @@ pub(super) struct Record {
     pub input_batch_warning_mask: u8,
     pub controller_warning_reported: bool,
     pub feedback_warning_reported: bool,
+    pub control_feedback_warning_reported: bool,
     pub rumble_pending: BTreeMap<u16, (RumbleCommand, Option<u64>)>,
     pub rumble_active_until: BTreeMap<u16, u64>,
     pub rumble_shutdown_deadline: Option<u64>,
@@ -543,6 +545,7 @@ impl Record {
             input_batch_warning_mask: 0,
             controller_warning_reported: false,
             feedback_warning_reported: false,
+            control_feedback_warning_reported: false,
             rumble_pending: BTreeMap::new(),
             rumble_active_until: BTreeMap::new(),
             rumble_shutdown_deadline: None,
@@ -855,13 +858,17 @@ impl Record {
                     "video_bind":config.video_bind,"audio_bind":config.audio_bind,"video":config.video,
                     "ping_timeout_ms":config.ping_timeout_ms,
                     "stream_audio":config.stream_audio,
-                    "audio":{"packet_ms":config.audio.packet_ms,"channels":config.audio.channels,"wire_payload_bytes":self.wire_audio_bytes},
+                    "audio":{"packet_ms":config.audio.packet_ms,"channels":config.audio.channels,"wire_payload_bytes":0},
                     "encryption":if config.encrypt_video || audio_encrypted {
                         json!({"key_hex":config.key_hex,"key_id":config.key_id,"video":config.encrypt_video,
                             "audio":audio_encrypted,"permit_legacy_audio_iv_wrap":permit_legacy_audio_iv_wrap})
                     } else { Value::Null }});
                 if config.audio.custom.is_some() {
                     payload["audio_profile"] = config.audio.custom_profile();
+                } else {
+                    payload["audio_packet_sizing"] = json!(AudioPacketSizing {
+                        encoded_packet_bytes: self.packet_bytes as u32,
+                    });
                 }
                 if let Some(policy) = &config.video_encryption_policy {
                     payload["video_encryption_policy"] = json!({

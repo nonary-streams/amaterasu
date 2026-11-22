@@ -891,5 +891,27 @@ fn safe_provider_code(value: &Value) -> &str {
 
 /// A provider's own failure code, when it gave a well-formed one.
 fn provider_code(payload: &Value) -> Option<&str> {
-    Some(safe_provider_code(&payload["code"])).filter(|code| *code != "unavailable")
+    ["code", "error"]
+        .into_iter()
+        .map(|field| safe_provider_code(&payload[field]))
+        .find(|code| *code != "unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_code_reads_bounded_session_failure_after_allocation() {
+        assert_eq!(
+            provider_code(
+                &serde_json::json!({"state":"failed","error":"invalid_audio_configuration"})
+            ),
+            Some("invalid_audio_configuration")
+        );
+        assert_eq!(
+            provider_code(&serde_json::json!({"error":"secret=unsafe"})),
+            None
+        );
+    }
 }

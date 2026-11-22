@@ -272,6 +272,18 @@ fails the stream. The processor's output is copied for later repeats so repeats
 do not process a frame twice. The configured component needs a native-use grant
 and a signed startup dependency. This processor does not accept GPU frames.
 
+The asynchronous `CpuFrameFitApi` is the frame-size and SDR conversion
+contract for borrowed CPU capture. Trusted settings pin a capture alias and
+fit service using `cpu_frame_fit_capture` and `cpu_frame_fit_service`. One
+accepted job per stream retains its own copy until receive or cancellation.
+The SDK's `media::cpu_fit::Factory` runs the selected implementation off
+the host tick. It fences late output by job identity, keeps the original
+timestamp and sequence, and holds completed output when the encoder is
+busy. The target supplies width, height and the agreed SDR matrix and
+range. A provider can attest an identity frame so video forwards it
+without scheduling background work. The native family for substitution is
+`amaterasu.cpu-frame-fit.native/1`.
+
 The legacy capture v1.4 DMA-BUF descriptors remain borrowed for the callback.
 Duplicating a descriptor pins its allocation but does not prevent the producer
 from overwriting its pixels. A consumer must obey the acquire fence and finish a

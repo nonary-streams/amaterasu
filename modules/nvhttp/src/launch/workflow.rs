@@ -7,9 +7,7 @@ use super::{
     record::{ApplicationRetirementState, Record, Stage, State},
     success_reply,
 };
-use crate::encoder_snapshot::{
-    CodecOffer, SOFTWARE_MAX_FPS, SOFTWARE_MAX_HEIGHT, SOFTWARE_MAX_WIDTH,
-};
+use crate::encoder_snapshot::CodecOffer;
 use crate::wire::Reply;
 use amaterasu_contracts::virtual_display::{
     VirtualDisplayConfigurationOption, VirtualDisplayHdrOption, VirtualDisplayIntent,
@@ -3158,18 +3156,18 @@ impl Phase {
     }
 }
 
-/// RTSP may accept any client mode up to the profile maximum, but an offer
-/// that includes a software-only codec stays within the software limit.
+/// Every advertised codec must support the mode accepted by RTSP.
 fn negotiation_mode_limit(config: &StreamingConfig, offer: &CodecOffer) -> (u32, u32, u32) {
     let profile = &config.profile;
-    if !offer.software_limited {
-        return (profile.max_width, profile.max_height, profile.max_fps);
-    }
-    (
-        profile.max_width.min(SOFTWARE_MAX_WIDTH),
-        profile.max_height.min(SOFTWARE_MAX_HEIGHT),
-        profile.max_fps.min(SOFTWARE_MAX_FPS),
-    )
+    let policy = crate::encoder_snapshot::StreamMode {
+        width: profile.max_width,
+        height: profile.max_height,
+        fps: profile.max_fps,
+    };
+    let limit = offer
+        .mode_limit
+        .map_or(policy, |limit| policy.intersect(limit));
+    (limit.width, limit.height, limit.fps)
 }
 
 /// A binding acknowledgment follows durable persistence. Pending retries the

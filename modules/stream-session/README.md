@@ -36,7 +36,9 @@ that caller needs the selected control contracts in its approved composition.
 The role map grants no authority on its own. A replacement implements the same
 control semantics and exact native interface version; a service selector is not
 permission to reinterpret a different table. Missing providers, denied grants and incompatible tables fail
-the operation explicitly. Requests cannot supply or override this role map.
+the operation explicitly. Requests cannot supply or override this role map. The
+control transport role requires the v1.1 semantic control tail for authenticated
+input parsing, controller feedback framing and HDR metadata framing.
 
 For a custom native service, `open` includes `required_native_contract` containing
 the role's canonical contract ID (for example `amaterasu.media-transport/1`).

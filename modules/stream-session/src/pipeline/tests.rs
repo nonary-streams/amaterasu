@@ -96,7 +96,7 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
     let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
         "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
         "payload_type":100,"encoding_name":"EXAMPLE"});
-    let mut route: crate::model::ExtensionRoute = serde_json::from_value(json!({"profile":profile,
+    let route: crate::model::ExtensionRoute = serde_json::from_value(json!({"profile":profile,
         "source_id":42,"encoder_provider":"fixture", "encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
         "video_unit_service":"example.units/1","framer_service":"example.framer/1","plan_transport_service":"example.plan/1"})).unwrap();
     let limits = VideoFramingLimits {
@@ -116,29 +116,44 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
         fec_policy_flags: 0,
         reserved: 0,
     };
-    for (source_ok, downstream_ok, wrong_identity, expected_offer, wire_budget) in [
-        (false, true, false, false, None::<u32>),
-        (true, false, false, false, None),
-        (true, true, true, false, None),
-        (true, true, false, true, None),
-        (true, true, false, true, Some(45_000)),
+    for (
+        source_ok,
+        downstream_ok,
+        wrong_identity,
+        needs_budget,
+        expected_offer,
+        wire_budget,
+        planned_bitrate,
+    ) in [
+        (false, true, false, false, false, None::<u32>, None::<u32>),
+        (true, false, false, false, false, None, None),
+        (true, true, true, false, false, None, None),
+        (true, true, false, false, true, None, None),
+        (
+            true,
+            true,
+            false,
+            true,
+            true,
+            Some(45_000),
+            Some(34_000_000),
+        ),
+        (true, true, false, true, false, Some(45_000), None),
+        (true, true, false, false, true, Some(45_000), None),
     ] {
-        if wire_budget.is_some() {
-            route.profile =
-                serde_json::from_str(include_str!("../../../../scripts/pyrowave/profile.json"))
-                    .unwrap();
-            route.profile.media_format = None;
-        }
         let profile = json!(route.profile);
         let mut host = Harness::new();
         host.pipeline.settings.allowed_principals = vec!["amaterasu.rtsp".into()];
-        host.pipeline.settings.extension_route = Some(route.clone());
+        let mut selected = route.clone();
+        selected.wire_budget_required = needs_budget;
+        host.pipeline.settings.extension_route = Some(selected);
         host.broker.extension_probe_supported = source_ok;
         if wrong_identity {
             host.broker.extension_probe_encoder_override =
                 Some(json!({"clsid":"sibling","friendly_name":"Source","hardware_url":null}));
         }
         host.extension_probe_limits = downstream_ok.then_some(limits);
+        host.extension_encoder_bitrate = planned_bitrate;
         let mut request = prepare();
         request["stream_audio"] = json!(false);
         request["extension_probe"] = start(0)["configuration"]["configuration"].clone();
@@ -152,8 +167,8 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
         if let Some(budget) = wire_budget {
             request["configuration"]["extension_wire_bitrate_kbps"] = json!(budget);
         }
-        let result = host.response_from(2, "amaterasu.rtsp", request);
-        if expected_offer {
+        let result = host.response_from(2, "amaterasu.rtsp", request.clone());
+        if expected_offer && (wire_budget.is_none() || planned_bitrate.is_some()) {
             assert_eq!(result["state"], "active");
             assert_eq!(host.plane.borrow().planned_planes, 1);
             let video = host
@@ -166,9 +181,8 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
                 .unwrap();
             assert_eq!(video.payload["source_id"], 42);
             assert_eq!(video.payload["configuration"]["extension_profile"], profile);
-            if wire_budget.is_some() {
-                let bitrate = video.payload["configuration"]["bitrate"].as_u64().unwrap();
-                assert!(bitrate > 10_000_000 && bitrate < 45_000_000, "{bitrate}");
+            if let Some(bitrate) = planned_bitrate {
+                assert_eq!(video.payload["configuration"]["bitrate"], bitrate);
             }
             assert_eq!(
                 video.payload["configuration"]["color_mode"],
@@ -181,8 +195,27 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
                     .iter()
                     .any(|call| call.payload["action"] == "configure_video_format")
             );
+            if let Some(budget) = wire_budget {
+                host.extension_encoder_bitrate = None;
+                assert_eq!(
+                    host.response_from(3, "amaterasu.rtsp", request.clone())["state"],
+                    "active"
+                );
+                request["configuration"]["extension_wire_bitrate_kbps"] = json!(budget + 1);
+                assert_eq!(
+                    host.response_from(4, "amaterasu.rtsp", request)["code"],
+                    "start_conflict"
+                );
+            }
         } else {
-            assert_eq!(result["code"], "extension_profile_not_offered");
+            assert_eq!(
+                result["code"],
+                if expected_offer {
+                    "invalid_extension_wire_budget"
+                } else {
+                    "extension_profile_not_offered"
+                }
+            );
             let fallback = host.response_from(3, "amaterasu.rtsp", start(session));
             assert_eq!(fallback["state"], "active", "{fallback}");
             assert_eq!(host.plane.borrow().planned_planes, 0);
@@ -544,8 +577,8 @@ fn stereo_512k_prepare_reaches_encoder_with_bounded_packet_size() {
             })
             .expect("media transport opened");
         assert_eq!(
-            media.payload["audio"]["wire_payload_bytes"],
-            prepared["wire_audio_bytes"]
+            media.payload["audio_packet_sizing"]["encoded_packet_bytes"],
+            prepared["packet_bytes"]
         );
     }
 
@@ -633,7 +666,11 @@ fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
         assert_eq!(
             media.payload["audio"],
             json!({"channels":channels,
-            "packet_ms":packet_ms,"wire_payload_bytes":wire})
+            "packet_ms":packet_ms,"wire_payload_bytes":0})
+        );
+        assert_eq!(
+            media.payload["audio_packet_sizing"]["encoded_packet_bytes"],
+            bytes
         );
         let mut start_request = start(id);
         start_request["configuration"]["audio_endpoint"] = json!("");
@@ -989,13 +1026,8 @@ fn partial_audio_reconfiguration_failure_retires_owned_components() {
 }
 
 #[test]
-fn surround_invalid_layout_and_packet_size_fail_before_resources() {
-    for (channels, mask, packet_ms, bitrate) in [
-        (6, 3, 5, 256_000),
-        (8, 0x63f, 5, 450_000),
-        (8, 0x63f, 5, 2_048_000),
-        (6, 0x3f, 10, 1_536_000),
-    ] {
+fn surround_invalid_layout_and_bitrate_fail_before_resources() {
+    for (channels, mask, packet_ms, bitrate) in [(6, 3, 5, 256_000), (8, 0x63f, 5, 450_000)] {
         let mut host = Harness::new();
         let mut request = prepare();
         request["audio"] = json!({"channels":channels,"channel_mask":mask,
@@ -1210,7 +1242,10 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
         .iter()
         .find(|call| call.service == Resource::Media.service())
         .unwrap();
-    assert_eq!(media.payload["audio"]["wire_payload_bytes"], 176);
+    assert_eq!(
+        media.payload["audio_packet_sizing"]["encoded_packet_bytes"],
+        160
+    );
     let active = host.response(2, start(id));
     assert_eq!(active["state"], "active");
     assert_eq!(host.broker.leases(), 2);
@@ -1689,7 +1724,10 @@ fn disabled_audio_skips_encoder_capture_and_audio_lease_but_keeps_video_plane() 
         .find(|call| call.service == Resource::Media.service())
         .unwrap();
     assert_eq!(media.payload["stream_audio"], false);
-    assert_eq!(media.payload["audio"]["wire_payload_bytes"], 16);
+    assert_eq!(
+        media.payload["audio_packet_sizing"]["encoded_packet_bytes"],
+        0
+    );
     assert_eq!(media.payload["encryption"]["audio"], false);
 
     let mut configuration = start(id);
@@ -1951,6 +1989,8 @@ fn host_direction_termination_is_rejected_and_idr_is_coalesced() {
         .borrow_mut()
         .controls
         .push(crate::plane::ControlRecord {
+            channel: 0,
+            delivery: amaterasu_media::CONTROL_RELIABLE,
             message_type: 0x0109,
             payload: vec![0; 4],
             sequence: 3,
@@ -1963,6 +2003,8 @@ fn host_direction_termination_is_rejected_and_idr_is_coalesced() {
             .borrow_mut()
             .controls
             .push(crate::plane::ControlRecord {
+                channel: 0,
+                delivery: amaterasu_media::CONTROL_RELIABLE,
                 message_type: 0x0302,
                 payload: vec![0, 0],
                 sequence,
@@ -1991,6 +2033,8 @@ fn continuous_idr_control_cannot_starve_explicit_stop() {
             .borrow_mut()
             .controls
             .push(crate::plane::ControlRecord {
+                channel: 0,
+                delivery: amaterasu_media::CONTROL_RELIABLE,
                 message_type: 0x0302,
                 payload: vec![0, 0],
                 sequence,
@@ -2279,14 +2323,17 @@ fn configured_media_status_requires_the_selected_codec_and_preserves_wire_checks
         "channels":record.config.audio.channels,"wire_payload_bytes":record.wire_audio_bytes},
         "video_encrypted":record.config.encrypt_video,"audio_encrypted":record.config.stream_audio && record.config.encrypt_audio,
         "permit_legacy_audio_iv_wrap":record.config.stream_audio && record.config.permit_legacy_audio_iv_wrap});
-    assert!(super::responses::media_status(record, &status).is_err());
+    assert!(super::responses::media_status(record, &status, record.wire_audio_bytes).is_err());
     record.media_video_format_configured = true;
-    assert!(super::responses::media_status(record, &status).is_ok());
+    assert!(super::responses::media_status(record, &status, record.wire_audio_bytes).is_ok());
+    status["audio"]["wire_payload_bytes"] = json!(record.wire_audio_bytes + 1);
+    assert!(super::responses::media_status(record, &status, record.wire_audio_bytes).is_err());
+    status["audio"]["wire_payload_bytes"] = json!(record.wire_audio_bytes);
     status["video"]["codec"] = json!("av1");
-    assert!(super::responses::media_status(record, &status).is_err());
+    assert!(super::responses::media_status(record, &status, record.wire_audio_bytes).is_err());
     status["video"] = json!(video);
     status["video"]["packet_size"] = json!(1200);
-    assert!(super::responses::media_status(record, &status).is_err());
+    assert!(super::responses::media_status(record, &status, record.wire_audio_bytes).is_err());
 }
 
 #[test]

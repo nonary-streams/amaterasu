@@ -432,6 +432,7 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
     for scenario in [
         "source",
         "downstream",
+        "wire_budget",
         "unconfirmed",
         "deadline",
         "second_deadline",
@@ -445,6 +446,11 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
             "source_id":42,"encoder_provider":"fixture","encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
             "video_unit_service":"example.units/1","framer_service":"example.framer/1","plan_transport_service":"example.plan/1"})).unwrap());
         host.broker.extension_probe_supported = scenario != "source";
+        if scenario == "wire_budget" {
+            let route = host.pipeline.settings.extension_route.as_mut().unwrap();
+            route.wire_budget_required = true;
+            host.extension_probe_limits = Some(Default::default());
+        }
         if scenario == "unconfirmed" {
             host.broker.fault = Some((
                 "amaterasu.video/1:probe_source".into(),
@@ -516,6 +522,8 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
                     && issue.disposition == IssueDisposition::DemotedWarning
                     && issue.fallback.as_deref() == Some("negotiate_standard_video")
                     && issue.operation == "launch-extension"
+                    && (scenario != "wire_budget"
+                        || issue.reason == "video_wire_budget_probe_failed")
                     && issue.caused_by == Some(LifecycleLayer::EncodeVideo)),
             "{issues:?}"
         );

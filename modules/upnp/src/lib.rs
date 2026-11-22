@@ -9,6 +9,11 @@ mod deadline;
 mod igd;
 mod ipv6;
 mod pinhole;
+mod provider;
+mod upnp;
+mod upnp_ipv6;
+
+pub use amaterasu_module_sdk::router_mapping::{MappingEndpoint, Protocol};
 
 pub use deadline::OperationDeadline;
 pub use igd::{IgdGateway, SEARCH_TIMEOUT, discover_gateway, discover_gateway_with_deadline};
@@ -39,13 +44,6 @@ pub const MAPPING_LEASE_SECONDS: u32 = 60 * 60;
 /// Recommended interval for refreshing owned mappings before their lease expires.
 /// Callers schedule this interval because this crate does not run a refresh timer.
 pub const RECOMMENDED_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
-
-/// The network protocol used by an IGD port mapping.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum Protocol {
-    Tcp,
-    Udp,
-}
 
 /// The IGD lookup key for a wildcard-remote-host mapping.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -105,26 +103,6 @@ impl ListenerEndpoint {
         Self {
             address,
             port,
-            active,
-        }
-    }
-}
-
-/// One protocol-specific mapping for a live listener.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MappingEndpoint {
-    pub address: IpAddr,
-    pub port: u16,
-    pub protocol: Protocol,
-    pub active: bool,
-}
-
-impl MappingEndpoint {
-    pub fn new(address: IpAddr, port: u16, protocol: Protocol, active: bool) -> Self {
-        Self {
-            address,
-            port,
-            protocol,
             active,
         }
     }

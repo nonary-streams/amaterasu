@@ -1,10 +1,11 @@
 //! Bounded, owner-scoped lifecycle and nonblocking UDP driving for WebRTC peers.
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use amaterasu_network_policy::valid_peer;
+use amaterasu_module_sdk::network::{Network, UdpSocket, abi};
+use amaterasu_network_policy::{valid_peer, validate_bound_endpoint};
 use sha2::{Digest, Sha256};
 use str0m::channel::ChannelId;
 use str0m::net::{Protocol, Transmit};
@@ -106,6 +107,7 @@ struct Session {
 }
 
 pub struct BrowserSessionSet {
+    network: Network,
     bind_ip: IpAddr,
     allow_remote: bool,
     sessions: BTreeMap<String, Session>,
@@ -114,12 +116,21 @@ pub struct BrowserSessionSet {
 
 impl BrowserSessionSet {
     /// Only concrete unicast addresses are supported; remote use requires an
-    /// explicit policy choice. This constructor does not open a socket.
-    pub fn new(bind_ip: IpAddr, allow_remote: bool) -> Result<Self, SessionError> {
+    /// explicit policy choice. The embedding module selects the network provider
+    /// through trusted startup composition. This constructor opens no sockets.
+    pub fn new(
+        network: Network,
+        bind_ip: IpAddr,
+        allow_remote: bool,
+    ) -> Result<Self, SessionError> {
         if !valid_peer(bind_ip) || (!allow_remote && !bind_ip.is_loopback()) {
             return Err(SessionError::InvalidAddress);
         }
+        if !network.supports(abi::UDP) {
+            return Err(SessionError::Network);
+        }
         Ok(Self {
+            network,
             bind_ip,
             allow_remote,
             sessions: BTreeMap::new(),
@@ -162,14 +173,18 @@ impl BrowserSessionSet {
         if self.sessions.len() >= MAX_SESSIONS || self.operations.len() >= MAX_OPERATIONS {
             return Err(SessionError::Capacity);
         }
-        let socket =
-            UdpSocket::bind(SocketAddr::new(self.bind_ip, 0)).map_err(|_| SessionError::Network)?;
+        let requested = SocketAddr::new(self.bind_ip, 0);
+        let socket = self
+            .network
+            .bind_udp(requested)
+            .map_err(|_| SessionError::Network)?;
         socket
             .set_nonblocking(true)
             .map_err(|_| SessionError::Network)?;
-        let mut peer =
-            BrowserTransport::new(socket.local_addr().map_err(|_| SessionError::Network)?, now)
-                .map_err(|_| SessionError::Transport)?;
+        let local = socket.local_addr().map_err(|_| SessionError::Network)?;
+        validate_bound_endpoint(local, Some(requested), self.bind_ip)
+            .map_err(|_| SessionError::Network)?;
+        let mut peer = BrowserTransport::new(local, now).map_err(|_| SessionError::Transport)?;
         let answer = peer
             .accept_offer(sdp)
             .map_err(|_| SessionError::InvalidOffer)?;
@@ -424,8 +439,13 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amaterasu_module_sdk::abi::{
+        AbiHeader, BorrowedBytes, NativeInterfaceQuery, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
+    };
+    use std::ffi::c_void;
     use std::net::{Ipv4Addr, UdpSocket};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use str0m::Rtc;
     use str0m::media::{Direction, MediaKind};
 
@@ -442,13 +462,145 @@ mod tests {
         changes.apply().unwrap().0.to_sdp_string()
     }
 
+    fn loopback_sessions() -> BrowserSessionSet {
+        BrowserSessionSet::new(Network::test_provider(), Ipv4Addr::LOCALHOST.into(), false).unwrap()
+    }
+
+    const VIRTUAL_SOCKET: u64 = 41;
+    const VIRTUAL_ENDPOINT: abi::Address = abi::Address {
+        family: 4,
+        port: 4242,
+        reserved: 0,
+        scope_id: 0,
+        flowinfo: 0,
+        bytes: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    };
+    static VIRTUAL_READS: AtomicUsize = AtomicUsize::new(0);
+    static VIRTUAL_CLOSES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn bind_virtual(
+        _: *mut c_void,
+        requested: abi::Address,
+        handle: *mut u64,
+    ) -> Status {
+        if requested
+            != (abi::Address {
+                port: 0,
+                ..VIRTUAL_ENDPOINT
+            })
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the Network SDK borrows valid output storage through the callback.
+        unsafe { handle.write(VIRTUAL_SOCKET) };
+        STATUS_OK
+    }
+
+    unsafe extern "C" fn virtual_local_addr(
+        _: *mut c_void,
+        handle: u64,
+        address: *mut abi::Address,
+    ) -> Status {
+        if handle != VIRTUAL_SOCKET {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the Network SDK borrows valid output storage through the callback.
+        unsafe { address.write(VIRTUAL_ENDPOINT) };
+        STATUS_OK
+    }
+
+    unsafe extern "C" fn virtual_option(
+        _: *mut c_void,
+        handle: u64,
+        option: u32,
+        value: u64,
+    ) -> Status {
+        if handle != VIRTUAL_SOCKET || option != abi::NONBLOCKING || value != 1 {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        STATUS_OK
+    }
+
+    unsafe extern "C" fn virtual_receive(
+        _: *mut c_void,
+        handle: u64,
+        _: *mut u8,
+        _: usize,
+        _: *mut usize,
+        _: *mut abi::Address,
+    ) -> Status {
+        if handle != VIRTUAL_SOCKET {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        VIRTUAL_READS.fetch_add(1, Ordering::Relaxed);
+        abi::WOULD_BLOCK
+    }
+
+    unsafe extern "C" fn virtual_close(_: *mut c_void, handle: u64) -> Status {
+        if handle != VIRTUAL_SOCKET {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        VIRTUAL_CLOSES.fetch_add(1, Ordering::Relaxed);
+        STATUS_OK
+    }
+
+    fn virtual_network() -> Network {
+        let factory = amaterasu_network_sockets::Factory::new();
+        let query = NativeInterfaceQuery {
+            header: AbiHeader::of::<NativeInterfaceQuery>(),
+            interface_major: abi::MAJOR,
+            min_minor: abi::MINOR,
+            min_size: std::mem::size_of::<abi::NetworkApi>() as u32,
+        };
+        let mut table = std::ptr::null();
+        // SAFETY: the factory and output storage are live for bind. The
+        // returned owned table retains provider state.
+        let status = unsafe {
+            (factory.api.bind.unwrap())(
+                factory.api.context,
+                BorrowedBytes::new(b"webrtc.virtual"),
+                &query,
+                &mut table,
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        let table = table.cast::<abi::NetworkApi>().cast_mut();
+        // SAFETY: the new table has no published aliases. The session's socket
+        // callbacks use a virtual handle, and the original release still owns
+        // the table and its context.
+        unsafe {
+            (*table).udp_bind = bind_virtual;
+            (*table).local_addr = virtual_local_addr;
+            (*table).set_option = virtual_option;
+            (*table).recv_from = virtual_receive;
+            (*table).close = virtual_close;
+            Network::from_native_table(table).unwrap()
+        }
+    }
+
+    #[test]
+    fn normal_session_uses_the_replacement_udp_provider() {
+        let now = Instant::now();
+        let alice = owner('a');
+        let reads = VIRTUAL_READS.load(Ordering::Relaxed);
+        let closes = VIRTUAL_CLOSES.load(Ordering::Relaxed);
+        let mut sessions =
+            BrowserSessionSet::new(virtual_network(), Ipv4Addr::LOCALHOST.into(), false).unwrap();
+        let opened = sessions.open(&alice, "virtual", &offer(now), now).unwrap();
+        assert!(opened.answer_sdp.contains("127.0.0.1 4242"));
+        sessions.tick(&alice, &opened.id, now).unwrap();
+        assert!(VIRTUAL_READS.load(Ordering::Relaxed) > reads);
+        sessions.close(&alice, &opened.id).unwrap();
+        assert_eq!(VIRTUAL_CLOSES.load(Ordering::Relaxed), closes + 1);
+    }
+
     #[test]
     fn retries_are_owner_scoped_and_closed_operations_cannot_reopen() {
         let now = Instant::now();
         let offer = offer(now);
         let alice = owner('a');
         let bob = owner('b');
-        let mut sessions = BrowserSessionSet::new(Ipv4Addr::LOCALHOST.into(), false).unwrap();
+        let mut sessions = loopback_sessions();
         let first = sessions.open(&alice, "operation", &offer, now).unwrap();
         assert!(first.created);
         let retry = sessions.open(&alice, "operation", &offer, now).unwrap();
@@ -487,7 +639,7 @@ mod tests {
         let offer = offer(now);
         let alice = owner('a');
         let bob = owner('b');
-        let mut sessions = BrowserSessionSet::new(Ipv4Addr::LOCALHOST.into(), false).unwrap();
+        let mut sessions = loopback_sessions();
         let first = sessions.open(&alice, "first", &offer, now).unwrap();
         let other = sessions.open(&bob, "other", &offer, now).unwrap();
         assert_eq!(
@@ -513,7 +665,7 @@ mod tests {
     fn malformed_loopback_packets_do_not_end_the_session() {
         let now = Instant::now();
         let alice = owner('a');
-        let mut sessions = BrowserSessionSet::new(Ipv4Addr::LOCALHOST.into(), false).unwrap();
+        let mut sessions = loopback_sessions();
         let opened = sessions.open(&alice, "first", &offer(now), now).unwrap();
         let destination = sessions.sessions[&opened.id].socket.local_addr().unwrap();
         UdpSocket::bind("127.0.0.1:0")
@@ -538,13 +690,24 @@ mod tests {
             Err(SessionError::InvalidOwner)
         ));
         assert!(matches!(
-            BrowserSessionSet::new(Ipv4Addr::UNSPECIFIED.into(), true),
+            BrowserSessionSet::new(Network::test_provider(), Ipv4Addr::UNSPECIFIED.into(), true),
             Err(SessionError::InvalidAddress)
         ));
         assert!(matches!(
-            BrowserSessionSet::new(Ipv4Addr::new(192, 0, 2, 1).into(), false),
+            BrowserSessionSet::new(
+                Network::test_provider(),
+                Ipv4Addr::new(192, 0, 2, 1).into(),
+                false
+            ),
             Err(SessionError::InvalidAddress)
         ));
-        assert!(BrowserSessionSet::new(Ipv4Addr::new(192, 0, 2, 1).into(), true).is_ok());
+        assert!(
+            BrowserSessionSet::new(
+                Network::test_provider(),
+                Ipv4Addr::new(192, 0, 2, 1).into(),
+                true
+            )
+            .is_ok()
+        );
     }
 }

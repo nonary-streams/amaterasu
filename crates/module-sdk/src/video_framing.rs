@@ -76,6 +76,13 @@ pub struct OwnedFramePlan {
     pub blocks: Vec<VideoFecBlock>,
 }
 
+#[derive(Clone, Copy)]
+pub struct WireBudget {
+    pub wire_kbps: u32,
+    pub fps: u32,
+    pub audio_payload_bps: u32,
+}
+
 /// Providers authorize the stream in their own binding and implement a pure,
 /// retry-safe plan operation. They may not retain the input or limits.
 pub trait FramingProvider: Send + Sync + 'static {
@@ -87,6 +94,21 @@ pub trait FramingProvider: Send + Sync + 'static {
         _framing: EncoderFormatId,
         _limits: &VideoFramingLimits,
     ) -> Result<(), Status> {
+        Err(MEDIA_UNSUPPORTED)
+    }
+    /// Whether an otherwise supported profile can use negotiated link budgeting.
+    fn supports_wire_budget(&self, _: EncoderFormatId, _: EncoderFormatId) -> bool {
+        false
+    }
+    /// Translate a negotiated link limit without mutating provider state.
+    fn encoder_bitrate(
+        &self,
+        _principal: &str,
+        _codec: EncoderFormatId,
+        _framing: EncoderFormatId,
+        _limits: &VideoFramingLimits,
+        _budget: WireBudget,
+    ) -> Result<u32, Status> {
         Err(MEDIA_UNSUPPORTED)
     }
     fn plan(
@@ -103,7 +125,7 @@ pub struct Factory<P: FramingProvider> {
     provider: Arc<P>,
 }
 struct Binding<P: FramingProvider> {
-    api: VideoFramingApiV2_1,
+    api: VideoFramingApiV2_2,
     provider: Arc<P>,
     principal: String,
 }
@@ -150,35 +172,38 @@ unsafe extern "C" fn bind_factory<P: FramingProvider>(
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != VIDEO_FRAMING_INTERFACE_MAJOR
             || query.min_minor > VIDEO_FRAMING_INTERFACE_MINOR
-            || query.min_size as usize > size_of::<VideoFramingApiV2_1>()
+            || query.min_size as usize > size_of::<VideoFramingApiV2_2>()
         {
             return STATUS_INVALID_ARGUMENT;
         }
         // SAFETY: registered factory stays live during binding.
         let factory = unsafe { &*context.cast::<Factory<P>>() };
         let mut binding = Box::new(Binding {
-            api: VideoFramingApiV2_1 {
-                base: VideoFramingApi {
-                    base: NativeInterface {
-                        header: AbiHeader {
-                            size: size_of::<VideoFramingApiV2_1>() as u32,
-                            major: VIDEO_FRAMING_INTERFACE_MAJOR,
-                            minor: VIDEO_FRAMING_INTERFACE_MINOR,
+            api: VideoFramingApiV2_2 {
+                base: VideoFramingApiV2_1 {
+                    base: VideoFramingApi {
+                        base: NativeInterface {
+                            header: AbiHeader {
+                                size: size_of::<VideoFramingApiV2_2>() as u32,
+                                major: VIDEO_FRAMING_INTERFACE_MAJOR,
+                                minor: VIDEO_FRAMING_INTERFACE_MINOR,
+                            },
+                            context: std::ptr::null_mut(),
+                            release: Some(release::<P>),
                         },
-                        context: std::ptr::null_mut(),
-                        release: Some(release::<P>),
+                        plan: plan::<P>,
                     },
-                    plan: plan::<P>,
+                    probe: probe::<P>,
                 },
-                probe: probe::<P>,
+                encoder_bitrate: encoder_bitrate::<P>,
             },
             provider: factory.provider.clone(),
             principal,
         });
-        binding.api.base.base.context = (&mut *binding as *mut Binding<P>).cast();
+        binding.api.base.base.base.context = (&mut *binding as *mut Binding<P>).cast();
         // SAFETY: runtime owns output and resulting binding.
         unsafe {
-            *output = &(*Box::into_raw(binding)).api.base.base;
+            *output = &(*Box::into_raw(binding)).api.base.base.base;
         }
         STATUS_OK
     }))
@@ -229,6 +254,132 @@ unsafe extern "C" fn release<P: FramingProvider>(context: *mut c_void) {
     if !context.is_null() {
         // SAFETY: runtime releases each binding once after callbacks retire.
         drop(unsafe { Box::from_raw(context.cast::<Binding<P>>()) });
+    }
+}
+
+unsafe extern "C" fn encoder_bitrate<P: FramingProvider>(
+    context: *mut c_void,
+    codec: *const EncoderFormatId,
+    framing: *const EncoderFormatId,
+    limits: *const VideoFramingLimits,
+    wire_kbps: u32,
+    fps: u32,
+    audio_payload_bps: u32,
+    output: *mut u32,
+) -> Status {
+    catch_unwind(AssertUnwindSafe(|| {
+        if output.is_null() || !(output as usize).is_multiple_of(align_of::<u32>()) {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the same caller-owned descriptors are required by probe.
+        let status = unsafe { probe::<P>(context, codec, framing, limits) };
+        if status != STATUS_OK {
+            return status;
+        }
+        // SAFETY: the successful probe validated the descriptors and context.
+        let (binding, codec, framing, limits) =
+            unsafe { (&*context.cast::<Binding<P>>(), *codec, *framing, &*limits) };
+        if !binding.provider.supports_wire_budget(codec, framing) {
+            return MEDIA_UNSUPPORTED;
+        }
+        if wire_kbps == 0 && fps == 0 && audio_payload_bps == 0 {
+            return STATUS_OK;
+        }
+        if wire_kbps == 0 || fps == 0 {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let budget = WireBudget {
+            wire_kbps,
+            fps,
+            audio_payload_bps,
+        };
+        match binding
+            .provider
+            .encoder_bitrate(&binding.principal, codec, framing, limits, budget)
+        {
+            Ok(bitrate) if valid_budget_bitrate(bitrate, wire_kbps) => {
+                // SAFETY: the caller lends an aligned writable output.
+                unsafe { *output = bitrate };
+                STATUS_OK
+            }
+            Ok(_) => STATUS_INVALID_ARGUMENT,
+            Err(status) => status,
+        }
+    }))
+    .unwrap_or(STATUS_INTERNAL_ERROR)
+}
+
+fn valid_budget_bitrate(bitrate: u32, wire_kbps: u32) -> bool {
+    bitrate != 0 && u64::from(bitrate) <= u64::from(wire_kbps) * 1_000
+}
+
+/// Ask the selected framer how much of the total wire budget can be given
+/// to the encoder. Older framers may omit this independently of frame planning.
+pub fn plan_encoder_bitrate(
+    runtime: &RuntimeClient,
+    service: &str,
+    codec: EncoderFormatId,
+    framing: EncoderFormatId,
+    limits: &VideoFramingLimits,
+    budget: WireBudget,
+) -> ModuleResult<u32> {
+    if budget.wire_kbps == 0 || budget.fps == 0 {
+        return Err("invalid wire budget".into());
+    }
+    call_encoder_bitrate(runtime, service, codec, framing, limits, Some(budget))
+}
+
+/// Probe budgeting support without assuming the client's eventual link rate.
+pub fn probe_encoder_bitrate(
+    runtime: &RuntimeClient,
+    service: &str,
+    codec: EncoderFormatId,
+    framing: EncoderFormatId,
+    limits: &VideoFramingLimits,
+) -> ModuleResult<()> {
+    call_encoder_bitrate(runtime, service, codec, framing, limits, None).map(|_| ())
+}
+
+fn call_encoder_bitrate(
+    runtime: &RuntimeClient,
+    service: &str,
+    codec: EncoderFormatId,
+    framing: EncoderFormatId,
+    limits: &VideoFramingLimits,
+    budget: Option<WireBudget>,
+) -> ModuleResult<u32> {
+    // SAFETY: the typed runtime contract authenticates the table family.
+    let binding = unsafe {
+        runtime.bind_native_typed(
+            service,
+            FRAMING_CONTRACT,
+            VIDEO_FRAMING_INTERFACE_MAJOR,
+            2,
+            size_of::<VideoFramingApiV2_2>() as u32,
+        )?
+    };
+    // SAFETY: the bind above requires the v2.2 layout, and all descriptors
+    // remain live for the synchronous call.
+    let api = unsafe { binding.table::<VideoFramingApiV2_2>()? };
+    let mut bitrate = 0;
+    let status = unsafe {
+        (api.encoder_bitrate)(
+            binding.context(),
+            &codec,
+            &framing,
+            limits,
+            budget.map_or(0, |budget| budget.wire_kbps),
+            budget.map_or(0, |budget| budget.fps),
+            budget.map_or(0, |budget| budget.audio_payload_bps),
+            &mut bitrate,
+        )
+    };
+    if status == STATUS_OK
+        && budget.is_none_or(|budget| valid_budget_bitrate(bitrate, budget.wire_kbps))
+    {
+        Ok(bitrate)
+    } else {
+        Err(format!("framer wire budget rejected ({status})"))
     }
 }
 unsafe extern "C" fn plan<P: FramingProvider>(

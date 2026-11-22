@@ -11,6 +11,10 @@ DNS and interface operations use the Network SDK. HTTP/TLS framing, GameStream
 packetization/encryption/pacing, router protocols, library ownership and user
 permissions remain with their domain implementations.
 
+NVHTTP delegates router discovery, port mappings and IPv6 pinhole leases to a
+startup-selected [router mapping provider](router-mapping-sdk.md). The default
+implementation sends its discovery and router requests through the Network SDK.
+
 See [the Network SDK](network-plugin-sdk.md) for native contracts, configuration,
 capabilities, ownership and platform qualification. Providers register a typed
 native contract; the runtime rejects a mismatched interface family before
@@ -51,6 +55,27 @@ through native binding, cleanup and restart recovery. Custom native roles must
 acknowledge their expected contract before the table is used. Refer to the
 stream-session README for exact keys and the required delegated call grants.
 
+The selected media transport validates packet sizing and FEC during Open. For
+standard audio, the coordinator supplies the encoder's packet size through
+`audio_packet_sizing` and pins the transport's effective wire size from its
+reply. A stream-session update that uses this field requires support from its
+selected media transport. Stream-session uses the selected control transport's
+v1.1 semantic callbacks for input decoding and feedback framing. Package updates
+must include compatible control and media providers.
+
+NVHTTP obtains the encoder catalog from the selected video service. Video queries
+the same encoder route it uses for ordinary Open. An encoder can declare its
+supported mode limit in the catalog. The Linux PipeWire composition selects a
+CPU frame fitter through `cpu_frame_fit_service` and `cpu_frame_fit_capture`.
+Constant-rate timing is available through capture providers that acknowledge the
+requested mode and expose the frame timing interface.
+
+The selected router-mapping component owns UPnP discovery, IPv4 mappings and
+IPv6 pinholes. NVHTTP supplies the desired listener endpoints through the
+[Router Mapping SDK](router-mapping-sdk.md). The WebRTC session driver receives
+its Network SDK provider from the embedding module and retains that provider's
+UDP handles through session retirement.
+
 The selected `amaterasu.input/1` provider may advertise ordered mixed-event
 batches per lease. The shared [input batch contract](input-batch-contract.md)
 and SDK describe capability negotiation and partial failure; an older provider
@@ -77,10 +102,9 @@ SDK. See [artwork transfer](artwork-transfer.md) for the revision-pinned record,
 provider grants, cleanup bounds, and remaining external Playnite protocol boundary.
 
 The legacy encoded packet path accepts H.264/HEVC/AV1 and has a 16 MiB packet
-limit. Generic format identifiers exist elsewhere, but full nonstandard-codec
-orchestration and transport still need a negotiated output contract. WGC-specific
-constant-rate pacing similarly needs a generic timing handshake. Neither adding
-a network provider nor removing a codec validator would establish those semantics.
+limit. Extensions use a negotiated video profile and framing provider. When a
+route requires a wire bitrate budget, the provider qualifies its v2.2 sizing
+callback before the offer and converts the negotiated budget at startup.
 
 The default network backend's caller DNS timeout is bounded; final unload joins
 uncancellable OS resolver calls and can wait on the operating system. Windows

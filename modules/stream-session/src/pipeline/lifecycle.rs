@@ -1,6 +1,7 @@
 use super::input::*;
 use super::responses::*;
 use super::*;
+use amaterasu_module_sdk::transport::AudioPacketSizing;
 
 impl Pipeline {
     pub(super) fn advance(
@@ -488,6 +489,12 @@ impl Pipeline {
             return true;
         }
         if let Step::Open(resource) = job.step {
+            if resource == Resource::Control
+                && let Err(code) = (operations.probe_control)(&record.providers.control_transport)
+            {
+                job.fail(record, code, now);
+                return true;
+            }
             record.attempted.insert(resource);
         }
         if job.step == Step::AcquireOutput
@@ -1268,12 +1275,21 @@ impl Pipeline {
             {
                 return false;
             }
+            let dependency_code = safe_dependency_code(&payload);
             eprintln!(
                 "amaterasu session dependency rejected step={:?} code={}",
-                job.step,
-                safe_dependency_code(&payload),
+                job.step, dependency_code,
             );
-            job.fail(record, "dependency_rejected", now);
+            let reason = match (job.step, dependency_code) {
+                (Step::Open(Resource::Media), "invalid_video_configuration") => {
+                    "invalid_video_configuration"
+                }
+                (Step::Open(Resource::Media), "invalid_audio_configuration") => {
+                    "invalid_audio_configuration"
+                }
+                _ => "dependency_rejected",
+            };
+            job.fail(record, reason, now);
             return true;
         }
         let result = (|| match job.step {
@@ -1513,7 +1529,7 @@ impl Pipeline {
             Step::MediaReady => {
                 let status = component_status(&payload, record.resources[&Resource::Media])
                     .ok_or("invalid_transport_response")?;
-                let media = media_status(record, status)?;
+                let media = media_status(record, status, record.wire_audio_bytes)?;
                 record.media_ready = media.ready;
                 record.peer_discovery = media.peer_discovery;
                 record.video_peer_port = media.video_port;
@@ -1852,11 +1868,7 @@ impl Pipeline {
                     );
                 } else {
                     record.packet_bytes = 0;
-                    record.wire_audio_bytes = if record.config.audio.encoded_source() {
-                        0
-                    } else {
-                        16
-                    };
+                    record.wire_audio_bytes = 0;
                     job.step = Step::Open(Resource::Media);
                 }
             }
@@ -1891,7 +1903,9 @@ impl Pipeline {
                 }
                 let bytes = payload["packet_bytes"]
                     .as_u64()
-                    .filter(|bytes| (1..=1275).contains(bytes))
+                    .filter(|bytes| {
+                        (1..=amaterasu_media::MAX_ENCODED_AUDIO_BYTES as u64).contains(bytes)
+                    })
                     .ok_or("unsupported_audio_packet")? as usize;
                 if payload["constant_bitrate"] != true
                     || payload["channels"] != record.config.audio.channels
@@ -1921,20 +1935,22 @@ impl Pipeline {
                     }));
                 }
                 record.packet_bytes = bytes;
-                record.wire_audio_bytes = if record.config.encrypt_audio {
-                    (bytes / 16 + 1) * 16
-                } else {
-                    bytes
-                };
-                if record.wire_audio_bytes > 1280 {
-                    return Err("unsupported_audio_packet");
-                }
                 job.step = Step::Open(Resource::Media);
             }
             Resource::Media => {
                 record.video_local = Some(local_address(payload, "video_local")?);
                 record.audio_local = Some(local_address(payload, "audio_local")?);
-                let media = media_status(record, payload)?;
+                let wire_audio_bytes = if record.config.audio.custom.is_none() {
+                    AudioPacketSizing::effective_wire_payload_bytes(
+                        payload,
+                        record.config.stream_audio,
+                    )
+                    .ok_or("invalid_transport_response")?
+                } else {
+                    record.wire_audio_bytes
+                };
+                let media = media_status(record, payload, wire_audio_bytes)?;
+                record.wire_audio_bytes = wire_audio_bytes;
                 record.media_ready = media.ready;
                 record.peer_discovery = media.peer_discovery;
                 record.video_peer_port = media.video_port;

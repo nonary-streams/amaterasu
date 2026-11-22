@@ -9,9 +9,13 @@ pub mod native_contracts {
     pub const FRAME_RESOURCE_CONSUMER: &str = "amaterasu.frame-resource-consumer.native/1";
     pub const FRAME_RESOURCE_PROCESSOR: &str = "amaterasu.frame-resource-processor.native/1";
     pub const CPU_PROCESSOR: &str = "amaterasu.cpu-frame-processor.native/1";
+    pub const CPU_FRAME_FIT: &str = "amaterasu.cpu-frame-fit.native/1";
     pub const FRAME_PROCESSOR: &str = "amaterasu.frame-processor.native/1";
 }
 
+pub mod cpu_fit;
+mod image_fit;
+pub use image_fit::ImageFit;
 mod cpu_pixels;
 pub use cpu_pixels::CpuPixels;
 mod generic;

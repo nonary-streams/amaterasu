@@ -452,6 +452,8 @@ fn keyboard_packet_with_modifiers(
     let magic = if pressed { 3 } else { 4 };
     let key_code = key_code.to_le_bytes();
     crate::plane::ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x0206,
         payload: vec![
             0,
@@ -642,6 +644,8 @@ fn controller_packet(sequence: u64) -> crate::plane::ControlRecord {
     payload.extend_from_slice(&0x89abu16.to_le_bytes());
     payload.extend_from_slice(&0x55u16.to_le_bytes());
     crate::plane::ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x0206,
         payload,
         sequence,
@@ -659,6 +663,8 @@ fn controller_extension_packet(
     payload[4..8].copy_from_slice(&magic.to_le_bytes());
     payload[8..].copy_from_slice(body);
     crate::plane::ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x0206,
         payload,
         sequence,
@@ -899,6 +905,8 @@ fn unavailable_virtual_gamepad_is_dropped_without_stopping_the_stream_or_input_l
 
 fn relative(sequence: u64) -> crate::plane::ControlRecord {
     crate::plane::ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x0206,
         payload: vec![0, 0, 0, 8, 7, 0, 0, 0, 0, 1, 0, 2],
         sequence,
@@ -911,6 +919,8 @@ fn vertical_scroll(sequence: u64, amount: i16) -> crate::plane::ControlRecord {
     payload.extend_from_slice(&amount.to_be_bytes());
     payload.extend_from_slice(&[0, 0]);
     crate::plane::ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x0206,
         payload,
         sequence,
@@ -921,6 +931,8 @@ fn horizontal_scroll(sequence: u64, amount: i16) -> crate::plane::ControlRecord 
     let mut payload = vec![0, 0, 0, 6, 1, 0, 0, 0x55];
     payload.extend_from_slice(&amount.to_be_bytes());
     crate::plane::ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x0206,
         payload,
         sequence,
@@ -935,6 +947,8 @@ fn absolute(sequence: u64, x: u16, y: u16, width: u16, height: u16) -> crate::pl
     payload.extend_from_slice(&(width - 1).to_be_bytes());
     payload.extend_from_slice(&(height - 1).to_be_bytes());
     crate::plane::ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x0206,
         payload,
         sequence,
@@ -967,6 +981,8 @@ fn touch_packet(magic: u32, event: u8, pointer_id: u32) -> crate::plane::Control
         }
     }
     crate::plane::ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x0206,
         payload,
         sequence: u64::from(event),
@@ -1590,6 +1606,8 @@ fn virtual_display_geometry_refresh_preserves_held_keys_and_mouse_buttons() {
         .unwrap()
         .output = super::super::virtual_display::REQUESTED_OUTPUT.into();
     let right_button = |pressed, sequence| crate::plane::ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x0206,
         payload: vec![0, 0, 0, 5, if pressed { 8 } else { 9 }, 0, 0, 0, 3],
         sequence,
@@ -2656,4 +2674,82 @@ fn loaded_neutral_provider_crosses_broker_session_and_real_queue() {
         )["state"],
         "stopped"
     );
+}
+
+#[test]
+fn unsupported_feedback_is_acknowledged_with_warning_while_video_continues() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let id = host.response_from(1, "amaterasu.rtsp", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut launch = start(id);
+    launch["configuration"]["client_feature_flags"] = json!(7);
+    assert_eq!(
+        host.response_from(2, "amaterasu.rtsp", launch)["state"],
+        "active"
+    );
+    host.pipeline
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .config
+        .rtsp_operation_id = Some("launch-feedback".into());
+    host.pipeline.enable_stream_issue_reports();
+    let previous_media_ticks = host.plane.borrow().media_ticks;
+    host.plane.borrow_mut().feedback_unsupported = true;
+    host.broker
+        .input_feedback_events
+        .push_back(json!({"sequence":1,"feedback":pcm_feedback(9)}));
+    host.idle();
+
+    assert_eq!(host.broker.input_feedback_acks, vec![1]);
+    assert!(host.plane.borrow().feedback.is_empty());
+    assert!(host.plane.borrow().media_ticks > previous_media_ticks);
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert!(host.broker.commands.iter().any(|command| matches!(
+        command,
+        Command::Publish { payload, .. }
+            if payload["code"] == "control_feedback_unsupported"
+                && payload["caused_by"] == "control_transport"
+    )));
+}
+
+#[test]
+fn unsupported_first_legacy_rumble_demotes_haptics_and_preserves_playback() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker
+        .gamepad_feedback
+        .push_back(feedback(4, 100, 200, 5_000));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.pipeline
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .config
+        .rtsp_operation_id = Some("launch-legacy-rumble".into());
+    host.pipeline.enable_stream_issue_reports();
+    host.plane.borrow_mut().rumble_unsupported = true;
+    enable_client_haptics(&mut host, id);
+    let previous_media_ticks = host.plane.borrow().media_ticks;
+    host.idle();
+
+    let record = &host.pipeline.records[&id];
+    assert_eq!(record.state, State::Active);
+    assert!(!record.client_haptics_requested);
+    assert!(record.rumble_pending.is_empty());
+    assert!(record.rumble_active_until.is_empty());
+    assert!(host.plane.borrow().media_ticks > previous_media_ticks);
+    assert!(host.broker.commands.iter().any(|command| matches!(
+        command,
+        Command::Publish { payload, .. }
+            if payload["code"] == "control_feedback_unsupported"
+    )));
 }

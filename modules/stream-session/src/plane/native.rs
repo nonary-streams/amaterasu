@@ -2,10 +2,11 @@
 //! until every pending call and callback has returned, then released by the SDK.
 use super::*;
 mod planned;
-use amaterasu_gamestream::control::{RUMBLE_MESSAGE_TYPE, RumbleFeedback, encode_rumble_feedback};
 use amaterasu_media::{CONTROL_RELIABLE, ControlMessage};
-use amaterasu_module_sdk::{NativeBinding, abi::*};
+use amaterasu_module_sdk::transport::control::HostFeedbackDelivery;
+use amaterasu_module_sdk::{NativeBinding, abi::*, transport::ControlCodec};
 use std::{
+    cell::Cell,
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
 };
@@ -77,16 +78,14 @@ pub(super) fn probe_chain(
     {
         return Err("video_plan_probe_failed");
     }
-    let expected_crypto = if config.encrypt_video {
-        amaterasu_gamestream::crypto::VIDEO_PREFIX_BYTES as u32
-    } else {
-        0
-    };
     if limits.size as usize != size_of::<VideoFramingLimits>()
         || limits.version != VIDEO_FRAMING_LIMITS_VERSION
         || limits.packet_size as usize != config.video.packet_size
-        || limits.crypto_overhead != expected_crypto
-        || limits.network_overhead != if config.peer_ip.is_ipv6() { 48 } else { 28 }
+        // The selected transport attests its own byte overhead. Retain the
+        // negotiated encryption requirement and the shared frame-plan bounds.
+        || (limits.crypto_overhead != 0) != config.encrypt_video
+        || limits.crypto_overhead > 256
+        || limits.network_overhead > 128
         || limits.min_fec_percentage != u32::from(config.video.fec_percentage)
         || limits.min_parity_shards != u32::from(config.video.min_parity_shards)
         // The approved extension transport may support more blocks than the
@@ -120,6 +119,16 @@ pub(super) fn probe_chain(
     {
         return Err("video_framer_probe_failed");
     }
+    if route.wire_budget_required {
+        amaterasu_module_sdk::video_framing::probe_encoder_bitrate(
+            runtime,
+            &route.framer_service,
+            request.base.codec,
+            request.base.framing,
+            &limits,
+        )
+        .map_err(|_| "video_wire_budget_probe_failed")?;
+    }
     Ok(limits)
 }
 
@@ -134,9 +143,11 @@ pub(super) struct NativeBackend {
     encoder: Option<NativeBinding>,
     processor: Option<NativeBinding>,
     media: NativeBinding,
-    control: NativeBinding,
+    control: ControlCodec,
     handles: Handles,
     last_hdr: Option<HdrMetadata>,
+    // A framed nonzero rumble may already have reached transport admission.
+    rumble_may_have_effect: Cell<bool>,
     unit_transport_draining: bool,
 }
 
@@ -174,17 +185,11 @@ impl NativeBackend {
         if self.last_hdr == Some(metadata) {
             return Ok(());
         }
-        let mut payload = vec![1u8];
-        for field in metadata.fields {
-            payload.extend_from_slice(&field.to_le_bytes());
-        }
-        payload.extend_from_slice(&0u16.to_le_bytes()); // optional max full-frame luminance
-        let message = HostFeedbackMessage {
-            message_type: 0x010e,
-            channel: 0,
-            delivery: HostFeedbackDelivery::Reliable,
-            payload,
-        };
+        let message = self
+            .frame_feedback(HostControl::HdrMetadata {
+                fields: metadata.fields,
+            })?
+            .ok_or("video_hdr_metadata_unsupported")?;
         if self.send_feedback(&message)? {
             self.last_hdr = Some(metadata);
         }
@@ -429,11 +434,15 @@ impl NativeBackend {
             processor,
             media,
             control: unsafe {
-                amaterasu_module_sdk::transport::bind_control(runtime, &providers.control_transport)
+                amaterasu_module_sdk::transport::bind_control_codec(
+                    runtime,
+                    &providers.control_transport,
+                )
             }
-            .map_err(|_| "native_binding_failed")?,
+            .map_err(|_| "control_codec_unavailable")?,
             handles,
             last_hdr: None,
+            rumble_may_have_effect: Cell::new(false),
             unit_transport_draining: false,
         })
     }
@@ -482,43 +491,60 @@ impl Backend for NativeBackend {
     }
 
     fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
-        let payload = encode_rumble_feedback(RumbleFeedback {
-            slot: command.slot,
+        let Some(message) = self.frame_feedback(HostControl::Feedback(HostFeedback::Rumble {
+            controller: command.slot,
             low_frequency: command.low_frequency,
             high_frequency: command.high_frequency,
-        })
-        .map_err(|_| "invalid_rumble_feedback")?;
-        let message = ControlMessage {
-            message_type: u32::from(RUMBLE_MESSAGE_TYPE),
-            channel: 0,
-            delivery: CONTROL_RELIABLE,
-            reserved: 0,
-            data: payload.as_ptr(),
-            len: payload.len(),
-            sequence: 0,
+        }))?
+        else {
+            return Err(if self.rumble_may_have_effect.get() {
+                "control_rumble_stop_unconfirmed"
+            } else {
+                "control_rumble_unsupported"
+            });
         };
-        // SAFETY: the authenticated control provider copies this bounded stack
-        // payload synchronously and owns encryption/sequence assignment.
-        let api = unsafe { self.control.table::<ControlTransportApi>() }
-            .map_err(|_| "native_layout_mismatch")?;
-        let status = unsafe {
-            (api.send)(
-                self.control.context(),
-                self.handles.control_transport,
-                &message,
+        self.send_feedback(&message)
+    }
+
+    fn decode_control(&self, record: &ControlRecord) -> PlaneResult<ClientControl<'static>> {
+        self.control
+            .decode_client(
+                record.message_type,
+                record.channel,
+                record.delivery,
+                &record.payload,
+                record.sequence,
             )
-        };
-        accepted(status, "native_rumble_failed")
+            .map_err(|_| "native_control_decode_failed")
+    }
+
+    fn frame_feedback(&self, event: HostControl) -> PlaneResult<Option<HostFeedbackMessage>> {
+        let starts_rumble = matches!(
+            &event,
+            HostControl::Feedback(HostFeedback::Rumble {
+                low_frequency,
+                high_frequency,
+                ..
+            }) if *low_frequency != 0 || *high_frequency != 0
+        );
+        let message = self
+            .control
+            .encode_host(&event)
+            .map_err(|_| "native_control_encode_failed")?;
+        if starts_rumble && message.is_some() {
+            self.rumble_may_have_effect.set(true);
+        }
+        Ok(message)
     }
 
     fn control(&mut self, accept: bool) -> PlaneResult<Option<ControlRecord>> {
         let mut output = Delivery::default();
         // SAFETY: the owned binding and stack sink remain live for one callback.
-        let api = unsafe { self.control.table::<ControlTransportApi>() }
+        let api = unsafe { self.control.binding().table::<ControlTransportApi>() }
             .map_err(|_| "native_layout_mismatch")?;
         let status = unsafe {
             (api.receive)(
-                self.control.context(),
+                self.control.binding().context(),
                 self.handles.control_transport,
                 ControlMessageSink {
                     context: (&mut output as *mut Delivery<ControlRecord>).cast(),
@@ -532,7 +558,7 @@ impl Backend for NativeBackend {
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
         // SAFETY: the owned binding and message allocation remain live through
         // the synchronous provider call. The transport copies accepted bytes.
-        let api = unsafe { self.control.table::<ControlTransportApi>() }
+        let api = unsafe { self.control.binding().table::<ControlTransportApi>() }
             .map_err(|_| "native_layout_mismatch")?;
         let control_message = ControlMessage {
             message_type: u32::from(message.message_type),
@@ -540,6 +566,7 @@ impl Backend for NativeBackend {
             delivery: match message.delivery {
                 HostFeedbackDelivery::Reliable => CONTROL_RELIABLE,
                 HostFeedbackDelivery::SequencedUnreliable => CONTROL_UNRELIABLE,
+                HostFeedbackDelivery::Unsequenced => CONTROL_UNSEQUENCED,
             },
             reserved: 0,
             data: message.payload.as_ptr(),
@@ -549,7 +576,7 @@ impl Backend for NativeBackend {
         accepted(
             unsafe {
                 (api.send)(
-                    self.control.context(),
+                    self.control.binding().context(),
                     self.handles.control_transport,
                     &control_message,
                 )
@@ -1096,6 +1123,8 @@ unsafe extern "C" fn copy_control(context: *mut c_void, message: *const ControlM
             let bytes = message.bytes().map_err(|_| "invalid_control_message")?;
             Ok(ControlRecord {
                 message_type: message.message_type as u16,
+                channel: message.channel as u8,
+                delivery: message.delivery,
                 payload: bytes.to_vec(),
                 sequence: message.sequence,
             })

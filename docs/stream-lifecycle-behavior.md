@@ -136,6 +136,79 @@ video Open, optional probe rejection and timeout with standard startup, and
 GPU encode-decode at 8-bit SDR, 10-bit SDR, and HDR10. Live client playback and
 installed-package activation require separate verification.
 
+### Extension link-budget ownership review
+
+Codex reviewed the framer ABI v2.2 change against Core `bacbc238`, including
+the PyroWave encoder submodule, the signed extension route settings, and the
+RTSP and stream-session startup paths. RTSP still interprets Moonlight's
+PyroWave ANNOUNCE fields. The selected transport supplies framing limits
+under the already prepared stream's transport and encryption policy.
+The selected framer supplies the encoder payload rate under those limits.
+
+Routes that require link budgeting probe for support without a client bitrate.
+A missing v2.2 table or refused profile leaves the standard offer available
+and records an extension fallback on that launch. Once an authenticated
+ANNOUNCE selects an extension and a wire budget, a refused calculation leaves
+the prepared session intact and reports the exact request failure to the
+lifecycle owner. The host cannot substitute a different codec or cipher
+after the client has selected them. The budget callback is synchronous,
+bounded and read-only, with no delayed effect or cleanup ownership.
+Accepted bitrate and wire budget are pinned for replay and teardown.
+
+Stream-session checks the selected transport's reported overhead against
+generic frame-plan bounds and the agreed encryption state. The GameStream
+transport remains responsible for checking its exact protocol overhead when
+it prepares a frame plan. Constant-rate capture requests pass through RTSP
+to the video provider's normal capability check.
+
+### Streaming provider substitution review
+
+Codex and the independent architecture reviewer traced the media, control,
+encoder, capture and router changes against Core `bacbc238` and encode-video
+`0687cfce`. NVHTTP and RTSP retain request and wire validation. Stream-session
+opens the selected media transport under the original prepare operation. The
+provider validates packetization before binding, and the session pins its
+returned audio wire size. A malformed successful reply leaves the allocated
+provider handle in the original cleanup record. A refused required media format
+is reported through the stream lifecycle owner with the transport's bounded
+reason. Retry and status checks use the pinned result.
+
+Before opening the selected control transport, stream-session verifies that its
+v1.1 semantic interface is available. Missing required control support fails
+preparation with `control_codec_unavailable` and retires resources already
+opened under that attempt. The data plane preserves authenticated record
+metadata for the selected decoder. Unsupported optional feedback records a
+warning while media continues. The provider retains responsibility for wire
+encoding, sequencing and delivery. Control and media replacements ship with
+the updated session consumer in the signed update path.
+
+NVHTTP reads encoder capabilities from video, which obtains them from the
+configured encoder used for ordinary Open. Enumeration is idle-only, and
+failed refreshes keep the prior successful snapshot. Capture Open must confirm
+requested constant-rate behavior. Video retains a returned capture handle
+before checking capability so refusal can close the correct resource. If the
+selected fitter is unavailable and direct submission succeeds, video reports
+the fallback. Incompatible frame geometry still needs a fitting provider.
+The fitter owns its pending output and fences late completion when the video
+stream is retired.
+
+NVHTTP sends only current listener plans to the selected router provider.
+UPnP failures affect mapping status independently of stream admission. Workers
+retain mapping and pinhole ownership through shutdown. Unchanged plans still
+poll their updated status. The scoped PyroWave updater carries the required
+provider artifacts and preserves the installed FFmpeg fitting backend when it
+was enabled. WebRTC's selected Network SDK binding owns the session UDP handle.
+
+Focused provider replacement tests cover media admission and wire sizing,
+control decode and feedback, encoder opening and launch limits, frame fitting,
+constant-rate capture retirement, router mapping, and WebRTC UDP retirement.
+The signed stream-session and encrypted RTSP probes passed on private loopback
+with synthetic capture, real Opus, encrypted UDP, and an independent ENet
+client. RTSP exercised authorized destination discovery, pre-PLAY warmup,
+and confirmed TEARDOWN. Chromium loopback separately verified WebRTC video
+decode, audio delivery and managed session close. Hardware capture, physical
+router changes and installed-package activation require separate verification.
+
 ## Preparation and restart
 
 Reached preparation steps own their undo commands, including steps with an

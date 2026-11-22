@@ -121,10 +121,11 @@ for only base +9 through +11 cover one client. Further admissions fail until
 a slot is available. A reserved slot is reused only after its prior transport
 confirms cleanup.
 
-PLAY arms the owned media session. It does not claim capture is already active:
-Moonlight opens control after RTSP completes. The session library waits for
-control authentication before opening capture, with bounded startup and rollback.
-RTSP TEARDOWN and trusted ticket close require confirmed session cleanup.
+PLAY waits for the owned video source to confirm startup frame readiness, then
+arms the session. Moonlight opens control after RTSP completes. The session
+library waits for authenticated control and the authorized UDP destinations
+before forwarding warmed video or opening audio capture. RTSP TEARDOWN and
+trusted ticket close require confirmed session cleanup.
 
 One encrypted RTSP request is accepted per TCP connection, followed by an encrypted
 response and EOF. Crypto counters and replay windows live on the ticket across

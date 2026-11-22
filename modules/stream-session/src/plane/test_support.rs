@@ -17,6 +17,14 @@ impl Backend for Transport {
             None
         })
     }
+    fn decode_control(&self, record: &ControlRecord) -> PlaneResult<ClientControl<'static>> {
+        Ok(test_decode_control(record))
+    }
+
+    fn frame_feedback(&self, event: HostControl) -> PlaneResult<Option<HostFeedbackMessage>> {
+        test_frame_feedback(event).map(Some)
+    }
+
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
         let mut state = self.0.borrow_mut();
         if state.busy {
@@ -83,6 +91,7 @@ impl TestPlane {
         self.pump.enqueue_message(PendingFeedback {
             message,
             contribution: true,
+            best_effort: false,
         })
     }
     pub fn pump_contributions(&mut self, allowed: bool) -> PlaneResult<()> {

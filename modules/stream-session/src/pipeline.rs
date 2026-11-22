@@ -35,7 +35,7 @@ use crate::{
         TickFailure as PlaneFailure,
     },
 };
-use amaterasu_gamestream::control::HostFeedback;
+use amaterasu_module_sdk::transport::control::{ClientControl, HostFeedback, HostFeedbackMessage};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use record::{Record, Resource, State, error};
 use rpc::Send;
@@ -55,6 +55,18 @@ trait Drive {
         media_active: bool,
         control_budget: usize,
     ) -> Result<PlaneProgress, PlaneFailure>;
+    #[cfg(not(test))]
+    fn decode_control(
+        &self,
+        record: &crate::plane::ControlRecord,
+    ) -> Result<ClientControl<'static>, &'static str>;
+    #[cfg(test)]
+    fn decode_control(
+        &self,
+        record: &crate::plane::ControlRecord,
+    ) -> Result<ClientControl<'static>, &'static str> {
+        Ok(crate::plane::test_decode_control(record))
+    }
     fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str>;
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
@@ -65,7 +77,7 @@ trait Drive {
     ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError>;
     fn enqueue_contribution(
         &mut self,
-        message: amaterasu_gamestream::control::HostFeedbackMessage,
+        message: HostFeedbackMessage,
     ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError>;
     fn pump_contributions(&mut self, allowed: bool) -> Result<(), &'static str>;
     fn discard_contributions(&mut self);
@@ -77,7 +89,7 @@ impl Drive for Plane {
     }
     fn enqueue_contribution(
         &mut self,
-        message: amaterasu_gamestream::control::HostFeedbackMessage,
+        message: HostFeedbackMessage,
     ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
         Plane::enqueue_contribution(self, message)
     }
@@ -93,6 +105,12 @@ impl Drive for Plane {
         control_budget: usize,
     ) -> Result<PlaneProgress, PlaneFailure> {
         Plane::tick(self, media_active, control_budget)
+    }
+    fn decode_control(
+        &self,
+        record: &crate::plane::ControlRecord,
+    ) -> Result<ClientControl<'static>, &'static str> {
+        Plane::decode_control(self, record)
     }
     fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
         Plane::send_rumble(self, command)
@@ -126,10 +144,18 @@ type Probe<'a> = dyn FnMut(
         &crate::model::PrepareConfig,
     ) -> Result<amaterasu_media::VideoFramingLimits, &'static str>
     + 'a;
+type BitratePlanner<'a> = dyn FnMut(
+        &str,
+        &amaterasu_contracts::media_profile::VideoProfile,
+        &amaterasu_media::VideoFramingLimits,
+        amaterasu_module_sdk::video_framing::WireBudget,
+    ) -> Result<u32, &'static str>
+    + 'a;
 
 struct NativeOperations<'a, 'b> {
     factory: &'a mut Factory<'b>,
     probe: &'a mut Probe<'b>,
+    probe_control: &'a dyn Fn(&str) -> Result<(), &'static str>,
 }
 
 /// Queued events need a batch request only when the direct lane is not
@@ -429,15 +455,42 @@ impl Pipeline {
                     runtime.send_ephemeral(command)
                 }
             },
-            &mut |handles, providers, route| {
-                match route {
-                    Some(route) => Plane::new_planned(runtime, handles, providers, route),
-                    None => Plane::new(runtime, handles, providers),
-                }
-                .map(|plane| Box::new(plane) as Box<dyn Drive>)
+            NativeOperations {
+                factory: &mut |handles, providers, route| {
+                    match route {
+                        Some(route) => Plane::new_planned(runtime, handles, providers, route),
+                        None => Plane::new(runtime, handles, providers),
+                    }
+                    .map(|plane| Box::new(plane) as Box<dyn Drive>)
+                },
+                probe: &mut |route, media, config| {
+                    crate::plane::probe_extension_chain(runtime, route, media, config)
+                },
+                probe_control: &|service| {
+                    // SAFETY: the runtime outlives this synchronous probe and
+                    // the binding is released before preparing any control socket.
+                    unsafe { amaterasu_module_sdk::transport::bind_control_codec(runtime, service) }
+                        .map(drop)
+                        .map_err(|_| "control_codec_unavailable")
+                },
             },
-            &mut |route, media, config| {
-                crate::plane::probe_extension_chain(runtime, route, media, config)
+            &mut |service, profile, limits, budget| {
+                let id = |format: amaterasu_contracts::media_profile::FormatId| {
+                    amaterasu_media::EncoderFormatId {
+                        namespace_id: format.namespace_id,
+                        value: format.value,
+                        schema: format.schema,
+                    }
+                };
+                amaterasu_module_sdk::video_framing::plan_encoder_bitrate(
+                    runtime,
+                    service,
+                    id(profile.codec),
+                    id(profile.framing),
+                    limits,
+                    budget,
+                )
+                .map_err(|_| "invalid_extension_wire_budget")
             },
             &mut |service, payload| runtime.call_direct(service, payload),
         );
@@ -481,19 +534,29 @@ impl Pipeline {
         factory: &mut Factory<'_>,
         probe: &mut Probe<'_>,
     ) -> ModuleResult<()> {
-        self.tick_with_direct(now, send, factory, probe, &mut |_, _| {
-            Ok(amaterasu_module_sdk::DirectReply::Unavailable {
-                code: amaterasu_module_sdk::DIRECT_UNAVAILABLE.into(),
-            })
-        })
+        self.tick_with_direct(
+            now,
+            send,
+            NativeOperations {
+                factory,
+                probe,
+                probe_control: &|_| Ok(()),
+            },
+            &mut |_, _, _, _| Err("invalid_extension_wire_budget"),
+            &mut |_, _| {
+                Ok(amaterasu_module_sdk::DirectReply::Unavailable {
+                    code: amaterasu_module_sdk::DIRECT_UNAVAILABLE.into(),
+                })
+            },
+        )
     }
 
     fn tick_with_direct(
         &mut self,
         now: u64,
         send: &mut Send<'_>,
-        factory: &mut Factory<'_>,
-        probe: &mut Probe<'_>,
+        mut operations: NativeOperations<'_, '_>,
+        plan_bitrate: &mut BitratePlanner<'_>,
         direct: &mut direct_input::DirectCall<'_>,
     ) -> ModuleResult<()> {
         if !self.journal.loaded {
@@ -577,7 +640,6 @@ impl Pipeline {
                 .records
                 .remove(&job.session)
                 .expect("owned workflow record");
-            let mut operations = NativeOperations { factory, probe };
             let retain = self.advance(&mut record, &mut job, now, send, &mut operations);
             self.records.insert(record.id, record);
             if retain {
@@ -628,16 +690,17 @@ impl Pipeline {
                             serde_json::from_value::<Operation>(payload).map_err(|e| e.to_string())
                         })
                     {
-                        self.receive(
-                            id,
-                            actions::RequestCaller {
-                                principal: caller,
+                        self.receive_with_bitrate_planner(
+                            actions::Incoming {
+                                request: id,
+                                owner: caller,
                                 approved_api: service == "nonary.stream-status/1",
+                                now,
+                                remaining: 0,
                             },
                             operation,
-                            now,
-                            0,
                             send,
+                            plan_bitrate,
                         );
                     } else {
                         rpc::complete(send, id, error("restart_recovery_unconfirmed"));
@@ -691,16 +754,17 @@ impl Pipeline {
                 .and_then(|payload| {
                     serde_json::from_value::<Operation>(payload).map_err(|e| e.to_string())
                 }) {
-                    Ok(operation) => self.receive(
-                        id,
-                        actions::RequestCaller {
-                            principal: caller,
+                    Ok(operation) => self.receive_with_bitrate_planner(
+                        actions::Incoming {
+                            request: id,
+                            owner: caller,
                             approved_api: service == "nonary.stream-status/1",
+                            now,
+                            remaining: remaining_ms,
                         },
                         operation,
-                        now,
-                        remaining_ms,
                         send,
+                        plan_bitrate,
                     ),
                     Err(_) => {
                         rpc::complete(send, id, error("invalid_request"));
@@ -1106,10 +1170,6 @@ impl Pipeline {
     }
 
     fn pump(&mut self, now: u64) {
-        use amaterasu_gamestream::{
-            control::{self, Message, Profile},
-            crypto::Direction,
-        };
         let input_trace = self.input_trace;
         for record in self.records.values_mut() {
             if let Some(trace) = input_trace {
@@ -1209,6 +1269,7 @@ impl Pipeline {
                 plane.stop();
             }
             let mut rumble_delivery_failed = false;
+            let mut rumble_unsupported = false;
             if let Some((slot, (command, expires_at))) = record
                 .rumble_pending
                 .first_key_value()
@@ -1230,6 +1291,13 @@ impl Pipeline {
                         }
                     }
                     Ok(false) => {}
+                    Err("control_rumble_unsupported") => {
+                        rumble_unsupported = true;
+                        record.client_haptics_requested = false;
+                        record.rumble_pending.clear();
+                        record.rumble_active_until.clear();
+                        record.rumble_shutdown_deadline = None;
+                    }
                     Err(_) => {
                         rumble_delivery_failed = true;
                         record.rumble_stop_unconfirmed = true;
@@ -1245,6 +1313,10 @@ impl Pipeline {
             }
             let media_active = matches!(record.state, State::Active | State::Stopping);
             let result = plane.tick(media_active, control_budget);
+            if rumble_unsupported && !record.control_feedback_warning_reported {
+                record.control_feedback_warning_reported = true;
+                record.report_control_feedback_fallback();
+            }
             if rumble_delivery_failed {
                 record.report_failure(
                     amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
@@ -1288,12 +1360,12 @@ impl Pipeline {
                             .begin_message(control_stream.map_or(0, |stream| {
                                 amaterasu_module_sdk::trace::flow_id(stream, event.sequence)
                             }));
-                        let message = match control::decode(
-                            Profile::SunshineModern,
-                            Direction::ClientToHost,
-                            event.message_type,
-                            &event.payload,
-                        ) {
+                        let message = match record
+                            .plane
+                            .as_ref()
+                            .expect("plane produced this control record")
+                            .decode_control(&event)
+                        {
                             Ok(message) => message,
                             Err(_) => {
                                 record.rejected_controls =
@@ -1303,10 +1375,8 @@ impl Pipeline {
                             }
                         };
                         match message {
-                            Message::RequestIdr | Message::InvalidateReferences { .. } => {
-                                record.force_idr = true
-                            }
-                            Message::Input(input) => {
+                            ClientControl::RequestIdr => record.force_idr = true,
+                            ClientControl::Input(input) => {
                                 let generation = record.contribution_barrier.generation();
                                 if let Err(code) = input::queue_control_input(
                                     record,
@@ -1322,8 +1392,12 @@ impl Pipeline {
                                     plane.discard_contributions();
                                 }
                             }
-                            Message::Ping { .. } | Message::Start => {}
-                            _ => {
+                            ClientControl::Keepalive => {}
+                            ClientControl::Invalid => {
+                                record.rejected_controls =
+                                    record.rejected_controls.saturating_add(1);
+                            }
+                            ClientControl::Unsupported => {
                                 record.unsupported_controls =
                                     record.unsupported_controls.saturating_add(1)
                             }

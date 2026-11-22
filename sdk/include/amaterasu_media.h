@@ -149,6 +149,23 @@ typedef struct {
 } AmaterasuCpuProcessorApi;
 #define AMATERASU_CPU_PROCESSOR_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuCpuProcessorApi))
 
+/* Nonblocking CPU image fitting v1.0. Submit copies input on OK, accepts
+ * nothing on BUSY and returns UNSUPPORTED for an attested identity frame.
+ * Receive delivers at most one synchronous callback and retains output on
+ * BUSY. Cancel fences output for this stream without waiting for the worker.
+ * Serialize all calls on the binding. Keep frame identity unchanged. */
+#define AMATERASU_CPU_FRAME_FIT_MAJOR 1u
+#define AMATERASU_CPU_FRAME_FIT_MINOR 0u
+typedef struct {
+    uint32_t width, height, bt709, full_range;
+} AmaterasuCpuFrameFitTarget;
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*submit)(void *context, uint64_t stream, const AmaterasuCpuFrame *frame, AmaterasuCpuFrameFitTarget target);
+    AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuFrameSink sink);
+    void (*cancel)(void *context, uint64_t stream);
+} AmaterasuCpuFrameFitApi;
+
 /* Freshness is source provenance, not encoder acceptance: FRESH identifies a
  * newly acquired source frame; CACHED_REUSE identifies reused pixels. */
 #define AMATERASU_CAPTURE_FRAME_CACHED_REUSE 0u
@@ -751,6 +768,18 @@ typedef struct {
     AmaterasuStatus (*send)(void *context, uint64_t stream, const AmaterasuControlMessage *message);
     AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuControlMessageSink sink);
 } AmaterasuControlTransportApi;
+
+/* v1.1 semantic control framing. JSON is bounded to 16 KiB.
+ * decode_client replies with ClientControl JSON for authenticated plaintext.
+ * encode_host borrows a framed record for HostControl JSON without sending it. */
+typedef struct {
+    AmaterasuControlTransportApi v1_0;
+    AmaterasuStatus (*decode_client)(void *context,
+        const AmaterasuControlMessage *message, AmaterasuReplySink reply);
+    AmaterasuStatus (*encode_host)(void *context, AmaterasuBorrowedBytes event,
+        AmaterasuControlMessageSink sink);
+} AmaterasuControlTransportApiV1_1;
+
 /* Negotiated video unit/framing contracts are separate from legacy VideoApi
  * and MediaTransportApi. Codec IDs match the encoder-provider triple; zero is
  * invalid. Buffers are borrowed synchronously and BUSY consumes nothing. */
@@ -768,7 +797,7 @@ typedef struct {
 #define AMATERASU_VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED 1u
 #define AMATERASU_VIDEO_FRAMING_LIMITS_VERSION 2u
 #define AMATERASU_VIDEO_FRAMING_INTERFACE_MAJOR 2u
-#define AMATERASU_VIDEO_FRAMING_INTERFACE_MINOR 1u
+#define AMATERASU_VIDEO_FRAMING_INTERFACE_MINOR 2u
 typedef struct { uint64_t namespace_id, value, schema; } AmaterasuVideoFormatId;
 typedef struct {
     uint32_t size, version;
@@ -854,6 +883,16 @@ typedef struct {
     AmaterasuVideoFramingApi base;
     AmaterasuStatus (*probe)(void *, const AmaterasuVideoFormatId *, const AmaterasuVideoFormatId *, const AmaterasuVideoFramingLimits *);
 } AmaterasuVideoFramingApiV2_1;
+typedef struct {
+    AmaterasuVideoFramingApiV2_1 base;
+    /* Converts wire_kbps, fps and audio_payload_bps to video payload bps.
+     * Three zero scalars query capability without calculating a bitrate.
+     * Pure and bounded. Output is valid only for a successful calculation. */
+    AmaterasuStatus (*encoder_bitrate)(void *, const AmaterasuVideoFormatId *,
+        const AmaterasuVideoFormatId *, const AmaterasuVideoFramingLimits *,
+        uint32_t wire_kbps, uint32_t fps, uint32_t audio_payload_bps,
+        uint32_t *video_payload_bps);
+} AmaterasuVideoFramingApiV2_2;
 
 /* HDR metadata is tied to a completed capture presentation. Fields: RGB xy,
  * white xy (1/50000), max nits, min 1/10000 nit, MaxCLL and MaxFALL. */

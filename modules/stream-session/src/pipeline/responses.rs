@@ -66,7 +66,11 @@ pub(super) fn local_address(payload: &Value, name: &str) -> Result<String, &'sta
     Ok(value.to_owned())
 }
 
-pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStatus, &'static str> {
+pub(super) fn media_status(
+    record: &Record,
+    payload: &Value,
+    wire_audio_bytes: usize,
+) -> Result<MediaStatus, &'static str> {
     let config = &record.config;
     let expected_discovery = config.discovery.is_some();
     let mut expected_video = config.video.effective();
@@ -109,7 +113,7 @@ pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStat
         || batch_size_fallback != config.video.batch_size_fallback()
         || payload["audio"]["packet_ms"] != config.audio.packet_ms
         || payload["audio"]["channels"] != config.audio.channels
-        || payload["audio"]["wire_payload_bytes"] != record.wire_audio_bytes
+        || payload["audio"]["wire_payload_bytes"] != wire_audio_bytes
         || payload["video_encrypted"] != config.encrypt_video
         || payload["audio_encrypted"] != (config.stream_audio && config.encrypt_audio)
         || payload["permit_legacy_audio_iv_wrap"]

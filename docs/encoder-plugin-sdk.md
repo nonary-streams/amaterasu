@@ -10,8 +10,8 @@ Check the interface major and table size before calling an optional table.
 
 ## Integration boundaries
 
-The existing video pipeline uses the legacy encoder control service and native
-encoder tables. Its CPU path submits a borrowed CPU frame synchronously; success
+The video pipeline uses the selected v1 encoder control service and native
+encoder table. Its CPU path submits a borrowed CPU frame synchronously; success
 means input was accepted or copied, while busy accepts nothing. The Linux
 DMA-BUF path requires compatible advertised input and encoder interfaces. Its
 leased variant pins immutable pixels and requires acquire and completion
@@ -19,6 +19,28 @@ synchronization. Bindings must outlive the leases and their completion fences.
 See [Capture provider SDK](capture-plugin-sdk.md) for the frame contracts and
 `modules/encode-video/encode/README.md` for built-in backend capabilities and qualification.
 Those capabilities do not automatically apply to a third-party component.
+
+### Default encoder selection and launch capabilities
+
+Set `encoder_provider` in the video component's trusted startup settings to
+replace the encoder used by ordinary streams. The default service is
+`amaterasu.encode/1`. Grant the video component broker and native use of the
+selected service and declare its provider as a startup dependency.
+
+NVHTTP reads `selected_encoder_catalog` from the selected video service. The
+video service enumerates its own encoder through the broker while idle and
+returns the last completed snapshot. NVHTTP needs access to video and uses the
+attested frame-consumer binding when a processing composition supplies one. For
+other compositions, set NVHTTP's trusted `video_provider` to the same versioned
+video service selected by `stream-session`. A replacement video implementation
+can expose the same action to publish its encoder catalog.
+
+An enumeration entry may include a `mode_limit` object with positive integer
+`width`, `height`, and `fps`. This uses the SDK's `encode::ModeLimit` schema.
+NVHTTP filters codec offers against those bounds and limits RTSP to a mode
+supported by every offered codec. Entries without a declared limit use the
+legacy 1920×1080 at 60 FPS ceiling for software encoders. Exact configuration
+probes and encoder Open still determine whether a configuration works.
 
 `EncoderProviderApi`, `FrameResourceConsumerApi`, and `EncoderInputPoolApiV1`
 are independent optional native interfaces. Their definitions do not by

@@ -4,6 +4,7 @@ mod admission;
 mod backend;
 mod buffers;
 mod controller;
+mod frame_fit;
 mod lifecycle_issues;
 mod model;
 mod native;
@@ -47,6 +48,8 @@ struct CaptureModule {
     controller: native::Shared<NativeBackend>,
     _factory: Box<native::Factory<NativeBackend>>,
     _preflight_factory: Box<SourcePreflightFactory<PipewirePreflight>>,
+    _frame_fit_factory:
+        Option<Box<amaterasu_module_sdk::media::cpu_fit::Factory<frame_fit::PortalFitter>>>,
     epoch: Instant,
     pending_opens: Vec<PendingOpen>,
     polled_request: Option<PolledRequest>,
@@ -79,6 +82,9 @@ impl ManagedModule for CaptureModule {
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
         settings.validate().map_err(str::to_owned)?;
         let mut backend = NativeBackend::new();
+        let frame_fit_factory = settings.frame_fit_enabled.then(|| {
+            amaterasu_module_sdk::media::cpu_fit::Factory::new(frame_fit::PortalFitter::new)
+        });
         if settings.remember_source {
             backend.configure_persistence().map_err(str::to_owned)?;
         }
@@ -104,11 +110,22 @@ impl ManagedModule for CaptureModule {
                 &preflight_factory.api,
             )
         }?;
+        if let Some(factory) = &frame_fit_factory {
+            // SAFETY: this module retains the factory until all bindings are released.
+            unsafe {
+                runtime.register_native_typed(
+                    frame_fit::SERVICE,
+                    amaterasu_module_sdk::media::native_contracts::CPU_FRAME_FIT,
+                    &factory.api,
+                )
+            }?;
+        }
         Ok(Self {
             runtime,
             controller,
             _factory: factory,
             _preflight_factory: preflight_factory,
+            _frame_fit_factory: frame_fit_factory,
             epoch: Instant::now(),
             pending_opens: Vec::new(),
             polled_request: None,

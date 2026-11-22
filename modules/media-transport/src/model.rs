@@ -247,6 +247,8 @@ pub struct Open {
     #[serde(default)]
     pub video: VideoSettings,
     pub audio: AudioSettings,
+    #[serde(default)]
+    pub audio_packet_sizing: Option<amaterasu_module_sdk::transport::AudioPacketSizing>,
     #[serde(default = "yes")]
     pub stream_audio: bool,
     #[serde(default = "default_ping_timeout_ms")]
@@ -283,10 +285,11 @@ impl Open {
         for bind in [self.video_bind, self.audio_bind].into_iter().flatten() {
             validate_local_bind(bind.ip(), self.peer_ip, allow_remote)?;
         }
+        let audio = self.effective_audio_settings()?;
         if self.stream_audio
             && (!matches!(self.audio.packet_ms, 5 | 10)
                 || !matches!(self.audio.channels, 2 | 6 | 8)
-                || !self.valid_audio_wire_length())
+                || !self.valid_audio_wire_length(audio.wire_payload_bytes))
         {
             return Err("invalid_audio_configuration");
         }
@@ -328,8 +331,36 @@ impl Open {
         }
     }
 
-    fn valid_audio_wire_length(&self) -> bool {
-        let length = self.audio.wire_payload_bytes;
+    pub(crate) fn effective_audio_settings(&self) -> TransportResult<AudioSettings> {
+        let Some(sizing) = self.audio_packet_sizing else {
+            return Ok(self.audio);
+        };
+        let bytes = sizing.encoded_packet_bytes as usize;
+        if self.audio.wire_payload_bytes != 0
+            || (self.stream_audio && !(1..=1275).contains(&bytes))
+            || (!self.stream_audio && bytes != 0)
+        {
+            return Err("invalid_audio_configuration");
+        }
+        let wire_payload_bytes = if !self.stream_audio {
+            // Preserve the legacy inactive audio metadata.
+            16
+        } else if self
+            .encryption
+            .as_ref()
+            .is_some_and(|encryption| encryption.audio)
+        {
+            (bytes / 16 + 1) * 16
+        } else {
+            bytes
+        };
+        Ok(AudioSettings {
+            wire_payload_bytes,
+            ..self.audio
+        })
+    }
+
+    fn valid_audio_wire_length(&self, length: usize) -> bool {
         if self
             .encryption
             .as_ref()

@@ -20,3 +20,12 @@ owned DMA-BUF identity. Source guards and a destination claim survive failed GPU
 submissions until native completion is proven; failure to prove retirement keeps
 them quarantined and prevents successful provider retirement. Copy completion
 is polled on the presentation worker, never waited on the host tick.
+
+Constant-rate cached delivery uses the version-1 capture open request and
+reply. A consumer requests it with `"constant_rate": true`. The selected
+capture provider confirms that field only when the returned stream can
+produce the latest image at a scheduled read without waiting for a new
+presentation. The consumer supplies the cadence and checks the reply
+through `capture::confirm_constant_rate`. A successful open without the
+required confirmation is retired using the selected provider's exact open
+identity. Unrequested legacy opens need no confirmation.

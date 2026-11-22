@@ -14,7 +14,6 @@ amaterasu-input-policy.workspace = true
 amaterasu-module-sdk.workspace = true
 amaterasu-identity.workspace = true
 amaterasu-gamestream.workspace = true
-amaterasu-upnp = { path = "../upnp" }
 amaterasu-media.workspace = true
 base64 = "0.22.1"
 serde.workspace = true

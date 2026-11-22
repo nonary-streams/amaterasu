@@ -211,6 +211,14 @@ impl Backend for Fake {
             })
         }
     }
+    fn decode_control(&self, record: &ControlRecord) -> PlaneResult<ClientControl<'static>> {
+        Ok(test_decode_control(record))
+    }
+
+    fn frame_feedback(&self, event: HostControl) -> PlaneResult<Option<HostFeedbackMessage>> {
+        test_frame_feedback(event).map(Some)
+    }
+
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
         if self.feedback_busy {
             return Ok(false);
@@ -393,6 +401,8 @@ fn control_bursts_drain_promptly_without_starving_video() {
     backend
         .controls
         .extend((0..65).map(|sequence| ControlRecord {
+            channel: 0,
+            delivery: amaterasu_media::CONTROL_RELIABLE,
             message_type: 1,
             payload: Vec::new(),
             sequence,
@@ -990,7 +1000,8 @@ fn contributed_feedback_obeys_shared_queue_busy_and_invalidation_gate() {
     assert_eq!(
         pump.enqueue_message(PendingFeedback {
             message: message.clone(),
-            contribution: true
+            contribution: true,
+            best_effort: false,
         }),
         Ok(FeedbackEnqueueOutcome::Queued)
     );
@@ -1026,7 +1037,8 @@ fn contribution_queue_is_bounded_and_stop_discards_unsent_messages() {
         assert_eq!(
             pump.enqueue_message(PendingFeedback {
                 message,
-                contribution: true
+                contribution: true,
+                best_effort: false,
             }),
             Ok(FeedbackEnqueueOutcome::Queued)
         );
@@ -1040,7 +1052,8 @@ fn contribution_queue_is_bounded_and_stop_discards_unsent_messages() {
     assert_eq!(
         pump.enqueue_message(PendingFeedback {
             message,
-            contribution: true
+            contribution: true,
+            best_effort: false,
         }),
         Err(FeedbackEnqueueError::QueueFull)
     );
@@ -1055,6 +1068,8 @@ fn contribution_queue_is_bounded_and_stop_discards_unsent_messages() {
 fn zero_control_budget_preserves_queued_input_and_still_checks_transport() {
     let mut pump = Pump::new(Fake::default());
     pump.backend.controls.push_back(ControlRecord {
+        channel: 0,
+        delivery: amaterasu_media::CONTROL_RELIABLE,
         message_type: 0x200,
         sequence: 1,
         payload: vec![0],

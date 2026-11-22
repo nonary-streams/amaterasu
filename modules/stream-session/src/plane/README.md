@@ -13,9 +13,11 @@ rejecting callback still checks the live control provider without consuming its
 queued event; media continues while input catches up. Closed or failed
 control delivery stops media forwarding. Initial authentication is a pipeline
 precondition; an empty authenticated control queue is normal. Records preserve the
-message kind, authenticated sequence and bounded body for the pipeline's typed
-parser. Channel and delivery metadata confer no authority. Unknown messages are
-not represented as executed actions.
+message kind, authenticated sequence, bounded body, channel, and delivery. The
+same selected control provider's v1.1 semantic decoder interprets each record
+after the receive call returns. Channel and delivery metadata confer no
+authority. The stream coordinator retains input permissions and session policy,
+and counts invalid and unsupported records without interrupting playback.
 
 Each video tick reads at most four fragments. The assembler accepts only one
 sequence and timestamp until `FLAG_END_OF_ACCESS_UNIT`; it combines keyframe flags
@@ -26,7 +28,8 @@ incoming fragment can temporarily add another 8 MiB. The encoder must declare a
 real access-unit boundary through the ABI flag.
 
 Host feedback enters through `Plane::enqueue_feedback`, which accepts an owned,
-validated `HostFeedback` into a session-bound queue capped at 64 messages and
+`HostFeedback` for the selected provider to validate and frame. The plane queues
+that provider's exact record in a session-bound queue capped at 64 messages and
 16 KiB. The result `Queued` means the plane now owns the event; it is not transport
 admission or client acknowledgement. When full, the plane may drop best-effort
 PCM or evict an older PCM event to preserve a reliable rumble stop, trigger,

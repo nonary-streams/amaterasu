@@ -234,3 +234,30 @@ Session-lifecycle participation is hand-written by each provider against the
 types in `extension_api`; see [the session extension API](session-extension-api.md).
 No built-in module runs a hook yet, and the default profiles compose no
 layers: both exist once an operator's policy declares them.
+
+
+## Semantic streaming control
+
+The streaming coordinator requires the selected control provider to implement
+`AmaterasuControlTransportApiV1_1`, in the existing typed native control
+transport family. The v1.0 raw send and receive prefix remains available to raw
+consumers. A provider registering an alternate service must provide the same
+family, native-use grant and dependency as the default provider.
+
+`decode_client` accepts a raw record the provider already authenticated and
+returns `ClientControl`. Routing flags are informational. `encode_host` converts
+`HostControl` into one borrowed raw record. An explicit `MEDIA_UNSUPPORTED`
+response carries no record and lets the coordinator skip an optional feedback
+event with a lifecycle warning. Neither operation sends or consumes a
+transport record. The callbacks are synchronous, bounded to 16 KiB of
+semantic JSON, and must not wait for sockets, hardware, or another host tick.
+The Rust SDK validates reply bounds and callback cardinality. The event types
+are exported in `amaterasu_module_sdk::transport::control` and the C callback
+tables live in `amaterasu_media.h`. The
+[semantic event declarations](../crates/contracts/src/control.rs) define the
+v1.1 JSON schema, including its serde field and variant names.
+
+The default provider implements GameStream input and feedback framing,
+including controller rumble and HDR metadata. The coordinator owns input and
+feedback permissions, bounded admission and retry. The selected transport
+owns encryption, sequence assignment and delivery.

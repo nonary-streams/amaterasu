@@ -181,20 +181,27 @@ def missing_backend_features(bootstrap: dict, manifest: dict, artifacts: dict[st
 
 def source_state(tree: Path) -> dict:
     """Identifies the exact source, including uncommitted and untracked files."""
-    digest = hashlib.sha256(git(tree, "diff", "HEAD", "--binary"))
-    untracked = git(tree, "ls-files", "--others", "--exclude-standard").decode().split("\n")
-    for name in sorted(name for name in untracked if name.endswith((".rs", ".toml", ".c", ".h"))):
-        digest.update(name.encode())
-        digest.update((tree / name).read_bytes())
+    digest = source_diff_digest(tree)
     submodules = {}
     for line in git(tree, "config", "-f", ".gitmodules", "--get-regexp", "path$").decode().splitlines():
-        path = line.split()[1]
-        submodules[path] = git(tree / path, "rev-parse", "HEAD").decode().strip()
+        path = line.split(maxsplit=1)[1]
+        checkout = tree / path
+        submodules[path] = git(checkout, "rev-parse", "HEAD").decode().strip()
+        digest.update(path.encode() + b"\0" + source_diff_digest(checkout).digest())
     return {
         "commit": git(tree, "rev-parse", "HEAD").decode().strip(),
         "uncommitted_sha256": digest.hexdigest(),
         "submodules": submodules,
     }
+
+
+def source_diff_digest(checkout: Path):
+    digest = hashlib.sha256(git(checkout, "diff", "HEAD", "--binary", "--ignore-submodules=dirty"))
+    untracked = git(checkout, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
+    for name in sorted(name for name in untracked if name.endswith((b".rs", b".toml", b".c", b".h"))):
+        digest.update(name + b"\0")
+        digest.update((checkout / os.fsdecode(name)).read_bytes())
+    return digest
 
 
 def drift(provenance: dict, manifest: dict, running_host_sha256: str) -> list[str]:

@@ -17,6 +17,8 @@ mod hdr;
 pub use hdr::*;
 mod color;
 pub use color::*;
+mod cpu_fit;
+pub use cpu_fit::*;
 mod dmabuf;
 pub use dmabuf::*;
 mod dmabuf_lease;

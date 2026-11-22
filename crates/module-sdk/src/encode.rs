@@ -15,6 +15,42 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+/// Legacy broker service name. Signed composition can select another service
+/// implementing the same encoder control and native contracts.
+pub const DEFAULT_CONTROL_SERVICE: &str = "amaterasu.encode/1";
+
+/// Read the last enumeration from the video service's selected encoder.
+pub const SELECTED_ENCODER_CATALOG_ACTION: &str = "selected_encoder_catalog";
+
+/// Optional `mode_limit` in each encoder's v1 enumeration entry. This is an
+/// upper bound on the provider's supported launch mode. An exact configuration
+/// can still require a probe before use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModeLimit {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+impl ModeLimit {
+    pub fn supports(self, mode: Self) -> bool {
+        self.width >= mode.width && self.height >= mode.height && self.fps >= mode.fps
+    }
+
+    pub fn intersect(self, other: Self) -> Self {
+        Self {
+            width: self.width.min(other.width),
+            height: self.height.min(other.height),
+            fps: self.fps.min(other.fps),
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.width != 0 && self.height != 0 && self.fps != 0
+    }
+}
+
 pub mod cpu_pool_writer;
 pub mod pool;
 mod provider;

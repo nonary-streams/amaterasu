@@ -346,7 +346,7 @@ impl Record {
             encoder_snapshot: None,
             video_codec_offer: CodecOffer {
                 codecs: vec![amaterasu_media::VideoCodec::H264],
-                software_limited: true,
+                mode_limit: Some(crate::encoder_snapshot::LEGACY_SOFTWARE_MODE_LIMIT),
             },
             desktop: false,
             auxiliary: None,

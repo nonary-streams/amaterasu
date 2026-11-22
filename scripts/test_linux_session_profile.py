@@ -46,7 +46,7 @@ from test_nvhttp import (
 # `pack-linux-session` names the first missing library if this list falls behind
 # the profile in crates/release/src/profiles/linux_session.rs.
 LIBRARY_PACKAGES = [
-    "amaterasu-runtime", "amaterasu-network", "amaterasu-state", "amaterasu-session", "amaterasu-configuration",
+    "amaterasu-runtime", "amaterasu-network", "amaterasu-upnp", "amaterasu-state", "amaterasu-session", "amaterasu-configuration",
     "amaterasu-session-history", "amaterasu-host-metrics", "amaterasu-catalog",
     "amaterasu-application", "amaterasu-steam", "amaterasu-lutris", "amaterasu-authentication",
     "amaterasu-management", "amaterasu-pairing", "amaterasu-nvhttp", "amaterasu-display",

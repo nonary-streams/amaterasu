@@ -288,14 +288,12 @@ pub fn preflight(
         println!("[info] selected encoder compatibility requires runtime negotiation");
     }
 
-    if let Some(video) = verified
-        .manifest
-        .components
-        .iter()
-        .find(|component| component.id == crate::profiles::linux_session::VIDEO_COMPONENT_ID)
-    {
+    for component in verified.manifest.components.iter().filter(|component| {
+        component.id == crate::profiles::linux_session::VIDEO_COMPONENT_ID
+            || component.id == "amaterasu.capture-pipewire"
+    }) {
         crate::linux_video_runtime::validate(&read_bounded(
-            &package_path.join(&video.file),
+            &package_path.join(&component.file),
             256 * 1024 * 1024,
         )?)?;
     }

@@ -16,6 +16,60 @@ fn alternatives() -> ProviderServices {
 }
 
 #[test]
+fn selected_media_provider_owns_packetization_and_effective_audio_wire_length() {
+    let mut request = prepare();
+    request["video"] = json!({"packet_size": 1024, "max_fec_blocks": 5});
+    request["audio"] = json!({"channels":6,"channel_mask":0x3f,"layout":"5.1",
+        "packet_ms":10,"bitrate":1_200_000});
+
+    let mut default_host = Harness::new();
+    let refused = default_host.response(1, request.clone());
+    assert_eq!(refused["state"], "failed");
+    assert_eq!(refused["error"], "invalid_video_configuration");
+    assert!(
+        default_host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Media.service()
+                && call.payload["action"] == "open")
+    );
+    let mut audio_check = request.clone();
+    audio_check["operation_id"] = json!("check-audio-size");
+    audio_check["video"]["max_fec_blocks"] = json!(1);
+    let refused = Harness::new().response(1, audio_check);
+    assert_eq!(refused["state"], "failed");
+    assert_eq!(refused["error"], "invalid_audio_configuration");
+
+    let mut host = Harness::new();
+    let service = "vendor.media-delivery/1";
+    host.pipeline.settings.providers.media_transport = service.into();
+    let prepared = host.response(1, request);
+    let id = prepared["session"]
+        .as_u64()
+        .expect("prepared replacement stream");
+    assert_eq!(prepared["packet_bytes"], 1500);
+    assert_eq!(prepared["wire_audio_bytes"], 1537);
+    let call = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == service && call.payload["action"] == "open")
+        .expect("replacement media open");
+    assert_eq!(call.payload["video"]["max_fec_blocks"], 5);
+    assert_eq!(
+        call.payload["audio_packet_sizing"]["encoded_packet_bytes"],
+        1500
+    );
+    assert_eq!(call.payload["audio"]["wire_payload_bytes"], 0);
+    let mut configuration = start(id);
+    configuration["configuration"]["audio_endpoint"] = json!("");
+    configuration["configuration"]["virtual_sink"] = json!("Steam Streaming Speakers");
+    configuration["configuration"]["channels"] = json!(6);
+    assert_eq!(host.response(2, configuration)["state"], "active");
+}
+
+#[test]
 fn workflow_routes_to_selected_contracts_through_the_real_broker() {
     let providers = alternatives();
     let mut payload = prepare();
@@ -357,4 +411,24 @@ fn custom_native_roles_require_an_explicit_contract_acknowledgment_before_bindin
             .get("required_native_contract")
             .is_none()
     );
+}
+
+#[test]
+fn missing_control_codec_refuses_preparation_before_opening_control() {
+    let mut host = Harness::new();
+    host.control_codec_available = false;
+    let refused = host.response(1, prepare());
+    assert_eq!(refused["state"], "failed");
+    assert_eq!(refused["error"], "control_codec_unavailable");
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == Resource::Control.service() && call.payload["action"] == "open"
+    }));
+    assert!(host.broker.calls.iter().any(|call| {
+        call.service == Resource::Media.service() && call.payload["action"] == "close"
+    }));
+
+    host.control_codec_available = true;
+    let mut retry = prepare();
+    retry["operation_id"] = json!("supported-control-codec");
+    assert!(host.response(2, retry)["session"].is_u64());
 }

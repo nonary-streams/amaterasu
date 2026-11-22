@@ -4,6 +4,7 @@ use amaterasu_media::{VideoApi, VideoApiV1_3};
 
 /// Interface family independent of the selected service alias.
 pub const CONTRACT: &str = "amaterasu.video.native/1";
+pub const DEFAULT_CONTROL_SERVICE: &str = "amaterasu.video/1";
 
 /// # Safety
 /// The factory implements VideoApi and remains live until all bindings are released.

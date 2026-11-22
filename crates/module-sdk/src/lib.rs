@@ -35,6 +35,7 @@ pub mod protocol_handler;
 pub mod requests;
 pub mod retained_options;
 pub mod retirement;
+pub mod router_mapping;
 pub mod service_worker;
 pub mod session_presentation;
 pub mod stream_lifecycle;

@@ -1,10 +1,10 @@
 //! IPv6 UPnP firewall pinholes for the live listener endpoints.
 
-use amaterasu_module_sdk::network::Network;
-use amaterasu_upnp::{
+use crate::{
     IgdIpv6Firewall, Ipv6FirewallControl, OperationDeadline, PinholeEndpoint, PinholeManager,
     RECOMMENDED_REFRESH_INTERVAL, discover_ipv6_firewalls_with_deadline,
 };
+use amaterasu_module_sdk::network::Network;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::mpsc::RecvTimeoutError;
@@ -12,9 +12,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::upnp::{
-    LifecycleCommand, LifecycleReceiver, LifecycleSender, LifecycleWorker, UpnpRuntimeStatus,
-    UpnpStatusMailbox, WorkerCompletion, lifecycle_channel,
+    LifecycleCommand, LifecycleReceiver, LifecycleSender, LifecycleWorker, UpnpStatusMailbox,
+    WorkerCompletion, lifecycle_channel,
 };
+use amaterasu_module_sdk::router_mapping::Status as UpnpRuntimeStatus;
 
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RUNTIME_ERROR_CHARS: usize = 256;
@@ -23,7 +24,7 @@ const DEFAULT_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct DesiredPinholes {
     enabled: bool,
-    endpoints: Vec<amaterasu_upnp::MappingEndpoint>,
+    endpoints: Vec<crate::MappingEndpoint>,
 }
 
 /// Owns the IPv6 pinhole worker and makes orderly cleanup part of module shutdown.
@@ -70,7 +71,7 @@ impl Ipv6PinholeLifecycle {
         &mut self,
         enabled: bool,
         address_family_includes_ipv6: bool,
-        endpoints: &[amaterasu_upnp::MappingEndpoint],
+        endpoints: &[crate::MappingEndpoint],
     ) {
         let desired = DesiredPinholes {
             enabled: enabled && address_family_includes_ipv6,
@@ -90,6 +91,10 @@ impl Ipv6PinholeLifecycle {
                 };
             }
         }
+        self.refresh_status();
+    }
+
+    pub(crate) fn refresh_status(&mut self) {
         while let Ok(status) = self.statuses.try_recv() {
             self.status = status;
         }
@@ -226,9 +231,7 @@ fn run_worker(
                     match network
                         .as_ref()
                         .ok_or_else(|| {
-                            amaterasu_upnp::GatewayError::new(
-                                "IPv6 UPnP network provider unavailable",
-                            )
+                            crate::GatewayError::new("IPv6 UPnP network provider unavailable")
                         })
                         .and_then(|network| {
                             discover_ipv6_firewalls_with_deadline(network, deadline.clone())
@@ -350,7 +353,7 @@ struct Ipv6GatewayOwner<C: Ipv6FirewallControl> {
     internal_addresses: Vec<Ipv6Addr>,
 }
 
-fn has_ipv6_candidate(endpoints: &[amaterasu_upnp::MappingEndpoint]) -> bool {
+fn has_ipv6_candidate(endpoints: &[crate::MappingEndpoint]) -> bool {
     endpoints.iter().any(|endpoint| {
         endpoint.active
             && matches!(endpoint.address, IpAddr::V6(address) if address.is_unspecified() || routable_listener_address(address))
@@ -365,7 +368,7 @@ fn routable_listener_address(address: Ipv6Addr) -> bool {
 }
 
 fn materialize_pinhole_endpoints(
-    endpoints: &[amaterasu_upnp::MappingEndpoint],
+    endpoints: &[crate::MappingEndpoint],
     internal_addresses: &[Ipv6Addr],
 ) -> Vec<PinholeEndpoint> {
     let Some(preferred_internal_address) = internal_addresses.first().copied() else {
@@ -570,7 +573,21 @@ fn bounded_runtime_error(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amaterasu_upnp::{
+
+    #[test]
+    fn status_poll_observes_ipv6_worker_progress_without_a_configuration_change() {
+        let mut lifecycle = Ipv6PinholeLifecycle::new(None, OperationDeadline::default());
+        lifecycle
+            .statuses
+            .send(UpnpRuntimeStatus {
+                status: "active".into(),
+                error: None,
+            })
+            .unwrap();
+        lifecycle.refresh_status();
+        assert_eq!(lifecycle.status().status, "active");
+    }
+    use crate::{
         FirewallStatus, GatewayError, Ipv6FirewallControl, MappingEndpoint, PinholeDeleteOutcome,
         PinholeRefreshOutcome, Protocol,
     };

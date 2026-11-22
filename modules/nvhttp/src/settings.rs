@@ -23,6 +23,8 @@ pub enum AddressFamily {
 pub struct Settings {
     pub enabled: bool,
     pub network_provider: String,
+    pub router_mapping_provider: Option<String>,
+    pub video_provider: String,
     pub audio_capture_provider: String,
     /// Trusted startup selection of the optional, versioned client-session policy.
     /// A selected provider must be available; requests never fall back to a
@@ -50,6 +52,8 @@ impl Default for Settings {
         Self {
             enabled: false,
             network_provider: "amaterasu.network/1".into(),
+            router_mapping_provider: Some(amaterasu_module_sdk::router_mapping::SERVICE.into()),
+            video_provider: amaterasu_module_sdk::video::DEFAULT_CONTROL_SERVICE.into(),
             audio_capture_provider: "amaterasu.audio/1".into(),
             session_presentation_provider: None,
             auxiliary_black_capture_provider: None,
@@ -78,6 +82,16 @@ impl Settings {
         crate::wire::participants::validate(&self.protocol_handlers)?;
         if !amaterasu_module_sdk::network::valid_provider(&self.network_provider) {
             return Err("invalid_network_provider");
+        }
+        if self
+            .router_mapping_provider
+            .as_deref()
+            .is_some_and(|provider| !amaterasu_module_sdk::network::valid_provider(provider))
+        {
+            return Err("invalid_router_mapping_provider");
+        }
+        if !amaterasu_module_sdk::network::valid_provider(&self.video_provider) {
+            return Err("invalid_video_provider");
         }
         if !amaterasu_module_sdk::network::valid_provider(&self.audio_capture_provider) {
             return Err("invalid_audio_capture_provider");

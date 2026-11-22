@@ -13,7 +13,7 @@ pub const VIDEO_UNIT_VERSION: u32 = 1;
 /// FEC policy fields extend the v1 limits prefix and require framing API v2.
 pub const VIDEO_FRAMING_LIMITS_VERSION: u32 = 2;
 pub const VIDEO_FRAMING_INTERFACE_MAJOR: u32 = 2;
-pub const VIDEO_FRAMING_INTERFACE_MINOR: u32 = 1;
+pub const VIDEO_FRAMING_INTERFACE_MINOR: u32 = 2;
 pub const VIDEO_UNIT_KEYFRAME: u32 = 1;
 pub const VIDEO_UNIT_DISCONTINUITY: u32 = 2;
 pub const VIDEO_UNIT_END_OF_STREAM: u32 = 4;
@@ -501,6 +501,24 @@ pub struct VideoFramingApiV2_1 {
         *const EncoderFormatId,
         *const EncoderFormatId,
         *const VideoFramingLimits,
+    ) -> Status,
+}
+
+/// Pure, bounded conversion of a negotiated total link budget to encoder
+/// payload bits per second. This includes the provider's framing overhead.
+/// Pass three zero scalars to query budgeting capability for these descriptors.
+#[repr(C)]
+pub struct VideoFramingApiV2_2 {
+    pub base: VideoFramingApiV2_1,
+    pub encoder_bitrate: unsafe extern "C" fn(
+        *mut c_void,
+        *const EncoderFormatId,
+        *const EncoderFormatId,
+        *const VideoFramingLimits,
+        u32, // wire kilobits per second
+        u32, // frames per second
+        u32, // audio payload bits per second
+        *mut u32,
     ) -> Status,
 }
 

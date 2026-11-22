@@ -75,6 +75,29 @@ pub struct ControlTransportApi {
     pub receive: unsafe extern "C" fn(*mut c_void, u64, ControlMessageSink) -> Status,
 }
 
+/// Bounded JSON for the semantic control messages in amaterasu-contracts.
+pub const MAX_SEMANTIC_CONTROL_BYTES: usize = 16 * 1024;
+
+/// v1.1 adds semantic framing without changing the raw v1.0 transport.
+#[repr(C)]
+pub struct ControlTransportApiV1_1 {
+    pub v1_0: ControlTransportApi,
+    /// Interprets authenticated plaintext. The versioned reply is ClientControl
+    /// JSON. Invalid or unsupported protocol records are explicit semantic results.
+    pub decode_client: unsafe extern "C" fn(
+        *mut c_void,
+        *const ControlMessage,
+        amaterasu_abi::ReplySink,
+    ) -> Status,
+    /// Frames HostControl JSON and borrows one raw message to the sink.
+    /// This operation never submits the message or assigns a sequence.
+    pub encode_host: unsafe extern "C" fn(
+        *mut c_void,
+        amaterasu_abi::BorrowedBytes,
+        ControlMessageSink,
+    ) -> Status,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

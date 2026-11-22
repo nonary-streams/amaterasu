@@ -167,7 +167,8 @@ impl Stream {
         }
         request.validate_video_encryption_policy()?;
         let ping_timeout_ms = validate_ping_timeout_ms(request.ping_timeout_ms)?;
-        let (video, audio) = packetizers(request)?;
+        let audio_settings = request.effective_audio_settings()?;
+        let (video, audio) = packetizers(request, audio_settings)?;
         let (video_sealer, audio_sealer) = ciphers(request)?;
         let mut delivery = match (&request.discovery, request.video_port, request.audio_port) {
             (Some(discovery), None, None) => Delivery::discover_with_network(
@@ -202,7 +203,7 @@ impl Stream {
             peer: request.peer_ip,
             video_settings,
             video_batch_size_fallback: request.video.batch_size_fallback(),
-            audio_settings: request.audio,
+            audio_settings,
             stream_audio: request.stream_audio,
             ping_timeout_ms,
             video_local,
@@ -917,7 +918,10 @@ impl Stream {
     }
 }
 
-fn packetizers(request: &Open) -> TransportResult<(VideoPacketizer, AudioPacketizer)> {
+fn packetizers(
+    request: &Open,
+    audio_settings: AudioSettings,
+) -> TransportResult<(VideoPacketizer, AudioPacketizer)> {
     let encrypted_video = request
         .encryption
         .as_ref()
@@ -929,10 +933,10 @@ fn packetizers(request: &Open) -> TransportResult<(VideoPacketizer, AudioPacketi
     let video = video_packetizer(&request.video, codec)?;
     let audio = AudioPacketizer::new(AudioConfig {
         sample_rate: 48_000,
-        channels: request.audio.channels,
-        frames_per_packet: request.audio.packet_ms * 48,
-        wire_payload_bytes: request.audio.wire_payload_bytes,
-        ssrc: request.audio.ssrc,
+        channels: audio_settings.channels,
+        frames_per_packet: audio_settings.packet_ms * 48,
+        wire_payload_bytes: audio_settings.wire_payload_bytes,
+        ssrc: audio_settings.ssrc,
     })
     .map_err(|_| "invalid_audio_configuration")?;
     Ok((video, audio))

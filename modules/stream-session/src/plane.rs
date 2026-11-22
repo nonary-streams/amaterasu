@@ -6,12 +6,13 @@ mod packets;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use amaterasu_gamestream::control::{
-    FeedbackEncodeError, HostFeedback, HostFeedbackDelivery, HostFeedbackMessage,
-    encode_host_feedback,
-};
 use amaterasu_media::*;
 use amaterasu_module_sdk::RuntimeClient;
+#[cfg(test)]
+use amaterasu_module_sdk::transport::control::HostFeedbackDelivery;
+use amaterasu_module_sdk::transport::control::{
+    ClientControl, HostControl, HostFeedback, HostFeedbackMessage,
+};
 pub(crate) use packets::VideoUnitSelection;
 use packets::{AudioPacket, PcmPacket, VideoAssembly, VideoPacket, VideoUnitPacket};
 use std::collections::VecDeque;
@@ -39,7 +40,8 @@ pub enum FeedbackEnqueueOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeedbackEnqueueError {
-    Invalid(FeedbackEncodeError),
+    Invalid,
+    Unsupported,
     QueueFull,
     Stopped,
 }
@@ -93,6 +95,8 @@ pub(crate) fn probe_extension_chain(
 #[derive(Debug)]
 pub struct ControlRecord {
     pub message_type: u16,
+    pub channel: u8,
+    pub delivery: u32,
     pub payload: Vec<u8>,
     pub sequence: u64,
 }
@@ -222,6 +226,10 @@ impl Plane {
             .tick_with_control_budget(media_active, control_budget)
     }
 
+    pub fn decode_control(&self, record: &ControlRecord) -> PlaneResult<ClientControl<'static>> {
+        self.pump.backend.decode_control(record)
+    }
+
     pub fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
         self.pump.backend.send_rumble(command)
     }
@@ -243,6 +251,7 @@ impl Plane {
         self.pump.enqueue_message(PendingFeedback {
             message,
             contribution: true,
+            best_effort: false,
         })
     }
 
@@ -286,6 +295,8 @@ trait Backend {
         Ok(None)
     }
     fn control(&mut self, accept: bool) -> PlaneResult<Option<ControlRecord>>;
+    fn decode_control(&self, record: &ControlRecord) -> PlaneResult<ClientControl<'static>>;
+    fn frame_feedback(&self, event: HostControl) -> PlaneResult<Option<HostFeedbackMessage>>;
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool>;
     fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool>;
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>>;
@@ -323,6 +334,7 @@ trait Backend {
 struct PendingFeedback {
     message: HostFeedbackMessage,
     contribution: bool,
+    best_effort: bool,
 }
 
 struct Pump<B> {
@@ -527,10 +539,16 @@ impl<B: Backend> Pump<B> {
         if self.stopping || self.failure.is_some() {
             return Err(FeedbackEnqueueError::Stopped);
         }
-        let message = encode_host_feedback(feedback).map_err(FeedbackEnqueueError::Invalid)?;
+        let best_effort = matches!(feedback, HostFeedback::HapticsPcm { .. });
+        let message = self
+            .backend
+            .frame_feedback(HostControl::Feedback(feedback))
+            .map_err(|_| FeedbackEnqueueError::Invalid)?
+            .ok_or(FeedbackEnqueueError::Unsupported)?;
         self.enqueue_message(PendingFeedback {
             message,
             contribution: false,
+            best_effort,
         })
     }
 
@@ -545,15 +563,14 @@ impl<B: Backend> Pump<B> {
         if message_bytes > MAX_PENDING_FEEDBACK_BYTES {
             return Err(FeedbackEnqueueError::QueueFull);
         }
-        if pending.message.delivery == HostFeedbackDelivery::SequencedUnreliable
-            && self.would_exceed_feedback_bounds(message_bytes)
-        {
+        if pending.best_effort && self.would_exceed_feedback_bounds(message_bytes) {
             return Ok(FeedbackEnqueueOutcome::DroppedBestEffort);
         }
         while self.would_exceed_feedback_bounds(message_bytes) {
-            let pcm_index = self.pending_feedback.iter().position(|pending| {
-                pending.message.delivery == HostFeedbackDelivery::SequencedUnreliable
-            });
+            let pcm_index = self
+                .pending_feedback
+                .iter()
+                .position(|pending| pending.best_effort);
             let Some(pcm_index) = pcm_index else {
                 return Err(FeedbackEnqueueError::QueueFull);
             };
@@ -922,3 +939,37 @@ mod tests;
 
 #[cfg(test)]
 mod negotiated_tests;
+
+#[cfg(test)]
+pub(crate) fn test_decode_control(record: &ControlRecord) -> ClientControl<'static> {
+    use amaterasu_gamestream::{
+        control::{Message, Profile, decode},
+        crypto::Direction,
+    };
+    match decode(
+        Profile::SunshineModern,
+        Direction::ClientToHost,
+        record.message_type,
+        &record.payload,
+    ) {
+        Ok(Message::RequestIdr | Message::InvalidateReferences { .. }) => ClientControl::RequestIdr,
+        Ok(Message::Ping { .. } | Message::Start) => ClientControl::Keepalive,
+        Ok(Message::Input(input)) => {
+            let json = serde_json::to_vec(&input).unwrap();
+            ClientControl::Input(serde_json::from_slice(&json).unwrap())
+        }
+        Ok(_) => ClientControl::Unsupported,
+        Err(_) => ClientControl::Invalid,
+    }
+}
+
+#[cfg(test)]
+fn test_frame_feedback(event: HostControl) -> PlaneResult<HostFeedbackMessage> {
+    match event {
+        HostControl::Feedback(feedback) => {
+            amaterasu_gamestream::control::encode_host_feedback(feedback)
+                .map_err(|_| "invalid_feedback")
+        }
+        HostControl::HdrMetadata { .. } => Err("hdr_metadata_unimplemented"),
+    }
+}

@@ -1,10 +1,7 @@
 //! Validated GameStream host-to-client controller feedback records.
 use super::ControllerMotionType;
-
-pub const MAX_CONTROLLER_SLOT: u16 = 16;
-pub const MAX_HAPTICS_FRAMES: u16 = 240;
-pub const HAPTICS_FRAME_BYTES: usize = 4;
-pub const ADAPTIVE_TRIGGER_EFFECT_BYTES: usize = 10;
+#[cfg(test)]
+use amaterasu_contracts::control::ADAPTIVE_TRIGGER_EFFECT_BYTES;
 
 const RUMBLE: u16 = 0x010b;
 const TRIGGER_RUMBLE: u16 = 0x5500;
@@ -15,74 +12,10 @@ const HAPTICS_PCM: u16 = 0x5601;
 const HAPTICS_CHANNEL: u8 = 0x08;
 const ADAPTIVE_TRIGGER_EVENT_FLAGS: u8 = 0x0c;
 
-/// Output from a native controller backend, addressed by client-relative slot.
-/// Slot ownership must be established by the input lease before it reaches here.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HostFeedback {
-    Rumble {
-        controller: u16,
-        low_frequency: u16,
-        high_frequency: u16,
-    },
-    TriggerRumble {
-        controller: u16,
-        left: u16,
-        right: u16,
-    },
-    Motion {
-        controller: u16,
-        report_rate_hz: u16,
-        motion_type: ControllerMotionType,
-    },
-    RgbLed {
-        controller: u16,
-        red: u8,
-        green: u8,
-        blue: u8,
-    },
-    AdaptiveTriggers {
-        controller: u16,
-        event_flags: u8,
-        type_left: u8,
-        type_right: u8,
-        left: [u8; ADAPTIVE_TRIGGER_EFFECT_BYTES],
-        right: [u8; ADAPTIVE_TRIGGER_EFFECT_BYTES],
-    },
-    HapticsPcm {
-        controller: u16,
-        sequence: u32,
-        frames: u16,
-        /// Interleaved left/right actuator samples, signed 16-bit little endian.
-        samples_s16le: Vec<u8>,
-    },
-}
-
-/// ENet delivery for the encoded control event. Unreliable means sequenced,
-/// matching the haptics extension's real-time PCM route.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostFeedbackDelivery {
-    Reliable,
-    SequencedUnreliable,
-}
-
-/// Owned inner control record; encryption and nonce assignment remain with the
-/// authenticated control-transport provider.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostFeedbackMessage {
-    pub message_type: u16,
-    pub channel: u8,
-    pub delivery: HostFeedbackDelivery,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FeedbackEncodeError {
-    InvalidController,
-    InvalidAdaptiveTriggerFlags,
-    InvalidHapticsFrameCount,
-    InvalidHapticsSampleLength,
-}
+pub use amaterasu_contracts::control::{
+    FeedbackEncodeError, HAPTICS_FRAME_BYTES, HostFeedback, HostFeedbackDelivery,
+    HostFeedbackMessage, MAX_CONTROLLER_SLOT, MAX_HAPTICS_FRAMES,
+};
 
 /// Encodes one client-relative feedback record without constructing its outer
 /// authenticated envelope. The control transport adds that envelope and owns

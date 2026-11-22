@@ -84,6 +84,8 @@ pub(super) fn media_layer(code: &str) -> LifecycleLayer {
         LifecycleLayer::EncodeVideo
     } else if code.starts_with("capture") {
         LifecycleLayer::Capture
+    } else if code.starts_with("native_control") || code.starts_with("control_codec") {
+        LifecycleLayer::ControlTransport
     } else {
         LifecycleLayer::MediaTransport
     }
@@ -120,6 +122,27 @@ impl Record {
                 .caused_by(LifecycleLayer::Input),
         );
     }
+    #[track_caller]
+    pub(super) fn report_control_feedback_fallback(&mut self) {
+        eprintln!(
+            "amaterasu session warning code=control_feedback_unsupported fallback=skip_unsupported_feedback"
+        );
+        let Some(operation) = self.config.rtsp_operation_id.clone() else {
+            return;
+        };
+        self.issues.push(
+            StreamIssue::demoted(
+                operation,
+                LifecycleLayer::StreamSession,
+                "frame_feedback",
+                "control_feedback_unsupported",
+                "skip_unsupported_feedback",
+            )
+            .because("selected_control_provider_declined_feedback")
+            .caused_by(LifecycleLayer::ControlTransport),
+        );
+    }
+
     #[track_caller]
     pub(super) fn report_extension_probe_fallback(&mut self, reason: &str) {
         self.extension_checked = true;

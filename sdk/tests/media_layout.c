@@ -1,4 +1,5 @@
 #include "amaterasu_media.h"
+#include "amaterasu_router_mapping.h"
 _Static_assert(AMATERASU_PIXEL_BGRA8 == 1 && AMATERASU_PIXEL_NV12 == 2, "existing CPU pixel identities");
 _Static_assert(AMATERASU_PIXEL_P010 == 3, "P010 CPU pixel identity");
 _Static_assert(sizeof(AmaterasuCpuResourceCapabilitiesV2) == 44, "CPU color capabilities v2 layout");
@@ -7,6 +8,8 @@ _Static_assert(offsetof(AmaterasuCaptureApiV1_11,source_preflight) == sizeof(Ama
 _Static_assert(offsetof(AmaterasuCaptureApiV1_11,base) == 0, "capture v1.11 complete prefix");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(AmaterasuNativeInterface) == 32, "native prefix layout");
+_Static_assert(sizeof(AmaterasuRouterMappingApi) == 40, "router mapping table layout");
+_Static_assert(offsetof(AmaterasuRouterMappingApi, request) == sizeof(AmaterasuNativeInterface), "router mapping callback offset");
 _Static_assert(sizeof(AmaterasuCaptureSwapRequest) == 56, "capture swap request layout");
 _Static_assert(sizeof(AmaterasuCaptureEventSink) == 32, "capture notification sink layout");
 _Static_assert(sizeof(AmaterasuCaptureApiV1_7) == 112, "capture event table layout");
@@ -43,6 +46,9 @@ _Static_assert(sizeof(AmaterasuNativeInterfaceQuery) == 24, "native query layout
 _Static_assert(sizeof(AmaterasuNativeServiceFactory) == 32, "native factory layout");
 _Static_assert(sizeof(AmaterasuCpuFrame) == 48, "frame layout");
 _Static_assert(sizeof(AmaterasuCpuProcessorApi) == 40, "CPU processor layout");
+_Static_assert(sizeof(AmaterasuCpuFrameFitTarget) == 16, "CPU frame fit target layout");
+_Static_assert(sizeof(AmaterasuCpuFrameFitApi) == 56, "CPU frame fit table layout");
+_Static_assert(offsetof(AmaterasuCpuFrameFitApi, submit) == sizeof(AmaterasuNativeInterface), "CPU frame fit submit offset");
 _Static_assert(offsetof(AmaterasuCpuProcessorApi, process) == 32, "CPU processor callback offset");
 _Static_assert(AMATERASU_CPU_PROCESSOR_API_V1_0_SIZE == 40, "CPU processor v1.0 size");
 _Static_assert(offsetof(AmaterasuCpuFrame, data) == 16, "frame data offset");
@@ -111,6 +117,8 @@ _Static_assert(offsetof(AmaterasuNegotiatedVideoPlanTransportApi, probe) == 32, 
 _Static_assert(offsetof(AmaterasuNegotiatedVideoPlanTransportApi, submit) == 48, "plan submit offset");
 _Static_assert(sizeof(AmaterasuVideoFramingApiV2_1) == 48, "video framing probe table layout");
 _Static_assert(offsetof(AmaterasuVideoFramingApiV2_1, probe) == 40, "video framing probe offset");
+_Static_assert(sizeof(AmaterasuVideoFramingApiV2_2) == 56, "video framing bitrate table layout");
+_Static_assert(offsetof(AmaterasuVideoFramingApiV2_2, encoder_bitrate) == sizeof(AmaterasuVideoFramingApiV2_1), "video framing bitrate tail preserves probe prefix");
 _Static_assert(sizeof(AmaterasuVideoApiV1_1) == 48, "video v1.1 table layout");
 _Static_assert(offsetof(AmaterasuVideoApiV1_1, geometry) == 40, "video geometry offset");
 _Static_assert(sizeof(AmaterasuAudioFrame) == 104, "audio frame layout");
@@ -143,6 +151,9 @@ _Static_assert(offsetof(AmaterasuControlMessage, sequence) == 32, "control seque
 _Static_assert(sizeof(AmaterasuControlTransportApi) == 48, "control API layout");
 _Static_assert(offsetof(AmaterasuControlTransportApi, send) == 32, "control send layout");
 _Static_assert(offsetof(AmaterasuControlTransportApi, receive) == 40, "control receive layout");
+_Static_assert(offsetof(AmaterasuControlTransportApiV1_1, decode_client) == sizeof(AmaterasuControlTransportApi), "semantic control tail preserves raw prefix");
+_Static_assert(offsetof(AmaterasuControlTransportApiV1_1, encode_host) == 56, "semantic control encode offset");
+_Static_assert(sizeof(AmaterasuControlTransportApiV1_1) == 64, "semantic control table layout");
 
 _Static_assert(offsetof(AmaterasuFrameProcessorApi, base) == 0, "frame processor resource prefix");
 _Static_assert(sizeof(AmaterasuFrameProcessorApi) == sizeof(AmaterasuFrameResourceProcessorApi) + 3 * sizeof(void *), "complete frame processor layout");

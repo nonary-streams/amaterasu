@@ -134,7 +134,7 @@ struct MediaBinding {
 }
 #[repr(C)]
 struct ControlBinding {
-    api: ControlTransportApi,
+    api: ControlTransportApiV1_1,
 }
 unsafe extern "C" fn release_video(ctx: *mut c_void) {
     drop(unsafe { Box::from_raw(ctx.cast::<VideoBinding>()) });
@@ -165,7 +165,7 @@ unsafe extern "C" fn bind(
     let query = unsafe { &*query };
     if !query.header.supports::<NativeInterfaceQuery>()
         || query.interface_major != 1
-        || query.min_minor != 0
+        || query.min_minor > u32::from(matches!(factory.kind, Kind::Control))
     {
         return STATUS_INVALID_ARGUMENT;
     }
@@ -234,19 +234,24 @@ unsafe extern "C" fn bind(
             }
         }
         Kind::Control => {
-            if query.min_size as usize > size_of::<ControlTransportApi>() {
+            if query.min_size as usize > size_of::<ControlTransportApiV1_1>() {
                 return STATUS_INVALID_ARGUMENT;
             }
             let mut table = Box::new(ControlBinding {
-                api: ControlTransportApi {
-                    base: prefix(size_of::<ControlTransportApi>(), release_control),
-                    send: control_send,
-                    receive: control_receive,
+                api: ControlTransportApiV1_1 {
+                    v1_0: ControlTransportApi {
+                        base: prefix(size_of::<ControlTransportApiV1_1>(), release_control),
+                        send: control_send,
+                        receive: control_receive,
+                    },
+                    decode_client: unavailable_decode,
+                    encode_host: unavailable_encode,
                 },
             });
-            table.api.base.context = (&mut *table as *mut ControlBinding).cast();
+            table.api.v1_0.base.header.minor = 1;
+            table.api.v1_0.base.context = (&mut *table as *mut ControlBinding).cast();
             unsafe {
-                *out = &(*Box::into_raw(table)).api.base;
+                *out = &(*Box::into_raw(table)).api.v1_0.base;
             }
         }
     }
@@ -1115,6 +1120,12 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             let mut unsupported = route.clone();
             unsupported.framer_service = BAD_FRAMER.into();
             assert!(probe_extension_chain(&consumer, &unsupported, media_stream, &config).is_err());
+            let mut requires_encryption = config.clone();
+            requires_encryption.encrypt_video = true;
+            assert_eq!(
+                probe_extension_chain(&consumer, &route, media_stream, &requires_encryption).err(),
+                Some("video_plan_policy_mismatch")
+            );
             let limits = probe_extension_chain(&consumer, &route, media_stream, &config).unwrap();
             assert_eq!(limits.max_fec_blocks, transport_fec_blocks);
             let selection = VideoUnitSelection {
@@ -1275,4 +1286,20 @@ fn negotiated_unit_copy_requires_exact_selection_and_owns_payload() {
         unsafe { std::slice::from_raw_parts(header.data.ptr, header.data.len) },
         [10, 20, 30]
     );
+}
+
+unsafe extern "C" fn unavailable_decode(
+    _: *mut c_void,
+    _: *const ControlMessage,
+    _: ReplySink,
+) -> Status {
+    MEDIA_UNSUPPORTED
+}
+
+unsafe extern "C" fn unavailable_encode(
+    _: *mut c_void,
+    _: BorrowedBytes,
+    _: ControlMessageSink,
+) -> Status {
+    MEDIA_UNSUPPORTED
 }

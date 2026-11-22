@@ -979,7 +979,7 @@ mod tests {
             );
         }
         assert_eq!(
-            translator.translate(Input::Text("a")),
+            translator.translate(Input::Text("a".into())),
             Err(TranslationError::UnsupportedInput)
         );
     }

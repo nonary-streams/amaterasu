@@ -82,6 +82,18 @@ const NETWORK: ComponentDefinition = ComponentDefinition {
     dependencies: &[RUNTIME_ID],
 };
 
+const ROUTER_MAPPING: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.router-mapping",
+    library: "amaterasu_upnp",
+    provides: &[],
+    calls: &[],
+    publishes: &[],
+    subscribes: &[],
+    native_provides: &["amaterasu.router-mapping/1"],
+    native_uses: &["amaterasu.network/1"],
+    dependencies: &[RUNTIME_ID, "amaterasu.network"],
+};
+
 const EXAMPLE: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.example-echo",
     library: "amaterasu_echo_fixture",
@@ -432,10 +444,12 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
     native_uses: &[
         "amaterasu.library/1",
         "amaterasu.network/1",
+        "amaterasu.router-mapping/1",
         "amaterasu.identity/1",
     ],
     dependencies: &[
         "amaterasu.network",
+        ROUTER_MAPPING.id,
         RUNTIME_ID,
         "amaterasu.configuration",
         "amaterasu.pairing",
@@ -662,7 +676,7 @@ const CAPTURE_PIPEWIRE: ComponentDefinition = ComponentDefinition {
     calls: &[],
     publishes: &[STREAM_REPORT_TOPIC],
     subscribes: &[],
-    native_provides: &["amaterasu.capture-pipewire/1"],
+    native_provides: &["amaterasu.capture-pipewire/1", "amaterasu.cpu-frame-fit/1"],
     native_uses: &[],
     dependencies: &[RUNTIME_ID],
 };
@@ -866,7 +880,11 @@ const PAIRING_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
 };
 
 const NVHTTP_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
-    native_uses: &["amaterasu.network/1", "amaterasu.identity/1"],
+    native_uses: &[
+        "amaterasu.network/1",
+        "amaterasu.identity/1",
+        "amaterasu.router-mapping/1",
+    ],
     calls: &[
         "amaterasu.configuration/1",
         "amaterasu.input/1",
@@ -886,6 +904,7 @@ const NVHTTP_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
     ],
     dependencies: &[
         "amaterasu.network",
+        ROUTER_MAPPING.id,
         RUNTIME_ID,
         "amaterasu.configuration",
         "amaterasu.input",
@@ -1596,6 +1615,7 @@ impl PackageProfile {
             Self::StreamProbe => &[
                 RUNTIME,
                 NETWORK,
+                ROUTER_MAPPING,
                 STATE,
                 CONFIGURATION,
                 CATALOG,
@@ -1630,6 +1650,7 @@ impl PackageProfile {
             Self::SoftwareProbe => &[
                 RUNTIME,
                 NETWORK,
+                ROUTER_MAPPING,
                 STATE,
                 CONFIGURATION,
                 CATALOG,
@@ -1668,6 +1689,7 @@ impl PackageProfile {
             Self::LinuxProbe => &[
                 RUNTIME,
                 NETWORK,
+                ROUTER_MAPPING,
                 STATE,
                 CONFIGURATION,
                 CATALOG,
@@ -1707,6 +1729,7 @@ impl PackageProfile {
             Self::DesktopStreamSmoke => &[
                 RUNTIME,
                 NETWORK,
+                ROUTER_MAPPING,
                 STATE,
                 SESSION,
                 SESSION_HISTORY,
@@ -1734,6 +1757,7 @@ impl PackageProfile {
             Self::Platform => &[
                 RUNTIME,
                 NETWORK,
+                ROUTER_MAPPING,
                 STATE,
                 SESSION,
                 SESSION_HISTORY,
@@ -1778,6 +1802,7 @@ impl PackageProfile {
             Self::ExtensionExample => &[
                 RUNTIME,
                 NETWORK,
+                ROUTER_MAPPING,
                 EXTENSION_EXAMPLE,
                 STATE,
                 SESSION,

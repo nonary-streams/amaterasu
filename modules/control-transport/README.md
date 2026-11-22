@@ -3,7 +3,8 @@
 `amaterasu.control-transport/1` owns a GameStream control connection independently
 of the shell. It combines Rust ENet connection/reliability state with modern
 Sunshine AES-GCM control envelopes and exposes borrowed plaintext through a C
-interface. It does not interpret input, launch applications or coordinate media.
+interface. The semantic extension interprets authenticated input and frames host
+events. Session and input modules still authorize effects.
 
 ## Authority and configuration
 
@@ -147,3 +148,12 @@ This verifies an encrypted control component, not a complete Moonlight session.
 Authenticated launch/RTSP orchestration, actual input dispatch, IDR/feedback
 routing, congestion/pacing integration, reconnect policy and target-system
 runtime qualification remain required.
+
+
+The v1.1 tail also serves the semantic control codec. The streaming coordinator
+binds this tail on the same selected service as raw send and receive. The
+provider recognizes modern GameStream control messages and builds standard
+rumble, haptics, and HDR records. A malformed peer record yields an invalid
+semantic event and a message outside the supported control vocabulary yields
+an unsupported event. Neither conversion touches socket, key, or session state.
+See the [Control Plane SDK](../../docs/control-plane-sdk.md#semantic-streaming-control).

@@ -530,6 +530,8 @@ impl Profile {
             || !(1..=1000).contains(&self.fps)
             || !(100..=1_000_000).contains(&self.bitrate_kbps)
             || self.max_reference_frames > 16
+            || self.packet_size == 0
+            || u32::try_from(self.packet_size).is_err()
             || self.video_max_batch_size_kb > 64
             || !matches!(self.packet_ms, 5 | 10)
             || !(6000..=512000).contains(&self.audio_bitrate)
@@ -545,24 +547,6 @@ impl Profile {
         if !self.codecs.is_empty() && (!self.codec.is_default() || !unique_codecs) {
             return Err("invalid_profile");
         }
-        // Framing and FEC limits do not depend on the codec.
-        let codec = match self.offered_codecs()[0] {
-            amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
-            amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
-            amaterasu_media::VideoCodec::Av1 => amaterasu_gamestream::video::VideoCodec::Av1,
-        };
-        amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
-            amaterasu_gamestream::video::VideoConfig {
-                packet_size: self.packet_size,
-                fec_percentage: self.fec_percentage,
-                min_parity_shards: self.min_parity_shards,
-                max_fec_blocks: self.max_fec_blocks,
-                // Encryption is applied by media transport after packetization.
-                encrypted: false,
-            },
-            codec,
-        )
-        .map_err(|_| "invalid_profile")?;
         Ok(())
     }
 }
@@ -1186,9 +1170,6 @@ impl Open {
         {
             return Err("invalid_adapter_selection");
         }
-        if self.capture.constant_rate && self.capture.capture_provider != CaptureProvider::Wgc {
-            return Err("constant_rate_requires_wgc");
-        }
         if !valid_label(&self.capture.output, 512)
             || (!self.capture.audio_endpoint.is_empty()
                 && !valid_label(&self.capture.audio_endpoint, 4096))
@@ -1223,12 +1204,6 @@ impl Open {
             };
             if self.profile.audio_bitrate < minimum {
                 return Err("unsupported_surround_bitrate");
-            }
-            let packet_bytes = (u64::from(self.profile.audio_bitrate)
-                * u64::from(self.profile.packet_ms))
-            .div_ceil(8000);
-            if packet_bytes > 1275 {
-                return Err("unsupported_audio_packet");
             }
         }
         Ok(())
@@ -3366,7 +3341,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_validation_covers_geometry_media_bounds_and_packetizer_configuration() {
+    fn profile_validation_covers_wire_fields_without_applying_packetizer_limits() {
         let request = open();
         assert!(request.validate(false).is_ok());
 
@@ -3386,15 +3361,20 @@ mod tests {
             ("audio_bitrate", json!(5999)),
             ("audio_bitrate", json!(512001)),
             ("packet_size", json!(0)),
-            ("fec_percentage", json!(0)),
-            ("max_fec_blocks", json!(0)),
-            ("max_fec_blocks", json!(5)),
         ] {
             let mut value = open_json();
             value["profile"] = json!({(field): profile_value});
             let request: Open = serde_json::from_value(value).unwrap();
             assert_eq!(request.validate(false), Err("invalid_profile"), "{field}");
         }
+
+        let mut request = open();
+        request.profile.max_fec_blocks = 5;
+        assert!(request.validate(false).is_ok());
+        assert_eq!(
+            request.prepare("operation", None)["video"]["max_fec_blocks"],
+            5
+        );
 
         for maximum in [0, 1, 2, 16] {
             let mut request = open();
@@ -3874,8 +3854,6 @@ mod tests {
         assert_eq!(configuration["capture_provider"], "pipewire");
         assert_eq!(configuration["output"], "portal-selected-session-source");
         assert_eq!(configuration["constant_rate"], false);
-        request.capture.constant_rate = true;
-        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
     }
 
     #[test]
@@ -3888,8 +3866,6 @@ mod tests {
         assert_eq!(configuration["capture_provider"], "x11");
         assert_eq!(configuration["output"], "x11:DP-1/000000a4");
         assert_eq!(configuration["constant_rate"], false);
-        request.capture.constant_rate = true;
-        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
     }
 
     #[test]
@@ -3905,12 +3881,10 @@ mod tests {
             "kms:card1/conn=34/crtc=56/plane=78"
         );
         assert_eq!(configuration["constant_rate"], false);
-        request.capture.constant_rate = true;
-        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
     }
 
     #[test]
-    fn constant_rate_capture_is_wgc_only_and_reaches_session_start() {
+    fn constant_rate_capture_is_forwarded_to_the_selected_provider() {
         let mut request = open();
         assert!(!request.capture.constant_rate);
         request.capture.capture_provider = CaptureProvider::Wgc;
@@ -3921,8 +3895,11 @@ mod tests {
         assert_eq!(arm["configuration"]["capture_provider"], "wgc");
         assert_eq!(arm["configuration"]["constant_rate"], true);
 
-        request.capture.capture_provider = CaptureProvider::Dxgi;
-        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
+        request.capture.capture_provider = CaptureProvider::External("example".into());
+        assert!(request.validate(false).is_ok());
+        let arm = request.arm(41);
+        assert_eq!(arm["configuration"]["capture_provider"], "example");
+        assert_eq!(arm["configuration"]["constant_rate"], true);
     }
 
     #[test]
