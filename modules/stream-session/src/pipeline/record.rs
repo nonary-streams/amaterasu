@@ -286,7 +286,7 @@ pub(super) struct Record {
     pub input_events_sent: u64,
     pub input_batches: u64,
     pub packet_bytes: usize,
-    pub audio_encoder_layout: Option<Value>,
+    pub audio_encoder_layout: Option<amaterasu_module_sdk::audio::OpusSurroundLayout>,
     pub wire_audio_bytes: usize,
     pub control_local: Option<String>,
     pub video_local: Option<String>,
@@ -592,6 +592,16 @@ impl Record {
                 .expect("resolved audio endpoint")
                 .as_bytes()
                 .to_vec()
+        } else if let Some(binding) = &start.lifecycle_candidate {
+            serde_json::to_vec(&(
+                &binding.capture_provider,
+                &binding.resource.provider,
+                &binding.resource.execution_domain,
+                &binding.resource.resource_id,
+                &binding.resource.incarnation,
+                start.constant_rate,
+            ))
+            .expect("bounded capture identity")
         } else if let Some(source_id) = start.source_id {
             serde_json::to_vec(&(&start.encoder_provider, source_id))
                 .expect("bounded source identity")
@@ -767,6 +777,8 @@ impl Record {
             "client_feature_flags": self.start.as_ref().and_then(|start| start.client_feature_flags),
             "extension_profile": self.offered_extensions().next().map(|(profile, _)| profile),
             "extension_profiles": self.offered_extensions().map(|(profile, _)| profile).collect::<Vec<_>>(),
+            "extension_wire_budget": self.offered_extensions().next().is_some()
+                && self.extension_route.as_ref().is_some_and(|route| route.wire_budget_required),
             "haptics_pcm_negotiated": self.start.as_ref().is_some_and(|start| {
                 start.client_feature_flags.is_some_and(|flags| {
                     flags & amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM != 0
@@ -914,15 +926,16 @@ impl Record {
                         .as_ref()
                         .is_some_and(|route| route.submitted)
                 {
-                    payload["capture_provider"] = json!(start.capture_provider);
-                    payload["output"] = json!(
-                        start
-                            .lifecycle_candidate
-                            .as_ref()
-                            .and_then(|binding| binding.selector["output"].as_str())
-                            .or(self.virtual_display_output.as_deref())
-                            .unwrap_or(&start.output)
-                    );
+                    if let Some(binding) = &start.lifecycle_candidate {
+                        payload["capture_binding"] = json!(binding);
+                    } else {
+                        payload["capture_provider"] = json!(start.capture_provider);
+                        payload["output"] = json!(
+                            self.virtual_display_output
+                                .as_deref()
+                                .unwrap_or(&start.output)
+                        );
+                    }
                     payload["constant_rate"] = json!(start.constant_rate);
                     payload["minimum_fps_target"] = json!(start.minimum_fps_target);
                     payload["wgc_pacing_smoothing"] = json!(start.wgc_pacing_smoothing);

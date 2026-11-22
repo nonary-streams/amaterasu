@@ -20,7 +20,7 @@ use query::Query;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 pub(crate) use streaming::StreamQueryError;
 
@@ -33,6 +33,7 @@ pub struct Request {
 pub struct RequestContext {
     pub secure: bool,
     pub remote: IpAddr,
+    pub local: Option<SocketAddr>,
     pub peer_certificate: Option<Vec<u8>>,
     /// Set only after the transport verifies TLS possession and checks this
     /// certificate against the live committed pairing authority for this request.
@@ -121,6 +122,7 @@ pub struct Router {
     launches: LaunchController,
     transcripts: BTreeMap<String, pairing::Transcript>,
     client_names: crate::client_names::ClientNames,
+    wake_identity: capabilities::WakeIdentity,
     jobs: BTreeMap<u64, Job>,
     artwork_reservations: BTreeSet<u64>,
     cancellations: BTreeMap<u64, Instant>,
@@ -157,6 +159,7 @@ enum Call {
 enum Purpose {
     Identity {
         paired: bool,
+        local: Option<SocketAddr>,
         peer: Option<PeerIdentity>,
         presentation_client: Option<amaterasu_module_sdk::session_presentation::Client>,
         certificate: Option<Vec<u8>>,
@@ -237,6 +240,7 @@ impl Router {
             launches,
             transcripts: BTreeMap::new(),
             client_names: crate::client_names::ClientNames::new(None),
+            wake_identity: capabilities::WakeIdentity::default(),
             jobs: BTreeMap::new(),
             artwork_reservations: BTreeSet::new(),
             cancellations: BTreeMap::new(),
@@ -246,8 +250,16 @@ impl Router {
         }
     }
 
-    pub fn set_pairing_network(&mut self, network: Option<amaterasu_module_sdk::network::Network>) {
-        self.client_names = crate::client_names::ClientNames::new(network);
+    pub fn set_network_provider(
+        &mut self,
+        network: Option<amaterasu_module_sdk::network::Network>,
+    ) {
+        self.client_names = crate::client_names::ClientNames::new(network.clone());
+        self.wake_identity.network = network;
+    }
+
+    pub(crate) fn set_wake_identity_logger(&mut self, logger: amaterasu_module_sdk::LogEmitter) {
+        self.wake_identity.logger = Some(logger);
     }
 
     pub fn set_participants(&mut self, bindings: Vec<participants::Binding>) {
@@ -510,6 +522,7 @@ impl Router {
                     connection.into(),
                     Purpose::Identity {
                         paired: trusted,
+                        local: peer.local,
                         peer: peer.launch_allowed.then(|| peer.identity().ok()).flatten(),
                         presentation_client: self
                             .presentation

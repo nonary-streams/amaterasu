@@ -66,7 +66,7 @@ impl Controller {
                     rpc::complete(runtime, request, error("module_quiescing"));
                 } else {
                     let payload = self
-                        .configure_network_policy(port, address_family, bind_address, now)
+                        .set_network_policy(port, address_family, bind_address)
                         .unwrap_or_else(error);
                     rpc::complete(runtime, request, payload);
                 }
@@ -369,6 +369,7 @@ impl Controller {
             negotiated_color: None,
             negotiated_video: None,
             extension_offer: Vec::new(),
+            extension_wire_budget: None,
             extension_announce: None,
             url,
             session_token,
@@ -414,10 +415,7 @@ impl Controller {
             // The Open request itself cannot select a display release owner.
             payload["application_owner"] = json!(record.owner);
         }
-        if self.settings.extension_enabled
-            && record.config.min_threads == 2
-            && record.config.qp == 28
-        {
+        if self.settings.extension_enabled {
             payload["extension_probe"] = record.config.extension_configuration(
                 record
                     .config

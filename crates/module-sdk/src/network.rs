@@ -372,6 +372,28 @@ impl Network {
             })
             .collect()
     }
+    /// Read the selected provider's Wake-on-LAN identity for a local endpoint.
+    /// Providers without the optional v1.4 tail return Unsupported.
+    pub fn wake_mac(&self, local_endpoint: Option<SocketAddr>) -> io::Result<[u8; 6]> {
+        self.require(abi::WAKE_MAC)?;
+        let header = self.table().base.header;
+        if header.minor < abi::WAKE_MAC_MINOR
+            || header.size < size_of::<abi::NetworkApiV1_4>() as u32
+        {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        let local =
+            local_endpoint.unwrap_or_else(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
+        // SAFETY: feature, version and size establish the optional tail. The
+        // binding keeps the provider alive and the output is borrowed for the call.
+        let table = unsafe { &*std::ptr::from_ref(self.table()).cast::<abi::NetworkApiV1_4>() };
+        let mut mac = [0; 6];
+        check(unsafe { (table.wake_mac)(self.context(), address_to_native(local), &mut mac) })?;
+        if mac == [0; 6] || mac[0] & 1 != 0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(mac)
+    }
     /// Explicit default-provider injection for tests. It never participates in
     /// production provider selection and is absent without the opt-in feature.
     #[cfg(feature = "network-test-support")]

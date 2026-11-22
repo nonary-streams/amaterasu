@@ -4,15 +4,23 @@ use crate::{
     admission::Admission,
     backend::{Backend, SourceSession},
     lifecycle_issues,
-    model::{CaptureResult, SourceState, new_id, validate_operation_id},
+    model::{
+        CaptureResult, SourceState, new_id, valid_owned_name as valid_name, validate_operation_id,
+    },
 };
 use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc};
+#[derive(PartialEq)]
+pub(super) struct NamedTarget {
+    pub output: String,
+    pub binding: Option<Box<amaterasu_module_sdk::extension_api::CaptureBinding>>,
+}
+
 struct Source {
     owner: String,
     operation: String,
-    output: String,
+    target: Arc<NamedTarget>,
     session: Box<dyn SourceSession>,
     admission: Arc<Admission>,
     id: Option<u64>,
@@ -24,6 +32,7 @@ pub(super) struct DirectSources {
     sources: BTreeMap<(String, String), Source>,
     retiring: BTreeMap<(String, String), Source>,
     closed: BTreeMap<u64, String>,
+    bound_operations: BTreeMap<(String, String), Arc<NamedTarget>>,
     opened: u64,
 }
 impl DirectSources {
@@ -31,12 +40,13 @@ impl DirectSources {
         &mut self,
         backend: &impl Backend,
         caller: &str,
-        output: String,
+        target: NamedTarget,
         operation: Option<String>,
         now: u64,
         timeout: u32,
     ) -> CaptureResult<Reply> {
-        let Some(name) = output
+        let Some(name) = target
+            .output
             .strip_prefix("kwin:")
             .filter(|name| valid_direct_name(name, true))
         else {
@@ -46,23 +56,40 @@ impl DirectSources {
         validate_operation_id(&operation)?;
         let key = (caller.to_owned(), operation.clone());
         if let Some(existing) = self.sources.get(&key) {
-            if existing.output != output {
+            if existing.target.as_ref() != &target {
                 return Err("operation_conflict");
             }
         } else {
-            if self.retiring.contains_key(&key) {
+            if let Some(retained) = self.bound_operations.get(&key) {
+                return if retained.as_ref() == &target {
+                    Err("stream_closed")
+                } else {
+                    Err("operation_conflict")
+                };
+            }
+            if let Some(retiring) = self.retiring.get(&key) {
+                if retiring.target.as_ref() != &target {
+                    return Err("operation_conflict");
+                }
                 return Err("source_retirement_pending");
             }
             if self.sources.len() + self.retiring.len() >= 4 || self.opened >= 128 {
                 return Err("resource_exhausted");
             }
+            if target.binding.is_some() && self.bound_operations.len() >= 128 {
+                return Err("operation_limit");
+            }
             let source = backend.select_output(name, timeout)?;
+            let target = Arc::new(target);
+            if target.binding.is_some() {
+                self.bound_operations.insert(key.clone(), target.clone());
+            }
             self.sources.insert(
                 key.clone(),
                 Source {
                     owner: caller.into(),
                     operation,
-                    output,
+                    target,
                     session: source,
                     admission: Arc::new(Admission::default()),
                     id: None,
@@ -97,6 +124,12 @@ impl DirectSources {
             .get(&(caller.into(), operation.into()))
             .filter(|source| source.id.is_some())
             .map(response)
+    }
+
+    pub fn bound_lookup_pending(&self, caller: &str, operation: &str) -> bool {
+        let key = (caller.into(), operation.into());
+        self.bound_operations.contains_key(&key)
+            && (self.sources.contains_key(&key) || self.retiring.contains_key(&key))
     }
     pub fn reader(&self, caller: &str, id: u64) -> Option<CaptureResult<Reader>> {
         let source = self
@@ -239,7 +272,7 @@ impl DirectSources {
     }
 }
 fn response(source: &Source) -> Value {
-    let mut response = json!({"ok":true,"stream":source.id,"output":source.output,"operation_id":source.operation,"geometry_supported":false});
+    let mut response = json!({"ok":true,"stream":source.id,"output":source.target.output,"operation_id":source.operation,"geometry_supported":false});
     if let Some(geometry) = source.session.geometry() {
         response["desktop_geometry"] = json!(geometry);
         response["geometry_supported"] = json!(true);
@@ -250,13 +283,6 @@ fn response(source: &Source) -> Value {
         response["observed_capture"] = json!(observed);
     }
     response
-}
-
-pub(super) fn valid_name(name: &str) -> bool {
-    name.strip_prefix("Virtual-")
-        .filter(|number| !number.starts_with('0') && number.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|number| number.parse::<u32>().ok())
-        .is_some_and(|number| number > 0)
 }
 
 pub(super) fn valid_direct_name(name: &str, allow_desktop_outputs: bool) -> bool {

@@ -137,16 +137,17 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
 pub(super) fn media_extension(
     value: &sdp::Announce<sdp::NegotiatedVideoFormat>,
     capabilities: &Capabilities,
+    extension_wire_budget: Option<bool>,
 ) -> Result<(), Error> {
     value
         .check_common_support(&capabilities.transport)
         .map_err(|_| Error::UnsupportedMedia)?;
-    // PyroWave uses the configured wire budget. The legacy field in Moonlight
-    // is reduced for FEC and capped at the old GameStream maximum of 100 Mbps.
+    // A proven wire budget is capped by the launch owner before the framer
+    // derives the encoder bitrate. Otherwise use the legacy encoder field.
     media_common(
         value,
         capabilities,
-        sdp::pyrowave::wire_bitrate_kbps(value).is_none(),
+        sdp::extension_wire_bitrate_kbps(value, extension_wire_budget).is_none(),
     )
 }
 
@@ -233,4 +234,30 @@ pub(super) fn description(capabilities: &Capabilities) -> String {
     format!(
         "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Amaterasu\r\nt=0 0\r\na=x-ss-general.featureFlags:0\r\na=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n{hevc_marker}{av1_marker}m=audio 0 RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
     )
+}
+
+pub(super) fn append_opus_surround(
+    body: &mut String,
+    layout: &amaterasu_contracts::audio::OpusSurroundLayout,
+) {
+    use std::fmt::Write;
+
+    let mapping = &layout.wave_channel_mapping;
+    write!(
+        body,
+        "a=fmtp:97 surround-params={}{}{}",
+        mapping.len(),
+        layout.streams,
+        layout.coupled_streams
+    )
+    .expect("writing to a string cannot fail");
+    // Moonlight moves the last normal-quality mapping digit (LFE) to index 3.
+    for index in mapping[..3]
+        .iter()
+        .chain(&mapping[4..])
+        .chain(&mapping[3..4])
+    {
+        body.push(char::from(b'0' + *index));
+    }
+    body.push_str("\r\n");
 }

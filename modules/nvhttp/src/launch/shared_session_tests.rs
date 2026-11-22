@@ -168,6 +168,51 @@ fn two_client_application() -> (Controller, SharedSessionBroker, Instant) {
 }
 
 #[test]
+fn amd_av1_application_policy_is_frozen_for_shared_resume() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_display_policy(7, json!({}));
+    controller.set_session_lifecycle_required(true);
+    let mut broker = SharedSessionBroker::default();
+    broker.broker.application_input_overrides = Some(json!({"amd_av1_latency_mode":"realtime"}));
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, first) = broker.reply(&mut controller, now);
+    assert_eq!(
+        first.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    controller.reply_delivered(10, now);
+    broker.broker.application_input_overrides = Some(json!({"amd_av1_latency_mode":"lowest"}));
+    assert!(controller.resume(11, request(2), &peer(2), now).is_none());
+    let (_, second) = broker.reply(&mut controller, now);
+    assert_eq!(
+        second.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&second.body)
+    );
+
+    let opened: Vec<_> = broker
+        .broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened.len(), 2);
+    assert_eq!(opened[0]["amd_av1_latency_mode"], "realtime");
+    assert_eq!(opened[1]["amd_av1_latency_mode"], "realtime");
+    assert_ne!(opened[0]["operation_id"], opened[1]["operation_id"]);
+}
+
+#[test]
 fn two_clients_have_distinct_transports_and_one_running_application() {
     let (mut controller, broker, now) = two_client_application();
     assert_eq!(controller.records.len(), 2);

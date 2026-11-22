@@ -31,6 +31,7 @@ pub struct Incoming {
     pub request: Request,
     pub secure: bool,
     pub remote: IpAddr,
+    pub local: Option<SocketAddr>,
     pub peer_certificate: Option<Vec<u8>>,
 }
 
@@ -327,13 +328,19 @@ impl Server {
                 continue;
             }
             match connection.tick() {
-                Ok(Some(ConnectionRequest::Request(request))) => events.requests.push(Incoming {
-                    id: *id,
-                    request,
-                    secure: connection.tls.is_some(),
-                    remote: connection.remote,
-                    peer_certificate: connection.peer_certificate(),
-                }),
+                Ok(Some(ConnectionRequest::Request(request))) => {
+                    let local = (request.target.split('?').next() == Some("/serverinfo"))
+                        .then(|| connection.socket.local_addr().ok())
+                        .flatten();
+                    events.requests.push(Incoming {
+                        id: *id,
+                        request,
+                        secure: connection.tls.is_some(),
+                        remote: connection.remote,
+                        local,
+                        peer_certificate: connection.peer_certificate(),
+                    });
+                }
                 Ok(Some(ConnectionRequest::RejectedStream(status))) => {
                     if connection.tls.is_some()
                         && connection
@@ -1719,4 +1726,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod provider_selection_tests;
+pub(crate) mod provider_selection_tests;

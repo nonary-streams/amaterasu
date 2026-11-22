@@ -1,5 +1,6 @@
 //! Capture-only publishing and notifications. No encoding or provider selection
 //! runs on a capture thread. Each channel represents one capture session.
+mod binding;
 mod connection;
 mod cpu_lease;
 mod cpu_source;
@@ -13,6 +14,7 @@ mod selector;
 mod source_format;
 mod subscription;
 
+pub use binding::{decode_capture_binding, decode_capture_observation};
 pub use connection::{ConnectionError, ResourceConnection};
 pub use cpu_lease::{CpuFrameLeasePool, CpuResourceLease};
 pub use cpu_source::{

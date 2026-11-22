@@ -92,12 +92,18 @@ impl Controller {
                 action: Action::Announce(announce),
             }) => {
                 let success = record.accept_announce(&announce);
+                let failure =
+                    if !success && record.config.standard_announce_format(&announce).is_none() {
+                        "unsupported_video_format"
+                    } else {
+                        "configuration_mismatch"
+                    };
                 let completed = self.finish_immediate_action(
                     &mut record,
                     connection,
                     action_ticket,
                     success,
-                    "configuration_mismatch",
+                    failure,
                 );
                 if completed && success {
                     if !record.extension_offer.is_empty()

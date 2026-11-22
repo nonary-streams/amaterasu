@@ -5,6 +5,7 @@ mod batch;
 mod diagnostics;
 mod interfaces;
 mod resolver;
+mod wake_identity;
 use amaterasu_abi::*;
 use amaterasu_network_api as net;
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
@@ -32,6 +33,7 @@ struct Shared {
     accepting_handles: AtomicBool,
     admission: Mutex<()>,
     resolver: resolver::Resolver,
+    wake_identity: Arc<wake_identity::Cache>,
 }
 struct Permit(Arc<Shared>);
 impl Drop for Permit {
@@ -52,7 +54,7 @@ struct Resource {
 }
 #[repr(C)]
 struct Binding {
-    api: net::NetworkApiV1_3,
+    api: net::NetworkApiV1_4,
     shared: Arc<Shared>,
     resources: Mutex<BTreeMap<u64, Arc<Resource>>>,
     next: AtomicU64,
@@ -63,6 +65,8 @@ struct Binding {
 pub struct Factory {
     pub api: NativeServiceFactory,
     shared: Arc<Shared>,
+    #[cfg(target_os = "linux")]
+    wake_refresh: Option<wake_identity::Refresh>,
 }
 
 /// A shutdown that has not proved retirement. The actual factory remains owned
@@ -101,10 +105,16 @@ impl Factory {
     /// materialization on platforms without sealed in-memory executables.
     /// Standalone constructors retain a private temporary helper location.
     pub fn with_runtime_state(max_handles: u32, root: &Path) -> io::Result<Box<Self>> {
-        Ok(Self::with_resolver(
-            max_handles,
-            resolver::Resolver::with_runtime_state(root)?,
-        ))
+        let factory =
+            Self::with_resolver(max_handles, resolver::Resolver::with_runtime_state(root)?);
+        #[cfg(target_os = "linux")]
+        let factory = {
+            let mut factory = factory;
+            factory.wake_refresh =
+                wake_identity::Refresh::start(factory.shared.wake_identity.clone()).ok();
+            factory
+        };
+        Ok(factory)
     }
     fn with_resolver(max_handles: u32, resolver: resolver::Resolver) -> Box<Self> {
         let mut factory = Box::new(Self {
@@ -119,7 +129,10 @@ impl Factory {
                 accepting_handles: AtomicBool::new(true),
                 admission: Mutex::new(()),
                 resolver,
+                wake_identity: Arc::default(),
             }),
+            #[cfg(target_os = "linux")]
+            wake_refresh: None,
         });
         factory.api.context = (&mut *factory as *mut Self).cast();
         factory
@@ -139,9 +152,16 @@ impl Factory {
         self.shared
             .accepting_handles
             .store(false, Ordering::Release);
+        #[cfg(target_os = "linux")]
+        let identity_ready = self
+            .wake_refresh
+            .as_ref()
+            .is_none_or(wake_identity::Refresh::quiesce);
+        #[cfg(not(target_os = "linux"))]
+        let identity_ready = true;
         let resolver_ready = self.shared.resolver.quiesce()?;
         match self.shared.admission.try_lock() {
-            Ok(_admission) => Ok(resolver_ready),
+            Ok(_admission) => Ok(resolver_ready && identity_ready),
             Err(TryLockError::WouldBlock) => Ok(false),
             Err(TryLockError::Poisoned(_)) => {
                 Err(io::Error::other("network admission unavailable"))
@@ -213,8 +233,8 @@ unsafe extern "C" fn bind(
         };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != net::MAJOR
-            || query.min_minor > net::REVERSE_DNS_MINOR
-            || query.min_size > size_of::<net::NetworkApiV1_3>() as u32
+            || query.min_minor > net::WAKE_MAC_MINOR
+            || query.min_size > size_of::<net::NetworkApiV1_4>() as u32
         {
             return Err(net::UNSUPPORTED);
         }
@@ -229,47 +249,50 @@ unsafe extern "C" fn bind(
         }
         let _admission = handle_admission(&factory.shared)?;
         let mut binding = Box::new(Binding {
-            api: net::NetworkApiV1_3 {
-                v1_2: net::NetworkApiV1_2 {
-                    v1_1: net::NetworkApiV1_1 {
-                        v1: net::NetworkApi {
-                            base: NativeInterface {
-                                header: AbiHeader {
-                                    size: size_of::<net::NetworkApiV1_3>() as u32,
-                                    major: net::MAJOR,
-                                    minor: net::REVERSE_DNS_MINOR,
+            api: net::NetworkApiV1_4 {
+                v1_3: net::NetworkApiV1_3 {
+                    v1_2: net::NetworkApiV1_2 {
+                        v1_1: net::NetworkApiV1_1 {
+                            v1: net::NetworkApi {
+                                base: NativeInterface {
+                                    header: AbiHeader {
+                                        size: size_of::<net::NetworkApiV1_4>() as u32,
+                                        major: net::MAJOR,
+                                        minor: net::WAKE_MAC_MINOR,
+                                    },
+                                    context: std::ptr::null_mut(),
+                                    release: Some(release),
                                 },
-                                context: std::ptr::null_mut(),
-                                release: Some(release),
+                                capabilities,
+                                resolve,
+                                interfaces,
+                                tcp_listen,
+                                tcp_connect,
+                                udp_bind,
+                                accept,
+                                local_addr,
+                                peer_addr,
+                                read,
+                                peek,
+                                write,
+                                recv_from,
+                                send_to,
+                                connect_udp,
+                                set_option,
+                                get_option,
+                                join_multicast,
+                                send_batch,
+                                shutdown,
+                                close,
                             },
-                            capabilities,
-                            resolve,
-                            interfaces,
-                            tcp_listen,
-                            tcp_connect,
-                            udp_bind,
-                            accept,
-                            local_addr,
-                            peer_addr,
-                            read,
-                            peek,
-                            write,
-                            recv_from,
-                            send_to,
-                            connect_udp,
-                            set_option,
-                            get_option,
-                            join_multicast,
-                            send_batch,
-                            shutdown,
-                            close,
+                            recv_from_timed: diagnostics::recv_from_timed,
+                            socket_diagnostics: diagnostics::socket_diagnostics,
                         },
-                        recv_from_timed: diagnostics::recv_from_timed,
-                        socket_diagnostics: diagnostics::socket_diagnostics,
+                        udp_bind_shared,
                     },
-                    udp_bind_shared,
+                    reverse_resolve,
                 },
-                reverse_resolve,
+                wake_mac,
             },
             shared: factory.shared.clone(),
             resources: Mutex::new(BTreeMap::new()),
@@ -516,7 +539,12 @@ unsafe extern "C" fn capabilities(context: *mut c_void, out: *mut net::Capabilit
                         | net::INTERFACES
                         | net::DATAGRAM_DIAGNOSTICS
                         | net::SHARED_UDP
-                        | net::REVERSE_DNS,
+                        | net::REVERSE_DNS
+                        | if cfg!(target_os = "linux") {
+                            net::WAKE_MAC
+                        } else {
+                            0
+                        },
                     max_io_bytes: net::MAX_IO_BYTES as u64,
                     max_handles: binding.shared.max_handles,
                     max_batch: net::MAX_BATCH as u32,
@@ -587,6 +615,39 @@ unsafe extern "C" fn reverse_resolve(
             std::ptr::copy_nonoverlapping(hostname.as_ptr(), out, hostname.len());
             output(count, hostname.len())
         }
+    })
+}
+unsafe extern "C" fn wake_mac(
+    context: *mut c_void,
+    local: net::Address,
+    out: *mut [u8; 6],
+) -> Status {
+    guarded(|| {
+        // SAFETY: runtime retains the binding throughout this callback.
+        let binding = unsafe { binding(context)? };
+        if out.is_null() {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        if !cfg!(target_os = "linux") {
+            return Err(net::UNSUPPORTED);
+        }
+        let local = match from_address(local)? {
+            SocketAddr::V6(endpoint) => endpoint.ip().to_ipv4_mapped().map_or(local, |ip| {
+                to_address(SocketAddr::new(ip.into(), endpoint.port()))
+            }),
+            SocketAddr::V4(_) => local,
+        };
+        let cache = binding
+            .shared
+            .wake_identity
+            .try_lock()
+            .map_err(|_| net::WOULD_BLOCK)?;
+        let mac = cache
+            .as_ref()
+            .and_then(|snapshot| snapshot.mac_for(local, std::time::Instant::now()))
+            .ok_or(net::NOT_FOUND)?;
+        // SAFETY: the ABI caller provides writable six-octet output.
+        unsafe { output(out, mac) }
     })
 }
 unsafe extern "C" fn interfaces(

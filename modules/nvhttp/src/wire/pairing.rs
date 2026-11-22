@@ -407,23 +407,35 @@ impl Router {
         match job.purpose.clone() {
             Purpose::Identity {
                 paired,
+                local,
                 peer,
                 presentation_client,
                 certificate,
             } => {
-                if let (Some(client), Some(certificate), Some(host_id)) = (
-                    presentation_client,
-                    certificate,
-                    payload
-                        .get("host_id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty() && id.len() <= 64),
-                ) {
+                let Some(host_id) = payload
+                    .get("host_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 64)
+                else {
+                    complete(
+                        &job,
+                        xml::error(503, "host identity is unavailable"),
+                        replies,
+                    );
+                    return None;
+                };
+                let mac = self.wake_identity.mac(local, now);
+                if let (Some(client), Some(certificate)) = (presentation_client, certificate) {
                     let context = self.launches.session_presentation_context(client);
                     if let (Some(connection), Some(presentation)) =
                         (job.connection, &mut self.presentation)
-                        && let Some(reply) =
-                            presentation.info(connection, certificate, context, host_id.into(), now)
+                        && let Some(reply) = presentation.info(
+                            connection,
+                            certificate,
+                            context,
+                            xml::ServerIdentity { host_id, mac },
+                            now,
+                        )
                     {
                         complete(&job, reply, replies);
                     }
@@ -432,22 +444,15 @@ impl Router {
                 let current_game = peer
                     .as_ref()
                     .map_or(0, |peer| self.launches.current_game(peer));
-                let reply = match payload
-                    .get("host_id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty() && id.len() <= 64)
-                {
-                    Some(host_id) => xml::server_info(
-                        &self.config,
-                        host_id,
-                        paired,
-                        current_game,
-                        paired && self.launches.busy(),
-                        self.launches.supported(),
-                        self.launches.codec_advertisement(),
-                    ),
-                    None => xml::error(503, "host identity is unavailable"),
-                };
+                let reply = xml::server_info(
+                    &self.config,
+                    xml::ServerIdentity { host_id, mac },
+                    paired,
+                    current_game,
+                    paired && self.launches.busy(),
+                    self.launches.supported(),
+                    self.launches.codec_advertisement(),
+                );
                 complete(&job, reply, replies);
                 None
             }

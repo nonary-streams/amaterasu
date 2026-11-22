@@ -47,9 +47,18 @@ action. For a valid base port in 1029..=65514, it configures this listener at
 base+21 and passes per-stream local UDP binds at base+9 (video), base+10 (control),
 and base+11 (audio) to `stream-session`. The existing listener IP is preserved.
 The action defers while a ticket is live or an accepted TCP connection remains,
-and reports active only after the replacement RTSP listener binds and all three
-UDP addresses pass a simultaneous bind check. UDP sockets themselves belong to
-per-session stream owners, so the check does not reserve ports between streams.
+and reports active only after the selected stream owner has qualified every
+configured ticket slot and the replacement RTSP listener binds. Each transport
+provider checks its complete, disjoint set of UDP endpoints at once through its
+own selected Network binding. Each provider releases the temporary sockets
+before replying. A missing capability or failed check leaves the current
+listener and media policy serving requests while the desired policy stays pending.
+The stream owner forwards `probe_udp_binds` on the same signed service aliases
+it uses for Media and Control `open`. A conflicting authorized stream open
+cancels the temporary check and runs once those handles retire. Disjoint opens,
+status, and close run during the check. The Network provider must return promptly
+from local bind and address readback. An unretired worker keeps its provider in
+quiescence until those calls return.
 Pending updates keep new opens on the currently bound listener's base until retry
 succeeds.
 An occupied unrelated target leaves the old TCP listeners bound. Same-port
@@ -71,15 +80,15 @@ uses it in the returned URL and that stream's UDP binds.
 
 With an explicit IP, RTSP and derived UDP binds use that one family. With an
 explicit empty address and `both`, RTSP binds separate IPv4 and IPv6 TCP sockets
-on the same port, and UDP preflight checks both family-specific video, control,
-and audio ports together. IPv6 sockets are v6-only, so IPv4 reachability does not
+on the same port, and each UDP owner checks its assigned ports in both families.
+IPv6 sockets are v6-only, so IPv4 reachability does not
 depend on host dual-stack defaults. When remote access is disabled, both sockets
 are loopback-only; otherwise each family uses its wildcard. Wildcard RTSP selects
 a concrete same-family local route for each peer and uses it for that ticket's URL
 and UDP binds. Status retains the compatibility `local` field for the primary
 listener and adds `locals` containing every bound address.
-The shared `amaterasu-network-policy` library also binds actual media/control UDP
-sockets with the same v6-only behavior. Each ticket freezes its requested UDP
+The selected media and control providers bind actual UDP sockets through their
+Network SDK bindings. Each ticket freezes its requested UDP
 endpoints; prepare readback must preserve their IP/family and fixed ports before
 SETUP can advertise them. Provider mismatches retain cleanup ownership until the
 existing stream-session cancellation and release workflow settles.
@@ -114,6 +123,8 @@ The modern transcript is OPTIONS, DESCRIBE, SETUP for audio/video/control,
 ANNOUNCE, then PLAY. Session tokens, targets, CSeq progression, launch epochs and
 pending completion tickets are checked explicitly. SETUP reports the allocated
 server ports. ANNOUNCE acceptance commits only a supported prepared profile.
+For surround Opus, DESCRIBE advertises the selected encoder's WAVE decoder
+mapping in Moonlight's normal-quality `surround-params` order.
 
 The first two simultaneous transports on an address use UDP ports at base +9
 through +14. Remote clients need inbound access to that range; existing rules
@@ -177,6 +188,11 @@ x264 ABR ignores it and Amaterasu has no VAAPI CQP consumer. The backend policy
 supports `auto` and `software`, and real codec availability remains a separate
 requirement. [NVHTTP policy](../nvhttp/README.md#software-encoder-policy)
 documents persistence, scope precedence and platform qualification limits.
+
+The native extension route uses its own encoder configuration. RTSP leaves
+the legacy software thread and QP fields out of its Prepare and Start
+requests for that route. Those fields remain in the standard encoder request
+when the client chooses a standard codec.
 
 
 ## Retained-source retirement observations

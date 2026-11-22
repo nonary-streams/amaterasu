@@ -465,6 +465,61 @@ fn moonlight_generated_extension_announcement_completes_negotiation() {
 }
 
 #[test]
+fn replacement_profile_uses_the_budget_proven_by_its_prepared_route() {
+    let profile = serde_json::from_value(serde_json::json!({
+        "codec":{"namespace_id":7,"value":8,"schema":1},
+        "framing":{"namespace_id":7,"value":9,"schema":1},
+        "wire_selector":4,"payload_type":100,"encoding_name":"EXAMPLE"
+    }))
+    .unwrap();
+    let snapshot = VideoProfileSnapshot {
+        profiles: vec![profile],
+    };
+    for prepared_support in [None, Some(false), Some(true)] {
+        let base = negotiation();
+        let mut capabilities = base.capabilities;
+        capabilities.max_bitrate_kbps = 15_000;
+        let mut machine = Negotiation::with_video_profiles_and_wire_budget(
+            base.launch,
+            capabilities,
+            snapshot.clone(),
+            snapshot.clone(),
+            prepared_support,
+        )
+        .unwrap();
+        setup_to_announce(&mut machine);
+        let mut announce = announce();
+        announce.body = std::str::from_utf8(&announce.body)
+            .unwrap()
+            .replace("bitStreamFormat:0", "bitStreamFormat:4")
+            .into_bytes();
+        if prepared_support == Some(true) {
+            let Step::Action {
+                ticket,
+                action: Action::ExtensionAnnounce(negotiated),
+            } = machine.handle(7, &announce).unwrap()
+            else {
+                panic!("extension ANNOUNCE action")
+            };
+            assert_eq!(
+                sdp::extension_wire_bitrate_kbps(&negotiated, prepared_support),
+                Some(20_000)
+            );
+            machine.complete(7, ticket, true).unwrap();
+            assert!(matches!(
+                machine.handle(7, &request(Method::Play, "/", 7, true)),
+                Ok(Step::Action {
+                    action: Action::Play,
+                    ..
+                })
+            ));
+        } else {
+            assert_eq!(machine.handle(7, &announce), Err(Error::UnsupportedMedia));
+        }
+    }
+}
+
+#[test]
 fn extension_attribute_rules_bound_optional_hints_and_reject_unsupported_modes() {
     let profile =
         serde_json::from_str(include_str!("../../../../../scripts/pyrowave/profile.json")).unwrap();

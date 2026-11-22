@@ -1384,6 +1384,7 @@ struct Broker {
     rtsp_qp: Value,
     rtsp_nvenc_settings: Value,
     rtsp_nvenc_spatial_aq: Value,
+    rtsp_amd_av1_latency_mode: Option<Value>,
     rtsp_display_request: Option<Value>,
     rtsp_lifecycle_fields: BTreeMap<String, Value>,
     wrong_rtsp_display_policy_snapshot: bool,
@@ -1483,6 +1484,7 @@ impl Default for Broker {
             rtsp_qp: Value::Null,
             rtsp_nvenc_settings: Value::Null,
             rtsp_nvenc_spatial_aq: Value::Null,
+            rtsp_amd_av1_latency_mode: None,
             rtsp_display_request: None,
             rtsp_lifecycle_fields: BTreeMap::new(),
             wrong_rtsp_display_policy_snapshot: false,
@@ -1792,6 +1794,7 @@ impl Broker {
             self.rtsp_qp = payload["qp"].clone();
             self.rtsp_nvenc_settings = payload["nvenc_settings"].clone();
             self.rtsp_nvenc_spatial_aq = payload["nvenc_spatial_aq"].clone();
+            self.rtsp_amd_av1_latency_mode = payload.get("amd_av1_latency_mode").cloned();
             self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
             self.rtsp_lifecycle_fields = [
                 "lifecycle_session_target",
@@ -2052,6 +2055,9 @@ impl Broker {
                 Value::Null
             },
         });
+        if let Some(mode) = &self.rtsp_amd_av1_latency_mode {
+            response["amd_av1_latency_mode"] = mode.clone();
+        }
         response
             .as_object_mut()
             .unwrap()
@@ -5832,6 +5838,24 @@ fn malformed_software_application_options_fail_before_rtsp_and_launch() {
                 )
         );
     }
+}
+
+#[test]
+fn default_amd_av1_application_policy_keeps_the_legacy_rtsp_open_shape() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({"amd_av1_latency_mode":"auto"})),
+        ..Default::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    assert!(
+        opened_rtsp_payload(&broker)
+            .get("amd_av1_latency_mode")
+            .is_none()
+    );
 }
 
 fn peer_with_keybindings(marker: u8, keybindings: Option<Value>) -> PeerIdentity {

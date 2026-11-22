@@ -54,6 +54,9 @@ impl Controller {
     }
 
     fn begin_quiescence(&mut self, runtime: &RuntimeClient) {
+        if let Some(probe) = self.network_probe.take() {
+            self.shutdown_settlement.push(probe.into_cancelled_call());
+        }
         if self.shutdown_settlement.len() < MAX_RECORDS
             && self
                 .job

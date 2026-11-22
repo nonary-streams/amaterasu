@@ -70,6 +70,13 @@ impl Call {
         self.failures = 0;
     }
 
+    pub fn with_timeout(mut self, timeout: u64) -> Self {
+        if let Command::Request { timeout_ms, .. } = &mut self.command {
+            *timeout_ms = timeout;
+        }
+        self
+    }
+
     /// The caller must use this only for an observation that cannot mutate
     /// provider resources. Broker cancellation then safely retires bookkeeping.
     pub fn cancel_read_only(&mut self) {

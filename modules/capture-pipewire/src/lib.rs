@@ -247,22 +247,34 @@ impl ManagedModule for CaptureModule {
                     return Err(format!("PipeWire request check failed: {result:?}"));
                 }
             }
-            let result = if request.service == SERVICE
-                && let Ok(operation) = serde_json::from_value::<Operation>(request.payload.clone())
-            {
-                self.dispatch_locked(
+            let operation = if request.service == SERVICE {
+                model::decode_operation(request.payload.clone())
+            } else {
+                Err("invalid_request")
+            };
+            let result = match operation {
+                Ok(operation) => self.dispatch_locked(
                     &mut controller,
                     request.id,
                     request.caller.clone(),
                     operation,
                     now,
-                )
-            } else {
-                self.runtime.send(Command::Complete {request:request.id,payload:json!({"ok":false,"error":{"code":"invalid_request","message":"invalid_request"}})}).and_then(|response| match response {
-                    Response::Ok => Ok(()),
-                    Response::Error { code, .. } if code == "not_found" || code == "request_ended" => Ok(()),
-                    response => Err(format!("PipeWire completion failed: {response:?}")),
-                })
+                ),
+                Err(code) => self
+                    .runtime
+                    .send(Command::Complete {
+                        request: request.id,
+                        payload: json!({"ok":false,"error":{"code":code,"message":code}}),
+                    })
+                    .and_then(|response| match response {
+                        Response::Ok => Ok(()),
+                        Response::Error { code, .. }
+                            if code == "not_found" || code == "request_ended" =>
+                        {
+                            Ok(())
+                        }
+                        response => Err(format!("PipeWire completion failed: {response:?}")),
+                    }),
             };
             if let Err(error) = result {
                 self.polled_request = Some(request);
@@ -320,7 +332,9 @@ impl CaptureModule {
         let reply = if self.shutting_down
             && matches!(
                 operation,
-                Operation::Open { .. } | Operation::SelectSource { .. }
+                Operation::Open { .. }
+                    | Operation::OpenBound { .. }
+                    | Operation::SelectSource { .. }
             ) {
             Err("capture_shutdown")
         } else {
@@ -340,14 +354,7 @@ impl CaptureModule {
             }
             self.cancel_unreferenced_open_locked(controller, &caller, &operation);
         }
-        if let (
-            Err(code),
-            Operation::Open {
-                operation_id: Some(operation),
-                ..
-            },
-        ) = (&reply, &operation)
-        {
+        if let (Err(code), Some((_, Some(operation)))) = (&reply, operation.open_target()) {
             self.stream_issues.push(lifecycle_issues::capture_failure(
                 operation,
                 "pipewire.open",
@@ -393,19 +400,10 @@ impl CaptureModule {
         caller: &str,
         operation: &Operation,
     ) {
-        let operation_id = match operation {
-            Operation::Open {
-                output,
-                operation_id: Some(id),
-                ..
-            } if output.starts_with("kwin:") => Some(id),
-            _ => None,
-        };
+        let operation_id = operation.named_operation();
         let still_referenced = operation_id.is_some_and(|id| {
             self.pending_opens.iter().any(|pending| {
-                pending.caller == caller
-                    && matches!(&pending.operation,
-                Operation::Open { output, operation_id: Some(other), .. } if output.starts_with("kwin:") && other == id)
+                pending.caller == caller && pending.operation.named_operation() == Some(id)
             })
         });
         if operation_id.is_some() && !still_referenced {

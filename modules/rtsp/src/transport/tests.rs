@@ -12,7 +12,7 @@ fn closed_loopback_connection_allows_immediate_transport_restart() {
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let (accepted, _) = transport.listeners[0].accept().unwrap();
+    let (accepted, _) = transport.listeners[0].socket.accept().unwrap();
     accepted.shutdown(Shutdown::Write).unwrap();
     let mut byte = [0];
     assert_eq!(client.read(&mut byte).unwrap(), 0);
@@ -62,7 +62,7 @@ fn invalid_rebind_preserves_connections_waiting_in_listener_backlog() {
     assert_eq!(server.local_addr().unwrap(), address);
     // The existing listener must remain open, not just be rebound at the same
     // address, because a successful TCP handshake may be waiting to be accepted.
-    assert!(server.listeners[0].accept().is_ok());
+    assert!(server.listeners[0].socket.accept().is_ok());
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn unrelated_bind_collision_preserves_existing_listener_backlog() {
         Err("tcp_bind_failed")
     );
     assert_eq!(server.local_addr().unwrap(), address);
-    assert!(server.listeners[0].accept().is_ok());
+    assert!(server.listeners[0].socket.accept().is_ok());
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn later_bind_collision_or_duplicate_preserves_existing_listener_backlog() {
             Err("tcp_bind_failed")
         );
         assert_eq!(server.local_addr().unwrap(), address);
-        assert!(server.listeners[0].accept().is_ok());
+        assert!(server.listeners[0].socket.accept().is_ok());
     }
 }
 
@@ -190,7 +190,7 @@ fn dual_family_transport_accepts_v4_and_v6_on_the_same_port() {
         false,
     )
     .unwrap();
-    let addresses = server.local_addrs().unwrap();
+    let addresses = server.local_addrs();
     assert_eq!(addresses.len(), 2);
     assert_eq!(addresses[0].port(), addresses[1].port());
 

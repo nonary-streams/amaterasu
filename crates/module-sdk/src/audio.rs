@@ -3,6 +3,7 @@
 //! These identifiers describe the interface family independently of a service
 //! alias. Signed composition still controls provider selection and authorization.
 use crate::{ModuleResult, NativeBinding, RuntimeClient, abi::NativeServiceFactory};
+pub use amaterasu_contracts::audio::OpusSurroundLayout;
 use amaterasu_media::{
     AUDIO_EXTENSIBLE_END, AudioCaptureApi, AudioEncoderApi, AudioFormatId, AudioUnit,
     AudioUnitSink, INTERFACE_MAJOR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_UNSUPPORTED,

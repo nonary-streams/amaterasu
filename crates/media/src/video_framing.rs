@@ -9,6 +9,8 @@ use crate::{
 use amaterasu_abi::{BorrowedBytes, NativeInterface, STATUS_INVALID_ARGUMENT, Status};
 use std::{ffi::c_void, mem::size_of};
 
+mod gamestream;
+
 pub const VIDEO_UNIT_VERSION: u32 = 1;
 /// FEC policy fields extend the v1 limits prefix and require framing API v2.
 pub const VIDEO_FRAMING_LIMITS_VERSION: u32 = 2;
@@ -127,8 +129,8 @@ pub struct NegotiatedVideoTransportApi {
     pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
 }
 
-/// One contiguous block in data-shard order. Percentage is the wire value;
-/// parity_shards must equal ceil(data_shards * percentage / 100).
+/// One contiguous block in data-shard order. The selected transport defines
+/// how the wire percentage maps to parity shards for its FEC scheme.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct VideoFecBlock {
@@ -139,7 +141,9 @@ pub struct VideoFecBlock {
 }
 
 /// Host-supplied bounds from trusted session composition and peer negotiation.
-/// packet_size is NV header plus payload, excluding the 16-byte RTP header.
+/// The selected transport defines its packet layout within the negotiated
+/// packet size. For GameStream this includes the NV header and excludes RTP.
+/// Crypto and network overhead are provider-supplied bytes per datagram.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VideoFramingLimits {
@@ -270,10 +274,12 @@ pub struct NegotiatedVideoPlanTransportApi {
     pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
 }
 
-/// Framed bytes exclude the eight-byte short header. record_starts has one byte
-/// per data shard (0 or 1), or is empty. Pointers are synchronous borrows.
-/// Providers may reorder records or add padding within framed_bytes. The host
-/// owns transport headers, FEC execution, sequence, encryption and delivery.
+/// Bytes in the agreed framing, before transport headers and encryption.
+/// For GameStream they also exclude the eight-byte short frame header.
+/// `record_starts` has one byte per data shard (0 or 1), or is empty.
+/// The transport owns packet layout, FEC execution, sequence, encryption and
+/// delivery.
+/// Pointers are synchronous borrows.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VideoFramePlan {
@@ -287,6 +293,12 @@ pub struct VideoFramePlan {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct VideoPlanCounts {
+    pub data_shards: u32,
+    pub datagrams: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct VideoPlanReservation {
     pub data_shards: u32,
     pub datagrams: u32,
@@ -295,23 +307,22 @@ pub struct VideoPlanReservation {
 }
 
 impl VideoFramePlan {
-    /// Validate all provider-supplied values and produce a conservative queue
-    /// reservation before sequence, frame-index or nonce mutation.
+    /// Check the common ABI shape and negotiated bounds before copying or
+    /// forwarding a plan. The selected transport verifies its actual packet
+    /// layout, FEC work and complete queue and wire reservations at admission.
     ///
     /// # Safety
     /// Both nonempty borrowed allocations must be initialized and immutable
     /// until this function returns. Structural checks cannot prove pointer validity.
-    pub unsafe fn validate(
+    pub unsafe fn validate_shape(
         &self,
         limits: &VideoFramingLimits,
-    ) -> Result<VideoPlanReservation, Status> {
-        let invalid = || STATUS_INVALID_ARGUMENT;
+    ) -> Result<VideoPlanCounts, Status> {
         if self.size as usize != size_of::<Self>()
             || self.version != 1
             || limits.size as usize != size_of::<VideoFramingLimits>()
             || limits.version != VIDEO_FRAMING_LIMITS_VERSION
             || !(256..=1392).contains(&limits.packet_size)
-            || !limits.packet_size.is_multiple_of(16)
             || limits.crypto_overhead > 256
             || limits.network_overhead > 128
             || limits.allowed_extensions & !(VIDEO_FRAME_RECORD_START | VIDEO_FRAME_CRITICAL_PREFIX)
@@ -333,141 +344,88 @@ impl VideoFramePlan {
             || self.block_count == 0
             || self.block_count > limits.max_fec_blocks
         {
-            return Err(invalid());
+            return Err(STATUS_INVALID_ARGUMENT);
         }
-        let shard_payload = (limits.packet_size - 16) as usize;
-        let data_count = self
-            .framed_bytes
-            .len
-            .checked_add(8)
-            .ok_or_else(invalid)?
-            .div_ceil(shard_payload);
-        let data_count = u32::try_from(data_count).map_err(|_| invalid())?;
-        if data_count > limits.max_datagrams
-            || self.critical_prefix_shards > data_count
+        let counts = self.validate_blocks(limits)?;
+        let bytes = self.framed_bytes.len as u64;
+        let datagrams = u64::from(counts.datagrams);
+        let min_queue = bytes + datagrams * u64::from(limits.crypto_overhead);
+        let min_wire = min_queue + datagrams * u64::from(limits.network_overhead);
+        if bytes > u64::from(counts.data_shards) * u64::from(limits.packet_size)
+            || min_queue > u64::from(limits.max_queue_bytes)
+            || min_wire > limits.max_wire_bytes
+            || self.critical_prefix_shards > counts.data_shards
             || (self.critical_prefix_shards != 0
                 && limits.allowed_extensions & VIDEO_FRAME_CRITICAL_PREFIX == 0)
         {
-            return Err(invalid());
+            return Err(STATUS_INVALID_ARGUMENT);
         }
         if self.record_starts.len != 0 {
             if limits.allowed_extensions & VIDEO_FRAME_RECORD_START == 0
-                || self.record_starts.len != data_count as usize
+                || self.record_starts.len != counts.data_shards as usize
                 || self.record_starts.ptr.is_null()
             {
-                return Err(invalid());
+                return Err(STATUS_INVALID_ARGUMENT);
             }
             // SAFETY: caller guarantees the record-start allocation is live and immutable.
             let flags = unsafe {
                 std::slice::from_raw_parts(self.record_starts.ptr, self.record_starts.len)
             };
             if flags.iter().any(|flag| *flag > 1) {
-                return Err(invalid());
+                return Err(STATUS_INVALID_ARGUMENT);
             }
         }
-        let mut offset = 0u32;
+        Ok(counts)
+    }
+
+    fn validate_blocks(&self, limits: &VideoFramingLimits) -> Result<VideoPlanCounts, Status> {
+        let mut data_shards = 0u32;
         let mut datagrams = 0u32;
-        let mut field_work = 0u64;
         let mut has_unprotected = false;
         let mut has_protected = false;
-        for (index, block) in self.blocks.iter().enumerate() {
-            if index >= self.block_count as usize {
-                if block.first_data_shard != 0
+        let (active, unused) = self.blocks.split_at(self.block_count as usize);
+        for block in active {
+            if block.first_data_shard != data_shards
+                || block.data_shards == 0
+                || block.data_shards > limits.max_datagrams
+                || block.parity_shards > limits.max_datagrams
+                || block.percentage > limits.max_fec_percentage
+                || (block.parity_shards == 0) != (block.percentage == 0)
+            {
+                return Err(STATUS_INVALID_ARGUMENT);
+            }
+            if block.parity_shards == 0 {
+                has_unprotected = true;
+            } else {
+                has_protected = true;
+                if block.percentage < limits.min_fec_percentage
+                    || block.parity_shards < limits.min_parity_shards
+                {
+                    return Err(STATUS_INVALID_ARGUMENT);
+                }
+            }
+            data_shards += block.data_shards;
+            datagrams += block.data_shards + block.parity_shards;
+        }
+        if datagrams > limits.max_datagrams
+            || unused.iter().any(|block| {
+                block.first_data_shard != 0
                     || block.data_shards != 0
                     || block.parity_shards != 0
                     || block.percentage != 0
-                {
-                    return Err(invalid());
-                }
-                continue;
-            }
-            if block.first_data_shard != offset
-                || block.data_shards == 0
-                || block.data_shards > 1023
-                || block.percentage > limits.max_fec_percentage
-            {
-                return Err(invalid());
-            }
-            has_unprotected |= block.parity_shards == 0;
-            has_protected |= block.parity_shards != 0;
-            if block.parity_shards != 0 && block.percentage < limits.min_fec_percentage {
-                return Err(invalid());
-            }
-            let expected = u64::from(block.data_shards)
-                .checked_mul(u64::from(block.percentage))
-                .ok_or_else(invalid)?
-                .div_ceil(100);
-            if expected != u64::from(block.parity_shards)
-                || (block.parity_shards > 0 && block.parity_shards < limits.min_parity_shards)
-                || (block.parity_shards > 0
-                    && block
-                        .data_shards
-                        .checked_add(block.parity_shards)
-                        .ok_or_else(invalid)?
-                        > 255)
-            {
-                return Err(invalid());
-            }
-            offset = offset.checked_add(block.data_shards).ok_or_else(invalid)?;
-            datagrams = datagrams
-                .checked_add(block.data_shards)
-                .and_then(|x| x.checked_add(block.parity_shards))
-                .ok_or_else(invalid)?;
-            field_work = field_work
-                .checked_add(
-                    u64::from(block.data_shards)
-                        * u64::from(block.parity_shards)
-                        * u64::from(limits.packet_size + 16),
-                )
-                .ok_or_else(invalid)?;
-        }
-        if offset != data_count
-            || datagrams > limits.max_datagrams
-            || field_work > VIDEO_FRAME_MAX_FIELD_WORK
+            })
+            || (limits.min_fec_percentage != 0
+                && has_unprotected
+                && (limits.fec_policy_flags & VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED == 0
+                    || has_protected))
         {
-            return Err(invalid());
+            return Err(STATUS_INVALID_ARGUMENT);
         }
-        if limits.min_fec_percentage != 0 && has_unprotected {
-            let largest =
-                largest_protected_data(limits.min_fec_percentage, limits.min_parity_shards)
-                    .ok_or_else(invalid)?;
-            let capacity = largest
-                .checked_mul(limits.max_fec_blocks)
-                .ok_or_else(invalid)?;
-            if limits.fec_policy_flags & VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED == 0
-                || has_protected
-                || data_count <= capacity
-            {
-                return Err(invalid());
-            }
-        }
-        let queue_bytes =
-            u64::from(datagrams) * u64::from(limits.packet_size + 16 + limits.crypto_overhead);
-        let wire_bytes = queue_bytes + u64::from(datagrams) * u64::from(limits.network_overhead);
-        if queue_bytes > u64::from(limits.max_queue_bytes) || wire_bytes > limits.max_wire_bytes {
-            return Err(invalid());
-        }
-        Ok(VideoPlanReservation {
-            data_shards: data_count,
+        Ok(VideoPlanCounts {
+            data_shards,
             datagrams,
-            queue_bytes,
-            wire_bytes,
         })
     }
-}
-
-/// Maximum data shards that fit one protected 255-shard block under the
-/// minimum trusted policy, considering every representable wire percentage.
-fn largest_protected_data(min_percentage: u32, min_parity: u32) -> Option<u32> {
-    (1u32..255).rev().find(|data| {
-        let rate_for_minimum = if min_parity == 0 {
-            0
-        } else {
-            ((min_parity - 1) * 100 / data) + 1
-        };
-        let rate = min_percentage.max(rate_for_minimum);
-        rate <= 255 && data + (data * rate).div_ceil(100) <= 255
-    })
 }
 
 #[repr(C)]
@@ -524,7 +482,7 @@ pub struct VideoFramingApiV2_2 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{gamestream::largest_protected_data, *};
     use crate::FRAME_CLOCK_STREAM_RELATIVE;
     use amaterasu_abi::BorrowedBytes;
 
@@ -635,6 +593,34 @@ mod tests {
         bounded.max_queue_bytes = reservation.queue_bytes as u32 - 1;
         assert!(unsafe { plan.validate(&bounded) }.is_err());
     }
+    #[test]
+    fn shape_enforces_common_bounds_without_gamestream_packing() {
+        let data = [7; 8];
+        let starts = [1, 0];
+        let plan = plan(&data, &starts);
+        let mut bounds = limits();
+        bounds.max_queue_bytes = 104;
+        bounds.max_wire_bytes = 188;
+        assert_eq!(
+            unsafe { plan.validate_shape(&bounds) }.unwrap(),
+            VideoPlanCounts {
+                data_shards: 2,
+                datagrams: 3,
+            }
+        );
+        assert!(unsafe { plan.validate_gamestream(&bounds) }.is_err());
+
+        let mut constrained = bounds;
+        constrained.max_datagrams = 2;
+        assert!(unsafe { plan.validate_shape(&constrained) }.is_err());
+        constrained = bounds;
+        constrained.max_queue_bytes -= 1;
+        assert!(unsafe { plan.validate_shape(&constrained) }.is_err());
+        constrained = bounds;
+        constrained.max_wire_bytes -= 1;
+        assert!(unsafe { plan.validate_shape(&constrained) }.is_err());
+    }
+
     #[test]
     fn plan_rejects_unnegotiated_flags_holes_and_bad_parity() {
         let data = vec![7; 1200];

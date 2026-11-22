@@ -239,6 +239,7 @@ pub struct Record {
     pub effective_nvenc_settings: amaterasu_module_sdk::NvencSettings,
     pub global_nvenc_spatial_aq: bool,
     pub effective_nvenc_spatial_aq: bool,
+    pub effective_amd_av1_latency_mode: amaterasu_module_sdk::AmdAv1LatencyMode,
     pub selected_encoder: amaterasu_module_sdk::EncoderSelection,
     pub application_stream_audio: Option<bool>,
     pub effective_stream_audio: bool,
@@ -346,6 +347,7 @@ impl Record {
             encoder_snapshot: None,
             video_codec_offer: CodecOffer {
                 codecs: vec![amaterasu_media::VideoCodec::H264],
+                ten_bit_formats: Vec::new(),
                 mode_limit: Some(crate::encoder_snapshot::LEGACY_SOFTWARE_MODE_LIMIT),
             },
             desktop: false,
@@ -462,6 +464,7 @@ impl Record {
             effective_nvenc_settings: amaterasu_module_sdk::NvencSettings::default(),
             global_nvenc_spatial_aq: false,
             effective_nvenc_spatial_aq: false,
+            effective_amd_av1_latency_mode: Default::default(),
             selected_encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
             application_stream_audio: None,
             effective_stream_audio: global_stream_audio,

@@ -1087,6 +1087,7 @@ pub(super) fn record(state: State) -> Record {
         negotiated_color: None,
         negotiated_video: None,
         extension_offer: Vec::new(),
+        extension_wire_budget: None,
         extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
@@ -1816,6 +1817,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         negotiated_color: None,
         negotiated_video: None,
         extension_offer: Vec::new(),
+        extension_wire_budget: None,
         extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
@@ -2429,8 +2431,8 @@ fn network_configuration_is_restricted_to_nvhttp_and_reports_disabled_listener_s
         &runtime,
     );
     assert_eq!(endpoint.completions[1].1["ok"], true);
-    assert_eq!(endpoint.completions[1].1["active"], true);
-    assert_eq!(endpoint.completions[1].1["active_base_port"], port);
+    assert_eq!(endpoint.completions[1].1["pending"], true);
+    assert_eq!(endpoint.completions[1].1["active_base_port"], Value::Null);
 }
 
 #[test]
@@ -2837,7 +2839,6 @@ fn accepted_announce_freezes_client_pcm_flags_into_authenticated_start() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn ten_bit_depth_and_launch_dynamic_range_are_independent() {
     for hdr in [false, true] {
@@ -2850,6 +2851,15 @@ fn ten_bit_depth_and_launch_dynamic_range_are_independent() {
             chroma_sampling: Default::default(),
             dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
         };
+        assert!(!record.accept_announce(&announce));
+        let mut offered = announce.video.format;
+        if !hdr {
+            offered.dynamic_range = amaterasu_module_sdk::DynamicRange::Sdr;
+        }
+        record.config.profile.ten_bit_formats = vec![offered];
+        let mut unoffered = announce.clone();
+        unoffered.video.format.chroma_sampling = amaterasu_module_sdk::ChromaSampling::Yuv444;
+        assert!(!record.accept_announce(&unoffered));
         assert!(record.accept_announce(&announce));
         let payload = record.authenticated_start_payload(23).unwrap();
         let format = &payload["configuration"]["configuration"]["video_stream_format"];
@@ -4480,8 +4490,14 @@ fn accepted_extension_announce_preserves_profile_and_rejects_changed_probe_param
             .unwrap();
     assert!(!record.accept_extension_announce(&announce));
     record.extension_offer = vec![profile.clone()];
+    record.extension_wire_budget = Some(false);
     assert!(record.accept_extension_announce(&announce));
     let payload = record.authenticated_start_payload(23).unwrap();
+    assert!(
+        payload["configuration"]
+            .get("extension_wire_bitrate_kbps")
+            .is_none()
+    );
     assert_eq!(
         payload["configuration"]["configuration"]["extension_profile"],
         json!(profile)
@@ -4495,9 +4511,85 @@ fn accepted_extension_announce_preserves_profile_and_rejects_changed_probe_param
             .any(|warning| warning["code"] == "optional_client_features"
                 && warning["requested"] == 16)
     );
-    announce.video.width += 2;
+    // A different framer's confirmed wire-budget capability admits the
+    // configured bitrate even when the legacy encoder field differs.
+    announce.video.bitrate_kbps += 1;
+    assert!(!record.accept_extension_announce(&announce));
+    record.extension_wire_budget = Some(true);
+    record.config.max_bitrate_kbps = Some(18_000);
+    assert!(record.accept_extension_announce(&announce));
+    let payload = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(
+        payload["configuration"]["extension_wire_bitrate_kbps"],
+        18_000
+    );
+    assert_eq!(
+        payload["configuration"]["configuration"]["bitrate"],
+        16_000_000
+    );
+    let mut legacy = announce.clone();
+    legacy.video.configured_bitrate_kbps = None;
+    assert!(!record.accept_extension_announce(&legacy));
+    legacy.video.bitrate_kbps = 16_000;
+    assert!(record.accept_extension_announce(&legacy));
+    assert!(
+        record.authenticated_start_payload(23).unwrap()["configuration"]
+            .get("extension_wire_bitrate_kbps")
+            .is_none()
+    );
+    let mut changed_geometry = announce.clone();
+    changed_geometry.video.width += 2;
+    assert!(!record.accept_extension_announce(&changed_geometry));
+    record.extension_offer.clear();
     assert!(!record.accept_extension_announce(&announce));
     assert!(record.authenticated_start_payload(23).is_none());
+}
+
+#[test]
+fn prepare_probes_extension_with_standard_software_tuning_configured() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let mut controller = Controller::new(Settings {
+        enabled: true,
+        extension_enabled: true,
+        bind: "127.0.0.1:0".parse().unwrap(),
+        allowed_principals: vec!["caller".into()],
+        ..Settings::default()
+    })
+    .unwrap();
+    let mut endpoint = Endpoint {
+        active_request: true,
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    let mut config = open();
+    config.min_threads = 5;
+    config.qp = 22;
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "caller".into(),
+            config,
+            deadline: 5_000,
+            display_preflight_deadline: None,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    controller.advance_job(&runtime, 1);
+    let prepare = endpoint
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request { payload, .. } if payload["action"] == "prepare" => Some(payload),
+            _ => None,
+        })
+        .expect("stream-session preparation");
+    let probe = prepare["extension_probe"]
+        .as_object()
+        .expect("extension probe");
+    assert!(!probe.contains_key("min_threads"));
+    assert!(!probe.contains_key("qp"));
 }
 
 #[test]
@@ -4509,17 +4601,27 @@ fn prepared_controller_advertises_only_the_preflighted_extension() {
     let mut full_chroma = profile.clone();
     full_chroma["media_format"] =
         json!({"bit_depth":8,"dynamic_range":"sdr","chroma_sampling":"yuv444"});
-    for (offered, hdr, reference_frames, expected_count) in [
-        (Value::Null, false, 0, 0),
-        (profile.clone(), false, 0, 1),
-        (profile.clone(), false, 1, 1),
-        (profile.clone(), true, 1, 1),
-        (json!([profile, full_chroma]), false, 1, 2),
-        (json!([profile, profile]), false, 1, 0),
+    for (offered, hdr, reference_frames, wire_budget, expected_count) in [
+        (Value::Null, false, 0, None, 0),
+        (Value::Null, false, 0, Some(json!(true)), 0),
+        (profile.clone(), false, 0, None, 1),
+        (profile.clone(), false, 1, Some(json!(false)), 1),
+        (profile.clone(), true, 1, Some(json!(true)), 1),
+        (
+            json!([profile, full_chroma]),
+            false,
+            1,
+            Some(json!(true)),
+            2,
+        ),
+        (json!([profile, profile]), false, 1, Some(json!(true)), 0),
+        (profile.clone(), false, 1, Some(json!("invalid")), 0),
     ] {
         let settings: Settings = serde_json::from_value(json!({"enabled":true,"extension_enabled":true,"bind":"127.0.0.1:0","allowed_principals":["caller"]})).unwrap();
         let mut controller = Controller::new(settings).unwrap();
-        let (mut record, _) = announced_profile_record();
+        let (mut record, standard_announce) = announced_profile_record();
+        record.config.min_threads = 5;
+        record.config.qp = 22;
         record.config.profile.max_reference_frames = reference_frames;
         record.config.profile.hdr = hdr;
         record.state = State::Preparing;
@@ -4537,6 +4639,9 @@ fn prepared_controller_advertises_only_the_preflighted_extension() {
             prepared["extension_profiles"] = offered;
         } else {
             prepared["extension_profile"] = offered;
+        }
+        if let Some(proof) = &wire_budget {
+            prepared["extension_wire_budget"] = proof.clone();
         }
         let mut endpoint = Endpoint {
             active_request: true,
@@ -4566,6 +4671,22 @@ fn prepared_controller_advertises_only_the_preflighted_extension() {
             usize::from(expected_count > 0)
         );
         assert_eq!(record.extension_offer.len(), expected_count);
+        let expected_wire_budget = if expected_count > 0 {
+            wire_budget.as_ref().and_then(Value::as_bool)
+        } else {
+            None
+        };
+        assert_eq!(record.extension_wire_budget, expected_wire_budget);
+        if wire_budget == Some(json!("invalid")) {
+            assert!(record.issues.drain().any(|report| matches!(report,
+                amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue)
+                    if issue.code == "invalid_extension_offer"
+            )));
+            assert!(record.accept_announce(&standard_announce));
+            let payload = record.authenticated_start_payload(23).unwrap();
+            assert_eq!(payload["configuration"]["configuration"]["min_threads"], 5);
+            assert_eq!(payload["configuration"]["configuration"]["qp"], 22);
+        }
     }
 }
 

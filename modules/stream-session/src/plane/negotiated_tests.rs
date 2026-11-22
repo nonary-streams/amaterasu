@@ -1,4 +1,5 @@
 use super::*;
+mod replacement_plan;
 use amaterasu_contracts::media_profile::{FormatId, VideoProfile, VideoProfileSnapshot};
 use amaterasu_gamestream::{
     rtsp::{
@@ -733,13 +734,18 @@ impl<const MARKER: u8> FramingProvider for ProductionFramer<MARKER> {
         }
         let mut bytes = bytes.to_vec();
         bytes.push(MARKER);
+        let data_shards = if MARKER == replacement_plan::FRAMER_MARKER {
+            bytes.len().div_ceil(replacement_plan::SHARD_PAYLOAD) as u32
+        } else {
+            1
+        };
         Ok(OwnedFramePlan {
             framed_bytes: bytes,
             record_starts: vec![],
             critical_prefix_shards: 0,
             blocks: vec![VideoFecBlock {
                 first_data_shard: 0,
-                data_shards: 1,
+                data_shards,
                 parity_shards: 0,
                 percentage: 0,
             }],
@@ -855,6 +861,15 @@ unsafe extern "C" fn bind_fixture_encoder<const MARKER: u8>(
 
 #[test]
 fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
+    exercise_planned_pump(&[(31, 1, false), (32, 2, false), (31, 1, true)]);
+}
+
+#[test]
+fn planned_pump_accepts_replacement_transport_layout_and_retries_busy() {
+    exercise_planned_pump(&[(31, replacement_plan::FRAMER_MARKER, false)]);
+}
+
+fn exercise_planned_pump(cases: &[(u8, u8, bool)]) {
     use amaterasu_module_sdk::{Command, Response};
     use std::net::UdpSocket;
     const PLAN: &str = "test.plan/1";
@@ -862,9 +877,9 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
     const VIDEO_CONTROL: &str = "amaterasu.video/1";
     const ENCODER_CONTROL: &str = "test.encoder/1";
     const ENCODER_NATIVE: &str = "test.encoder-native/1";
-    for (encoder_marker, framer_marker, multi_block) in
-        [(31u8, 1u8, false), (32, 2, false), (31, 1, true)]
-    {
+    for &(encoder_marker, framer_marker, multi_block) in cases {
+        let uses_replacement = framer_marker == replacement_plan::FRAMER_MARKER;
+        let stock_plan_service = if uses_replacement { None } else { Some(PLAN) };
         let transport_fec_blocks = if multi_block {
             VIDEO_FRAME_MAX_BLOCKS as u32
         } else {
@@ -925,11 +940,16 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                 "value": "186f0393",
             }]);
         }
+        let stock_profiles = if uses_replacement {
+            Vec::new()
+        } else {
+            vec![profile_json.clone()]
+        };
         let policy = serde_json::to_vec(&serde_json::json!({"principals":{
             "provider":{"provide":[MEDIA,ENCODER_CONTROL],"native_provide":[ENCODER_NATIVE,FRAMER,BAD_FRAMER,PLAN,MEDIA,CONTROL]},
             "video":{"provide":[VIDEO_CONTROL],"call":[ENCODER_CONTROL],"native_provide":[VIDEO,VIDEO_CONTROL],"native_use":[ENCODER_NATIVE]},
             "consumer":{"call":[VIDEO_CONTROL,ENCODER_CONTROL],"native_use":[VIDEO,FRAMER,BAD_FRAMER,PLAN,MEDIA,CONTROL]}},
-            "settings":{"provider":{"enabled":true,"allowed_principals":["consumer"],"plan_service":PLAN,"extension_profiles":[profile_json]},
+            "settings":{"provider":{"enabled":true,"allowed_principals":["consumer"],"plan_service":stock_plan_service,"extension_profiles":stock_profiles},
                 "video":{"enabled":true,"capture_providers":[],"unit_service":VIDEO,"source_encoder_providers":{"fixture":{
                     "control_service":ENCODER_CONTROL,"native_service":ENCODER_NATIVE,"source_ids":[6],"extension_profiles":[profile_json]}}}}})).unwrap();
         let runtime_api = unsafe { &*amaterasu_runtime_v1() };
@@ -990,9 +1010,20 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                 value: 10,
                 schema: 1,
             };
+            let replacement =
+                uses_replacement.then(|| replacement_plan::Transport::new(media_stream));
+            if let Some(replacement) = &replacement {
+                unsafe {
+                    video_framing::register_plan_transport_v2(&provider, PLAN, &replacement.factory)
+                }
+                .unwrap();
+            }
             let control_factory = Factory::new(std::ptr::null_mut(), Kind::Control);
             let framer_one = video_framing::Factory::new(ProductionFramer::<1>);
             let framer_two = video_framing::Factory::new(ProductionFramer::<2>);
+            let replacement_framer = video_framing::Factory::new(
+                ProductionFramer::<{ replacement_plan::FRAMER_MARKER }>,
+            );
             let bad_framer_factory = video_framing::Factory::new(UnsupportedFramer);
             provider
                 .require_success(Command::Register {
@@ -1026,6 +1057,8 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             .unwrap();
             if framer_marker == 1 {
                 unsafe { video_framing::register(&provider, FRAMER, &framer_one) }.unwrap();
+            } else if uses_replacement {
+                unsafe { video_framing::register(&provider, FRAMER, &replacement_framer) }.unwrap();
             } else {
                 unsafe { video_framing::register(&provider, FRAMER, &framer_two) }.unwrap();
             }
@@ -1171,6 +1204,16 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             let mut plane =
                 Plane::new_planned(&consumer, handles, &Default::default(), &planned).unwrap();
             video_module.tick().unwrap();
+            if let Some(replacement) = &replacement {
+                assert_eq!(
+                    plane
+                        .tick(true, usize::MAX)
+                        .unwrap()
+                        .accepted_video_access_units,
+                    0
+                );
+                assert!(replacement.datagrams.borrow().is_empty());
+            }
             assert_eq!(
                 plane
                     .tick(true, usize::MAX)
@@ -1178,10 +1221,17 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                     .accepted_video_access_units,
                 1
             );
-            transport.tick();
-            let mut datagram = [0u8; 2048];
-            assert!(video_peer.recv(&mut datagram).unwrap() >= 44);
-            assert_eq!(&datagram[40..44], &[10, 20, encoder_marker, framer_marker]);
+            if let Some(replacement) = &replacement {
+                assert_eq!(
+                    *replacement.datagrams.borrow(),
+                    [vec![0, 10, 20, encoder_marker], vec![1, framer_marker]]
+                );
+            } else {
+                transport.tick();
+                let mut datagram = [0u8; 2048];
+                assert!(video_peer.recv(&mut datagram).unwrap() >= 44);
+                assert_eq!(&datagram[40..44], &[10, 20, encoder_marker, framer_marker]);
+            }
             drop(plane);
         }
         unsafe { (runtime_api.destroy)(runtime) };

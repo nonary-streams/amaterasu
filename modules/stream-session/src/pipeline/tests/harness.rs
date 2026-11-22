@@ -321,6 +321,7 @@ pub struct Broker {
     pub video_close_polls: u8,
     pub video_remaining: u8,
     pub format_rate: u32,
+    pub opus_surround_layout: Option<Value>,
     pub reported_audio_capture_channels: Option<u32>,
     pub reported_audio_sink_channels: Option<u32>,
     pub fail_completion: bool,
@@ -1818,7 +1819,7 @@ impl Broker {
             "amaterasu.session/1" => {
                 json!({"ok":true,"sessions":[{"id":id,"key":allocation.key,"state":allocation.state,"leases":allocation.leases}]})
             }
-            "amaterasu.audio-encode/1" => {
+            "amaterasu.audio-encode/1" | "vendor.audio-encoder/1" => {
                 let bitrate = allocation.request["bitrate"].as_u64().unwrap();
                 let packet_ms = allocation.request["packet_ms"].as_u64().unwrap();
                 let packet_bytes = bitrate * packet_ms / 8_000;
@@ -1830,22 +1831,23 @@ impl Broker {
                         allocation.request["audio_profile"]["custom"]["sample_rate"].clone();
                     reply["audio_profile"] = allocation.request["audio_profile"].clone();
                 }
-                if let Some((streams, coupled, mapping, wave_mapping)) = (crate::model::AudioWire {
-                    channels: channels as u32,
-                    packet_ms: packet_ms as u32,
-                    bitrate: bitrate as u32,
-                    channel_mask: if channels == 6 { 0x3f } else { 0x63f },
-                    layout: if channels == 6 { "5.1" } else { "7.1" }.into(),
-                    custom: None,
-                    client_offers: vec![],
-                })
-                .channel_mapping()
-                {
-                    reply["mapping_family"] = json!(1);
-                    reply["streams"] = json!(streams);
-                    reply["coupled_streams"] = json!(coupled);
-                    reply["channel_mapping"] = json!(mapping);
-                    reply["wave_channel_mapping"] = json!(wave_mapping);
+                if service == "vendor.audio-encoder/1" {
+                    reply["native_contract"] =
+                        allocation.request["required_native_contract"].clone();
+                }
+                if matches!(channels, 6 | 8) {
+                    let layout = self.opus_surround_layout.as_ref().map_or_else(
+                        || {
+                            json!({"streams":channels,"coupled_streams":0,
+                            "wave_channel_mapping":(0..channels).rev().collect::<Vec<_>>()})
+                        },
+                        Clone::clone,
+                    );
+                    reply["codec"] = json!("opus");
+                    reply
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(layout.as_object().unwrap().clone());
                 }
                 reply
             }

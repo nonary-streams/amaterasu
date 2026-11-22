@@ -383,6 +383,7 @@ fn peer() -> RequestContext {
     RequestContext {
         secure: true,
         remote: "127.0.0.1".parse().unwrap(),
+        local: None,
         peer_certificate: Some(vec![1, 2, 3]),
         peer_trusted: true,
         list_allowed: true,
@@ -438,6 +439,7 @@ fn presentation_failures_record_the_request_without_duplicating_launch_refusals(
             context,
             Stage::Info {
                 host_id: "host".into(),
+                mac: None,
             },
             Some(DispatchIntent::Launch),
             now,
@@ -855,8 +857,14 @@ fn paired_server_info_uses_the_policy_projection_and_retains_transport_authoriza
     let mut router = router();
     let mut provider = Provider::new("policy");
     let now = Instant::now();
-    assert!(dispatch(&mut router, "/serverinfo", peer(), now).is_none());
+    router.set_network_provider(Some(
+        crate::server::provider_selection_tests::wake_identity_provider(),
+    ));
+    let mut context = peer();
+    context.local = Some("127.0.0.1:48000".parse().unwrap());
+    assert!(dispatch(&mut router, "/serverinfo", context, now).is_none());
     let reply = complete(&mut router, &mut provider, now);
+    assert!(String::from_utf8_lossy(&reply.body).contains("<mac>02:ab:00:00:00:01</mac>"));
     let body = String::from_utf8(reply.body).unwrap();
     assert!(body.contains("<currentgame>0</currentgame>"));
     assert!(body.contains("AMATERASU_SERVER_FREE"));
@@ -1292,6 +1300,7 @@ fn protocol_specific_replacement_validation_happens_before_game_stop_admission()
                 context.clone(),
                 Stage::Info {
                     host_id: "host".into(),
+                    mac: None,
                 },
                 Some(DispatchIntent::Launch),
                 now,
@@ -1347,6 +1356,7 @@ fn auxiliary_resume_uses_semantic_view_permission_even_from_an_applist_launch() 
                 context,
                 Stage::Info {
                     host_id: "host".into(),
+                    mac: None,
                 },
                 Some(DispatchIntent::Launch),
                 now,

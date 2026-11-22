@@ -1,5 +1,6 @@
 //! Version 1 control-plane messages. These types are independent of the bootstrap ABI.
 pub mod api_validation;
+pub mod audio;
 pub mod control;
 pub mod display_color_profile;
 pub mod encoder;

@@ -303,7 +303,8 @@ impl ManagedModule for NvhttpModule {
                 },
                 launches,
             );
-            router.set_pairing_network(network.clone());
+            router.set_network_provider(network.clone());
+            router.set_wake_identity_logger(log_emitter.clone());
             router.select_session_presentation(
                 &runtime,
                 settings.session_presentation_provider.as_deref(),
@@ -711,6 +712,7 @@ impl ManagedModule for NvhttpModule {
                     wire::RequestContext {
                         secure: incoming.secure,
                         remote: incoming.remote,
+                        local: incoming.local,
                         peer_certificate: incoming.peer_certificate,
                         peer_trusted: trusted,
                         list_allowed,

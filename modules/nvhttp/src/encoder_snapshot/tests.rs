@@ -161,6 +161,7 @@ fn unknown_encoders_offer_only_software_h264() {
         unknown_encoders_offer(FULL_HD_60),
         Ok(CodecOffer {
             codecs: vec![VideoCodec::H264],
+            ten_bit_formats: Vec::new(),
             mode_limit: Some(FULL_HD_60),
         })
     );
@@ -233,6 +234,7 @@ fn yuv444_advertisement_requires_explicit_provider_capabilities() {
     );
     entry["yuv444"] = json!(true);
     entry["yuv444_10bit"] = json!(true);
+    entry["hdr10"] = json!(true);
     assert_eq!(
         snapshot(vec![entry]).advertisement().codec_mode_support & 0x0018_0000,
         0x0018_0000
@@ -272,4 +274,57 @@ fn replacement_encoder_modes_bound_admission_and_the_offer() {
     let small = snapshot.offer(AUTO, FULL_HD_60).unwrap();
     assert_eq!(small.codecs, [VideoCodec::Av1, VideoCodec::H264]);
     assert_eq!(small.mode_limit, Some(FULL_HD_60));
+}
+
+#[test]
+fn replacement_encoder_offers_only_its_proved_ten_bit_range_and_sampling() {
+    let mut sdr = encoder("replacement-sdr", "hevc", false);
+    sdr["sdr10"] = json!(true);
+    sdr["yuv444_10bit"] = json!(true);
+    sdr["mode_limit"] = json!(FULL_HD_60);
+    let mut hdr = encoder("replacement-hdr", "hevc", true);
+    hdr["hdr10"] = json!(true);
+    let snapshot = snapshot(vec![sdr, hdr]);
+
+    let auto = snapshot.offer(AUTO, FULL_HD_60).unwrap();
+    assert_eq!(auto.mode_limit, Some(FULL_HD_60));
+    assert!(
+        snapshot
+            .offer(AUTO, UHD_120)
+            .unwrap()
+            .ten_bit_formats
+            .is_empty()
+    );
+
+    let sdr = snapshot
+        .offer(EncoderSelection::Index(0), FULL_HD_60)
+        .unwrap();
+    assert_eq!(sdr.ten_bit_formats.len(), 2);
+    assert!(
+        sdr.ten_bit_formats
+            .iter()
+            .all(|format| format.dynamic_range == DynamicRange::Sdr)
+    );
+    assert!(
+        sdr.ten_bit_formats
+            .iter()
+            .any(|format| format.chroma_sampling == ChromaSampling::Yuv444)
+    );
+    let hdr = snapshot
+        .hdr_offer(EncoderSelection::Index(1), FULL_HD_60)
+        .unwrap();
+    assert_eq!(hdr.ten_bit_formats.len(), 1);
+    assert_eq!(hdr.ten_bit_formats[0].dynamic_range, DynamicRange::Hdr);
+    assert!(
+        snapshot
+            .offer(EncoderSelection::Index(1), FULL_HD_60)
+            .unwrap()
+            .ten_bit_formats
+            .is_empty()
+    );
+    assert!(
+        snapshot
+            .hdr_offer(EncoderSelection::Index(0), FULL_HD_60)
+            .is_err()
+    );
 }

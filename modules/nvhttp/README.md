@@ -514,7 +514,7 @@ by `NvComputer::NvComputer` (`app/backend/nvcomputer.cpp:131-221`) unless noted.
 | --- | --- | --- | --- |
 | `hostname` | `nvcomputer.cpp:136` | configured hostname | Empty becomes "UNKNOWN". |
 | `uniqueid` | `nvcomputer.cpp:141` | persistent host id | Identity of the PC in the client's list. |
-| `mac` | `nvcomputer.cpp:142-148` | first physical interface, else zeros | Wake-on-LAN only; all-zero means unknown. |
+| `mac` | `nvcomputer.cpp:142-148` | selected Network provider’s Wake-on-LAN MAC, or zeros | The provider prefers the connection’s serving interface when known. All-zero means unknown. |
 | `ServerCodecModeSupport` | `nvcomputer.cpp:150-157`, `session.cpp:1798`, `session.cpp:1144-1300` | H.264 baseline while streaming is configured, plus enumerated HEVC and AV1 bits | `Connection.c:228-233` aborts `LiStartConnection` with -1 when zero. |
 | `MaxLumaPixelsHEVC` | `nvcomputer.cpp:159-165`, `session.cpp:1174,1216,1377` | `0`, or `1869449984` with HEVC | Zero removes HEVC from the client's formats. |
 | `FrameLimiter*` | `framelimitercapabilities.h:16-37` | omitted | Vibeshine extension; absent means unsupported. |

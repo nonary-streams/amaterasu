@@ -77,6 +77,7 @@ enum Stage {
     },
     Info {
         host_id: String,
+        mac: Option<[u8; 6]>,
     },
     Dispatch {
         peer: Box<PeerIdentity>,
@@ -270,14 +271,17 @@ impl PresentationRouter {
         connection: u64,
         certificate: Vec<u8>,
         context: Context,
-        host_id: String,
+        identity: xml::ServerIdentity<'_>,
         now: Instant,
     ) -> Option<Reply> {
         self.queue(
             Some(connection),
             certificate,
             context,
-            Stage::Info { host_id },
+            Stage::Info {
+                host_id: identity.host_id.to_owned(),
+                mac: identity.mac,
+            },
             None,
             now,
         )
@@ -764,7 +768,7 @@ impl PresentationRouter {
             _ => None,
         };
         match (&mut work.stage, response) {
-            (Stage::Info { host_id }, session::Reply::Info { presentation }) => {
+            (Stage::Info { host_id, mac }, session::Reply::Info { presentation }) => {
                 if !context_current(&work.context, launches) {
                     return Some(xml::error(409, "active application changed; request again"));
                 }
@@ -779,7 +783,7 @@ impl PresentationRouter {
                 };
                 let mut reply = xml::server_info(
                     config,
-                    host_id,
+                    xml::ServerIdentity { host_id, mac: *mac },
                     true,
                     current_game,
                     presentation.busy,

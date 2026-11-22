@@ -155,6 +155,27 @@ after the client has selected them. The budget callback is synchronous,
 bounded and read-only, with no delayed effect or cleanup ownership.
 Accepted bitrate and wire budget are pinned for replay and teardown.
 
+Codex reviewed the extension offer and startup changes against Core `c6126205`.
+Stream Session reports the prepared route's wire-budget support with its exact
+profile offer after every offered profile passes preflight. RTSP freezes the
+support result for the ticket and uses it in both ANNOUNCE validation and
+PLAY. A malformed support declaration withholds the extension and records
+`invalid_extension_offer` on that operation. Standard negotiation and startup
+remain available. An older preparation reply without the declaration retains
+PyroWave's established wire interpretation. The selected framer still owns
+encoder-rate calculation using the exact prepared limits, and the existing
+lifecycle owner handles its refusal after ANNOUNCE. Stream Session rejects a
+Start carrying a wire budget unless its prepared route proved support. Older
+RTSP versions can still use this path when the signed route requires that
+proof, and can use the legacy encoder rate without a wire budget.
+
+The native source's probe and Start omit legacy software thread and QP controls.
+The standard Start still carries those controls. The crop, range, chroma,
+encryption, source identity and session ownership checks still apply. Regression
+coverage exercises a replacement codec's prepared wire budget, stock startup
+after an invalid offer, and the existing PyroWave link-rate limit and legacy
+bitrate behavior.
+
 Stream-session checks the selected transport's reported overhead against
 generic frame-plan bounds and the agreed encryption state. The GameStream
 transport remains responsible for checking its exact protocol overhead when
@@ -208,6 +229,33 @@ client. RTSP exercised authorized destination discovery, pre-PLAY warmup,
 and confirmed TEARDOWN. Chromium loopback separately verified WebRTC video
 decode, audio delivery and managed session close. Hardware capture, physical
 router changes and installed-package activation require separate verification.
+
+### GameStream Opus surround layout review
+
+Codex traced the selected Opus layout from Stream Session's Audio Encoder Open
+through RTSP preparation, DESCRIBE, SETUP, ANNOUNCE and authenticated start. The
+coordinator records the encoder handle before validating the decoder descriptor
+and pins the approved layout to that prepared session. RTSP validates the
+descriptor against the ticket's actual channel count before registering the
+ticket. The client still has to announce the prepared channels, speaker mask
+and packet duration. The audio transport keeps the encoder's effective packet
+size and its own wire framing.
+
+Missing or malformed surround metadata leaves no verified decoder configuration
+for the requested channels. Stream Session reports that condition to the
+lifecycle owner and closes the opened encoder. A malformed prepared response at
+RTSP follows its owned session cleanup and never registers the ticket. Those
+paths use the existing operation identity, deadline and settlement rules. A late
+prepare after cancellation retains ownership for cleanup. Recovery of an open
+encoder preserves the decoder layout as required by the provider contract.
+
+The independent Codex reviewer checked the SDP digit order against Moonlight's
+parser and identified the need to make same-handle recovery stability explicit.
+Focused source fixtures exercise a replacement encoder's non-stock mapping,
+malformed metadata retirement, and the mapping recovered by the Moonlight SDP
+ordering rules. A standalone harness around the pinned Moonlight parser
+confirmed the decoder layouts for the same 5.1 and 7.1 SDP attributes.
+Hardware/client playback is outside these fixtures.
 
 ## Preparation and restart
 

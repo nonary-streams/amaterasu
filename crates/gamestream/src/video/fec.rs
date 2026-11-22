@@ -136,7 +136,8 @@ impl VideoPacketizer {
             return Err(VideoError::InvalidPlan);
         }
         // SAFETY: caller guarantees plan buffer lifetime for this call.
-        let reservation = unsafe { plan.validate(limits) }.map_err(|_| VideoError::InvalidPlan)?;
+        let reservation =
+            unsafe { plan.validate_gamestream(limits) }.map_err(|_| VideoError::InvalidPlan)?;
         // SAFETY: validation checked shape and caller guarantees the live buffers.
         let bytes =
             unsafe { std::slice::from_raw_parts(plan.framed_bytes.ptr, plan.framed_bytes.len) };

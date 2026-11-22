@@ -63,6 +63,7 @@ The underlying native table and the public C/C++ declarations are in
 | UDP | Bind/connect, send/receive whole datagrams and source addresses, multicast, TTL, broadcast |
 | DNS | Bounded hostname length and result count, caller-supplied timeout |
 | Interface addresses | Bounded IP-address/interface-index list, including IPv6 scope information |
+| Wake-on-LAN MAC | Optional v1.4 snapshot lookup for the accepted connection’s local endpoint |
 | Batched datagrams | Optional bounded accepted-prefix submission; callers retry only the unaccepted tail |
 | Ownership | Opaque binding-local IDs, provider-retained sockets, SDK shared resource guards |
 | Error behavior | Versioned provider-neutral statuses mapped to `io::ErrorKind`; OS-specific errno remains inside the implementation |
@@ -220,3 +221,41 @@ cumulative receive drops. Memory charges include OS packet overhead, and are not
 payload byte counts. Other platforms or replacement providers may expose the
 tail with flags zero; consumers retain unknown values. No IO outcome depends on
 diagnostic availability. See [Linux socket timestamp semantics](https://man7.org/linux/man-pages/man7/socket.7.html).
+
+
+## Optional Wake-on-LAN identity (v1.4)
+
+Call `Network::wake_mac(Some(local_endpoint))` with the endpoint from the
+accepted Network SDK socket. Use `None` when its local address is unknown.
+The tail requires `WAKE_MAC`, minor 4 and the complete v1.4 table. The
+callback returns one six-octet unicast address, with a provider-selected
+fallback when the serving interface cannot be identified. It must read an
+available snapshot without blocking on discovery. The SDK rejects zero and
+multicast addresses. Older providers retain the v1 contract and may decline
+the optional operation. The built-in Linux provider refreshes a per-factory
+snapshot of physical interfaces every 30 seconds on one owned worker. A
+failed refresh keeps the last successful snapshot for up to 60 seconds from
+collection. The provider joins its worker before unloading. The built-in
+provider exposes the capability on Linux.
+
+### NVHTTP architecture review
+
+Codex and the coordinating architecture reviewer traced the Network v1.4
+and NVHTTP changes from Core `c61262052`.
+The selected Network binding provides the accepted socket’s concrete local
+endpoint, including IPv6 scope, and the MAC used in either successful
+`/serverinfo` reply. If the provider lacks the capability, the snapshot is
+unavailable, or the returned address is invalid, NVHTTP writes the existing
+all-zero value and rate-limits a host advisory. This read targets a discovery
+request before stream admission, so it has no stream lifecycle record. The
+MAC has no role in pairing, authorization, application admission, RTSP
+offers, ANNOUNCE/PLAY, or teardown. Launch continues through the existing
+owner without a new rejection reason. The lookup creates no socket, lease,
+or pending request. The worker refreshes independently of any client or
+stream, and provider quiescence owns its retirement.
+
+Source coverage uses an alternate native provider across HTTP accept and
+the NVHTTP router, confirms the local endpoint changes the advertised MAC,
+preserves the paired presentation reply, and verifies that a legacy
+provider's fallback logs a warning and still lets the client open RTSP. C
+and Rust layout checks preserve all older ABI prefixes.

@@ -2,6 +2,16 @@
 
 Audio capture, encoding, and media transport are independently selected by trusted startup composition. The stream coordinator invokes those providers through their typed SDK interfaces; native plugins are trusted code and grants are not a native-code sandbox.
 
+## GameStream surround encoders
+
+For standard 5.1 and 7.1 Opus, the selected encoder returns
+`audio::OpusSurroundLayout` in its open reply. The three top-level fields are
+`streams`, `coupled_streams`, and `wave_channel_mapping`. They describe the
+actual encoded channels in WAVE speaker order. Keep them stable for the lifetime
+of the encoder handle, including recovery. Stream Session pins the validated
+layout to the prepared session. RTSP advertises that layout for the exact
+launch ticket before the client can agree to the prepared channel profile.
+
 ## Custom audio sessions
 
 An authorized protocol provider may prepare a session with an `audio` object containing `channels`, `channel_mask`, `layout`, `packet_ms`, `bitrate`, and `custom`. The `custom` object contains a namespaced `codec`, `sample_rate`, a `stream` description, a `pcm` descriptor and provider-defined JSON `options`, bounded to 64 KiB. Every identifier contains nonzero `namespace`, `value`, and `version` fields; unknown identifiers are available to providers without changes to the host. The PCM descriptor supplies the sample format, storage bytes, valid bits, packing, and an ordered list of speaker identifiers. The list describes actual sample order, including height channels, without inferring order from a channel mask. Standard speaker values use the corresponding WAVE speaker-position bits; provider-defined positions have their own namespace.

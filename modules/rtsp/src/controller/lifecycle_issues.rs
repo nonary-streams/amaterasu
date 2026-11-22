@@ -66,6 +66,7 @@ impl Cause<'static> {
             | "stream_status_unavailable"
             | "stream_observation_lost"
             | "invalid_prepare_response"
+            | "invalid_opus_surround_layout"
             | "display_lease_unverified"
             | "history_activity_unverified"
             | "lifecycle_identity_unverified"

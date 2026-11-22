@@ -63,6 +63,7 @@ pub(super) struct Record {
     pub negotiated_color: Option<amaterasu_gamestream::sdp::ColorMode>,
     pub negotiated_video: Option<crate::model::NegotiatedVideo>,
     pub extension_offer: Vec<amaterasu_contracts::media_profile::VideoProfile>,
+    pub extension_wire_budget: Option<bool>,
     pub extension_announce: Option<
         amaterasu_gamestream::sdp::Announce<amaterasu_gamestream::sdp::NegotiatedVideoFormat>,
     >,
@@ -214,7 +215,9 @@ impl Record {
             return false;
         };
         if !self.extension_offer.contains(profile)
-            || !self.config.accepts_extension_announce(announce)
+            || !self
+                .config
+                .accepts_extension_announce(announce, self.extension_wire_budget)
         {
             let expected = self.config.effective_profile();
             eprintln!(
@@ -320,13 +323,9 @@ impl Record {
             audio: announce.encryption.audio,
         });
         self.negotiated_slices_per_frame = accepted.then_some(announce.video.slices_per_frame);
-        // GameStream dynamicRangeMode selects ten-bit encoding; the trusted
-        // launch profile independently decides whether those samples are HDR.
-        let mut format = announce.video.format;
-        if format.bit_depth == 10 && !self.config.effective_profile().hdr {
-            format.dynamic_range = amaterasu_module_sdk::DynamicRange::Sdr;
-        }
-        self.negotiated_video_stream_format = accepted.then_some(format);
+        self.negotiated_video_stream_format = accepted
+            .then(|| self.config.standard_announce_format(announce))
+            .flatten();
         self.client_feature_flags = accepted.then_some(announce.client_feature_flags);
         self.negotiated_color = accepted.then_some(announce.video.color);
         self.negotiated_video = negotiated_video;
@@ -365,9 +364,10 @@ impl Record {
             }
             payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
             payload["configuration"]["configuration"]["color_mode"] = json!(announce.video.color);
-            if let Some(wire_kbps) =
-                amaterasu_gamestream::sdp::pyrowave::wire_bitrate_kbps(announce)
-            {
+            if let Some(wire_kbps) = amaterasu_gamestream::sdp::extension_wire_bitrate_kbps(
+                announce,
+                self.extension_wire_budget,
+            ) {
                 let wire_kbps = self
                     .config
                     .max_bitrate_kbps
@@ -503,6 +503,9 @@ impl Record {
             "display_applied":self.display_applied,
             "failure":self.failure,"cleanup_error":self.cleanup_error});
         response["warnings"] = json!(self.adjustments);
+        if !self.config.amd_av1_latency_mode.is_auto() {
+            response["amd_av1_latency_mode"] = json!(self.config.amd_av1_latency_mode);
+        }
         if let Some(context) = &self.config.source_capture_context {
             response["source_capture_context"] = json!(context);
         }

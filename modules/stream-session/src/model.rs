@@ -864,13 +864,6 @@ impl AudioWire {
     pub fn custom_profile(&self) -> serde_json::Value {
         serde_json::to_value(self.custom_session_profile()).expect("audio profile serializes")
     }
-    pub fn channel_mapping(&self) -> Option<(u32, u32, &'static [u8], &'static [u8])> {
-        match self.channels {
-            6 => Some((4, 2, &[0, 4, 1, 2, 3, 5], &[0, 1, 4, 5, 2, 3])),
-            8 => Some((5, 3, &[0, 6, 1, 2, 3, 4, 5, 7], &[0, 1, 6, 7, 4, 5, 2, 3])),
-            _ => None,
-        }
-    }
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if let Some(custom) = &self.custom {
             if self.client_offers.len() > 64
@@ -1146,6 +1139,11 @@ pub struct VideoConfiguration {
     pub nvenc_settings: amaterasu_module_sdk::NvencSettings,
     #[serde(default)]
     pub nvenc_spatial_aq: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_module_sdk::AmdAv1LatencyMode::is_auto"
+    )]
+    pub amd_av1_latency_mode: amaterasu_module_sdk::AmdAv1LatencyMode,
     /// Negotiated SDP color matrix and range, carried unchanged to the encoder.
     #[serde(default)]
     pub color_mode: amaterasu_media::ColorMode,
@@ -1524,7 +1522,8 @@ impl StartConfig {
         {
             return Err("invalid_start_configuration");
         }
-        if self.output == "amaterasu-owned-display"
+        if self.lifecycle_candidate.is_none()
+            && self.output == "amaterasu-owned-display"
             && !matches!(
                 self.capture_provider,
                 CaptureProvider::PipeWire | CaptureProvider::External(_)
@@ -1631,6 +1630,10 @@ impl VideoConfiguration {
                 ChromaSampling::Yuv444 => amaterasu_module_sdk::ChromaSampling::Yuv444,
             };
         config.extension_profile = Some(profile.clone());
+        // These controls configure the standard software encoder. Native
+        // sources are probed and opened through EncoderCommonConfigV1.
+        config.min_threads = default_min_threads();
+        config.qp = default_qp();
         config
     }
 
@@ -1641,10 +1644,9 @@ impl VideoConfiguration {
             && self.color_mode == amaterasu_media::ColorMode::default()
             && self.slices_per_frame == 1
             && self.max_reference_frames == 0
-            && self.min_threads == default_min_threads()
-            && self.qp == default_qp()
             && self.nvenc_settings == amaterasu_module_sdk::NvencSettings::default()
             && !self.nvenc_spatial_aq
+            && self.amd_av1_latency_mode.is_auto()
             && self.sw_preset.is_none()
             && self.sw_tune.is_none()
             && self.adapter_name.is_none()
@@ -1682,10 +1684,6 @@ impl VideoConfiguration {
                     == self.video_stream_format.bit_depth
                 && self.codec == amaterasu_media::VideoCodec::H264
         }) && self.video_stream_format.validate().is_ok()
-            && ((self.video_stream_format.bit_depth == 8
-                && self.video_stream_format.dynamic_range
-                    == amaterasu_module_sdk::DynamicRange::Sdr)
-                || (cfg!(target_os = "linux") && self.video_stream_format.bit_depth == 10))
             && (16..=8192).contains(&self.width)
             && (16..=8192).contains(&self.height)
             && self.width.is_multiple_of(2)
@@ -1724,6 +1722,9 @@ impl VideoConfiguration {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    ProbeUdpEndpoints {
+        endpoints: Vec<amaterasu_module_sdk::transport::udp_preflight::Endpoints>,
+    },
     /// End the display hold of an exact application lifecycle after its
     /// transports have drained. This does not stop other applications.
     ReleasePausedDisplay {
@@ -1843,10 +1844,8 @@ mod tests {
         assert!(!configuration.valid_extension_probe());
         configuration.max_reference_frames = 0;
         configuration.qp = 27;
-        assert!(!configuration.valid_extension_probe());
-        configuration.qp = 28;
         configuration.min_threads = 3;
-        assert!(!configuration.valid_extension_probe());
+        assert!(configuration.valid_extension_probe());
     }
     use super::*;
     use serde_json::{Value, json};
@@ -2234,8 +2233,8 @@ mod tests {
         for codec in ["h264", "hevc", "av1"] {
             for (bits, range, accepted) in [
                 (8, "sdr", true),
-                (10, "sdr", cfg!(target_os = "linux") && codec != "h264"),
-                (10, "hdr", cfg!(target_os = "linux") && codec != "h264"),
+                (10, "sdr", codec != "h264"),
+                (10, "hdr", codec != "h264"),
                 (8, "hdr", false),
             ] {
                 let mut request = start_json();

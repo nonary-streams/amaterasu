@@ -6,6 +6,7 @@ use std::{ffi::c_void, sync::Mutex};
 #[derive(Default)]
 struct Script {
     reject_listen: bool,
+    wake_supported: bool,
     reject_address_lookup: bool,
     listeners: Vec<Address>,
     listen_attempts: usize,
@@ -16,7 +17,7 @@ struct Script {
     released: bool,
 }
 struct ScriptedProvider {
-    api: NetworkApi,
+    api: NetworkApiV1_4,
     script: Arc<Mutex<Script>>,
 }
 unsafe fn script<'a>(context: *mut c_void) -> &'a Mutex<Script> {
@@ -28,13 +29,14 @@ unsafe extern "C" fn release(context: *mut c_void) {
     let provider = unsafe { Box::from_raw(context.cast::<ScriptedProvider>()) };
     provider.script.lock().unwrap().released = true;
 }
-unsafe extern "C" fn capabilities(_: *mut c_void, output: *mut Capabilities) -> Status {
+unsafe extern "C" fn capabilities(context: *mut c_void, output: *mut Capabilities) -> Status {
+    let wake_supported = unsafe { script(context) }.lock().unwrap().wake_supported;
     // SAFETY: SDK supplies writable callback-lifetime output storage.
     unsafe {
         *output = Capabilities {
             size: size_of::<Capabilities>() as u32,
             version: 1,
-            features: TCP,
+            features: TCP | if wake_supported { WAKE_MAC } else { 0 },
             max_io_bytes: MAX_IO_BYTES as u64,
             max_handles: 128,
             max_batch: 1,
@@ -205,44 +207,116 @@ unsupported!(
 );
 unsupported!(shutdown(c: *mut c_void, handle: u64, direction: u32));
 
+unsupported!(udp_bind_shared(c: *mut c_void, address: Address, handle: *mut u64));
+unsupported!(
+    recv_from_timed(
+        c: *mut c_void,
+        handle: u64,
+        data: *mut u8,
+        length: usize,
+        count: *mut usize,
+        address: *mut Address,
+        timing: *mut ReceiveTiming,
+    )
+);
+unsupported!(socket_diagnostics(c: *mut c_void, handle: u64, out: *mut SocketDiagnostics));
+unsupported!(
+    reverse_resolve(
+        c: *mut c_void,
+        address: Address,
+        timeout: u32,
+        out: *mut u8,
+        capacity: usize,
+        count: *mut usize,
+    )
+);
+
+unsafe extern "C" fn wake_mac(_: *mut c_void, local: Address, out: *mut [u8; 6]) -> Status {
+    let mac = match (local.family, local.bytes[3], local.port) {
+        (4, 1, 48000) => [2, 0xab, 0, 0, 0, 1],
+        (4, 2, 48000) => [2, 0xab, 0, 0, 0, 2],
+        (4, 3, 48000) => [1, 0xab, 0, 0, 0, 3],
+        (4, 4, 48000) => return WOULD_BLOCK,
+        (4, 5, 48000) => return IO_ERROR,
+        _ => return NOT_FOUND,
+    };
+    // SAFETY: the SDK supplies a writable six-byte borrow for this call.
+    unsafe { out.write(mac) };
+    STATUS_OK
+}
+
+pub(crate) fn wake_identity_provider() -> Network {
+    scripted_provider(false, true).0
+}
+
+pub(crate) fn legacy_provider() -> Network {
+    replacement(false).0
+}
+
 fn replacement(reject_listen: bool) -> (Network, Arc<Mutex<Script>>) {
+    scripted_provider(reject_listen, false)
+}
+
+fn scripted_provider(reject_listen: bool, wake_supported: bool) -> (Network, Arc<Mutex<Script>>) {
     let script = Arc::new(Mutex::new(Script {
         reject_listen,
+        wake_supported,
         ..Script::default()
     }));
     let mut provider = Box::new(ScriptedProvider {
-        api: NetworkApi {
-            base: NativeInterface {
-                header: AbiHeader::of::<NetworkApi>(),
-                context: std::ptr::null_mut(),
-                release: Some(release),
+        api: NetworkApiV1_4 {
+            v1_3: NetworkApiV1_3 {
+                v1_2: NetworkApiV1_2 {
+                    v1_1: NetworkApiV1_1 {
+                        v1: NetworkApi {
+                            base: NativeInterface {
+                                header: if wake_supported {
+                                    AbiHeader {
+                                        major: MAJOR,
+                                        minor: WAKE_MAC_MINOR,
+                                        size: size_of::<NetworkApiV1_4>() as u32,
+                                    }
+                                } else {
+                                    AbiHeader::of::<NetworkApi>()
+                                },
+                                context: std::ptr::null_mut(),
+                                release: Some(release),
+                            },
+                            capabilities,
+                            resolve,
+                            interfaces,
+                            tcp_listen: listen,
+                            tcp_connect: connect,
+                            udp_bind,
+                            accept,
+                            local_addr,
+                            peer_addr: address,
+                            read,
+                            peek,
+                            write,
+                            recv_from,
+                            send_to,
+                            connect_udp,
+                            set_option,
+                            get_option,
+                            join_multicast,
+                            send_batch,
+                            shutdown,
+                            close,
+                        },
+                        recv_from_timed,
+                        socket_diagnostics,
+                    },
+                    udp_bind_shared,
+                },
+                reverse_resolve,
             },
-            capabilities,
-            resolve,
-            interfaces,
-            tcp_listen: listen,
-            tcp_connect: connect,
-            udp_bind,
-            accept,
-            local_addr,
-            peer_addr: address,
-            read,
-            peek,
-            write,
-            recv_from,
-            send_to,
-            connect_udp,
-            set_option,
-            get_option,
-            join_multicast,
-            send_batch,
-            shutdown,
-            close,
+            wake_mac,
         },
         script: script.clone(),
     });
     provider.api.base.context = (&mut *provider as *mut ScriptedProvider).cast();
-    let table = &provider.api as *const NetworkApi;
+    let table = &provider.api.v1_3.v1_2.v1_1.v1 as *const NetworkApi;
     // SAFETY: SDK takes ownership of the complete table through its release
     // callback. No native pointer depends on an external library/allocation.
     let _provider = Box::into_raw(provider);
@@ -296,6 +370,7 @@ fn alternate_provider_serves_http_without_os_sockets_and_retires_all_handles() {
     assert_eq!(server.http_address().port(), 48_000);
     let request = server.tick().requests.pop().expect("scripted request");
     assert!(!request.secure);
+    assert_eq!(request.local, Some("127.0.0.1:48000".parse().unwrap()));
     assert!(server.respond(request.id, simple_reply(200, "alternate provider response")));
     for _ in 0..4 {
         server.tick();

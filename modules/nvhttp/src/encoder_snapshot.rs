@@ -6,6 +6,7 @@
 //! the codecs RTSP may offer a launched client. A codec is never offered when
 //! no enumerated encoder produces it.
 use amaterasu_media::VideoCodec;
+use amaterasu_module_sdk::{ChromaSampling, DynamicRange, VideoStreamFormat};
 use amaterasu_module_sdk::{EncoderBackend, EncoderIdentity, EncoderSelection, encode::ModeLimit};
 use serde_json::Value;
 
@@ -38,6 +39,7 @@ struct EncoderEntry {
     hardware: bool,
     mode_limit: Option<ModeLimit>,
     hdr10: bool,
+    sdr10: bool,
     yuv444: bool,
     yuv444_10bit: bool,
 }
@@ -54,6 +56,7 @@ pub struct EncoderSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodecOffer {
     pub codecs: Vec<VideoCodec>,
+    pub ten_bit_formats: Vec<VideoStreamFormat>,
     /// Bound shared by every offered codec with a finite provider limit.
     pub mode_limit: Option<ModeLimit>,
 }
@@ -151,7 +154,7 @@ impl EncoderSnapshot {
                     None => 0,
                 };
             }
-            if entry.yuv444_10bit {
+            if entry.hdr10 && entry.yuv444_10bit {
                 codec_mode_support |= match entry.codec {
                     Some(VideoCodec::Hevc) => 0x0010_0000,
                     Some(VideoCodec::Av1) => 0x0040_0000,
@@ -177,6 +180,15 @@ impl EncoderSnapshot {
         selection: EncoderSelection,
         mode: StreamMode,
     ) -> Result<CodecOffer, &'static str> {
+        self.offer_for_range(selection, mode, DynamicRange::Sdr)
+    }
+
+    fn offer_for_range(
+        &self,
+        selection: EncoderSelection,
+        mode: StreamMode,
+        dynamic_range: DynamicRange,
+    ) -> Result<CodecOffer, &'static str> {
         let candidates: Vec<EncoderEntry> = match selection {
             EncoderSelection::Index(index) => {
                 let entry = self
@@ -200,21 +212,54 @@ impl EncoderSnapshot {
                 .collect(),
         };
         let mut codecs = Vec::new();
+        let mut ten_bit_formats = Vec::new();
         let mut exceeds_provider_limit = false;
         let mut mode_limit: Option<ModeLimit> = None;
         for codec in [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264] {
-            let mut entries = candidates.iter().filter(|entry| entry.codec == Some(codec));
-            let best = entries
+            let mut entries = candidates.iter().filter(|entry| {
+                entry.codec == Some(codec)
+                    && (dynamic_range == DynamicRange::Sdr
+                        || (codec != VideoCodec::H264 && entry.hdr10))
+            });
+            let mode_entries = entries
                 .clone()
-                .filter(|entry| entry.mode_limit.is_none_or(|limit| limit.supports(mode)))
-                .max_by_key(|entry| {
-                    let size = entry.mode_limit.map_or(u128::MAX, |limit| {
-                        u128::from(limit.width) * u128::from(limit.height) * u128::from(limit.fps)
-                    });
-                    (entry.hardware, size)
-                });
+                .filter(|entry| entry.mode_limit.is_none_or(|limit| limit.supports(mode)));
+            let best = mode_entries.clone().max_by_key(encoder_priority);
             if let Some(entry) = best {
                 codecs.push(codec);
+                if let Some(codec) = match codec {
+                    VideoCodec::H264 => None,
+                    VideoCodec::Hevc => Some(amaterasu_module_sdk::VideoCodec::Hevc),
+                    VideoCodec::Av1 => Some(amaterasu_module_sdk::VideoCodec::Av1),
+                } {
+                    for chroma_sampling in [ChromaSampling::Yuv420, ChromaSampling::Yuv444] {
+                        let witness = mode_entries
+                            .clone()
+                            .filter(|entry| {
+                                let range = match dynamic_range {
+                                    DynamicRange::Sdr => entry.sdr10,
+                                    DynamicRange::Hdr => entry.hdr10,
+                                };
+                                range
+                                    && (chroma_sampling == ChromaSampling::Yuv420
+                                        || entry.yuv444_10bit)
+                            })
+                            .max_by_key(encoder_priority);
+                        if let Some(witness) = witness {
+                            if let Some(limit) = witness.mode_limit {
+                                mode_limit = Some(
+                                    mode_limit.map_or(limit, |current| current.intersect(limit)),
+                                );
+                            }
+                            ten_bit_formats.push(VideoStreamFormat {
+                                codec,
+                                bit_depth: 10,
+                                chroma_sampling,
+                                dynamic_range,
+                            });
+                        }
+                    }
+                }
                 if let Some(limit) = entry.mode_limit {
                     mode_limit = Some(mode_limit.map_or(limit, |current| current.intersect(limit)));
                 }
@@ -229,7 +274,11 @@ impl EncoderSnapshot {
                 "no video encoder is available"
             });
         }
-        Ok(CodecOffer { codecs, mode_limit })
+        Ok(CodecOffer {
+            codecs,
+            ten_bit_formats,
+            mode_limit,
+        })
     }
 
     pub fn hdr_offer(
@@ -237,19 +286,19 @@ impl EncoderSnapshot {
         selection: EncoderSelection,
         mode: StreamMode,
     ) -> Result<CodecOffer, &'static str> {
-        let mut snapshot = self.clone();
-        // Keep indices stable for an explicitly numbered selection.
-        for entry in &mut snapshot.entries {
-            if !entry.hdr10 {
-                entry.codec = None;
-            }
-        }
-        snapshot.offer(selection, mode)
+        self.offer_for_range(selection, mode, DynamicRange::Hdr)
     }
 
     fn has(&self, codec: VideoCodec) -> bool {
         self.entries.iter().any(|entry| entry.codec == Some(codec))
     }
+}
+
+fn encoder_priority(entry: &&EncoderEntry) -> (bool, u128) {
+    let size = entry.mode_limit.map_or(u128::MAX, |limit| {
+        u128::from(limit.width) * u128::from(limit.height) * u128::from(limit.fps)
+    });
+    (entry.hardware, size)
 }
 
 /// Use the conservative H.264 offer until enumeration completes.
@@ -259,6 +308,7 @@ pub fn unknown_encoders_offer(mode: StreamMode) -> Result<CodecOffer, &'static s
     }
     Ok(CodecOffer {
         codecs: vec![VideoCodec::H264],
+        ten_bit_formats: Vec::new(),
         mode_limit: Some(LEGACY_SOFTWARE_MODE_LIMIT),
     })
 }
@@ -298,11 +348,8 @@ fn encoder_entry(encoder: &Value) -> Result<EncoderEntry, &'static str> {
         mode_limit: mode_limit.or_else(|| (!hardware).then_some(LEGACY_SOFTWARE_MODE_LIMIT)),
         yuv444: encoder["yuv444"].as_bool().unwrap_or(false),
         yuv444_10bit: encoder["yuv444_10bit"].as_bool().unwrap_or(false),
-        hdr10: hardware
-            && encoder
-                .get("hdr10")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+        hdr10: encoder["hdr10"].as_bool().unwrap_or(false),
+        sdr10: encoder["sdr10"].as_bool().unwrap_or(false),
     })
 }
 

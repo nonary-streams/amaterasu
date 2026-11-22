@@ -105,6 +105,26 @@ pub struct Announce<T = VideoStreamFormat> {
     pub adjustments: Vec<StreamAdjustment>,
 }
 
+/// Interpret the configured rate as an extension's total wire budget only
+/// when the prepared route proved support. Older preparation replies omitted
+/// this proof and used PyroWave's existing wire-specific interpretation.
+pub fn extension_wire_bitrate_kbps(
+    announce: &Announce<NegotiatedVideoFormat>,
+    prepared_support: Option<bool>,
+) -> Option<u32> {
+    let NegotiatedVideoFormat::Extension(profile) = &announce.video.format else {
+        return None;
+    };
+    if !prepared_support.unwrap_or_else(|| pyrowave::is_profile(profile)) {
+        return None;
+    }
+    announce
+        .video
+        .configured_bitrate_kbps
+        .filter(|rate| *rate != 0)
+        .map(|rate| rate.min(1_000_000))
+}
+
 /// A downstream implementation must explicitly acknowledge transport features.
 /// Default denies audio, control, encryption and parity generation.
 #[derive(Default)]

@@ -108,6 +108,66 @@ fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
 }
 
 #[test]
+fn lifecycle_managed_capture_passes_replacement_binding_after_authority_checks() {
+    let (mut host, id, mut configuration) = prepared_lifecycle_for_cleanup(false);
+    configuration["output"] = json!("amaterasu-owned-display");
+    configuration["capture_provider"] = json!("dxgi");
+    let binding = &mut configuration["lifecycle_candidate"];
+    binding["capture_provider"] = json!("vendor.capture/1");
+    binding["selector_schema"] = json!("vendor.capture-selector/2");
+    binding["selector"] = json!({"opaque_slot":[17,42],"capture_domain":"seat-A"});
+    let binding: amaterasu_extension_api::CaptureBinding =
+        serde_json::from_value(binding.clone()).unwrap();
+    let binding = json!(binding);
+    let observation = json!({"width":1280,"height":720,"refresh_millihz":60000,
+        "native_identity":"vendor:device-42"});
+    host.broker.lifecycle_observation_override = Some(observation.clone());
+    host.broker.lifecycle_pending_once = true;
+    let response = host.response_from(
+        2,
+        "amaterasu.rtsp",
+        json!({
+            "action":"start_when_authenticated","session":id,"configuration":configuration,
+        }),
+    );
+    assert_eq!(response["state"], "armed", "{response}");
+    host.broker.authenticated = true;
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    let calls = &host.broker.calls;
+    let validate = calls
+        .iter()
+        .position(|call| {
+            call.payload["operation"] == "validate_candidate"
+                && call.payload["candidate"] == binding
+        })
+        .unwrap();
+    let open = calls
+        .iter()
+        .position(|call| call.service == "amaterasu.video/1" && call.payload["action"] == "open")
+        .unwrap();
+    let ack = calls
+        .iter()
+        .position(|call| {
+            call.payload["operation"] == "ack_binding" && call.payload["consumer"] == "capture"
+        })
+        .unwrap();
+    assert!(validate < open && open < ack);
+    assert_eq!(calls[open].payload["capture_binding"], binding);
+    assert!(calls[open].payload.get("output").is_none());
+    assert!(calls[open].payload.get("capture_provider").is_none());
+    assert_eq!(calls[ack].payload["observed_capture"], observation);
+    assert_eq!(calls[ack].payload["candidate"], binding);
+    assert!(!calls.iter().any(|call| {
+        call.payload["action"] == "create" && call.service.contains("virtual-display")
+    }));
+
+    let stopped = host.response_from(3, "amaterasu.rtsp", json!({"action":"stop","session":id}));
+    assert_eq!(stopped["state"], "stopped", "{stopped}");
+    assert_eq!(stopped["lifecycle_retired"], true);
+}
+
+#[test]
 fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
     for (enabled, source_hdr, output_hdr, bad_revision, omit_ranges, expected_open) in [
         (false, false, false, false, false, true),

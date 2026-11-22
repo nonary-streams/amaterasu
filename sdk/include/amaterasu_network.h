@@ -201,6 +201,17 @@ typedef struct {
         uint8_t *, size_t, size_t *);
 } AmaterasuNetworkApiV1_3;
 
+/* Optional v1.4 Wake-on-LAN identity. Check capability, minor and size.
+ * Provide the accepted connection's local address or unspecified IPv4 when
+ * unknown. Read a snapshot without waiting for discovery or network I/O.
+ * Write the six octets of a nonzero unicast MAC, or return NOT_FOUND. */
+#define AMATERASU_NETWORK_WAKE_MAC_MINOR 4u
+#define AMATERASU_NETWORK_CAP_WAKE_MAC UINT64_C(512)
+typedef struct {
+    AmaterasuNetworkApiV1_3 v1_3;
+    AmaterasuStatus (*wake_mac)(void *, AmaterasuNetworkAddress, uint8_t (*)[6]);
+} AmaterasuNetworkApiV1_4;
+
 #ifdef __cplusplus
 }
 #endif

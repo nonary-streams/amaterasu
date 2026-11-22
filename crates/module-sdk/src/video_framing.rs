@@ -432,7 +432,7 @@ unsafe extern "C" fn plan<P: FramingProvider>(
             blocks,
         };
         // SAFETY: both plan byte buffers are owned by `owned` through this call.
-        if unsafe { plan.validate(limits) }.is_err() {
+        if unsafe { plan.validate_shape(limits) }.is_err() {
             return STATUS_INVALID_ARGUMENT;
         }
         // SAFETY: host sink and the plan remain live through the synchronous callback.

@@ -145,7 +145,19 @@ impl Record {
 
     #[track_caller]
     pub(super) fn report_extension_probe_fallback(&mut self, reason: &str) {
+        self.report_extension_probe_fallback_from(reason, LifecycleLayer::EncodeVideo);
+    }
+
+    #[track_caller]
+    pub(super) fn report_extension_probe_fallback_from(
+        &mut self,
+        reason: &str,
+        source: LifecycleLayer,
+    ) {
         self.extension_checked = true;
+        eprintln!(
+            "amaterasu session warning code=extension_source_unavailable reason={reason} fallback=negotiate_standard_video"
+        );
         // Moonlight sees a codec-wide DESCRIBE marker. A partial probe would
         // let it choose a variant this launch cannot accept from serverinfo.
         self.extension_limits.clear();
@@ -161,7 +173,7 @@ impl Record {
                 "negotiate_standard_video",
             )
             .because(reason)
-            .caused_by(LifecycleLayer::EncodeVideo),
+            .caused_by(source),
         );
     }
     #[track_caller]

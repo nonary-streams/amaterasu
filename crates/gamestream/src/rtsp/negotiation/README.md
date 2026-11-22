@@ -1,7 +1,7 @@
 # Modern GameStream RTSP negotiation
 
 `Negotiation` is a socket-independent state machine for an already authorized
-launch epoch, modern application version >=7.1.431, H.264 SDR, and stereo Opus
+launch epoch, modern application version >=7.1.431, H.264 SDR, and Opus
 with 5 or 10 ms packets. The caller supplies `TrustedLaunch` only after preparing
 real transport resources. Its audio/video/control ports are actual server ports;
 its session token must be unpredictable, unique to the launch, and retained across
@@ -55,10 +55,21 @@ protection. HEVC and AV1 are advertised only when the caller enables them in
 AV1 with an `a=rtpmap:98 AV1/90000` line. Moonlight prefers AV1, then HEVC, then
 H.264 among the codecs both sides support, and reports its choice in ANNOUNCE as
 `x-nv-vqos[0].bitStreamFormat` 0, 1 or 2. An ANNOUNCE for a codec the ticket did
-not enable fails. It advertises no reference invalidation, surround audio, or
-input-device capability. The caller must supply the actual encoder color mode;
-there is no implicit BT.601/BT.709 or range conversion. Unsupported ANNOUNCE
-features fail rather than being silently downgraded.
+not enable fails. For surround, the caller binds the selected encoder's validated
+decoder layout before exposing the ticket. DESCRIBE adds one normal-quality
+`surround-params` value for that prepared channel count. Its digits put LFE last
+because Moonlight restores it to WAVE position 3 when parsing this attribute.
+Stereo uses Moonlight's implicit layout. The caller must supply the actual
+encoder color family and range. Reference invalidation and input-device
+signaling are unsupported. Unsupported ANNOUNCE features fail negotiation.
+
+An optional extension can interpret the client's configured bitrate as total
+wire bandwidth when the prepared route proves budget support for every offered
+profile. RTSP caps the configured value before Stream Session asks the selected
+framer to derive the encoder rate from the prepared transport limits. An older
+preparation reply without a capability retains PyroWave's wire convention.
+Without a configured bitrate or with an explicit negative capability, ANNOUNCE
+uses the legacy encoder-rate checks for the selected profile.
 
 When `encrypted_rtsp` is true, the exact launch URL must use `rtspenc://`. The
 transport must authenticate incoming CR envelopes with the launch key before

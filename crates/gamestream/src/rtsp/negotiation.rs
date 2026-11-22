@@ -5,6 +5,7 @@ mod validation;
 
 use super::{Method, Request, serialize_response};
 use crate::sdp;
+use amaterasu_contracts::audio::OpusSurroundLayout;
 use amaterasu_contracts::media_profile::VideoProfileSnapshot;
 
 pub struct TrustedLaunch {
@@ -113,6 +114,8 @@ pub struct Negotiation {
     last_cseq: Option<u32>,
     pending: Option<Pending>,
     profile_offer: Option<VideoProfileSnapshot>,
+    opus_surround: Option<OpusSurroundLayout>,
+    extension_wire_budget: Option<bool>,
 }
 
 impl Negotiation {
@@ -125,6 +128,8 @@ impl Negotiation {
             last_cseq: None,
             pending: None,
             profile_offer: None,
+            opus_surround: None,
+            extension_wire_budget: None,
         })
     }
 
@@ -136,16 +141,46 @@ impl Negotiation {
         offered: VideoProfileSnapshot,
         downstream: VideoProfileSnapshot,
     ) -> Result<Self, Error> {
+        Self::with_video_profiles_and_wire_budget(launch, capabilities, offered, downstream, None)
+    }
+
+    /// Attach the prepared route's wire budget capability to the immutable offer.
+    /// `None` preserves negotiation with stream coordinators that predate it.
+    pub fn with_video_profiles_and_wire_budget(
+        launch: TrustedLaunch,
+        capabilities: Capabilities,
+        offered: VideoProfileSnapshot,
+        downstream: VideoProfileSnapshot,
+        extension_wire_budget: Option<bool>,
+    ) -> Result<Self, Error> {
         if !offered.supported_by(&downstream) {
             return Err(Error::UnsupportedMedia);
         }
         let mut negotiation = Self::new(launch, capabilities)?;
         negotiation.profile_offer = Some(offered);
+        negotiation.extension_wire_budget = extension_wire_budget;
         Ok(negotiation)
     }
 
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// Bind the exact decoder configuration returned by the selected encoder
+    /// before exposing this ticket to peers.
+    pub fn with_opus_surround(
+        mut self,
+        channels: u32,
+        layout: OpusSurroundLayout,
+    ) -> Result<Self, Error> {
+        if self.state != State::Options || self.opus_surround.is_some() {
+            return Err(Error::WrongState);
+        }
+        layout
+            .validate(channels)
+            .map_err(|_| Error::InvalidLaunch)?;
+        self.opus_surround = Some(layout);
+        Ok(self)
     }
 
     /// Requests must come from the transport authorized for this exact epoch.
@@ -243,6 +278,9 @@ impl Negotiation {
                     return Err(Error::InvalidHeaders);
                 }
                 let mut body = validation::description(&self.capabilities);
+                if let Some(layout) = &self.opus_surround {
+                    validation::append_opus_surround(&mut body, layout);
+                }
                 if let Some(offer) = &self.profile_offer {
                     let insertion = body.find("m=audio ").ok_or(Error::Serialization)?;
                     let mut marker_lines = Vec::new();
@@ -320,7 +358,11 @@ impl Negotiation {
                         selected.video.format,
                         sdp::NegotiatedVideoFormat::Extension(_)
                     ) {
-                        validation::media_extension(&selected, &self.capabilities)?;
+                        validation::media_extension(
+                            &selected,
+                            &self.capabilities,
+                            self.extension_wire_budget,
+                        )?;
                         return Ok((
                             action(request, Action::ExtensionAnnounce(selected)),
                             State::Play,

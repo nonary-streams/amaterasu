@@ -1414,6 +1414,9 @@ impl Controller {
                 if offer.codecs != [amaterasu_media::VideoCodec::H264] {
                     profile["codecs"] = json!(offer.codecs);
                 }
+                if !offer.ten_bit_formats.is_empty() {
+                    profile["ten_bit_formats"] = json!(offer.ten_bit_formats);
+                }
                 let (max_width, max_height, max_fps) = negotiation_mode_limit(config, offer);
                 let negotiation_bounds = json!({
                     "max_width": max_width,
@@ -1426,9 +1429,7 @@ impl Controller {
                         }),
                     "max_reference_frames": config.profile.max_reference_frames,
                 });
-                (
-                    RTSP_SERVICE,
-                    json!({
+                let mut payload = json!({
                         "action": "open",
                         "operation_id": record.rtsp_operation,
                         "peer_ip": record.peer.remote,
@@ -1482,9 +1483,11 @@ impl Controller {
                         "capture": capture,
                         "profile": profile,
                         "negotiation_bounds": negotiation_bounds,
-                    }),
-                    15_000,
-                )
+                });
+                if !record.effective_amd_av1_latency_mode.is_auto() {
+                    payload["amd_av1_latency_mode"] = json!(record.effective_amd_av1_latency_mode);
+                }
+                (RTSP_SERVICE, payload, 15_000)
             }
             Phase::LookupRtsp => (
                 RTSP_SERVICE,
@@ -4271,6 +4274,9 @@ pub(super) fn project_application_policy(
         .client_nvenc_spatial_aq
         .or(application_overrides.nvenc_spatial_aq)
         .unwrap_or(record.global_nvenc_spatial_aq);
+    record.effective_amd_av1_latency_mode = application_overrides
+        .amd_av1_latency_mode
+        .unwrap_or_default();
     record.effective_qp = record
         .peer
         .client_qp
@@ -4573,6 +4579,7 @@ pub(super) struct ApplicationConfigOverrides {
     nvenc_latency_over_power: Option<bool>,
     vaapi_strict_rc_buffer: Option<bool>,
     nvenc_spatial_aq: Option<bool>,
+    amd_av1_latency_mode: Option<amaterasu_module_sdk::AmdAv1LatencyMode>,
     back_button_timeout: Option<i32>,
     controller: Option<bool>,
     gamepad: Option<String>,
@@ -5500,6 +5507,10 @@ fn rtsp_response<'a>(
         || payload["qp"] != record.effective_qp
         || payload["nvenc_settings"] != json!(record.effective_nvenc_settings)
         || payload["nvenc_spatial_aq"] != record.effective_nvenc_spatial_aq
+        || payload.get("amd_av1_latency_mode").map_or_else(
+            || !record.effective_amd_av1_latency_mode.is_auto(),
+            |mode| mode != &json!(record.effective_amd_av1_latency_mode),
+        )
         || payload.get("failure").is_none()
         || payload.get("cleanup_error").is_none()
         || payload.get("display_policy_snapshot")

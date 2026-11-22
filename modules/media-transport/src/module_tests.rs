@@ -311,3 +311,150 @@ fn quiesce_releases_sockets_after_controller_panic() {
     assert!(UdpSocket::bind(opened.payload["video_local"].as_str().unwrap()).is_ok());
     assert!(UdpSocket::bind(opened.payload["audio_local"].as_str().unwrap()).is_ok());
 }
+
+#[test]
+fn held_udp_probe_does_not_block_existing_cleanup_or_disjoint_open() {
+    use amaterasu_module_sdk::{network::abi, transport::udp_preflight::ProbeRequest};
+    use std::sync::{
+        Condvar, Mutex, OnceLock,
+        atomic::{AtomicU16, Ordering},
+    };
+
+    #[derive(Default)]
+    struct ProbeHost {
+        requests: VecDeque<Response>,
+        completed: std::collections::BTreeMap<u64, serde_json::Value>,
+    }
+
+    unsafe extern "C" fn invoke_probe_host(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        output: ReplySink,
+    ) -> Status {
+        let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+        let result = if matches!(command, Command::NotifyWorkReady {}) {
+            // The worker can notify without accessing the single-threaded fixture.
+            Response::Ok
+        } else {
+            // SAFETY: the host calls all other commands serially and retains this fixture.
+            let host = unsafe { &mut *context.cast::<ProbeHost>() };
+            match command {
+                Command::GetSettings {} => Response::Result {
+                    payload: json!({"enabled":true,"allowed_principals":["consumer"]}),
+                },
+                Command::Poll {} => host.requests.pop_front().unwrap_or(Response::Pending),
+                Command::Complete { request, payload } => {
+                    host.completed.insert(request, payload);
+                    Response::Ok
+                }
+                _ => Response::Ok,
+            }
+        };
+        unsafe { output.send(&serde_json::to_vec(&result).unwrap()) };
+        STATUS_OK
+    }
+
+    type Bind = unsafe extern "C" fn(*mut c_void, abi::Address, *mut u64) -> Status;
+    static ORIGINAL_BIND: OnceLock<Bind> = OnceLock::new();
+    static TEST_PORT: AtomicU16 = AtomicU16::new(0);
+    static GATE: (Mutex<(bool, bool)>, Condvar) = (Mutex::new((false, false)), Condvar::new());
+
+    unsafe extern "C" fn hold_probe(
+        context: *mut c_void,
+        address: abi::Address,
+        output: *mut u64,
+    ) -> Status {
+        if address.port == TEST_PORT.load(Ordering::Acquire) {
+            let mut gate = GATE.0.lock().unwrap();
+            gate.0 = true;
+            GATE.1.notify_all();
+            let _ = GATE
+                .1
+                .wait_timeout_while(gate, Duration::from_secs(2), |gate| !gate.1)
+                .unwrap();
+        }
+        // SAFETY: this wrapper forwards the unchanged ABI arguments to the retained factory.
+        unsafe { ORIGINAL_BIND.get().unwrap()(context, address, output) }
+    }
+
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let peer_port = peer.local_addr().unwrap().port();
+    let reserved = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let probe_address = reserved.local_addr().unwrap();
+    TEST_PORT.store(probe_address.port(), Ordering::Release);
+    let factory = amaterasu_network_sockets::Factory::new();
+    // SAFETY: the factory and copy of its table live until the module joins its probe.
+    let raw = unsafe { amaterasu_network_sockets::bind_standalone(&factory, "media-probe-test") }
+        .unwrap();
+    let mut table = unsafe { raw.read() };
+    ORIGINAL_BIND.set(table.udp_bind).unwrap();
+    table.udp_bind = hold_probe;
+    let network = unsafe { Network::from_native_table(&table) }.unwrap();
+
+    let request = |id, payload| Response::Request {
+        id,
+        caller: "consumer".into(),
+        initiator: "consumer".into(),
+        service: SERVICE.into(),
+        remaining_ms: 1_000,
+        payload,
+    };
+    let open = |operation| {
+        json!({"action":"open","operation_id":operation,"peer_ip":"127.0.0.1",
+        "video_port":peer_port,"audio_port":peer_port,"audio":{"channels":2,"packet_ms":10,"wire_payload_bytes":4}})
+    };
+    let mut host = ProbeHost::default();
+    host.requests.push_back(request(1, open("existing")));
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut host as *mut ProbeHost).cast(),
+        invoke: invoke_probe_host,
+    };
+    let mut module = MediaTransportModule::start_configured(
+        unsafe { RuntimeClient::from_endpoint(endpoint) },
+        Some(network),
+    )
+    .unwrap();
+    module.tick().unwrap();
+    let old_stream = host.completed[&1]["stream"].as_u64().unwrap();
+    host.requests
+        .push_back(request(2, ProbeRequest::for_transport(vec![probe_address])));
+    module.tick().unwrap();
+
+    let gate = GATE.0.lock().unwrap();
+    let (gate, _) = GATE
+        .1
+        .wait_timeout_while(gate, Duration::from_secs(1), |gate| !gate.0)
+        .unwrap();
+    assert!(gate.0, "the provider is holding the UDP probe open");
+    drop(gate);
+    for (id, payload) in [
+        (3, json!({"action":"status","stream":old_stream})),
+        (4, json!({"action":"close","stream":old_stream})),
+        (5, open("disjoint")),
+    ] {
+        host.requests.push_back(request(id, payload));
+        module.tick().unwrap();
+        assert_eq!(host.completed[&id]["ok"], true);
+    }
+
+    let mut overlapping = open("overlap");
+    overlapping["video_bind"] = json!(probe_address);
+    host.requests.push_back(request(6, overlapping));
+    module.tick().unwrap();
+    assert!(
+        !host.completed.contains_key(&6),
+        "only the conflicting open waits for probe retirement"
+    );
+
+    drop(reserved);
+    GATE.0.lock().unwrap().1 = true;
+    GATE.1.notify_all();
+    let until = Instant::now() + Duration::from_secs(1);
+    while !host.completed.contains_key(&6) && Instant::now() < until {
+        module.tick().unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(host.completed[&2]["code"], "udp_probe_cancelled");
+    assert_eq!(host.completed[&6]["video_local"], json!(probe_address));
+}

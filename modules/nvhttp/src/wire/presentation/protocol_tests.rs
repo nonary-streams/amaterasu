@@ -250,6 +250,7 @@ fn peer() -> RequestContext {
     RequestContext {
         secure: true,
         remote: "127.0.0.1".parse().unwrap(),
+        local: None,
         peer_certificate: Some(vec![1, 2, 3]),
         peer_trusted: true,
         list_allowed: true,

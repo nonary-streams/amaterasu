@@ -333,3 +333,12 @@ does not consume it and this build has no VAAPI CQP consumer. The backend policy
 supports `auto` and `software`, and real codec availability remains a separate
 requirement. [NVHTTP policy](../nvhttp/README.md#software-encoder-policy)
 documents persistence, scope precedence and platform qualification limits.
+
+## Extension route preparation
+
+Prepare reports `extension_wire_budget` together with the offered extension
+profiles. A true value means the startup-selected route requires wire budgeting
+and the selected framer passed its bitrate capability probe for every offered
+profile. Probing and opening the native source use the same configuration
+projection. The standard software encoder's thread and QP settings remain with
+its fallback path.

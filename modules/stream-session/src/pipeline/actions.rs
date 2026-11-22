@@ -87,6 +87,9 @@ impl Pipeline {
             return;
         }
         match operation {
+            Operation::ProbeUdpEndpoints { endpoints } => {
+                self.begin_udp_preflight(input, endpoints, send)
+            }
             Operation::ReserveHistoryActivity {
                 activity_id,
                 rtsp_operation_id,
@@ -305,7 +308,7 @@ impl Pipeline {
         ));
     }
 
-    fn authorize_open(&self, owner: &str) -> Result<(), &'static str> {
+    pub(super) fn authorize_open(&self, owner: &str) -> Result<(), &'static str> {
         if !self.settings.enabled {
             return Err("disabled");
         }
@@ -907,6 +910,9 @@ fn resolve_extension_start(
         return Err("extension_configuration_mismatch");
     }
     if let Some(wire_kbps) = configuration.extension_wire_bitrate_kbps {
+        if !route.wire_budget_required {
+            return Err("extension_wire_budget_not_offered");
+        }
         let bitrate = if let Some(accepted) = record.start.as_ref() {
             if accepted.extension_wire_bitrate_kbps != Some(wire_kbps) {
                 return Err("start_conflict");
@@ -1032,22 +1038,7 @@ fn validate_start_configuration(
             && *generation > 0
             && candidate.generation == *generation
             && amaterasu_extension_api::validate_capture_binding(candidate).is_ok()
-            && candidate.capture_provider == "amaterasu.capture-pipewire/1"
-            && candidate.selector_schema == "amaterasu.kwin-wl-output/1"
-            && candidate
-                .selector
-                .as_object()
-                .is_some_and(|object| object.len() == 1)
-            && candidate.selector["output"].as_str().is_some_and(|output| {
-                output.starts_with("kwin:Virtual-") && valid_name(output)
-            })
-            && super::shared_capture::uses_capture_frames(record, configuration)
-            && (record
-                .extension_route
-                .as_ref()
-                .is_some_and(|route| route.submitted)
-                || !candidate.mode.hdr)
-            && configuration.capture_provider == crate::model::CaptureProvider::PipeWire => {}
+            && super::shared_capture::uses_capture_frames(record, configuration) => {}
         _ => {
             return Err("invalid_lifecycle_identity");
         }

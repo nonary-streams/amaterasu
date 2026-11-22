@@ -42,6 +42,24 @@ supported by every offered codec. Entries without a declared limit use the
 legacy 1920×1080 at 60 FPS ceiling for software encoders. Exact configuration
 probes and encoder Open still determine whether a configuration works.
 
+For standard HEVC and AV1, an encoder entry can declare `sdr10: true` and
+`hdr10: true` independently. Each declares support for ten-bit 4:2:0 at that
+output range. Add `yuv444_10bit: true` when the same entry also supports
+ten-bit 4:4:4 for its declared ranges. A missing field supplies no new
+capability. Amaterasu's stock CUDA catalog also recognizes the earlier
+ten-bit capability field for its legacy HEVC and AV1 entries.
+
+NVHTTP freezes the selected encoder's supported ten-bit formats for each
+launch. RTSP validates the codec, depth, chroma and launch range together and
+passes the accepted format unchanged to Stream Session. Video prefers encoder
+entries that claim that format and probes the exact configuration before
+opening it. Capture and any selected frame processor must also supply a
+compatible source. GameStream uses the serverinfo MAIN10 flags for HDR
+advertisement, so those flags require an HDR capability claim. An SDR-only
+ten-bit entry can serve an explicit ten-bit SDR ANNOUNCE. A client that
+requires MAIN10 for automatic codec selection may still choose 8-bit SDR
+when the host lacks HDR support.
+
 `EncoderProviderApi`, `FrameResourceConsumerApi`, and `EncoderInputPoolApiV1`
 are independent optional native interfaces. Their definitions do not by
 themselves connect a provider to video. The current video source contains
@@ -95,6 +113,13 @@ configuration and supported controls. Its standard limits probe advertises
 128 control records and 128 KiB of bounded replay storage. Its generic CPU
 consumer validates the negotiated clock and sequence policy without retaining
 CPU frames.
+
+On this route, Video forwards `configuration.nvenc_settings` and
+`configuration.amd_av1_latency_mode` to the selected provider. The AMD mode
+defaults to `auto` and accepts `none`, `power_saving`, `realtime`, and `lowest`.
+The provider applies the requested controls or returns an explicit unsupported
+result. The stock standard and PyroWave encoders currently reject nondefault
+values for these controls.
 
 ## Source and generic resource routes
 

@@ -30,6 +30,7 @@ struct Endpoint {
     cleanup_fails: bool,
     reject_prepare: bool,
     wrong_history_reply: bool,
+    invalid_opus_surround_layout: bool,
     stop_pending_for: Duration,
     stop_pending_until: Option<Instant>,
 }
@@ -119,10 +120,19 @@ impl Endpoint {
             }),
             "prepare" => {
                 let sent = &self.downstream_payloads[&request];
+                let layout = match sent["audio"]["channels"].as_u64() {
+                    Some(6 | 8) if self.invalid_opus_surround_layout => json!(null),
+                    Some(6) => json!({"streams":4,"coupled_streams":2,
+                        "wave_channel_mapping":[0,1,4,5,2,3]}),
+                    Some(8) => json!({"streams":8,"coupled_streams":0,
+                        "wave_channel_mapping":[1,0,3,2,5,4,7,6]}),
+                    _ => json!(null),
+                };
                 json!({
                     "ok": true,
                     "session": SESSION,
                     "state": "prepared",
+                    "audio_encoder_layout":layout,
                     "audio_local": "127.0.0.1:51000",
                     "video_local": "127.0.0.1:51002",
                     "control_local": "127.0.0.1:51004",
@@ -580,6 +590,7 @@ fn negotiate_announce(record: &mut Record, body: &str) -> bool {
     let ticket = record.id;
     let target = record.url.clone();
     let session = record.session_token.clone();
+    let channels = record.config.channels;
     let negotiation = record.negotiation.as_mut().expect("prepared negotiation");
     negotiation
         .handle(
@@ -591,7 +602,34 @@ fn negotiate_announce(record: &mut Record, body: &str) -> bool {
     describe
         .headers
         .push(("accept".into(), "application/sdp".into()));
-    negotiation.handle(ticket, &describe).expect("describe");
+    let NegotiationStep::Reply(description) =
+        negotiation.handle(ticket, &describe).expect("describe")
+    else {
+        panic!("expected SDP response");
+    };
+    let description = std::str::from_utf8(&description).unwrap();
+    let parameter = "a=fmtp:97 surround-params=";
+    let lines = description
+        .lines()
+        .filter_map(|line| line.strip_prefix(parameter))
+        .collect::<Vec<_>>();
+    let expected: Option<(u8, u8, &[u8])> = match channels {
+        Some(6) => Some((4, 2, &[0, 1, 4, 5, 2, 3])),
+        Some(8) => Some((8, 0, &[1, 0, 3, 2, 5, 4, 7, 6])),
+        _ => None,
+    };
+    if let Some((streams, coupled, wave_mapping)) = expected {
+        assert_eq!(lines.len(), 1, "{description}");
+        let digits: Vec<_> = lines[0].bytes().map(|byte| byte - b'0').collect();
+        assert_eq!(digits[..3], [wave_mapping.len() as u8, streams, coupled]);
+        // Moonlight puts the last normal-quality entry (LFE) back at WAVE index 3.
+        let mut mapping = digits[3..].to_vec();
+        let lfe = mapping.pop().unwrap();
+        mapping.insert(3, lfe);
+        assert_eq!(mapping, wave_mapping);
+    } else {
+        assert!(lines.is_empty());
+    }
     for (cseq, target) in [
         (3, "streamid=audio/0/0"),
         (4, "streamid=video/0/0"),
@@ -759,31 +797,38 @@ fn surround_wrong_announce_cannot_arm_and_failed_prepare_stops_owned_stream() {
         assert!(parse_announce(body.as_bytes()).is_err());
     }
 
-    let mut endpoint = Endpoint {
-        reject_prepare: true,
-        ..Endpoint::default()
-    };
-    endpoint.enqueue(1, "owner", surround_open("failed-prepare", 8, 10, 512_000));
-    let runtime = runtime(&mut endpoint);
-    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
-    for now in 0..8 {
-        tick(&mut controller, &runtime, now);
+    for (reject_prepare, code) in [
+        (true, "prepare_rejected"),
+        (false, "invalid_opus_surround_layout"),
+    ] {
+        let mut endpoint = Endpoint {
+            reject_prepare,
+            invalid_opus_surround_layout: !reject_prepare,
+            ..Endpoint::default()
+        };
+        endpoint.enqueue(1, "owner", surround_open("failed-prepare", 8, 10, 512_000));
+        let runtime = runtime(&mut endpoint);
+        let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+        for now in 0..8 {
+            tick(&mut controller, &runtime, now);
+        }
+        assert_eq!(endpoint.completed(1)["state"], "failed");
+        assert_eq!(endpoint.completed(1)["failure"], code);
+        assert_eq!(
+            endpoint
+                .downstream_requests()
+                .iter()
+                .map(|(action, _, _)| *action)
+                .collect::<Vec<_>>(),
+            ["prepare", "stop"]
+        );
+        assert!(
+            controller
+                .records
+                .values()
+                .all(|record| record.cleanup_confirmed)
+        );
     }
-    assert_eq!(endpoint.completed(1)["state"], "failed");
-    assert_eq!(
-        endpoint
-            .downstream_requests()
-            .iter()
-            .map(|(action, _, _)| *action)
-            .collect::<Vec<_>>(),
-        ["prepare", "stop"]
-    );
-    assert!(
-        controller
-            .records
-            .values()
-            .all(|record| record.cleanup_confirmed)
-    );
 }
 
 #[test]

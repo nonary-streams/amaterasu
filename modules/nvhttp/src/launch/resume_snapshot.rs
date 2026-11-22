@@ -271,6 +271,7 @@ impl ResumeSnapshot {
             effective_nvenc_settings,
             global_nvenc_spatial_aq,
             effective_nvenc_spatial_aq,
+            effective_amd_av1_latency_mode,
             selected_encoder,
             application_stream_audio,
             effective_stream_audio,

@@ -821,9 +821,11 @@ typedef struct {
     AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *);
     AmaterasuStatus (*drain)(void *, uint64_t);
 } AmaterasuNegotiatedVideoTransportApi;
+/* Contiguous data shards. The selected transport checks the wire FEC scheme. */
 typedef struct {
     uint32_t first_data_shard, data_shards, parity_shards, percentage;
 } AmaterasuVideoFecBlock;
+/* Crypto and network overhead are provider-supplied bytes per datagram. */
 typedef struct {
     uint32_t size, version, packet_size, crypto_overhead, network_overhead;
     uint32_t allowed_extensions, max_datagrams, max_queue_bytes;
@@ -832,6 +834,8 @@ typedef struct {
     /* V2 tail; the distinct framing v2 contract is required. */
     uint32_t min_fec_percentage, max_fec_blocks, fec_policy_flags, reserved;
 } AmaterasuVideoFramingLimits;
+/* Framed access-unit bytes before the selected transport's headers.
+ * record_starts is empty or one boolean byte per declared data shard. */
 typedef struct {
     uint32_t size, version;
     AmaterasuBorrowedBytes framed_bytes, record_starts;
@@ -871,9 +875,11 @@ typedef struct {
     void *context;
     AmaterasuStatus (*write)(void *, const AmaterasuVideoFramePlan *);
 } AmaterasuVideoFramePlanSink;
-/* The host validates plan bounds and negotiated flags, then owns FEC,
- * sequence numbers, encryption and network delivery. The plan callback
- * must not retain pointers or commit rate state; retry after BUSY is safe. */
+/* The host validates common bounds and negotiated flags. The selected
+ * transport validates packet layout and reserves queue/wire capacity before
+ * admitting the plan. It owns FEC, sequence numbers, encryption and delivery.
+ * The plan callback must not retain pointers or commit rate state; retry after
+ * BUSY is safe. */
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*plan)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *,

@@ -18,6 +18,7 @@ mod recovery_status;
 mod retirement;
 #[cfg(test)]
 mod tests;
+mod udp_preflight;
 mod workflow;
 
 use crate::{
@@ -211,6 +212,8 @@ pub struct Controller {
     active_bind_address: Option<String>,
     network_error: Option<&'static str>,
     network_retry_at: u64,
+    network_probe: Option<udp_preflight::NetworkProbe>,
+    network_probe_sequence: u64,
     transport: Option<Transport>,
     local: Option<SocketAddr>,
     locals: Vec<SocketAddr>,
@@ -264,7 +267,7 @@ impl Controller {
                 settings.resolved_binds()?,
                 settings.allow_remote,
             )?;
-            let locals = transport.local_addrs()?;
+            let locals = transport.local_addrs();
             let local = locals.first().copied().ok_or("tcp_address_failed")?;
             (Some(transport), locals, Some(local))
         } else {
@@ -288,6 +291,8 @@ impl Controller {
             active_network_base_port: None,
             network_error: None,
             network_retry_at: 0,
+            network_probe: None,
+            network_probe_sequence: 0,
             transport,
             local,
             locals,
@@ -356,13 +361,16 @@ impl Controller {
         }
         self.move_ended_job_to_its_own_lane();
         self.cap_announced_cleanup_deadline();
-        self.reconcile_network_port(now);
+        self.reconcile_network_port_with_owner(runtime, now);
         Ok(())
     }
 
     /// Revoke RTSP tickets and make bounded, owner-scoped stop attempts for every
     /// known stream-session before this module unloads.
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
+        if let Some(probe) = self.network_probe.take() {
+            let _ = probe.into_cancelled_call().shutdown(runtime);
+        }
         if self.quiescence.is_some() || self.shutdown_deadline.is_some() {
             return;
         }
@@ -766,38 +774,49 @@ impl Controller {
             .retain(|pending| pending.ticket != ticket);
     }
 
-    pub(super) fn configure_network_policy(
+    pub(super) fn set_network_policy(
+        &mut self,
+        port: u16,
+        address_family: Option<crate::model::AddressFamily>,
+        bind_address: Option<String>,
+    ) -> Result<Value, &'static str> {
+        crate::model::validate_base_port(port)?;
+        let candidate =
+            self.candidate_network_settings(port, address_family, bind_address.clone())?;
+        candidate.validate()?;
+        if self.network_base_port != Some(port)
+            || self.network_address_family != address_family
+            || self.network_bind_address != bind_address
+        {
+            self.network_base_port = Some(port);
+            self.network_address_family = address_family;
+            self.network_bind_address = bind_address;
+            self.network_error = None;
+            self.network_retry_at = 0;
+            if let Some(probe) = self.network_probe.as_mut() {
+                probe.cancel();
+            }
+        }
+        let binds = candidate.rtsp_binds_for_base(port)?;
+        Ok(self.network_status(self.network_policy_active(port, &binds)))
+    }
+
+    #[cfg(test)]
+    fn configure_network_policy(
         &mut self,
         port: u16,
         address_family: Option<crate::model::AddressFamily>,
         bind_address: Option<String>,
         now: u64,
     ) -> Result<Value, &'static str> {
-        crate::model::validate_base_port(port)?;
-        let candidate =
-            self.candidate_network_settings(port, address_family, bind_address.clone())?;
-        candidate.validate()?;
-        self.network_base_port = Some(port);
-        self.network_address_family = address_family;
-        self.network_bind_address = bind_address;
-        self.network_error = None;
-        let applied = self.try_apply_network_port();
-        if let Err(error) = applied {
-            self.network_error = Some(error);
-            self.network_retry_at = now.saturating_add(1_000);
-        } else if applied == Ok(true) {
-            self.active_network_base_port = Some(port);
-            self.network_retry_at = 0;
-        }
-        Ok(self.network_status(applied.is_ok_and(|applied| applied)))
+        self.set_network_policy(port, address_family, bind_address)?;
+        self.reconcile_network_port(now);
+        let binds = self.settings.rtsp_binds_for_base(port)?;
+        Ok(self.network_status(self.network_policy_active(port, &binds)))
     }
 
     #[cfg(test)]
-    pub(super) fn configure_network_port(
-        &mut self,
-        port: u16,
-        now: u64,
-    ) -> Result<Value, &'static str> {
+    fn configure_network_port(&mut self, port: u16, now: u64) -> Result<Value, &'static str> {
         self.configure_network_policy(port, None, None, now)
     }
 
@@ -817,17 +836,7 @@ impl Controller {
         // been released, and a ticket that never confirms cannot keep them.
         let mut releasing: Option<(u64, crate::model::MediaBinds)> = None;
         for slot in 0..self.settings.max_live_tickets {
-            let offset = u16::try_from(slot).ok()?.checked_mul(3)?;
-            let mut candidate = binds;
-            candidate
-                .video
-                .set_port(binds.video.port().checked_add(offset)?);
-            candidate
-                .control
-                .set_port(binds.control.port().checked_add(offset)?);
-            candidate
-                .audio
-                .set_port(binds.audio.port().checked_add(offset)?);
+            let candidate = crate::model::media_binds_for_slot(binds, slot)?;
             let mut held = false;
             let mut last_ended = None;
             for record in self
@@ -887,13 +896,30 @@ impl Controller {
         Ok(SocketAddr::new(source.ip(), listener.port()))
     }
 
+    #[cfg(test)]
     fn reconcile_network_port(&mut self, now: u64) {
         if self.network_base_port.is_none() || now < self.network_retry_at {
             return;
         }
-        match self.try_apply_network_port() {
+        let result = self.try_apply_network_port(|endpoints| {
+            let network = Network::test_provider();
+            let addresses = endpoints
+                .iter()
+                .flat_map(|set| [set.video, set.control, set.audio])
+                .collect::<Vec<_>>();
+            amaterasu_module_sdk::transport::udp_preflight::probe_addresses(
+                &network,
+                &addresses,
+                || false,
+            )?;
+            Ok(true)
+        });
+        self.finish_network_reconciliation(now, result);
+    }
+
+    fn finish_network_reconciliation(&mut self, now: u64, result: Result<bool, &'static str>) {
+        match result {
             Ok(true) => {
-                self.active_network_base_port = self.network_base_port;
                 self.network_error = None;
                 self.network_retry_at = 0;
             }
@@ -905,7 +931,10 @@ impl Controller {
         }
     }
 
-    fn try_apply_network_port(&mut self) -> Result<bool, &'static str> {
+    fn try_apply_network_port(
+        &mut self,
+        preflight: impl FnOnce(Vec<crate::model::MediaBinds>) -> Result<bool, &'static str>,
+    ) -> Result<bool, &'static str> {
         let Some(base_port) = self.network_base_port else {
             return Ok(false);
         };
@@ -916,39 +945,32 @@ impl Controller {
         )?;
         candidate.validate()?;
         let binds = candidate.rtsp_binds_for_base(base_port)?;
-        if self.active_network_base_port == Some(base_port)
-            && self.active_address_family == self.network_address_family
-            && self.active_bind_address == self.network_bind_address
-            && self.locals == binds
-        {
+        if self.network_policy_active(base_port, &binds) {
             return Ok(true);
         }
-        if !candidate.enabled
-            || self.records.values().any(|record| !record.state.terminal())
-            || self
-                .transport
-                .as_ref()
-                .is_some_and(|transport| transport.connection_count() != 0)
-        {
+        if !self.network_update_idle() {
             return Ok(false);
         }
 
-        candidate.probe_media_binds_with_network(&self.network, base_port)?;
-        if self.locals == binds {
-            self.listener_base_port = Some(base_port);
-            self.active_network_base_port = Some(base_port);
-            self.active_address_family = self.network_address_family;
-            self.active_bind_address = self.network_bind_address.clone();
-            self.settings = candidate;
-            self.network_error = None;
-            return Ok(true);
+        if !preflight(candidate.udp_preflight_endpoints(base_port)?)? {
+            return Ok(false);
         }
-        let transport = self.transport.as_mut().ok_or("tcp_listener_unavailable")?;
-        transport.rebind_all(binds, candidate.allow_remote)?;
-        let locals = transport.local_addrs()?;
-        let local = locals.first().copied().ok_or("tcp_address_failed")?;
-        self.local = Some(local);
-        self.locals = locals;
+        if self.locals != binds {
+            let transport = self.transport.as_mut().ok_or("tcp_listener_unavailable")?;
+            let rebound = transport.rebind_all(binds, candidate.allow_remote);
+            let locals = transport.local_addrs();
+            if locals.is_empty() {
+                self.local = None;
+                self.locals.clear();
+                self.listener_base_port = None;
+                self.active_network_base_port = None;
+                self.active_address_family = None;
+                self.active_bind_address = None;
+            }
+            rebound?;
+            self.locals = locals;
+            self.local = Some(self.locals.first().copied().ok_or("tcp_address_failed")?);
+        }
         self.settings = candidate;
         self.listener_base_port = Some(base_port);
         self.active_network_base_port = Some(base_port);
@@ -956,6 +978,24 @@ impl Controller {
         self.active_bind_address = self.network_bind_address.clone();
         self.network_error = None;
         Ok(true)
+    }
+
+    fn network_policy_active(&self, base_port: u16, binds: &[SocketAddr]) -> bool {
+        self.active_network_base_port == Some(base_port)
+            && self.active_address_family == self.network_address_family
+            && self.active_bind_address == self.network_bind_address
+            && self.locals == binds
+    }
+
+    fn network_update_idle(&self) -> bool {
+        self.settings.enabled
+            && self.shutdown_deadline.is_none()
+            && self.quiescence.is_none()
+            && self.records.values().all(|record| record.state.terminal())
+            && self
+                .transport
+                .as_ref()
+                .is_none_or(|transport| transport.connection_count() == 0)
     }
 
     fn candidate_network_settings(

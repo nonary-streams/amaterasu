@@ -5,7 +5,7 @@ use amaterasu_gamestream::{
 };
 #[cfg(test)]
 use amaterasu_module_sdk::EncoderBackend;
-use amaterasu_module_sdk::{EncoderSelection, network::Network};
+use amaterasu_module_sdk::EncoderSelection;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -106,6 +106,9 @@ impl Settings {
             return Err("invalid_settings");
         }
         self.resolved_bind()?;
+        if let Some(base_port) = self.default_base_port() {
+            self.validate_media_port_range(base_port)?;
+        }
         Ok(())
     }
 
@@ -188,7 +191,22 @@ impl Settings {
 
     pub fn set_base_port(&mut self, base_port: u16) -> Result<(), &'static str> {
         validate_base_port(base_port)?;
+        self.validate_media_port_range(base_port)?;
         self.bind.set_port(base_port + RTSP_SETUP_OFFSET);
+        Ok(())
+    }
+
+    fn validate_media_port_range(&self, base_port: u16) -> Result<(), &'static str> {
+        let last_slot = self
+            .max_live_tickets
+            .checked_sub(1)
+            .ok_or("invalid_settings")?;
+        let offset = u16::try_from(last_slot).map_err(|_| "invalid_settings")?;
+        let offset = offset.checked_mul(3).ok_or("invalid_port")?;
+        base_port
+            .checked_add(AUDIO_OFFSET)
+            .and_then(|port| port.checked_add(offset))
+            .ok_or("invalid_port")?;
         Ok(())
     }
 
@@ -245,36 +263,15 @@ impl Settings {
         })
     }
 
-    #[cfg(test)]
-    pub fn probe_media_binds(&self, base_port: u16) -> Result<(), &'static str> {
-        self.probe_media_binds_with_network(&Network::test_provider(), base_port)
-    }
-
-    pub fn probe_media_binds_with_network(
-        &self,
-        network: &Network,
-        base_port: u16,
-    ) -> Result<(), &'static str> {
-        let binds = self.media_binds_by_family(base_port)?;
-        // Hold every provider-owned UDP handle until the complete set has been
-        // checked. Per-session transport admission performs its own later bind.
-        let mut sockets = Vec::with_capacity(binds.len() * 6);
-        for family in binds {
-            for offset in [0, 3] {
-                for mut bind in [family.video, family.control, family.audio] {
-                    bind.set_port(bind.port() + offset);
-                    sockets.push(network.bind_udp(bind).map_err(|_| "udp_bind_failed")?);
-                }
+    pub fn udp_preflight_endpoints(&self, base_port: u16) -> Result<Vec<MediaBinds>, &'static str> {
+        let mut endpoints = Vec::new();
+        for address in self.resolved_bind_ips()? {
+            let binds = self.media_binds_on(base_port, address)?;
+            for slot in 0..self.max_live_tickets {
+                endpoints.push(media_binds_for_slot(binds, slot).ok_or("invalid_port")?);
             }
         }
-        Ok(())
-    }
-
-    pub fn media_binds_by_family(&self, base_port: u16) -> Result<Vec<MediaBinds>, &'static str> {
-        self.resolved_bind_ips()?
-            .into_iter()
-            .map(|address| self.media_binds_on(base_port, address))
-            .collect()
+        Ok(endpoints)
     }
 }
 
@@ -316,11 +313,14 @@ fn invalid_configured_bind(address: IpAddr) -> bool {
         || matches!(address, IpAddr::V6(address) if address.to_ipv4_mapped().is_some())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MediaBinds {
-    pub video: SocketAddr,
-    pub control: SocketAddr,
-    pub audio: SocketAddr,
+pub type MediaBinds = amaterasu_module_sdk::transport::udp_preflight::Endpoints;
+
+pub fn media_binds_for_slot(mut binds: MediaBinds, slot: usize) -> Option<MediaBinds> {
+    let offset = u16::try_from(slot).ok()?.checked_mul(3)?;
+    for address in [&mut binds.video, &mut binds.control, &mut binds.audio] {
+        address.set_port(address.port().checked_add(offset)?);
+    }
+    Some(binds)
 }
 
 pub fn validate_base_port(port: u16) -> Result<(), &'static str> {
@@ -409,6 +409,9 @@ pub struct Profile {
     /// NVHTTP. DESCRIBE advertises them and ANNOUNCE must choose one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codecs: Vec<amaterasu_media::VideoCodec>,
+    /// Exact 10-bit formats supported by the selected encoder for this launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ten_bit_formats: Vec<amaterasu_module_sdk::VideoStreamFormat>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -438,6 +441,7 @@ impl Default for Profile {
             hdr: false,
             codec: amaterasu_media::VideoCodec::H264,
             codecs: Vec::new(),
+            ten_bit_formats: Vec::new(),
             width: 1920,
             height: 1080,
             fps: 60,
@@ -546,6 +550,22 @@ impl Profile {
             .all(|(index, codec)| !self.codecs[..index].contains(codec));
         if !self.codecs.is_empty() && (!self.codec.is_default() || !unique_codecs) {
             return Err("invalid_profile");
+        }
+        if self.ten_bit_formats.len() > 4
+            || self
+                .ten_bit_formats
+                .iter()
+                .enumerate()
+                .any(|(index, format)| {
+                    format.bit_depth != 10
+                        || format.validate().is_err()
+                        || !self.offers(sdp_codec(format.codec))
+                        || self.hdr
+                            != (format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr)
+                        || self.ten_bit_formats[..index].contains(format)
+                })
+        {
+            return Err("invalid_video_format_offer");
         }
         Ok(())
     }
@@ -725,6 +745,8 @@ pub struct Open {
     pub nvenc_settings: amaterasu_module_sdk::NvencSettings,
     #[serde(default)]
     pub nvenc_spatial_aq: bool,
+    #[serde(default)]
+    pub amd_av1_latency_mode: amaterasu_module_sdk::AmdAv1LatencyMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1049,15 +1071,7 @@ impl Open {
         } else {
             profile.matches_video(announce)
         };
-        let hdr = announce.video.format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr;
-        let format_allowed = if profile.hdr {
-            cfg!(target_os = "linux") && hdr && announce.video.format.bit_depth == 10
-        } else {
-            (!hdr && announce.video.format.bit_depth == 8)
-                || (cfg!(target_os = "linux") && announce.video.format.bit_depth == 10)
-        };
-        if announce.video.format.validate().is_err()
-            || !format_allowed
+        if self.standard_announce_format(announce).is_none()
             || !video_matches
             || !audio_matches
             || !profile.matches_transport(announce)
@@ -1067,9 +1081,34 @@ impl Open {
         Some(video)
     }
 
+    pub(crate) fn standard_announce_format(
+        &self,
+        announce: &Announce,
+    ) -> Option<amaterasu_module_sdk::VideoStreamFormat> {
+        use amaterasu_module_sdk::DynamicRange;
+        let mut format = announce.video.format;
+        // GameStream's dynamicRangeMode selects the sample depth. The trusted
+        // launch independently establishes whether ten-bit samples are HDR.
+        format.validate().ok()?;
+        if format.bit_depth == 10 {
+            format.dynamic_range = if self.profile.hdr {
+                DynamicRange::Hdr
+            } else {
+                DynamicRange::Sdr
+            };
+            self.profile
+                .ten_bit_formats
+                .contains(&format)
+                .then_some(format)
+        } else {
+            (!self.profile.hdr).then_some(format)
+        }
+    }
+
     pub(crate) fn accepts_extension_announce(
         &self,
         announce: &Announce<amaterasu_gamestream::sdp::NegotiatedVideoFormat>,
+        extension_wire_budget: Option<bool>,
     ) -> bool {
         let profile = self.effective_profile();
         let channels = self.channels.unwrap_or(2);
@@ -1081,20 +1120,20 @@ impl Open {
                 && announce.audio.channels == channels
                 && announce.audio.channel_mask == audio_channel_mask(channels)
         };
-        let negotiated_pyrowave =
-            amaterasu_gamestream::sdp::pyrowave::wire_bitrate_kbps(announce).is_some();
         let legacy_pyrowave = matches!(&announce.video.format,
             amaterasu_gamestream::sdp::NegotiatedVideoFormat::Extension(extension)
                 if amaterasu_gamestream::sdp::pyrowave::is_profile(extension));
-        let bitrate_matches = if legacy_pyrowave {
-            negotiated_pyrowave
-                || ((100..=profile.bitrate_kbps).contains(&announce.video.bitrate_kbps)
-                    && self.negotiation_bounds.is_none_or(|bounds| {
-                        announce.video.bitrate_kbps <= bounds.max_bitrate_kbps
-                    }))
-        } else {
-            announce.video.bitrate_kbps == profile.bitrate_kbps
-        };
+        let bitrate_matches =
+            amaterasu_gamestream::sdp::extension_wire_bitrate_kbps(announce, extension_wire_budget)
+                .is_some()
+                || if legacy_pyrowave {
+                    (100..=profile.bitrate_kbps).contains(&announce.video.bitrate_kbps)
+                        && self.negotiation_bounds.is_none_or(|bounds| {
+                            announce.video.bitrate_kbps <= bounds.max_bitrate_kbps
+                        })
+                } else {
+                    announce.video.bitrate_kbps == profile.bitrate_kbps
+                };
         audio
             && profile.matches_transport(announce)
             && announce.video.width == profile.width
@@ -1361,6 +1400,10 @@ impl Open {
         if let Some(tune) = &self.sw_tune {
             payload["configuration"]["configuration"]["sw_tune"] = serde_json::json!(tune);
         }
+        if !self.amd_av1_latency_mode.is_auto() {
+            payload["configuration"]["configuration"]["amd_av1_latency_mode"] =
+                serde_json::json!(self.amd_av1_latency_mode);
+        }
         if let Some(continuous_audio) = self.continuous_audio {
             payload["configuration"]["continuous_audio"] = serde_json::json!(continuous_audio);
         }
@@ -1370,9 +1413,6 @@ impl Open {
         payload
     }
 
-    /// Project the ordinary launch's inherited software defaults out of an
-    /// independently selected encoder's contract. Explicit overrides remain
-    /// present so unsupported requirements are still rejected by preflight.
     /// The extension format a launch probes: 10-bit HDR when the client
     /// launched in HDR and the host allows 10-bit extensions, else 8-bit SDR,
     /// which is what Moonlight requests for an extension without HDR.
@@ -1385,9 +1425,9 @@ impl Open {
     }
 
     /// The encoder configuration for an extension stream in `format`
-    /// (bit depth, HDR). Prepare and start both describe the format
-    /// explicitly, so the start matches the probe exactly when the client
-    /// picks the profile offered for its launch.
+    /// (bit depth, HDR). Prepare and start project software-only controls out
+    /// of the native source configuration and describe the same output format.
+    /// Explicit preset and tune overrides still reach preflight for validation.
     pub(crate) fn extension_configuration(&self, format: (u8, bool)) -> serde_json::Value {
         let mut configuration = self.arm(1)["configuration"]["configuration"].clone();
         let object = configuration
@@ -1398,6 +1438,8 @@ impl Open {
                 object.remove(key);
             }
         }
+        object.remove("min_threads");
+        object.remove("qp");
         object.insert("max_reference_frames".into(), serde_json::json!(0));
         let (bit_depth, hdr) = format;
         object.insert(
@@ -2749,7 +2791,8 @@ mod tests {
             "allow_remote": true,
             "address_family": "both",
             "bind_address": "",
-            "bind": "127.0.0.1:48010"
+            "bind": "127.0.0.1:48010",
+            "max_live_tickets": 1
         }))
         .unwrap();
         assert_eq!(
@@ -2760,7 +2803,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            settings.media_binds_by_family(DEFAULT_BASE_PORT).unwrap(),
+            settings.udp_preflight_endpoints(DEFAULT_BASE_PORT).unwrap(),
             vec![
                 MediaBinds {
                     video: "0.0.0.0:47998".parse().unwrap(),
@@ -2797,11 +2840,21 @@ mod tests {
         }))
         .unwrap();
         let base_port = (20_000..=30_000)
-            .find(|port| settings.probe_media_binds(*port).is_ok())
+            .find(|port| {
+                run_test_udp_probe(
+                    &settings,
+                    *port,
+                    &amaterasu_module_sdk::network::Network::test_provider(),
+                )
+                .is_ok()
+            })
             .expect("find an available local UDP bind set");
-        settings
-            .probe_media_binds(base_port)
-            .expect("both family-specific UDP port sets bind together");
+        run_test_udp_probe(
+            &settings,
+            base_port,
+            &amaterasu_module_sdk::network::Network::test_provider(),
+        )
+        .expect("both family-specific UDP port sets bind together");
 
         let occupied_address = SocketAddr::new(
             IpAddr::V6(if allow_remote {
@@ -2817,15 +2870,37 @@ mod tests {
         let _blocker = UdpSocket::from(blocker);
 
         assert_eq!(
-            settings.probe_media_binds(base_port),
+            run_test_udp_probe(
+                &settings,
+                base_port,
+                &amaterasu_module_sdk::network::Network::test_provider()
+            ),
             Err("udp_bind_failed"),
             "a conflict on only the IPv6 video bind must defer network activation"
         );
     }
 
+    fn run_test_udp_probe(
+        settings: &Settings,
+        base_port: u16,
+        network: &amaterasu_module_sdk::network::Network,
+    ) -> Result<(), &'static str> {
+        let addresses = settings
+            .udp_preflight_endpoints(base_port)?
+            .into_iter()
+            .flat_map(|set| [set.video, set.control, set.audio])
+            .collect::<Vec<_>>();
+        amaterasu_module_sdk::transport::udp_preflight::probe_addresses(network, &addresses, || {
+            false
+        })
+    }
+
     #[test]
     fn udp_preflight_uses_the_injected_provider_instead_of_binding_os_sockets() {
-        use amaterasu_module_sdk::{abi::Status, network::abi};
+        use amaterasu_module_sdk::{
+            abi::Status,
+            network::{Network, abi},
+        };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static BIND_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
@@ -2854,7 +2929,7 @@ mod tests {
             unsafe { Network::from_native_table(&table) }.expect("alternate network provider");
         let settings = Settings::default();
         assert_eq!(
-            settings.probe_media_binds_with_network(&network, 25_000),
+            run_test_udp_probe(&settings, 25_000, &network),
             Err("udp_bind_failed")
         );
         assert_eq!(BIND_ATTEMPTS.load(Ordering::SeqCst), 1);
@@ -2911,15 +2986,34 @@ mod tests {
     }
 
     #[test]
-    fn nvenc_settings_and_spatial_aq_reach_the_frozen_video_open() {
+    fn encoder_tuning_reaches_the_frozen_video_open() {
         let mut request = open();
+        assert!(
+            request.arm(52)["configuration"]["configuration"]
+                .get("amd_av1_latency_mode")
+                .is_none()
+        );
         request.nvenc_settings.nvenc_preset = 6;
         request.nvenc_settings.nvenc_h264_cavlc = true;
         request.nvenc_settings.nvenc_vbv_increase = 40;
         request.nvenc_spatial_aq = true;
+        request.amd_av1_latency_mode = amaterasu_module_sdk::AmdAv1LatencyMode::Realtime;
         request.validate(false).unwrap();
 
-        let payload = request.arm(52);
+        let payload = request.arm_with_negotiation(
+            52,
+            EncryptionSnapshot {
+                video: false,
+                audio: false,
+            },
+            1,
+            amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
+            0,
+        );
+        assert_eq!(
+            payload["configuration"]["configuration"]["amd_av1_latency_mode"],
+            "realtime"
+        );
         assert_eq!(
             payload["configuration"]["configuration"]["nvenc_settings"]["nvenc_preset"],
             6

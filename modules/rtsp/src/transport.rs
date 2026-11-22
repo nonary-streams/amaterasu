@@ -50,12 +50,17 @@ pub enum Event {
 
 pub struct Transport {
     network: Network,
-    listeners: Vec<TcpListener>,
+    listeners: Vec<BoundListener>,
     tickets: Tickets,
     connections: BTreeMap<u64, Connection>,
     next_connection: u64,
     now: u64,
     allow_remote: bool,
+}
+
+struct BoundListener {
+    socket: TcpListener,
+    address: SocketAddr,
 }
 
 impl Transport {
@@ -103,15 +108,20 @@ impl Transport {
             listener
                 .set_nonblocking(true)
                 .map_err(|_| BindError::Failure("tcp_configuration_failed"))?;
-            if selected_port.is_none() {
-                selected_port = Some(
-                    listener
-                        .local_addr()
-                        .map_err(|_| BindError::Failure("tcp_address_failed"))?
-                        .port(),
-                );
+            let bound = listener
+                .local_addr()
+                .map_err(|_| BindError::Failure("tcp_address_failed"))?;
+            if bound.ip() != address.ip()
+                || bound.port() == 0
+                || (address.port() != 0 && bound.port() != address.port())
+            {
+                return Err(BindError::Failure("tcp_address_failed"));
             }
-            listeners.push(listener);
+            selected_port.get_or_insert(bound.port());
+            listeners.push(BoundListener {
+                socket: listener,
+                address: bound,
+            });
         }
         Ok(Self {
             network,
@@ -126,16 +136,16 @@ impl Transport {
 
     #[cfg(test)]
     pub fn local_addr(&self) -> TransportResult<SocketAddr> {
-        self.local_addrs()?
-            .into_iter()
-            .next()
+        self.listeners
+            .first()
+            .map(|listener| listener.address)
             .ok_or("tcp_address_failed")
     }
 
-    pub fn local_addrs(&self) -> TransportResult<Vec<SocketAddr>> {
+    pub fn local_addrs(&self) -> Vec<SocketAddr> {
         self.listeners
             .iter()
-            .map(|listener| listener.local_addr().map_err(|_| "tcp_address_failed"))
+            .map(|listener| listener.address)
             .collect()
     }
 
@@ -152,7 +162,7 @@ impl Transport {
         // Invalid configuration is not a bind collision. Reject it before
         // releasing listeners, including connections already in their backlog.
         validate_listen_addresses(&addresses, allow_remote)?;
-        let previous_addresses = self.local_addrs()?;
+        let previous_addresses = self.local_addrs();
         match Self::try_bind_all(self.network.clone(), addresses.clone(), allow_remote) {
             Ok(replacement) => {
                 self.listeners = replacement.listeners;
@@ -305,7 +315,7 @@ impl Transport {
     fn accept(&mut self) {
         for listener in &self.listeners {
             for _ in 0..ACCEPT_BUDGET {
-                let (socket, peer) = match listener.accept() {
+                let (socket, peer) = match listener.socket.accept() {
                     Ok(accepted) => accepted,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,

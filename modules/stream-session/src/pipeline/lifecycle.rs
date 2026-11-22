@@ -1,7 +1,9 @@
 use super::input::*;
 use super::responses::*;
 use super::*;
+use amaterasu_module_sdk::audio::OpusSurroundLayout;
 use amaterasu_module_sdk::transport::AudioPacketSizing;
+use serde::Deserialize;
 
 impl Pipeline {
     pub(super) fn advance(
@@ -1913,26 +1915,17 @@ impl Pipeline {
                 {
                     return Err("unsupported_audio_format");
                 }
-                if let Some((streams, coupled, mapping, wave_mapping)) =
-                    record.config.audio.channel_mapping()
-                {
-                    if payload["mapping_family"] != 1
-                        || payload["streams"] != streams
-                        || payload["coupled_streams"] != coupled
-                        || payload["channel_mapping"] != json!(mapping)
-                        || payload["wave_channel_mapping"] != json!(wave_mapping)
+                if matches!(record.config.audio.channels, 6 | 8) {
+                    if payload["codec"] != "opus"
                         || payload["packet_ms"] != record.config.audio.packet_ms
                         || payload["bitrate"] != record.config.audio.bitrate
                     {
                         return Err("unsupported_audio_format");
                     }
-                    record.audio_encoder_layout = Some(json!({
-                        "mapping_family": 1,
-                        "streams": streams,
-                        "coupled_streams": coupled,
-                        "channel_mapping": mapping,
-                        "wave_channel_mapping": wave_mapping,
-                    }));
+                    let layout = OpusSurroundLayout::deserialize(payload)
+                        .map_err(|_| "invalid_opus_surround_layout")?;
+                    layout.validate(record.config.audio.channels)?;
+                    record.audio_encoder_layout = Some(layout);
                 }
                 record.packet_bytes = bytes;
                 job.step = Step::Open(Resource::Media);
@@ -2096,18 +2089,33 @@ impl Pipeline {
                 .as_ref()
                 .is_some_and(|config| config.valid_extension_probe())
             {
+                let requires_managed_capture = record
+                    .extension_route
+                    .as_ref()
+                    .is_some_and(|route| route.submitted)
+                    && record.config.lifecycle_session_target.is_some()
+                    && record.config.lifecycle_capture_mode.is_managed();
                 let outstanding_reads: usize = self
                     .records
                     .values()
                     .map(|other| other.shutdown_observations.len())
                     .sum::<usize>()
                     + record.shutdown_observations.len();
-                if outstanding_reads >= MAX_DEFERRED_READ_SETTLEMENTS {
+                if requires_managed_capture {
+                    // DESCRIBE precedes PLAY's exact binding. An encoder
+                    // probe alone cannot qualify this submitted capture route.
+                    record.report_extension_probe_fallback_from(
+                        "managed_capture_binding_unavailable",
+                        amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Capture,
+                    );
+                } else if outstanding_reads >= MAX_DEFERRED_READ_SETTLEMENTS {
                     record.report_extension_probe_fallback("probe_settlement_pending");
                 } else {
                     job.step = Step::ProbeExtensionSource;
                     return true;
                 }
+            } else if record.config.extension_probe.is_some() {
+                record.report_extension_probe_fallback("extension_probe_configuration_unsupported");
             }
             record.extension_checked = true;
         }

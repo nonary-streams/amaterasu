@@ -23,6 +23,7 @@ mod shared_capture;
 mod source_preparation;
 #[cfg(test)]
 mod tests;
+mod udp_preflight;
 mod virtual_display;
 mod workflow;
 
@@ -171,6 +172,7 @@ pub struct Pipeline {
     report_stream_issues: bool,
     admission_issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
     settings: Settings,
+    udp_preflight: Option<udp_preflight::UdpPreflight>,
     service: String,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
@@ -214,6 +216,7 @@ impl Pipeline {
             report_stream_issues: false,
             admission_issues: Default::default(),
             settings,
+            udp_preflight: None,
             service,
             records: BTreeMap::new(),
             job: None,
@@ -411,6 +414,7 @@ impl Pipeline {
             && !self.recovery_blocked
             && self.journal.document.entries.is_empty()
             && self.recovery_queue.is_empty()
+            && self.udp_preflight.is_none()
             && self.job.is_none()
             && self.display_start_waiter.is_none()
             && !self.history_activities.has_active_reservations()
@@ -507,6 +511,11 @@ impl Pipeline {
 
     fn retained_journal_requests(&self) -> BTreeSet<u64> {
         let mut requests = BTreeSet::new();
+        requests.extend(
+            self.udp_preflight
+                .as_ref()
+                .and_then(udp_preflight::UdpPreflight::child_request),
+        );
         requests.extend(self.journal.load_request_id());
         if let Some(job) = self
             .job
@@ -559,6 +568,7 @@ impl Pipeline {
         plan_bitrate: &mut BitratePlanner<'_>,
         direct: &mut direct_input::DirectCall<'_>,
     ) -> ModuleResult<()> {
+        self.progress_udp_preflight(now, send);
         if !self.journal.loaded {
             match self.journal.progress_load(send, now) {
                 journal::LoadProgress::Waiting => return Ok(()),

@@ -327,8 +327,15 @@ fn authorized_host_root_registers_the_public_contract_and_drains_lifecycle() {
     );
     module.tick().unwrap();
     drop(network);
-    assert!(module.quiesce().unwrap());
-    module.tick().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !module.quiesce().unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "provider worker did not retire"
+        );
+        module.tick().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(module.quiesce().unwrap());
     drop(module);
 

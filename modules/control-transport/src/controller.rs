@@ -80,7 +80,24 @@ impl Controller {
         result
     }
 
-    fn open(&mut self, owner: &str, request: Open) -> ControlResult<Reply> {
+    pub fn udp_bind_policy(&self, owner: &str) -> ControlResult<(Network, bool)> {
+        self.authorize_open(owner)?;
+        Ok((self.network.clone(), self.settings.allow_remote))
+    }
+
+    pub fn new_open_bind(&self, owner: &str, request: &Open) -> Option<std::net::SocketAddr> {
+        self.authorize_open(owner).ok()?;
+        request.validate(self.settings.allow_remote).ok()?;
+        if request.operation_id.as_ref().is_some_and(|operation| {
+            self.operations
+                .contains_key(&(owner.into(), operation.clone()))
+        }) {
+            return None;
+        }
+        Some(request.local())
+    }
+
+    fn authorize_open(&self, owner: &str) -> ControlResult<()> {
         if !self.settings.enabled {
             return Err("disabled");
         }
@@ -92,6 +109,11 @@ impl Controller {
         {
             return Err("forbidden");
         }
+        Ok(())
+    }
+
+    fn open(&mut self, owner: &str, request: Open) -> ControlResult<Reply> {
+        self.authorize_open(owner)?;
         let key = request.validate(self.settings.allow_remote)?;
         if let Some(operation) = &request.operation_id {
             if let Some(record) = self.operations.get(&(owner.into(), operation.clone())) {

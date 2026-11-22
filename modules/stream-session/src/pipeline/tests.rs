@@ -139,7 +139,15 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
             Some(34_000_000),
         ),
         (true, true, false, true, false, Some(45_000), None),
-        (true, true, false, false, true, Some(45_000), None),
+        (
+            true,
+            true,
+            false,
+            false,
+            true,
+            Some(45_000),
+            Some(34_000_000),
+        ),
     ] {
         let profile = json!(route.profile);
         let mut host = Harness::new();
@@ -157,8 +165,26 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
         let mut request = prepare();
         request["stream_audio"] = json!(false);
         request["extension_probe"] = start(0)["configuration"]["configuration"].clone();
+        request["extension_probe"]["min_threads"] = json!(5);
+        request["extension_probe"]["qp"] = json!(22);
         let prepared = host.response_from(1, "amaterasu.rtsp", request);
         assert_eq!(!prepared["extension_profile"].is_null(), expected_offer);
+        assert_eq!(
+            prepared["extension_wire_budget"],
+            needs_budget && expected_offer
+        );
+        let source_probe = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| call.payload["action"] == "probe_source")
+            .unwrap();
+        assert!(
+            source_probe.payload["configuration"]
+                .get("min_threads")
+                .is_none()
+        );
+        assert!(source_probe.payload["configuration"].get("qp").is_none());
         let session = prepared["session"].as_u64().unwrap();
         let mut request = start(session);
         request["configuration"]["client_feature_flags"] = json!(0);
@@ -168,7 +194,8 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
             request["configuration"]["extension_wire_bitrate_kbps"] = json!(budget);
         }
         let result = host.response_from(2, "amaterasu.rtsp", request.clone());
-        if expected_offer && (wire_budget.is_none() || planned_bitrate.is_some()) {
+        if expected_offer && (wire_budget.is_none() || (needs_budget && planned_bitrate.is_some()))
+        {
             assert_eq!(result["state"], "active");
             assert_eq!(host.plane.borrow().planned_planes, 1);
             let video = host
@@ -210,7 +237,9 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
         } else {
             assert_eq!(
                 result["code"],
-                if expected_offer {
+                if expected_offer && !needs_budget {
+                    "extension_wire_budget_not_offered"
+                } else if expected_offer {
                     "invalid_extension_wire_budget"
                 } else {
                     "extension_profile_not_offered"
@@ -626,6 +655,7 @@ fn prepared_stereo_session_requests_48khz_float_stereo_loopback() {
 
 #[test]
 fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
+    let encoder_service = "vendor.audio-encoder/1";
     for (channels, mask, packet_ms, bitrate, bytes, wire) in [
         (6, 0x3f, 5, 1_536_000, 960, 976),
         (6, 0x3f, 10, 800_000, 1000, 1008),
@@ -633,6 +663,7 @@ fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
         (8, 0x63f, 10, 450_000, 562, 576),
     ] {
         let mut host = Harness::new();
+        host.pipeline.settings.providers.audio_encoder = encoder_service.into();
         let mut request = prepare();
         request["audio"] = json!({"channels":channels,"channel_mask":mask,
             "layout":if channels == 6 { "5.1" } else { "7.1" },
@@ -644,14 +675,16 @@ fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
         assert_eq!(prepared["audio"], request["audio"]);
         assert_eq!(prepared["packet_bytes"], bytes);
         assert_eq!(prepared["wire_audio_bytes"], wire);
-        assert_eq!(prepared["audio_encoder_layout"]["mapping_family"], 1);
+        assert_eq!(
+            prepared["audio_encoder_layout"],
+            json!({"streams":channels,"coupled_streams":0,
+                "wave_channel_mapping":(0..channels).rev().collect::<Vec<_>>()})
+        );
         let encoder = host
             .broker
             .calls
             .iter()
-            .find(|call| {
-                call.service == Resource::AudioEncoder.service() && call.payload["action"] == "open"
-            })
+            .find(|call| call.service == encoder_service && call.payload["action"] == "open")
             .unwrap();
         assert_eq!(encoder.payload["channels"], channels);
         assert_eq!(encoder.payload["bitrate"], bitrate);
@@ -694,6 +727,31 @@ fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
             host.response(3, json!({"action":"stop","session":id}))["state"],
             "stopped"
         );
+        assert_eq!(host.broker.leases(), 0);
+    }
+}
+
+#[test]
+fn invalid_surround_descriptor_retires_only_the_allocated_resources() {
+    for layout in [
+        json!({}),
+        json!({"streams":4,"coupled_streams":2,"wave_channel_mapping":[0,1,2,3,4,4]}),
+        json!({"streams":4,"coupled_streams":2,"wave_channel_mapping":[0,1,2,3,4,255]}),
+        json!({"streams":6,"coupled_streams":9,"wave_channel_mapping":[0,1,2,3,4,5]}),
+    ] {
+        let mut host = Harness::new();
+        host.broker.opus_surround_layout = Some(layout);
+        let mut request = prepare();
+        request["audio"] = json!({"channels":6,"channel_mask":63,"layout":"5.1",
+            "packet_ms":5,"bitrate":256000});
+        let result = host.response(1, request);
+        assert_eq!(result["error"], "invalid_opus_surround_layout", "{result}");
+        assert!(host.broker.calls.iter().any(|call| {
+            call.service == Resource::AudioEncoder.service() && call.payload["action"] == "close"
+        }));
+        assert!(!host.broker.calls.iter().any(|call| {
+            call.service == Resource::Media.service() && call.payload["action"] == "open"
+        }));
         assert_eq!(host.broker.leases(), 0);
     }
 }

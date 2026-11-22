@@ -371,10 +371,8 @@ impl Controller {
                 udp_discovery: record.udp_discovery.clone(),
             };
             let mut offer = amaterasu_contracts::media_profile::VideoProfileSnapshot::default();
-            if self.settings.extension_enabled
-                && record.config.min_threads == 2
-                && record.config.qp == 28
-            {
+            let mut extension_wire_budget = None;
+            if self.settings.extension_enabled {
                 let profiles = match payload.get("extension_profiles") {
                     Some(profiles) => serde_json::from_value(profiles.clone()),
                     None if payload["extension_profile"].is_null() => Ok(Vec::new()),
@@ -386,7 +384,13 @@ impl Controller {
                 } else {
                     record.report_invalid_extension_offer();
                 }
-                if !offer.validate() {
+                extension_wire_budget = payload
+                    .get("extension_wire_budget")
+                    .and_then(Value::as_bool);
+                if !offer.validate()
+                    || (payload.get("extension_wire_budget").is_some()
+                        && extension_wire_budget.is_none())
+                {
                     offer.profiles.clear();
                     record.report_invalid_extension_offer();
                 }
@@ -394,14 +398,28 @@ impl Controller {
             let negotiation = if offer.profiles.is_empty() {
                 Negotiation::new(launch, record.capabilities())
             } else {
-                Negotiation::with_video_profiles(
+                Negotiation::with_video_profiles_and_wire_budget(
                     launch,
                     record.capabilities(),
                     offer.clone(),
                     offer.clone(),
+                    extension_wire_budget,
                 )
             }
             .map_err(|_| "invalid_prepare_response")?;
+            let negotiation = if let Some(channels @ (6 | 8)) = record.config.channels {
+                use serde::Deserialize;
+
+                let layout = amaterasu_module_sdk::audio::OpusSurroundLayout::deserialize(
+                    &payload["audio_encoder_layout"],
+                )
+                .map_err(|_| "invalid_opus_surround_layout")?;
+                negotiation
+                    .with_opus_surround(channels, layout)
+                    .map_err(|_| "invalid_opus_surround_layout")?
+            } else {
+                negotiation
+            };
             self.transport.as_mut().ok_or("disabled")?.add_ticket(
                 record.id,
                 record.config.peer_ip,
@@ -409,6 +427,11 @@ impl Controller {
             )?;
             record.session = Some(session);
             record.extension_offer = offer.profiles;
+            record.extension_wire_budget = if record.extension_offer.is_empty() {
+                None
+            } else {
+                extension_wire_budget
+            };
             record.negotiation = Some(negotiation);
             record.needs_lookup = false;
             record.stream_state = Some("prepared".into());

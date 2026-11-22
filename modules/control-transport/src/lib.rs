@@ -7,7 +7,9 @@ mod native;
 mod stream;
 
 use amaterasu_module_sdk::{
-    Command, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
+    Command, ManagedModule, ModuleResult, Response, RuntimeClient,
+    network::Network,
+    transport::udp_preflight::{ProbeWorker, TRANSPORT_ACTION},
 };
 use controller::{Controller, Reply};
 use model::{Operation, Settings};
@@ -22,6 +24,7 @@ struct ControlTransport {
     controller: native::Shared,
     _factory: Box<native::Factory>,
     shutdown_announced: bool,
+    udp_probe: ProbeWorker,
     last_timing_log: Instant,
 }
 
@@ -33,6 +36,7 @@ impl ManagedModule for ControlTransport {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.udp_probe.tick(&self.runtime);
         let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
             amaterasu_module_sdk::threading::ThreadPriority::Critical,
         );
@@ -65,7 +69,25 @@ impl ManagedModule for ControlTransport {
                 Err(TryLockError::Poisoned(_)) => return Err("control state unavailable".into()),
             };
         }
-        match self.runtime.send(Command::Poll {})? {
+        let response = self.udp_probe.poll_request(&self.runtime)?;
+        if self.udp_probe.has_probe()
+            && !self.shutdown_announced
+            && let Response::Request {
+                caller,
+                service,
+                payload,
+                ..
+            } = &response
+            && service == SERVICE
+            && payload["action"] == "open"
+            && let Ok(Operation::Open(open)) = serde_json::from_value(payload.clone())
+            && let Some(bind) = controller.new_open_bind(caller, &open)
+            && self.udp_probe.overlaps_open([bind])
+        {
+            self.udp_probe.defer_open(&self.runtime, response);
+            return Ok(());
+        }
+        match response {
             Response::Pending => Ok(()),
             Response::Request {
                 id,
@@ -78,6 +100,15 @@ impl ManagedModule for ControlTransport {
                     self.runtime.send(Command::CheckRequest { request: id })?,
                     Response::Ok
                 ) {
+                    return Ok(());
+                }
+                if service == SERVICE && payload["action"] == TRANSPORT_ACTION {
+                    self.udp_probe.dispatch(&self.runtime, id, payload, 1, || {
+                        if self.shutdown_announced {
+                            return Err("shutting_down");
+                        }
+                        controller.udp_bind_policy(&caller)
+                    });
                     return Ok(());
                 }
                 let reply = Self::dispatch_locked(
@@ -117,6 +148,9 @@ impl ManagedModule for ControlTransport {
 
     fn quiesce(&mut self) -> ModuleResult<bool> {
         self.shutdown_announced = true;
+        if !self.udp_probe.quiesce(&self.runtime) {
+            return Ok(false);
+        }
         let mut controller = match self.controller.try_lock() {
             Ok(controller) => controller,
             Err(TryLockError::WouldBlock) => return Ok(false),
@@ -208,6 +242,7 @@ impl ControlTransport {
             controller,
             _factory: factory,
             shutdown_announced: false,
+            udp_probe: ProbeWorker::default(),
             last_timing_log: Instant::now(),
         })
     }

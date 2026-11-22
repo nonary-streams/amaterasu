@@ -790,6 +790,7 @@ fn frozen_hdr_override_drives_display_and_negotiation_without_rewriting_client_r
         let (mut controller, mut broker) = mutating_display_fixture("verify_only", true);
         let mut entry = encoder_entry("test.hevc.hdr", "hevc", true);
         entry["hdr10"] = json!(true);
+        entry["sdr10"] = json!(true);
         controller.set_encoder_snapshot(encoders(vec![entry]));
         controller.config.as_mut().unwrap().capture.encoder = EncoderSelection::Backend(
             amaterasu_module_sdk::EncoderBackend::Auto,
@@ -819,6 +820,14 @@ fn frozen_hdr_override_drives_display_and_negotiation_without_rewriting_client_r
         assert_eq!(reply.status, 200, "{global}/{application:?}/{client:?}");
         let open = opened_rtsp_payload(&broker);
         assert_eq!(open["profile"]["hdr"].as_bool().unwrap_or(false), expected);
+        assert_eq!(
+            open["profile"]["ten_bit_formats"],
+            json!([{
+                "codec": "hevc",
+                "bit_depth": 10,
+                "dynamic_range": if expected { "hdr" } else { "sdr" },
+            }])
+        );
         assert_eq!(open["display_request"]["mode_policy"]["effective_client_hdr_request"], expected);
         assert_eq!(controller.records.values().next().unwrap().request.hdr, raw_hdr);
         // An output request never substitutes for the processor's independent

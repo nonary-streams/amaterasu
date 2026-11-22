@@ -433,9 +433,11 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
         "source",
         "downstream",
         "wire_budget",
+        "managed_capture",
         "unconfirmed",
         "deadline",
         "second_deadline",
+        "encoder_policy",
     ] {
         let mut host = Harness::new();
         host.pipeline.settings.allowed_principals = vec!["amaterasu.rtsp".into()];
@@ -446,6 +448,15 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
             "source_id":42,"encoder_provider":"fixture","encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
             "video_unit_service":"example.units/1","framer_service":"example.framer/1","plan_transport_service":"example.plan/1"})).unwrap());
         host.broker.extension_probe_supported = scenario != "source";
+        if scenario == "managed_capture" {
+            host.pipeline
+                .settings
+                .extension_route
+                .as_mut()
+                .unwrap()
+                .submitted = true;
+            host.broker.lifecycle_success = true;
+        }
         if scenario == "wire_budget" {
             let route = host.pipeline.settings.extension_route.as_mut().unwrap();
             route.wire_budget_required = true;
@@ -471,6 +482,13 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
         let mut request = prepare();
         request["stream_audio"] = json!(false);
         request["extension_probe"] = start(0)["configuration"]["configuration"].clone();
+        if scenario == "encoder_policy" {
+            request["extension_probe"]["amd_av1_latency_mode"] = json!("realtime");
+        }
+        if scenario == "managed_capture" {
+            request["lifecycle_session_target"] = json!({"kind":"session","host_epoch":"epoch",
+                "session_id":"session","generation":1});
+        }
         host.broker.enqueue(1, "amaterasu.rtsp", request);
         for _ in 0..20 {
             host.tick();
@@ -524,7 +542,14 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
                     && issue.operation == "launch-extension"
                     && (scenario != "wire_budget"
                         || issue.reason == "video_wire_budget_probe_failed")
-                    && issue.caused_by == Some(LifecycleLayer::EncodeVideo)),
+                    && (scenario != "encoder_policy"
+                        || issue.reason == "extension_probe_configuration_unsupported")
+                    && if scenario == "managed_capture" {
+                        issue.reason == "managed_capture_binding_unavailable"
+                            && issue.caused_by == Some(LifecycleLayer::Capture)
+                    } else {
+                        issue.caused_by == Some(LifecycleLayer::EncodeVideo)
+                    }),
             "{issues:?}"
         );
         assert!(!issues.iter().any(StreamIssue::is_critical), "{issues:?}");
@@ -534,9 +559,53 @@ fn unavailable_optional_extension_warns_and_standard_video_starts() {
             host.idle();
             assert!(host.pipeline.records[&id].shutdown_observations.is_empty());
         }
-        let started = host.response_from(2, "amaterasu.rtsp", start(id));
+        let mut request = start(id);
+        if scenario == "encoder_policy" {
+            request["configuration"]["configuration"]["amd_av1_latency_mode"] = json!("realtime");
+        }
+        if scenario == "managed_capture" {
+            assert!(
+                !host
+                    .broker
+                    .calls
+                    .iter()
+                    .any(|call| call.payload["action"] == "probe_source")
+            );
+            request["configuration"]["lifecycle_target"] = json!({"kind":"stream",
+                "host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+            request["configuration"]["lifecycle_candidate"] = json!({
+                "capture_provider":"acme.capture/1","selector_schema":"acme.device/1",
+                "selector":{"slot":3},
+                "resource":{"provider":"display","resource_id":"handle","incarnation":"one",
+                    "revision":1,"execution_domain":"seat","mutation_domain":null},
+                "mode":{"width":1280,"height":720,"refresh_millihz":60000,"hdr":false},
+                "plan_revision":1,"geometry_revision":1,"generation":1
+            });
+        }
+        let started = host.response_from(2, "amaterasu.rtsp", request);
         assert_eq!(started["state"], "active", "{scenario}: {started}");
         assert_eq!(host.plane.borrow().planned_planes, 0);
+        if scenario == "encoder_policy" {
+            assert!(
+                !host
+                    .broker
+                    .calls
+                    .iter()
+                    .any(|call| call.payload["action"] == "probe_source")
+            );
+            let open = host
+                .broker
+                .calls
+                .iter()
+                .find(|call| {
+                    call.service == "amaterasu.video/1" && call.payload["action"] == "open"
+                })
+                .unwrap();
+            assert_eq!(
+                open.payload["configuration"]["amd_av1_latency_mode"],
+                "realtime"
+            );
+        }
     }
 }
 

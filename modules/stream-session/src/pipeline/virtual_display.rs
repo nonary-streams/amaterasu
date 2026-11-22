@@ -568,10 +568,9 @@ mod owned {
 
     pub(in super::super) const REQUESTED_OUTPUT: &str = "amaterasu-owned-display";
     pub(in super::super) fn requested(record: &Record) -> bool {
-        record
-            .start
-            .as_ref()
-            .is_some_and(|start| start.output == REQUESTED_OUTPUT)
+        record.start.as_ref().is_some_and(|start| {
+            start.lifecycle_candidate.is_none() && start.output == REQUESTED_OUTPUT
+        })
     }
     pub(in super::super) fn identity(record: &Record) -> String {
         if let Some(source) = &record.shared_capture {

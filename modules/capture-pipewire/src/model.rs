@@ -1,4 +1,6 @@
+use amaterasu_module_sdk::extension_api::CaptureBinding;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeSet;
 
 pub type CaptureResult<T> = Result<T, &'static str>;
@@ -100,12 +102,146 @@ pub enum Operation {
         operation_id: Option<String>,
         constant_rate: Option<bool>,
     },
+    #[serde(skip)]
+    OpenBound {
+        output: String,
+        operation_id: Option<String>,
+        constant_rate: Option<bool>,
+        binding: Box<CaptureBinding>,
+    },
     Lookup {
         operation_id: String,
     },
     Close {
         stream: u64,
     },
+}
+
+impl Operation {
+    pub fn open_target(&self) -> Option<(&str, Option<&str>)> {
+        match self {
+            Self::Open {
+                output,
+                operation_id,
+                ..
+            }
+            | Self::OpenBound {
+                output,
+                operation_id,
+                ..
+            } => Some((output, operation_id.as_deref())),
+            _ => None,
+        }
+    }
+
+    pub fn named_operation(&self) -> Option<&str> {
+        self.open_target()
+            .filter(|(output, _)| output.starts_with("kwin:"))
+            .and_then(|(_, operation)| operation)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KwinOutputSelector {
+    output: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundOpen {
+    action: String,
+    operation_id: Option<String>,
+    constant_rate: Option<bool>,
+    source_format: Option<Value>,
+    capture_binding: Value,
+}
+
+pub fn decode_operation(payload: Value) -> CaptureResult<Operation> {
+    if payload.get("capture_binding").is_some() {
+        let request: BoundOpen =
+            serde_json::from_value(payload).map_err(|_| "invalid_capture_binding")?;
+        if request.action != "open" {
+            return Err("invalid_capture_binding");
+        }
+        let binding =
+            amaterasu_module_sdk::capture::decode_capture_binding(request.capture_binding)?;
+        if binding.capture_provider != crate::SERVICE
+            || binding.selector_schema != "amaterasu.kwin-wl-output/1"
+        {
+            return Err("capture_selector_unsupported");
+        }
+        if binding.mode.hdr || request.source_format.is_some() {
+            return Err("capture_source_format_unsupported");
+        }
+        let selector: KwinOutputSelector = serde_json::from_value(binding.selector.clone())
+            .map_err(|_| "invalid_capture_selector")?;
+        if !selector
+            .output
+            .strip_prefix("kwin:")
+            .is_some_and(valid_owned_name)
+        {
+            return Err("invalid_capture_selector");
+        }
+        return Ok(Operation::OpenBound {
+            output: selector.output,
+            operation_id: request.operation_id,
+            constant_rate: request.constant_rate,
+            binding: Box::new(binding),
+        });
+    }
+    serde_json::from_value(payload).map_err(|_| "invalid_request")
+}
+
+pub(crate) fn valid_owned_name(name: &str) -> bool {
+    name.strip_prefix("Virtual-")
+        .filter(|number| !number.starts_with('0') && number.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|number| number.parse::<u32>().ok())
+        .is_some_and(|number| number > 0)
+}
+
+#[cfg(test)]
+mod managed_capture_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stock_binding_selects_only_the_exact_managed_output() {
+        let request = json!({"action":"open","operation_id":"exact-open","capture_binding":{
+            "capture_provider":crate::SERVICE,"selector_schema":"amaterasu.kwin-wl-output/1",
+            "selector":{"output":"kwin:Virtual-12"},
+            "resource":{"provider":"display","resource_id":"handle","incarnation":"one",
+                "revision":1,"execution_domain":"seat","mutation_domain":null},
+            "mode":{"width":1280,"height":720,"refresh_millihz":60000,"hdr":false},
+            "plan_revision":1,"geometry_revision":1,"generation":1
+        }});
+        assert!(matches!(decode_operation(request.clone()),
+            Ok(Operation::OpenBound { output, .. }) if output == "kwin:Virtual-12"));
+        for name in [
+            "kwin:DP-1",
+            "kwin:Virtual-0",
+            "portal-selected-session-source",
+        ] {
+            let mut invalid = request.clone();
+            invalid["capture_binding"]["selector"]["output"] = json!(name);
+            assert_eq!(
+                decode_operation(invalid).err(),
+                Some("invalid_capture_selector")
+            );
+        }
+        let mut unsupported = request.clone();
+        unsupported["capture_binding"]["selector_schema"] = json!("vendor.selector/1");
+        assert_eq!(
+            decode_operation(unsupported).err(),
+            Some("capture_selector_unsupported")
+        );
+        let mut unsupported = request;
+        unsupported["source_format"] = json!({"bit_depth":10,"dynamic_range":"sdr"});
+        assert_eq!(
+            decode_operation(unsupported).err(),
+            Some("capture_source_format_unsupported")
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

@@ -390,7 +390,10 @@ fn xml_escapes_metadata_and_advertises_configured_streaming_honestly() {
     assert_eq!(xml::escape("<&>\"'"), "&lt;&amp;&gt;&quot;&apos;");
     let response = xml::server_info(
         &router().config,
-        "host-id",
+        xml::ServerIdentity {
+            host_id: "host-id",
+            mac: None,
+        },
         false,
         0,
         false,
@@ -450,7 +453,10 @@ fn hostname_updates_change_the_default_launch_device_name() {
 fn configured_streaming_advertises_only_the_supported_h264_codec() {
     let response = xml::server_info(
         &router().config,
-        "host-id",
+        xml::ServerIdentity {
+            host_id: "host-id",
+            mac: None,
+        },
         true,
         0,
         true,
@@ -505,7 +511,10 @@ fn serverinfo_codec_mask_and_hevc_luma_follow_the_encoder_snapshot() {
             EncoderSnapshot::parse(&json!({"ok":true,"enabled":true,"encoders":encoders})).unwrap();
         let response = xml::server_info(
             &router().config,
-            "host-id",
+            xml::ServerIdentity {
+                host_id: "host-id",
+                mac: None,
+            },
             true,
             0,
             false,
@@ -986,6 +995,7 @@ fn peer(
 ) -> RequestContext {
     RequestContext {
         remote: remote.parse().unwrap(),
+        local: None,
         secure,
         peer_certificate,
         peer_trusted,
@@ -1003,7 +1013,10 @@ fn configured_hostname_replaces_xml_noncharacters_and_escapes_quotes() {
     config.hostname = "A&<\"'\u{fffe}\u{ffff}Z".into();
     let reply = xml::server_info(
         &config,
-        "host",
+        xml::ServerIdentity {
+            host_id: "host",
+            mac: None,
+        },
         false,
         0,
         false,
@@ -1113,6 +1126,117 @@ fn server_info_text(router: &mut Router, broker: &mut Broker, now: Instant) -> S
         }
     }
     panic!("serverinfo did not complete");
+}
+
+#[test]
+fn serverinfo_advertises_selected_provider_identity_or_its_zero_fallback() {
+    use crate::server::provider_selection_tests::{legacy_provider, wake_identity_provider};
+
+    let mut router = streaming_router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    router.set_network_provider(Some(wake_identity_provider()));
+    for (index, expected_mac) in [
+        (1, "02:ab:00:00:00:01"),
+        (2, "02:ab:00:00:00:02"),
+        (3, "00:00:00:00:00:00"),
+        (4, "00:00:00:00:00:00"),
+        (5, "00:00:00:00:00:00"),
+        (6, "00:00:00:00:00:00"),
+    ] {
+        let mut peer = peer("127.0.0.9", false, None, false);
+        peer.local = Some(format!("127.0.0.{index}:48000").parse().unwrap());
+        assert!(
+            router
+                .dispatch_with(index, request("/serverinfo"), peer, now, &mut |command| {
+                    broker.send(command)
+                })
+                .is_none()
+        );
+        let response = (0..4)
+            .find_map(|_| {
+                poll(&mut router, &mut broker, now)
+                    .into_iter()
+                    .find(|(connection, _)| *connection == index)
+            })
+            .unwrap()
+            .1;
+        assert_eq!(response.status, 200);
+        let text = String::from_utf8(response.body).unwrap();
+        assert!(text.contains(&format!("<mac>{expected_mac}</mac>")));
+        assert_eq!(codec_fields(&text), (SCM_H264, 0));
+        assert!(text.contains("<state>AMATERASU_SERVER_FREE</state>"));
+    }
+
+    use amaterasu_module_sdk::abi::{
+        AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
+    };
+    use std::{ffi::c_void, sync::Mutex};
+
+    unsafe extern "C" fn log(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> Status {
+        // SAFETY: the test retains the log vector and request borrows for each call.
+        let records = unsafe { &*context.cast::<Mutex<Vec<Command>>>() };
+        let Ok(input) = (unsafe { input.read() }) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let Ok(command @ Command::Log { .. }) = serde_json::from_slice(input) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        records.lock().unwrap().push(command);
+        // SAFETY: the sink copies the serialized response before returning.
+        unsafe { reply.send(&serde_json::to_vec(&Response::Ok).unwrap()) };
+        STATUS_OK
+    }
+
+    let records = Mutex::new(Vec::<Command>::new());
+    // SAFETY: the callback retains no values and the mutex outlives the runtime.
+    let runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&records as *const Mutex<Vec<Command>>).cast_mut().cast(),
+            invoke: log,
+        })
+    };
+    let (logger, mut log_queue) = runtime.log_emitter();
+    router.set_wake_identity_logger(logger);
+    router.set_network_provider(Some(legacy_provider()));
+    let text = server_info_text(&mut router, &mut broker, now);
+    assert!(text.contains("<mac>00:00:00:00:00:00</mac>"));
+    assert_eq!(codec_fields(&text), (SCM_H264, 0));
+    let _ = server_info_text(&mut router, &mut broker, now);
+    log_queue.flush(&runtime);
+    assert!(matches!(
+        records.lock().unwrap().as_slice(),
+        [Command::Log { level, target, message }]
+            if *level == amaterasu_module_sdk::LogLevel::Warning as u8
+                && target == "nvhttp.serverinfo.wake_mac_unavailable"
+                && message.contains("00:00:00:00:00:00")
+    ));
+
+    assert!(
+        router
+            .dispatch_with(
+                32,
+                request(LAUNCH_TARGET),
+                trusted_tls(&[1, 2, 3]),
+                now,
+                &mut |command| broker.send(command),
+            )
+            .is_none()
+    );
+    let (connection, reply) = poll_until_reply(&mut router, &mut broker, now);
+    assert_eq!(connection, 32);
+    assert_eq!(reply.status, 200);
+    assert!(
+        broker
+            .accepted
+            .iter()
+            .any(|payload| payload["action"] == "open")
+    );
 }
 
 fn codec_fields(text: &str) -> (u32, u32) {
@@ -2215,7 +2339,7 @@ fn pairing_legacy_placeholder_falls_back_to_the_requesting_address() {
 #[test]
 fn pairing_uses_the_requesting_hostname_without_blocking_the_router() {
     let mut router = router();
-    router.set_pairing_network(Some(amaterasu_module_sdk::network::Network::test_provider()));
+    router.set_network_provider(Some(amaterasu_module_sdk::network::Network::test_provider()));
     let mut broker = Broker::default();
     let now = Instant::now();
     let target = begin_target().replace("devicename=Living+room", "devicename=roth");
@@ -2242,7 +2366,7 @@ fn pairing_uses_the_requesting_hostname_without_blocking_the_router() {
 #[test]
 fn closing_pairing_connection_during_hostname_lookup_never_submits_a_begin() {
     let mut router = router();
-    router.set_pairing_network(Some(amaterasu_module_sdk::network::Network::test_provider()));
+    router.set_network_provider(Some(amaterasu_module_sdk::network::Network::test_provider()));
     let mut broker = Broker::default();
     let now = Instant::now();
     let target = begin_target().replace("devicename=Living+room", "devicename=roth");

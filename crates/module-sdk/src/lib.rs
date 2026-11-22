@@ -52,10 +52,10 @@ pub use native::NativeBinding;
 
 pub use amaterasu_abi as abi;
 pub use amaterasu_contracts::encoder::{
-    ChromaSampling, DynamicRange, EncoderBackend, EncoderIdentity, EncoderSelection, NvencSettings,
-    NvencSettingsOverrides, NvencSplitEncode, NvencTwoPass, SOFTWARE_ENCODER_ID,
-    SoftwareEncoderOptions, VideoCodec, VideoStreamFormat, validate_min_threads,
-    validate_software_options,
+    AmdAv1LatencyMode, ChromaSampling, DynamicRange, EncoderBackend, EncoderIdentity,
+    EncoderSelection, NvencSettings, NvencSettingsOverrides, NvencSplitEncode, NvencTwoPass,
+    SOFTWARE_ENCODER_ID, SoftwareEncoderOptions, VideoCodec, VideoStreamFormat,
+    validate_min_threads, validate_software_options,
 };
 pub use amaterasu_contracts::{
     ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, DIRECT_UNAVAILABLE,

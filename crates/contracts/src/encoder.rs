@@ -65,6 +65,24 @@ impl VideoStreamFormat {
     }
 }
 
+/// Application latency policy interpreted by the selected AV1 encoder.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AmdAv1LatencyMode {
+    #[default]
+    Auto,
+    None,
+    PowerSaving,
+    Realtime,
+    Lowest,
+}
+
+impl AmdAv1LatencyMode {
+    pub const fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NvencTwoPass {

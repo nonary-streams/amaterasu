@@ -7,7 +7,7 @@ use crate::{
     lifecycle_issues,
     model::{
         CaptureResult, Operation, Settings, SourceDiagnostics, SourceState, SourceType, new_id,
-        validate_operation_id,
+        valid_owned_name, validate_operation_id,
     },
 };
 use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
@@ -173,11 +173,28 @@ impl<B: Backend> Controller<B> {
                 operation_id,
                 constant_rate.unwrap_or(false),
                 now,
+                None,
+            ),
+            Operation::OpenBound {
+                output,
+                operation_id,
+                constant_rate,
+                binding,
+            } => self.open(
+                caller,
+                output,
+                operation_id,
+                constant_rate.unwrap_or(false),
+                now,
+                Some(binding),
             ),
             Operation::Lookup { operation_id } => {
                 validate_operation_id(&operation_id)?;
                 if let Some(response) = self.direct.lookup(caller, &operation_id) {
                     return Ok(Reply::existing(response));
+                }
+                if self.direct.bound_lookup_pending(caller, &operation_id) {
+                    return Err("source_retirement_pending");
                 }
                 self.lease
                     .as_ref()
@@ -271,6 +288,7 @@ impl<B: Backend> Controller<B> {
         operation: Option<String>,
         constant_rate: bool,
         now: u64,
+        binding: Option<Box<amaterasu_module_sdk::extension_api::CaptureBinding>>,
     ) -> CaptureResult<Reply> {
         if !self.settings.enabled {
             return Err("capture_disabled");
@@ -283,7 +301,7 @@ impl<B: Backend> Controller<B> {
         }
         if output.starts_with("kwin:") {
             let name = output.strip_prefix("kwin:").expect("named output prefix");
-            let managed = direct::valid_name(name);
+            let managed = valid_owned_name(name);
             if managed && !self.settings.allow_named_outputs && !self.settings.allow_desktop_outputs
             {
                 return Err("named_capture_disabled");
@@ -294,7 +312,7 @@ impl<B: Backend> Controller<B> {
             return self.direct.open(
                 &self.backend,
                 caller,
-                output,
+                direct::NamedTarget { output, binding },
                 operation,
                 now,
                 self.settings.selection_timeout_seconds,
@@ -511,11 +529,7 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn cancel_pending_open(&mut self, caller: &str, operation: &Operation) {
-        if let Operation::Open {
-            operation_id: Some(operation),
-            ..
-        } = operation
-        {
+        if let Some(operation) = operation.named_operation() {
             self.direct.cancel_pending(caller, operation);
         }
     }

@@ -1,60 +1,62 @@
+use amaterasu_module_sdk::{LogEmitter, LogLevel, network::Network};
+use std::{
+    io,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
+
 const NO_HARDWARE_ADDRESS: &str = "00:00:00:00:00:00";
+const ADVISORY_INTERVAL: Duration = Duration::from_secs(60);
 
-pub(super) fn mac() -> &'static str {
-    static ADDRESS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ADDRESS.get_or_init(|| hardware_address().unwrap_or_else(|| NO_HARDWARE_ADDRESS.into()))
+#[derive(Default)]
+pub(super) struct WakeIdentity {
+    pub(super) network: Option<Network>,
+    pub(super) logger: Option<LogEmitter>,
+    last_advisory: Option<Instant>,
 }
 
-/// Best-effort MAC of the first physical network interface, for Wake-on-LAN.
-/// Virtual, loopback and unreadable interfaces yield `None` (all zeros).
-#[cfg(target_os = "linux")]
-fn hardware_address() -> Option<String> {
-    let mut names: Vec<_> = std::fs::read_dir("/sys/class/net")
-        .ok()?
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .collect();
-    names.sort();
-    names.into_iter().find_map(|name| {
-        let base = std::path::Path::new("/sys/class/net").join(&name);
-        // Physical interfaces expose a backing `device`; bridges, veths and
-        // tunnels do not.
-        base.join("device").exists().then_some(())?;
-        let address = std::fs::read_to_string(base.join("address")).ok()?;
-        valid_hardware_address(address.trim())
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn hardware_address() -> Option<String> {
-    None
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn valid_hardware_address(text: &str) -> Option<String> {
-    let octets: Vec<_> = text.split(':').collect();
-    let well_formed = octets.len() == 6
-        && octets
-            .iter()
-            .all(|octet| octet.len() == 2 && octet.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    (well_formed && text != NO_HARDWARE_ADDRESS).then(|| text.to_ascii_lowercase())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn hardware_address_is_validated() {
-        assert_eq!(
-            valid_hardware_address("AA:bb:0c:0D:ee:ff").as_deref(),
-            Some("aa:bb:0c:0d:ee:ff")
-        );
-        for text in [
-            "",
-            "00:00:00:00:00:00",
-            "aa:bb:cc:dd:ee",
-            "aa:bb:cc:dd:ee:g0",
-        ] {
-            assert!(valid_hardware_address(text).is_none());
+impl WakeIdentity {
+    pub(super) fn mac(&mut self, local: Option<SocketAddr>, now: Instant) -> Option<[u8; 6]> {
+        let result = self.network.as_ref()?.wake_mac(local);
+        match result {
+            Ok(mac) => Some(mac),
+            Err(error) => {
+                if let Some(logger) = &self.logger
+                    && self
+                        .last_advisory
+                        .is_none_or(|last| now.saturating_duration_since(last) >= ADVISORY_INTERVAL)
+                {
+                    let reason = match error.kind() {
+                        io::ErrorKind::Unsupported => {
+                            "selected network provider lacks Wake-on-LAN identity"
+                        }
+                        io::ErrorKind::NotFound => {
+                            "selected network provider has no usable hardware address"
+                        }
+                        io::ErrorKind::InvalidData => {
+                            "selected network provider returned an invalid hardware address"
+                        }
+                        io::ErrorKind::WouldBlock => {
+                            "selected network provider's identity snapshot is busy"
+                        }
+                        _ => "selected network provider could not read Wake-on-LAN identity",
+                    };
+                    let _ = logger.emit(
+                        LogLevel::Warning,
+                        "nvhttp.serverinfo.wake_mac_unavailable",
+                        &format!("{reason}. Advertising {NO_HARDWARE_ADDRESS}"),
+                    );
+                    self.last_advisory = Some(now);
+                }
+                None
+            }
         }
     }
+}
+
+pub(super) fn format_mac(mac: Option<[u8; 6]>) -> String {
+    let Some([a, b, c, d, e, f]) = mac else {
+        return NO_HARDWARE_ADDRESS.to_owned();
+    };
+    format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
 }

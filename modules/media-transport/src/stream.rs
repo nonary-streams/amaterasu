@@ -756,7 +756,7 @@ impl Stream {
             return self.fail("video_index_exhausted");
         };
         // SAFETY: caller guarantees immutable plan storage until the call returns.
-        let reservation = match unsafe { plan.validate(&selection.limits) } {
+        let reservation = match unsafe { plan.validate_gamestream(&selection.limits) } {
             Ok(value) => value,
             Err(_) => return STATUS_INVALID_ARGUMENT,
         };

@@ -1126,6 +1126,98 @@ fn named_outputs_have_independent_capture_leases_and_cancel_does_not_close_a_pee
 }
 
 #[test]
+fn managed_capture_operation_preserves_binding_across_pending_open_and_retirement() {
+    let mut settings = crate::test_support::settings();
+    settings.allow_named_outputs = true;
+    let (mut controller, driver) = crate::test_support::setup(settings);
+    let bound = |generation| {
+        crate::model::decode_operation(json!({
+            "action":"open","operation_id":"managed-exact","capture_binding":{
+                "capture_provider":crate::SERVICE,"selector_schema":"amaterasu.kwin-wl-output/1",
+                "selector":{"output":"kwin:Virtual-12"},
+                "resource":{"provider":"display","resource_id":"handle","incarnation":"one",
+                    "revision":1,"execution_domain":"seat","mutation_domain":null},
+                "mode":{"width":2,"height":2,"refresh_millihz":60000,"hdr":false},
+                "plan_revision":1,"geometry_revision":1,"generation":generation
+            }
+        }))
+        .unwrap()
+    };
+    let caller = "amaterasu.video";
+    assert!(matches!(
+        controller.handle(caller, bound(1), 0),
+        Err("named_source_pending")
+    ));
+    let lookup = || Operation::Lookup {
+        operation_id: "managed-exact".into(),
+    };
+    assert!(matches!(
+        controller.handle(caller, lookup(), 1),
+        Err("source_retirement_pending")
+    ));
+    assert!(matches!(
+        controller.handle(caller, bound(2), 1),
+        Err("operation_conflict")
+    ));
+    let legacy = Operation::Open {
+        output: "kwin:Virtual-12".into(),
+        operation_id: Some("managed-exact".into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle(caller, legacy.clone(), 1),
+        Err("operation_conflict")
+    ));
+    *driver.state.lock().unwrap() = SourceState::Ready {
+        node: 1,
+        width: 2,
+        height: 2,
+    };
+    let opened = controller.handle(caller, bound(1), 2).unwrap().payload;
+    let stream = opened["stream"].as_u64().unwrap();
+    assert_eq!(
+        controller.handle(caller, bound(1), 3).unwrap().payload,
+        opened
+    );
+    driver.retirement_ready.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        controller.close(caller, stream),
+        Err("source_retirement_pending")
+    ));
+    assert!(matches!(
+        controller.handle(caller, lookup(), 4),
+        Err("source_retirement_pending")
+    ));
+    assert!(matches!(
+        controller.handle(caller, bound(1), 4),
+        Err("stream_closed")
+    ));
+    assert!(matches!(
+        controller.handle(caller, bound(2), 4),
+        Err("operation_conflict")
+    ));
+    driver.retirement_ready.store(true, Ordering::SeqCst);
+    controller.refresh(5);
+    controller.close(caller, stream).unwrap();
+    assert!(matches!(
+        controller.handle(caller, lookup(), 4),
+        Err("not_found")
+    ));
+    assert!(matches!(
+        controller.handle(caller, bound(1), 4),
+        Err("stream_closed")
+    ));
+    assert!(matches!(
+        controller.handle(caller, bound(2), 4),
+        Err("operation_conflict")
+    ));
+    assert!(matches!(
+        controller.handle(caller, legacy, 4),
+        Err("operation_conflict")
+    ));
+}
+
+#[test]
 fn named_capture_reports_only_observed_live_output() {
     let mut settings = crate::test_support::settings();
     settings.allow_named_outputs = true;

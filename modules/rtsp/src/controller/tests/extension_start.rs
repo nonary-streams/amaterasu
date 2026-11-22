@@ -134,6 +134,23 @@ fn pyrowave_wire_budget_honors_explicit_host_limit_and_legacy_requests() {
         80_000
     );
 
+    record.extension_wire_budget = Some(false);
+    assert!(!record.accept_extension_announce(&announce));
+    let mut bounded_legacy = announce.clone();
+    bounded_legacy.video.bitrate_kbps = 19_600;
+    assert!(record.accept_extension_announce(&bounded_legacy));
+    let start = record.authenticated_start_payload(23).unwrap();
+    assert!(
+        start["configuration"]
+            .get("extension_wire_bitrate_kbps")
+            .is_none()
+    );
+    assert_eq!(
+        start["configuration"]["configuration"]["bitrate"],
+        19_600_000
+    );
+
+    record.extension_wire_budget = Some(true);
     announce.video.configured_bitrate_kbps = None;
     assert!(!record.accept_extension_announce(&announce));
     announce.video.bitrate_kbps = 19_600;

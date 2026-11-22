@@ -65,15 +65,21 @@ pub fn unpaired(removed: bool) -> Reply {
     response(200, "OK", &[("unpaired", if removed { "1" } else { "0" })])
 }
 
+pub struct ServerIdentity<'a> {
+    pub host_id: &'a str,
+    pub mac: Option<[u8; 6]>,
+}
+
 pub fn server_info(
     config: &RouterConfig,
-    host_id: &str,
+    identity: ServerIdentity<'_>,
     paired: bool,
     current_game: u32,
     busy: bool,
     streaming_supported: bool,
     codecs: CodecAdvertisement,
 ) -> Reply {
+    let mac = super::capabilities::format_mac(identity.mac);
     let codec_mode_support = codecs.codec_mode_support.to_string();
     let max_luma_pixels_hevc = codecs.max_luma_pixels_hevc.to_string();
     response(
@@ -96,10 +102,10 @@ pub fn server_info(
                 },
             ),
             ("GfeVersion", "0.0.0.0"),
-            ("uniqueid", host_id),
+            ("uniqueid", identity.host_id),
             ("HttpsPort", &config.https_port.to_string()),
             ("ExternalPort", &config.http_port.to_string()),
-            ("mac", super::capabilities::mac()),
+            ("mac", &mac),
             ("PairStatus", if paired { "1" } else { "0" }),
             ("currentgame", &current_game.to_string()),
             (

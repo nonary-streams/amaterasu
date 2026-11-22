@@ -206,6 +206,31 @@ pub struct NetworkApiV1_3 {
     pub reverse_resolve:
         unsafe extern "C" fn(*mut c_void, Address, u32, *mut u8, usize, *mut usize) -> Status,
 }
+/// Optional v1.4 tail for Wake-on-LAN hardware identity.
+pub const WAKE_MAC_MINOR: u32 = 4;
+pub const WAKE_MAC: u64 = 512;
+#[repr(C)]
+pub struct NetworkApiV1_4 {
+    pub v1_3: NetworkApiV1_3,
+    /// Writes six octets of a nonzero unicast MAC. The endpoint is the accepted
+    /// connection's local address, or an unspecified IPv4 address when unknown.
+    /// Prefer the serving interface, with a provider-selected fallback if
+    /// needed. Return NOT_FOUND when no usable address is known. This read must
+    /// use an available snapshot, without waiting for discovery or performing
+    /// network I/O. The output is borrowed only for this call.
+    pub wake_mac: unsafe extern "C" fn(*mut c_void, Address, *mut [u8; 6]) -> Status,
+}
+impl std::ops::Deref for NetworkApiV1_4 {
+    type Target = NetworkApiV1_3;
+    fn deref(&self) -> &Self::Target {
+        &self.v1_3
+    }
+}
+impl std::ops::DerefMut for NetworkApiV1_4 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.v1_3
+    }
+}
 impl std::ops::Deref for NetworkApiV1_3 {
     type Target = NetworkApiV1_2;
     fn deref(&self) -> &Self::Target {
@@ -259,6 +284,9 @@ mod tests {
 
     #[test]
     fn public_c_layout_matches_supported_host_abi() {
+        assert_eq!(std::mem::offset_of!(NetworkApiV1_4, v1_3), 0);
+        assert_eq!(size_of::<NetworkApiV1_4>(), 240);
+        assert_eq!(std::mem::offset_of!(NetworkApiV1_4, wake_mac), 232);
         assert_eq!(size_of::<bool>(), 1);
         assert_eq!(size_of::<Address>(), 32);
         assert_eq!(std::mem::offset_of!(Address, port), 4);

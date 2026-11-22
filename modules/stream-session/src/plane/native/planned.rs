@@ -42,7 +42,7 @@ unsafe extern "C" fn capture(context: *mut c_void, plan: *const VideoFramePlan) 
     } else {
         // SAFETY: trusted provider lends the plan and nested bytes synchronously.
         let plan = unsafe { &*plan };
-        if unsafe { plan.validate(delivery.limits) }.is_err() {
+        if unsafe { plan.validate_shape(delivery.limits) }.is_err() {
             STATUS_INVALID_ARGUMENT
         } else {
             // SAFETY: validation bounded both allocations; provider retains them for the callback.

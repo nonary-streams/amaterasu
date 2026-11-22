@@ -30,5 +30,9 @@ CHECK(sizeof(AmaterasuNetworkApiV1_3) == 232, "reverse DNS table");
 CHECK(offsetof(AmaterasuNetworkApiV1_3, v1_2) == 0, "v1.2 prefix offset");
 CHECK(offsetof(AmaterasuNetworkApiV1_3, reverse_resolve) == 224, "reverse DNS callback offset");
 CHECK(AMATERASU_NETWORK_CAP_REVERSE_DNS == UINT64_C(256), "reverse DNS capability");
+CHECK(sizeof(AmaterasuNetworkApiV1_4) == 240, "wake MAC table");
+CHECK(offsetof(AmaterasuNetworkApiV1_4, v1_3) == 0, "v1.3 prefix offset");
+CHECK(offsetof(AmaterasuNetworkApiV1_4, wake_mac) == 232, "wake MAC callback offset");
+CHECK(AMATERASU_NETWORK_CAP_WAKE_MAC == UINT64_C(512), "wake MAC capability");
 
 int main(void) { return 0; }
