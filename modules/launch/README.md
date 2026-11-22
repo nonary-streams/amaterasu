@@ -41,8 +41,7 @@ order and resolves relative or empty entries against the expanded explicit app
 working directory, or the host's current directory when none is configured. It
 retains an absolute executable path before launch so later cwd changes cannot
 select another executable. Lookup is capped at 128 entries and 16 KiB, and on Windows considers `.com`
-and `.exe` for extensionless names. Implicit `.bat` and `.cmd` executables remain
-rejected. Executable and working-directory values support bounded `$()` references
+and `.exe` for extensionless names. Windows batch executables require an explicit interpreter. Executable and working-directory values support bounded `$()` references
 to configured launch environment values, then host environment values; an unset
 reference expands to empty, malformed references fail admission, and `$$` produces
 a literal dollar. Matching outer single or double quotes are trimmed from these two
@@ -52,7 +51,7 @@ program/cwd paths must fit application limits (1024 bytes); arguments remain lim
 to 64 values, 1024 bytes each, and 8192 total bytes. A catalog entry valid as
 cross-platform metadata may still be unsupported on this host. The application
 provider enforces its remaining native launch constraints, including rejection of
-implicit batch executables.
+implicit batch executables on Windows.
 
 A preparation plan contains at most eight ordered steps. Structured steps use
 `run` commands with optional paired `undo` commands. Raw compatibility steps
@@ -107,9 +106,11 @@ on the launch record before any session or child mutation and forwarded to the
 application or provider preparation lease. Preflight callbacks, catalog edits,
 changed environment, and operation retries do not re-resolve the retained path.
 The application owns one append-open handle through reverse undo and failed
-cleanup retries; typed detached stream paths retain precedence. Provider output
-without commands still opens an output-only preparation lease, so its file
-open/support failure prevents provider start. External Playnite game stdout and
+cleanup retries; typed detached stream paths retain precedence. A configured
+log path that fails expansion or exceeds the resolved path limit records
+`application_output_unavailable` and selects null output for that launch.
+A resolved provider log path can use an output-only preparation lease.
+External Playnite game stdout and
 stderr remain outside the current provider ABI. Output text is never forwarded
 in API reports. The reference's configuration-parse expansion timing and native
 Windows SYSTEM output behavior remain qualification gaps.
@@ -226,7 +227,7 @@ map. Host variables are not inherited implicitly. Supply OS/application-required
 variables explicitly; Windows Python and some native applications may require
 `SystemRoot`. Keys/values use application limits (32 keys, 128-byte keys containing
 ASCII letters/digits/underscore, 1024-byte values, 4096 total bytes, no NUL or
-case-insensitive duplicate keys). No request-level environment override exists.
+duplicate keys under the host OS name comparison). No request-level environment override exists.
 
 The module needs a provide grant for `amaterasu.launch/1` and call grants for
 `amaterasu.catalog/1`, `amaterasu.state/1`, `amaterasu.session/1`,
@@ -247,8 +248,9 @@ Accepted workflows and status/stop replies return:
 Application catalog entries may set `config_overrides.amd_av1_latency_mode` to
 exactly `auto`, `none`, `power_saving`, `realtime`, or `lowest` (case-sensitive).
 Missing or null values inherit; explicit `auto` remains present in the application
-snapshot. Launch preserves the catalog value in launch and status records without
-resolving global or client precedence.
+snapshot. Launch preserves the catalog value in launch and status records. NVHTTP
+freezes that application setting for the launch and forwards non-`auto` values
+through RTSP and Stream Session to the selected encoder provider.
 
 `nvenc_spatial_aq` is read as a strict optional boolean: absent or null inherits,
 while explicit `false` remains present in the launch snapshot. Wrong JSON types

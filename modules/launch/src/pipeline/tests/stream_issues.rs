@@ -91,6 +91,43 @@ fn a_failed_application_launch_is_published_under_the_launch_operation() {
 }
 
 #[test]
+fn unresolved_optional_output_warns_and_launches_without_a_log() {
+    for output in ["$(UNCLOSED", "$(OUTPUT_PATH)/log.txt"] {
+        let mut harness = Harness::new();
+        harness.catalog_output = Some(json!(output));
+        let mut pipeline =
+            Pipeline::new(BTreeMap::from([("OUTPUT_PATH".into(), "a".repeat(1020))])).unwrap();
+        pipeline.enable_stream_issue_reports();
+        let (reply, issues) =
+            request_and_publish(&mut harness, &mut pipeline, launch("optional-output"));
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        let issue = &issues[0];
+        assert_reported_here(issue, "optional-output");
+        assert_eq!(issue.disposition, IssueDisposition::DemotedWarning);
+        assert_eq!(issue.fallback.as_deref(), Some("discard_output"));
+        assert_eq!(reply["launch"]["state"], "active", "{reply}");
+        let spawn = harness
+            .commands
+            .iter()
+            .find(|(service, request, _)| {
+                service == crate::workflow::APPLICATION && request["action"] == "launch"
+            })
+            .unwrap();
+        assert!(spawn.1["output"].is_null());
+        let warnings = harness.request(
+            &mut pipeline,
+            "alice",
+            json!({"action":"warnings", "launch_id": reply["launch"]["launch_id"]}),
+        );
+        assert_eq!(
+            warnings["warnings"][0]["reason"],
+            "output_path_resolution_failed"
+        );
+        assert_eq!(warnings["warnings"][0]["effective"], "discarded");
+    }
+}
+
+#[test]
 fn a_launch_warning_is_published_once_as_an_advisory() {
     let mut harness = Harness::new();
     harness.application_warning = Some("proton_hook_unconfirmed");

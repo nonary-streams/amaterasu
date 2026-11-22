@@ -140,8 +140,8 @@ otherwise each raw target's directory is inferred from its resolved path or
 executable when the catalog omits `working_directory`.
 Raw preparation uses the same bounded executable lookup as detached commands.
 Explicit relative target paths resolve against the configured preparation cwd
-or the current host directory. Both raw preparation and detached commands reject
-implicit `.bat`/`.cmd` targets; configure an interpreter explicitly instead.
+or the current host directory. On Windows, both raw preparation and detached commands require an explicit
+interpreter for `.bat` and `.cmd` targets.
 Raw `do` waits for the command to exit, matching the reference helper; an
 explicit stop or cancellation still begins bounded process-tree cleanup. Raw
 `undo` snapshots a deadline of `max(exit_timeout_seconds, 15)` seconds, matching
@@ -183,8 +183,8 @@ preparation commands use structured argv with no command-string splitting or
 implicit shell. There is no executable allowlist. The launch-level
 `elevated` flag defaults to false and is passed to the primary application and
 detached children; Unix spawning ignores it.
-`.bat` and `.cmd` executable extensions are rejected case-insensitively on every
-platform because Windows may otherwise invoke a shell implicitly. A trusted
+`.bat` and `.cmd` executable extensions require an explicit interpreter on Windows because the OS may
+invoke a shell implicitly. Unix uses native executable semantics. A trusted
 caller can explicitly choose an interpreter and pass arguments to it. Arguments
 follow `std::process::Command` platform conventions, including Windows argument
 encoding; this is not a universal argument parser for unusual Windows programs.
@@ -301,7 +301,7 @@ Limits, measured in UTF-8 bytes unless otherwise stated:
 - Args: at most 64, each at most 1,024 bytes, 8,192 bytes combined, no NUL.
 - Environment: at most 32 keys, keys of 1–128 ASCII alphanumeric/underscore
   bytes, values at most 1,024 bytes without NUL, 4,096 key/value bytes combined.
-  Keys must be unique ignoring ASCII case.
+  Keys are case-sensitive on Unix and ASCII case-insensitive on Windows.
 - Preparation: at most eight steps. Structured run/undo commands have the same
   path, argument, and environment limits as the application plus a 1–30,000 ms
   timeout. Raw run has a 10-second deadline; raw undo uses the 15–300 second

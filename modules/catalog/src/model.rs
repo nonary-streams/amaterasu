@@ -1,3 +1,7 @@
+use amaterasu_module_sdk::launch_command::{
+    environment_name_key, expand_launch_path, is_bare_command, requires_command_interpreter,
+    trim_path_quotes,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -1196,9 +1200,9 @@ impl Entry {
                 detached,
                 preparation,
             } => {
-                validate_path(program)?;
-                if arguments.len() > 32 || arguments.iter().any(|arg| !bounded_text(arg, 1024)) {
-                    return Err("at most 32 printable arguments of 1024 bytes are allowed");
+                validate_configured_launch_path(program, true)?;
+                if arguments.len() > 64 || arguments.iter().any(|arg| !bounded_text(arg, 1024)) {
+                    return Err("at most 64 printable arguments of 1024 bytes are allowed");
                 }
                 if let Some(directory) = working_directory {
                     validate_working_directory(directory)?;
@@ -1382,13 +1386,7 @@ fn validate_command(command: &ConfiguredCommand) -> Result<(), &'static str> {
     {
         return Err("command executable and cwd must be native absolute paths");
     }
-    if Path::new(&command.executable)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
-        })
-    {
+    if requires_command_interpreter(Path::new(&command.executable)) {
         return Err("batch command targets require an explicit interpreter");
     }
     if command.args.len() > 64
@@ -1436,7 +1434,7 @@ fn validate_command_environment(
     }
     let mut names = environment
         .keys()
-        .map(|key| key.to_ascii_uppercase())
+        .map(|key| environment_name_key(key))
         .collect::<Vec<_>>();
     names.sort_unstable();
     if names.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -1470,8 +1468,29 @@ fn validate_path(path: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+// Validate the template without reading the catalog process's environment. The
+// launch provider resolves the real values and checks the resulting native path.
+fn validate_configured_launch_path(path: &str, allow_bare: bool) -> Result<(), &'static str> {
+    if validate_path(path).is_ok() {
+        return Ok(());
+    }
+    if !bounded_text(path, 1_024) {
+        return Err("invalid configured launch path");
+    }
+    let template = trim_path_quotes(path);
+    let literal = expand_launch_path(template, |_| None)?;
+    if template.starts_with("$(") {
+        // A leading reference may supply the absolute directory or executable.
+        validate_path(&format!("/{literal}"))
+    } else if allow_bare && is_bare_command(&literal) {
+        Ok(())
+    } else {
+        validate_path(&literal)
+    }
+}
+
 fn validate_working_directory(path: &str) -> Result<(), &'static str> {
-    validate_path(path)?;
+    validate_configured_launch_path(path, false)?;
     if path.len() > MAX_LAUNCH_WORKING_DIRECTORY_BYTES {
         return Err("working directory exceeds the 1024-byte launch protocol limit");
     }

@@ -2091,6 +2091,7 @@ fn malformed_paths_arguments_environment_and_payload_are_rejected() {
     for (field, value) in [
         ("executable", json!("relative")),
         ("cwd", json!("relative")),
+        #[cfg(windows)]
         (
             "executable",
             json!(std::env::temp_dir().join("implicit.CMD")),
@@ -2098,6 +2099,7 @@ fn malformed_paths_arguments_environment_and_payload_are_rejected() {
         ("args", json!(["\u{0}"])),
         ("args", json!(vec!["arg"; 65])),
         ("environment", json!({"INVALID=KEY":"value"})),
+        #[cfg(windows)]
         ("environment", json!({"Path":"one","PATH":"two"})),
         ("operation_id", json!("has spaces")),
     ] {

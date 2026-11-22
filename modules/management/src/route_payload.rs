@@ -1,6 +1,7 @@
 //! Field validation for routes with explicit payload restrictions.
 //! Native domain services retain semantic validation and effect authorization.
 use crate::routes::Route;
+use amaterasu_module_sdk::launch_command::{environment_name_key, requires_command_interpreter};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -2386,10 +2387,10 @@ fn catalog_launch(value: &Value, raw_preparation_count: usize) -> Result<(), &'s
             optional_boolean(launch, "wait_all", "wait-all")?;
             optional_timeout(launch, "exit_timeout_seconds", "exit-timeout")?;
             if let Some(arguments) = launch.get("arguments") {
-                string_array(arguments, 32, 1024, true)?;
+                string_array(arguments, 64, 1024, true)?;
             }
             if let Some(detached) = launch.get("detached") {
-                string_array(detached, 16, 2048, false)?;
+                catalog_detached_commands(detached)?;
             }
             if let Some(preparation) = launch.get("preparation") {
                 catalog_preparation(preparation)?;
@@ -2526,12 +2527,7 @@ fn validate_global_preparation_command(value: &Value) -> Result<(), &'static str
         || executable.len() > 1024
         || executable.contains('\0')
         || !executable_path.is_absolute()
-        || executable_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
-            })
+        || requires_command_interpreter(executable_path)
     {
         return Err(INVALID);
     }
@@ -2563,35 +2559,86 @@ fn catalog_command(value: &Value) -> Result<(), &'static str> {
         return Err(INVALID);
     }
     if let Some(environment) = command.get("environment") {
-        let environment = environment.as_object().ok_or(INVALID)?;
-        let mut folded_names = BTreeSet::new();
-        if environment.len() > 32
-            || environment.iter().any(|(key, value)| {
-                let invalid_key = key.is_empty()
-                    || key.len() > 128
-                    || !key
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-                invalid_key
-                    || value
-                        .as_str()
-                        .is_none_or(|value| value.len() > 1024 || value.contains('\0'))
-                    || !folded_names.insert(key.to_ascii_uppercase())
-            })
-            || environment
-                .iter()
-                .map(|(key, value)| key.len() + value.as_str().map_or(0, str::len))
-                .sum::<usize>()
-                > 4096
-        {
-            return Err(INVALID);
-        }
+        command_environment(environment)?;
     }
     if command.get("timeout_ms").is_some_and(|value| {
         !value
             .as_u64()
             .is_some_and(|timeout| (1..=30_000).contains(&timeout))
     }) {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn catalog_detached_commands(value: &Value) -> Result<(), &'static str> {
+    let commands = value.as_array().ok_or(INVALID)?;
+    if commands.len() > 16 {
+        return Err(INVALID);
+    }
+    for command in commands {
+        let command_text = if let Some(settings) = command.as_object() {
+            fields(
+                settings,
+                &["command"],
+                &[
+                    "environment",
+                    "cwd",
+                    "working_directory",
+                    "stdout",
+                    "stderr",
+                ],
+            )?;
+            optional_string(settings, "cwd", "working_directory")?;
+            for key in ["cwd", "working_directory", "stdout", "stderr"] {
+                if settings.get(key).is_some_and(|v| {
+                    !v.is_null()
+                        && v.as_str().is_none_or(|s| {
+                            s.is_empty() || s.len() > 1024 || s.chars().any(char::is_control)
+                        })
+                }) {
+                    return Err(INVALID);
+                }
+            }
+            if let Some(environment) = settings.get("environment") {
+                command_environment(environment)?;
+            }
+            text(settings, "command")?
+        } else {
+            command.as_str().ok_or(INVALID)?
+        };
+        if command_text.is_empty()
+            || command_text.len() > 2048
+            || command_text.chars().any(char::is_control)
+        {
+            return Err(INVALID);
+        }
+    }
+    Ok(())
+}
+
+fn command_environment(environment: &Value) -> Result<(), &'static str> {
+    let environment = environment.as_object().ok_or(INVALID)?;
+    let mut folded_names = BTreeSet::new();
+    if environment.len() > 32
+        || environment.iter().any(|(key, value)| {
+            let invalid_key = key.is_empty()
+                || key.len() > 128
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            invalid_key
+                || value
+                    .as_str()
+                    .is_none_or(|value| value.len() > 1024 || value.contains('\0'))
+                || !folded_names.insert(environment_name_key(key))
+        })
+        || environment
+            .iter()
+            .map(|(key, value)| key.len() + value.as_str().map_or(0, str::len))
+            .sum::<usize>()
+            > 4096
+    {
         return Err(INVALID);
     }
     Ok(())
@@ -3444,6 +3491,7 @@ mod nvhttp_tests {
             serde_json::json!({}),
             serde_json::json!([{"run":{"executable":"relative.exe"}}]),
             serde_json::json!([{"run":{"executable":std::env::current_exe().unwrap(),"cwd":"relative"}}]),
+            #[cfg(windows)]
             serde_json::json!([{"run":{"executable":format!("{}.cmd", executable.display())}}]),
             serde_json::json!([{"run":{"executable":format!("{}\0", executable.display())}}]),
             serde_json::json!([{"run":{"executable":overlong_executable}}]),
@@ -3452,6 +3500,7 @@ mod nvhttp_tests {
             serde_json::json!([{"run":{"executable":executable,"unknown":true}}]),
             serde_json::json!([{"run":{"executable":executable,"args":[1]}}]),
             serde_json::json!([{"run":{"executable":executable,"args":std::iter::repeat_n("x", 9).map(|_| "x".repeat(1024)).collect::<Vec<_>>()}}]),
+            #[cfg(windows)]
             serde_json::json!([{"run":{"executable":executable,"environment":{"PATH":"a","Path":"b"}}}]),
             serde_json::json!(
                 std::iter::repeat_n(
@@ -5170,6 +5219,17 @@ mod catalog_tests {
                 "accepted invalid Catalog frame limiter override: {overrides}"
             );
         }
+    }
+
+    #[test]
+    fn catalog_routes_admit_configured_helpers_and_native_argument_count() {
+        let mut request = serde_json::json!({"expected_revision":0,"entry":{"name":"Game","launch":{
+            "kind":"executable","program":"game","arguments":vec!["arg";64],
+            "detached":["first",{"command":"helper","working_directory":"/games","environment":{"MODE":"play"},"stdout":"/logs/helper"}]
+        }}});
+        assert!(validate(route("create"), request.as_object().unwrap()).is_ok());
+        request["entry"]["launch"]["detached"][1]["elevated"] = Value::Bool(true);
+        assert!(validate(route("create"), request.as_object().unwrap()).is_err());
     }
 
     #[test]

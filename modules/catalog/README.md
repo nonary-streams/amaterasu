@@ -180,7 +180,10 @@ catalog document. Typed Playnite launch targets default to a 10-second exit
 timeout. `detached` defaults to an empty ordered list. The accepted
 aliases `auto-detach`, `wait-all`, and `exit-timeout` are serialized using their
 canonical underscore names. `exit_timeout_seconds` is limited to 300;
-`detached` accepts up to 16 nonempty command strings of 2048 bytes each.
+`detached` accepts up to 16 commands of 2048 bytes each. Each entry can be a
+string or an object with `command` and optional `cwd`, `environment`, `stdout`
+and `stderr`. The management editor supports both forms and preserves their
+order. Select JSON format to edit per-command settings.
 Detached strings are parsed by the application module at launch time, so catalog
 validation checks their bounds and control characters while launch validation
 checks command syntax. These fields configure the application process manager;
@@ -212,9 +215,13 @@ idempotent; reload first and reconcile.
 
 Entry names are nonblank and at most 160 UTF-8 bytes; descriptions 1024 bytes;
 at most 16 nonblank tags of 64 bytes each. Strings reject control characters.
-Executable and application paths must be absolute POSIX, Windows drive-rooted,
-or UNC paths, at most 2048 bytes, without `.`/`..` path segments. At most 32
-arguments of 1024 bytes each are allowed. Validation is structural across host
+Application paths accept absolute POSIX, Windows drive-rooted, or UNC paths
+of at most 2048 bytes without dot segments. Executable entries also accept
+a bare command found on the launch host's effective `PATH`. The executable
+and working directory support matching outer quotes and bounded `$(NAME)`
+references resolved by the launch provider. The resolved native paths must
+fit 1024 bytes. A launch accepts up to 64 arguments of at most 1024 bytes
+each and 8192 argument bytes in total. Catalog validation is structural across host
 platforms: no filesystem existence, executable type, bundle validity, network
 access, environment expansion, shell parsing or launch authorization is implied.
 Arguments remain literal metadata. This module never launches applications.
@@ -224,12 +231,11 @@ allowed. Each step requires one `run` command and may contain one `undo` command
 Each command has these limits:
 
 - `executable` and optional `cwd` are native absolute paths of 1–1,024 bytes
-  without NUL. `.bat` and `.cmd` executables are rejected case-insensitively;
-  choose an interpreter explicitly when needed.
+  without NUL. Windows requires an explicit interpreter for `.bat` and `.cmd` files.
 - `args` contains at most 64 literal values, each at most 1,024 bytes and without
   NUL, with at most 8,192 bytes combined.
 - `environment` contains at most 32 explicit keys. Keys are 1–128 ASCII
-  alphanumeric/underscore bytes and unique ignoring ASCII case; values are at
+  alphanumeric/underscore bytes and unique under the host OS name comparison; values are at
   most 1,024 bytes without NUL; keys and values total at most 4,096 bytes. The
   lifecycle consumer clears its inherited environment before applying this map.
 - `timeout_ms` is 1–30,000 milliseconds and defaults to 10,000.

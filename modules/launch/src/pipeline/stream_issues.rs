@@ -119,6 +119,30 @@ impl Record {
         ));
     }
 
+    /// A configured log path could not be resolved before a process was started.
+    #[track_caller]
+    pub(crate) fn discard_unresolved_output(&mut self, step: Step) {
+        use amaterasu_module_sdk::stream_warnings::{MAX_WARNINGS, WarningValue};
+        let issue = StreamIssue::demoted(
+            self.operation_id.clone(),
+            LifecycleLayer::Application,
+            step_phase(step),
+            "application_output_unavailable",
+            "discard_output",
+        )
+        .because("output_path_resolution_failed")
+        .with_values(
+            Some(WarningValue::Label("configured_output".into())),
+            Some(WarningValue::Label("discarded".into())),
+        );
+        eprintln!("{}", issue.description());
+        let warning = issue.to_stream_warning(crate::SERVICE);
+        if self.warnings.len() < MAX_WARNINGS && !self.warnings.contains(&warning) {
+            self.warnings.push(warning);
+        }
+        self.issues.push(issue);
+    }
+
     /// A launch warning, reported when this launch first records it.
     #[track_caller]
     pub(crate) fn report_warning(&mut self, step: Step, warning: &StreamWarning) {

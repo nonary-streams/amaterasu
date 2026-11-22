@@ -2,6 +2,7 @@ use crate::commands::{DetachedCommand, DetachedCommandInput};
 use crate::lifecycle::{PreparationStep, validate_environment};
 use crate::output::{deserialize_output, validate_output};
 use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
+use amaterasu_module_sdk::launch_command::requires_command_interpreter;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -230,15 +231,7 @@ impl LaunchSpec {
         {
             return Err("executable and cwd must be absolute paths of 1 to 1024 bytes without NUL");
         }
-        // std::process may invoke cmd.exe implicitly for batch targets on Windows.
-        // Disallow them on every platform to keep the explicit-executable contract.
-        if Path::new(&self.executable)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
-            })
-        {
+        if requires_command_interpreter(Path::new(&self.executable)) {
             return Err("batch targets are not supported; interpreters must be explicit");
         }
         if self.args.len() > 64
@@ -252,36 +245,7 @@ impl LaunchSpec {
                 "args exceed 64 items, 1024 bytes per item, or 8192 total bytes, or contain NUL",
             );
         }
-        if self.environment.len() > 32
-            || self.environment.iter().any(|(key, value)| {
-                key.is_empty()
-                    || key.len() > 128
-                    || !key
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                    || value.len() > 1024
-                    || value.contains('\0')
-            })
-            || self
-                .environment
-                .iter()
-                .map(|(key, value)| key.len() + value.len())
-                .sum::<usize>()
-                > 4096
-        {
-            return Err("environment exceeds limits or contains invalid keys or NUL values");
-        }
-        // Windows environment variable names are case insensitive. Reject ambiguity on
-        // every platform so the same request has one interpretation everywhere.
-        let mut names: Vec<_> = self
-            .environment
-            .keys()
-            .map(|key| key.to_ascii_uppercase())
-            .collect();
-        names.sort();
-        if names.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err("environment keys must be unique ignoring ASCII case");
-        }
+        validate_environment(&self.environment)?;
         PreparationStep::validate_all(&self.preparation)?;
         Ok(())
     }

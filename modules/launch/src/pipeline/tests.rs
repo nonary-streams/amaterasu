@@ -2332,13 +2332,8 @@ fn provider_output_creates_a_preparation_lease_even_without_commands() {
 }
 
 #[test]
-fn invalid_catalog_output_is_rejected_before_session_or_command_effects() {
-    for output in [
-        json!(42),
-        json!("bad\npath"),
-        json!("$(UNCLOSED"),
-        json!("x".repeat(1_025)),
-    ] {
+fn malformed_catalog_output_field_is_rejected_before_session_or_command_effects() {
+    for output in [json!(42), json!("bad\npath"), json!("x".repeat(1_025))] {
         let mut harness = Harness::new();
         harness.catalog_output = Some(output);
         let mut pipeline = pipeline();
