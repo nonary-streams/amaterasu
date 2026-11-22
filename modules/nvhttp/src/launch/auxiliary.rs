@@ -299,9 +299,11 @@ impl Controller {
         {
             return Some(private_error(503, code));
         }
-        if let Err(code) = self.codec_offer(
+        if let Err(code) = self.check_configured_encoder(
             self.config.as_ref().expect("validated streaming config"),
             &request,
+            &peer,
+            None,
         ) {
             return Some(private_error(503, code));
         }

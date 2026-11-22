@@ -432,15 +432,30 @@ var Amaterasu;
         return value;
     }
     Amaterasu.parseSteamInstallDir = parseSteamInstallDir;
-    function parseDetachedCommands(value) {
-        const commands = value
-            .split(/\r?\n/)
-            .map((command) => command.trim())
-            .filter(Boolean);
-        if (commands.length > 16 ||
-            commands.some((command) => new TextEncoder().encode(command).length > 2048 ||
-                /[\u0000-\u001f\u007f]/.test(command))) {
-            throw new Error("Enter up to 16 detached commands, each at most 2048 bytes without control characters.");
+    function parseDetachedCommands(value, jsonFormat = false) {
+        const commands = jsonFormat
+            ? JSON.parse(value.trim() || "[]")
+            : value.split(/\r?\n/).map(command => command.trim()).filter(Boolean);
+        if (!Array.isArray(commands) || commands.length > 16)
+            throw new Error("Enter up to 16 detached commands.");
+        for (const item of commands) {
+            let command = item;
+            if (typeof item === "object" && item !== null && !Array.isArray(item)) {
+                if (Object.keys(item).some(key => !["command", "environment", "cwd", "working_directory", "stdout", "stderr"].includes(key)) ||
+                    ("cwd" in item && "working_directory" in item))
+                    throw new Error("Detached command contains unsupported or conflicting settings.");
+                for (const path of [item.cwd, item.working_directory, item.stdout, item.stderr]) {
+                    if (path != null && (typeof path !== "string" || !isAbsolutePreparationPath(path) ||
+                        new TextEncoder().encode(path).length > 1024 || /[\u0000-\u001f\u007f-\u009f]/.test(path)))
+                        throw new Error("Detached command paths must be absolute and at most 1024 bytes.");
+                }
+                if (item.environment !== undefined)
+                    validateCommandEnvironment(item.environment);
+                command = item.command;
+            }
+            if (typeof command !== "string" || !command.length || new TextEncoder().encode(command).length > 2048 ||
+                /[\u0000-\u001f\u007f-\u009f]/.test(command))
+                throw new Error("Each detached command needs printable command text of at most 2048 bytes.");
         }
         return commands;
     }
@@ -492,9 +507,8 @@ var Amaterasu;
         if (typeof command.executable !== "string" ||
             !isAbsolutePreparationPath(command.executable) ||
             new TextEncoder().encode(command.executable).length > 1024 ||
-            command.executable.includes("\0") ||
-            /\.(bat|cmd)$/i.test(command.executable))
-            throw new Error("Preparation executable must be a native absolute path of at most 1024 bytes; batch files need an explicit interpreter.");
+            command.executable.includes("\0"))
+            throw new Error("Preparation executable must be a native absolute path of at most 1024 bytes.");
         if (command.cwd != null &&
             (typeof command.cwd !== "string" ||
                 !isAbsolutePreparationPath(command.cwd) ||
@@ -514,28 +528,26 @@ var Amaterasu;
             command.timeout_ms < 1 ||
             command.timeout_ms > 30000))
             throw new Error("Preparation timeout must be a whole number from 1 to 30000 milliseconds.");
-        if (command.environment !== undefined) {
-            const environment = command.environment;
-            if (environment === null || Array.isArray(environment) || typeof environment !== "object")
-                throw new Error("Preparation environment must be a JSON object.");
-            const entries = Object.entries(environment);
-            const foldedNames = new Set();
-            let totalBytes = 0;
-            for (const [key, rawValue] of entries) {
-                if (key.length === 0 ||
-                    new TextEncoder().encode(key).length > 128 ||
-                    !/^[A-Za-z0-9_]+$/.test(key) ||
-                    typeof rawValue !== "string" ||
-                    new TextEncoder().encode(rawValue).length > 1024 ||
-                    rawValue.includes("\0") ||
-                    foldedNames.has(key.toUpperCase()))
-                    throw new Error("Preparation environment names and values exceed their limits or are invalid.");
-                foldedNames.add(key.toUpperCase());
-                totalBytes += new TextEncoder().encode(key).length + new TextEncoder().encode(rawValue).length;
-            }
-            if (entries.length > 32 || totalBytes > 4096)
-                throw new Error("Preparation environment exceeds the 32 variable and 4096 byte limits.");
+        if (command.environment !== undefined)
+            validateCommandEnvironment(command.environment);
+    }
+    function validateCommandEnvironment(environment) {
+        if (environment === null || Array.isArray(environment) || typeof environment !== "object")
+            throw new Error("Command environment must be a JSON object.");
+        const entries = Object.entries(environment);
+        let totalBytes = 0;
+        for (const [key, rawValue] of entries) {
+            if (key.length === 0 ||
+                new TextEncoder().encode(key).length > 128 ||
+                !/^[A-Za-z0-9_]+$/.test(key) ||
+                typeof rawValue !== "string" ||
+                new TextEncoder().encode(rawValue).length > 1024 ||
+                rawValue.includes("\0"))
+                throw new Error("Command environment names and values exceed their limits or are invalid.");
+            totalBytes += new TextEncoder().encode(key).length + new TextEncoder().encode(rawValue).length;
         }
+        if (entries.length > 32 || totalBytes > 4096)
+            throw new Error("Command environment exceeds the 32 variable and 4096 byte limits.");
     }
     function isAbsolutePreparationPath(value) {
         return value.startsWith("/") ||
@@ -609,7 +621,7 @@ var Amaterasu;
                 ...(prefer10BitSdr === null ? {} : { prefer_10bit_sdr: prefer10BitSdr }),
             };
         const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
-        const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
+        const detached = kind === "executable" ? parseDetachedCommands(text("detached"), data.has("detached_json")) : [];
         const preparation = kind !== "application" ? parsePreparation(text("preparation")) : [];
         if (preparation.length + rawPreparation.length > 8)
             throw new Error("An application can contain at most 8 preparation steps.");
@@ -8741,7 +8753,24 @@ var Amaterasu;
         const detached = Amaterasu.el("textarea");
         detached.name = "detached";
         detached.rows = 3;
-        detached.value = executableLaunch?.detached?.join("\n") ?? "";
+        const helpers = executableLaunch?.detached ?? [];
+        const detachedJson = Amaterasu.input("detached_json", "1", "checkbox");
+        detachedJson.checked = helpers.some(helper => typeof helper !== "string" || helper.trim() !== helper);
+        detached.value = detachedJson.checked ? JSON.stringify(helpers, null, 2) : helpers.join("\n");
+        detachedJson.addEventListener("change", () => {
+            try {
+                const commands = Amaterasu.parseDetachedCommands(detached.value, !detachedJson.checked);
+                if (!detachedJson.checked && commands.some(command => typeof command !== "string" || command.trim() !== command))
+                    throw new Error("Per-command settings and surrounding whitespace require JSON format.");
+                detached.value = detachedJson.checked ? JSON.stringify(commands, null, 2) : commands.join("\n");
+            }
+            catch (error) {
+                detachedJson.checked = !detachedJson.checked;
+                detached.setCustomValidity(error instanceof Error ? error.message : "Invalid detached commands.");
+                detached.reportValidity();
+                detached.setCustomValidity("");
+            }
+        });
         const preparation = Amaterasu.input("preparation", JSON.stringify(preparedLaunch?.preparation ?? []), "hidden");
         const rawPreparation = Amaterasu.input("prep_cmd", JSON.stringify(entry?.prep_cmd ?? []), "hidden");
         const fec = Amaterasu.input("fec_percentage", entry?.config_overrides?.fec_percentage?.toString() ?? "", "number");
@@ -8782,10 +8811,10 @@ var Amaterasu;
         fullscreenTimeout.max = "300";
         fullscreenTimeout.step = "1";
         fullscreenTimeout.required = true;
-        const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Run with administrator privileges", elevated, "Windows uses an available elevated user token. Other platforms keep the host's normal launch identity."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "One ordered command per line; up to 16."));
+        const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Run with administrator privileges", elevated, "Windows uses an available elevated user token. Other platforms keep the host's normal launch identity."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "Enter up to 16 commands, one per line or as a JSON array."), Amaterasu.field("Use JSON for per-command settings", detachedJson));
         const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), processPolicy);
         const sharedLaunchOptions = Amaterasu.el("div", "form-grid", Amaterasu.field("Working directory", directory, "Optional absolute path."), preparation);
-        const pathField = Amaterasu.field("Absolute application path", path);
+        const pathField = Amaterasu.field("Application path", path, "Executable entries also accept a command on PATH.");
         const steamIdField = Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
         const steamInstallDirField = Amaterasu.field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
         const steamChooserStatus = Amaterasu.el("p", "muted");

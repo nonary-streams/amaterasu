@@ -20,6 +20,13 @@ See [Capture provider SDK](capture-plugin-sdk.md) for the frame contracts and
 `modules/encode-video/encode/README.md` for built-in backend capabilities and qualification.
 Those capabilities do not automatically apply to a third-party component.
 
+An enumeration entry may include a `mode_limit` object with positive integer
+`width`, `height`, and `fps`. This uses the SDK's `encode::ModeLimit` schema.
+NVHTTP filters codec offers against those bounds and limits RTSP to a mode
+supported by every offered codec. Entries without a provider limit inherit the configured host profile bounds.
+A software codec offered above 1920×1080 or 60 FPS produces a performance advisory. Exact configuration probes
+and the encoder's Open still decide whether the selected configuration works.
+
 `EncoderProviderApi`, `FrameResourceConsumerApi`, and `EncoderInputPoolApiV1`
 are independent optional native interfaces. Their definitions do not by
 themselves connect a provider to video. The current video source contains

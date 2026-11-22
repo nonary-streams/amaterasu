@@ -4,6 +4,7 @@ use crate::command_paths::resolve_command_executable;
 use crate::commands::parse_detached_commands;
 use crate::containment::ContainedChild;
 use crate::output::{SharedOutput, output_warning, push_warning};
+use amaterasu_module_sdk::launch_command::{environment_name_key, requires_command_interpreter};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -38,13 +39,7 @@ impl ConfiguredCommand {
         {
             return Err("command executable and cwd must be absolute paths");
         }
-        if Path::new(&self.executable)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
-            })
-        {
+        if requires_command_interpreter(Path::new(&self.executable)) {
             return Err("batch command targets require an explicit interpreter");
         }
         if self.args.len() > 64
@@ -427,7 +422,7 @@ pub(crate) fn validate_environment(
     }
     let mut names: Vec<_> = environment
         .keys()
-        .map(|key| key.to_ascii_uppercase())
+        .map(|key| environment_name_key(key))
         .collect();
     names.sort();
     if names.windows(2).any(|pair| pair[0] == pair[1]) {

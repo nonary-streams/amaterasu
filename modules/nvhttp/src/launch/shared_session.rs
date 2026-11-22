@@ -246,7 +246,12 @@ impl Controller {
         {
             return Some(private_error(503, "client stream capacity exhausted"));
         }
-        if let Err(message) = self.codec_offer(config, &request) {
+        if let Err(message) = self.check_configured_encoder(
+            config,
+            &request,
+            &peer,
+            Some(&self.records[&application]),
+        ) {
             return Some(private_error(503, message));
         }
         let id = match self.allocate_id() {

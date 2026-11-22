@@ -706,6 +706,8 @@ fn pagination_is_bounded_and_rejects_stale_or_cross_query_cursors() {
 #[test]
 fn validates_launch_metadata_cross_platform_and_persisted_identity() {
     for program in [
+        "game",
+        "\"$(GAME_ROOT)/bin/game\"",
         "/opt/games/game",
         "C:\\Games\\game.exe",
         "\\\\server\\games\\game.exe",
@@ -713,8 +715,8 @@ fn validates_launch_metadata_cross_platform_and_persisted_identity() {
         let mut game = entry("Game");
         game.launch = crate::model::Launch::Executable {
             program: program.into(),
-            arguments: vec!["--literal=$HOME".into()],
-            working_directory: None,
+            arguments: vec!["--literal=$HOME".into(); 64],
+            working_directory: Some("$(GAME_ROOT)".into()),
             auto_detach: Some(true),
             wait_all: Some(true),
             exit_timeout_seconds: Some(10),
@@ -1219,6 +1221,10 @@ fn preparation_and_command_bounds_are_enforced_for_run_and_undo() {
     ambiguous_environment["run"]["environment"] = json!({"PATH":"one","Path":"two"});
     assert_eq!(
         prepared_entry(vec![ambiguous_environment]).validate(),
-        Err("command environment names are ambiguous")
+        if cfg!(windows) {
+            Err("command environment names are ambiguous")
+        } else {
+            Ok(())
+        }
     );
 }

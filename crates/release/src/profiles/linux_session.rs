@@ -1119,11 +1119,8 @@ fn nvhttp_settings(options: &LinuxSessionOptions) -> Value {
     })
 }
 
-/// Streams reach 3840x2160 at 120 Hz when a hardware encoder serves the
-/// negotiated codec. NVHTTP refuses a launch above 1920x1080 at 60 Hz that only
-/// a software encoder could serve: software x264 cannot sustain the host
-/// desktop's own 3024x1890 at 90 Hz, and such requests are refused instead of
-/// silently degraded.
+/// The profile permits up to 3840×2160 at 120 Hz. Each selected encoder may
+/// publish tighter mode bounds for its codec.
 fn streaming_settings(options: &LinuxSessionOptions) -> Value {
     json!({
         "capture": {

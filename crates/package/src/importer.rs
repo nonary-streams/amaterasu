@@ -637,7 +637,7 @@ fn validate_catalog_entry(entry: &CatalogEntry) -> PackageResult<()> {
     if let Some(directory) = working_directory {
         valid_catalog_path(directory)?;
     }
-    if arguments.len() > 32
+    if arguments.len() > 64
         || arguments
             .iter()
             .any(|argument| !valid_plain_text(argument, 1024))

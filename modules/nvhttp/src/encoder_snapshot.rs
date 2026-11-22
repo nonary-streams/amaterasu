@@ -6,7 +6,7 @@
 //! the codecs RTSP may offer a launched client. A codec is never offered when
 //! no enumerated encoder produces it.
 use amaterasu_media::VideoCodec;
-use amaterasu_module_sdk::{EncoderBackend, EncoderIdentity, EncoderSelection};
+use amaterasu_module_sdk::{EncoderBackend, EncoderIdentity, EncoderSelection, encode::ModeLimit};
 use serde_json::Value;
 
 /// Moonlight's `ServerCodecModeSupport` bits (Limelight.h `SCM_*`). Only 8-bit
@@ -21,10 +21,12 @@ const SCM_AV1_MAIN10: u32 = 0x0002_0000;
 /// zero as none. This is the luma rate Sunshine reports for HEVC hosts.
 const HEVC_MAX_LUMA_PIXELS: u64 = 1_869_449_984;
 
-/// The largest stream a software encoder is trusted to sustain.
-pub const SOFTWARE_MAX_WIDTH: u32 = 1920;
-pub const SOFTWARE_MAX_HEIGHT: u32 = 1080;
-pub const SOFTWARE_MAX_FPS: u32 = 60;
+/// Higher software modes merit a performance advisory before playback.
+const SOFTWARE_ADVISORY_THRESHOLD: ModeLimit = ModeLimit {
+    width: 1920,
+    height: 1080,
+    fps: 60,
+};
 
 /// Matches the video module's bound on one enumeration reply.
 const MAX_ENCODERS: usize = 64;
@@ -35,6 +37,7 @@ struct EncoderEntry {
     codec: Option<VideoCodec>,
     identity: Option<EncoderIdentity>,
     hardware: bool,
+    mode_limit: Option<ModeLimit>,
     hdr10: bool,
     yuv444: bool,
     yuv444_10bit: bool,
@@ -52,9 +55,9 @@ pub struct EncoderSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodecOffer {
     pub codecs: Vec<VideoCodec>,
-    /// Some offered codec has only a software encoder, so negotiation stays
-    /// within the software stream limit.
-    pub software_limited: bool,
+    /// Bound shared by every offered codec with a finite provider limit.
+    pub mode_limit: Option<ModeLimit>,
+    pub warn_software_performance: bool,
 }
 
 /// Values serverinfo advertises for the host's video codecs.
@@ -72,20 +75,7 @@ impl CodecAdvertisement {
     };
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StreamMode {
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-}
-
-impl StreamMode {
-    fn within_software_limit(self) -> bool {
-        self.width <= SOFTWARE_MAX_WIDTH
-            && self.height <= SOFTWARE_MAX_HEIGHT
-            && self.fps <= SOFTWARE_MAX_FPS
-    }
-}
+pub use amaterasu_module_sdk::encode::ModeLimit as StreamMode;
 
 impl EncoderSnapshot {
     /// Parse an enumerate reply. A disabled encoder module yields an empty
@@ -183,8 +173,7 @@ impl EncoderSnapshot {
 
     /// Codecs whose encoders can serve `mode`. A numeric selection pins one
     /// enumerated encoder and so exactly its codec; automatic selection
-    /// offers every codec with a capable encoder. Above the software limit
-    /// only hardware encoders qualify.
+    /// offers every codec with a capable encoder.
     pub fn offer(
         &self,
         selection: EncoderSelection,
@@ -213,35 +202,42 @@ impl EncoderSnapshot {
                 .collect(),
         };
         let mut codecs = Vec::new();
-        let mut software_limited = false;
-        let mut refused_software = false;
+        let mut exceeds_provider_limit = false;
+        let mut warn_software_performance = false;
+        let mut mode_limit: Option<ModeLimit> = None;
         for codec in [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264] {
-            let mut encoders = candidates
-                .iter()
-                .filter(|entry| entry.codec == Some(codec))
-                .peekable();
-            if encoders.peek().is_none() {
-                continue;
-            }
-            if encoders.any(|entry| entry.hardware) {
+            let mut entries = candidates.iter().filter(|entry| entry.codec == Some(codec));
+            let best = entries
+                .clone()
+                .filter(|entry| entry.mode_limit.is_none_or(|limit| limit.supports(mode)))
+                .max_by_key(|entry| {
+                    let size = entry.mode_limit.map_or(u128::MAX, |limit| {
+                        u128::from(limit.width) * u128::from(limit.height) * u128::from(limit.fps)
+                    });
+                    (entry.hardware, size)
+                });
+            if let Some(entry) = best {
                 codecs.push(codec);
-            } else if mode.within_software_limit() {
-                codecs.push(codec);
-                software_limited = true;
+                warn_software_performance |=
+                    !entry.hardware && !SOFTWARE_ADVISORY_THRESHOLD.supports(mode);
+                if let Some(limit) = entry.mode_limit {
+                    mode_limit = Some(mode_limit.map_or(limit, |current| current.intersect(limit)));
+                }
             } else {
-                refused_software = true;
+                exceeds_provider_limit |= entries.next().is_some();
             }
         }
         if codecs.is_empty() {
-            return Err(if refused_software {
-                "no hardware encoder for this stream mode"
+            return Err(if exceeds_provider_limit {
+                "stream mode exceeds selected encoder capabilities"
             } else {
                 "no video encoder is available"
             });
         }
         Ok(CodecOffer {
             codecs,
-            software_limited,
+            mode_limit,
+            warn_software_performance,
         })
     }
 
@@ -265,16 +261,13 @@ impl EncoderSnapshot {
     }
 }
 
-/// Before the first enumeration completes, assume a single software H.264
-/// encoder: it never widens what the host offers.
-pub fn unknown_encoders_offer(mode: StreamMode) -> Result<CodecOffer, &'static str> {
-    if !mode.within_software_limit() {
-        return Err("encoder capabilities are not known yet");
-    }
-    Ok(CodecOffer {
+/// Baseline offer until enumeration completes. Exact media setup is still required.
+pub fn unknown_encoders_offer() -> CodecOffer {
+    CodecOffer {
         codecs: vec![VideoCodec::H264],
-        software_limited: true,
-    })
+        mode_limit: None,
+        warn_software_performance: false,
+    }
 }
 
 fn encoder_entry(encoder: &Value) -> Result<EncoderEntry, &'static str> {
@@ -286,6 +279,15 @@ fn encoder_entry(encoder: &Value) -> Result<EncoderEntry, &'static str> {
         .get("hardware")
         .and_then(Value::as_bool)
         .ok_or("invalid_encoder_enumeration")?;
+    let mode_limit = encoder
+        .get("mode_limit")
+        .cloned()
+        .map(serde_json::from_value::<ModeLimit>)
+        .transpose()
+        .map_err(|_| "invalid_encoder_enumeration")?;
+    if mode_limit.is_some_and(|limit| !limit.is_valid()) {
+        return Err("invalid_encoder_enumeration");
+    }
     Ok(EncoderEntry {
         identity: encoder
             .get("identity")
@@ -300,6 +302,7 @@ fn encoder_entry(encoder: &Value) -> Result<EncoderEntry, &'static str> {
             _ => None,
         },
         hardware,
+        mode_limit,
         yuv444: encoder["yuv444"].as_bool().unwrap_or(false),
         yuv444_10bit: encoder["yuv444_10bit"].as_bool().unwrap_or(false),
         hdr10: hardware

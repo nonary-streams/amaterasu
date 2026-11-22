@@ -344,10 +344,7 @@ impl Record {
             stop_application_after_stream_retirement: false,
             rtsp_closing_deadline: None,
             encoder_snapshot: None,
-            video_codec_offer: CodecOffer {
-                codecs: vec![amaterasu_media::VideoCodec::H264],
-                software_limited: true,
-            },
+            video_codec_offer: super::unknown_encoders_offer(),
             desktop: false,
             auxiliary: None,
             shared_capture: None,

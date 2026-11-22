@@ -128,12 +128,13 @@ pub fn merge_launch_environment(
             return Err("too many environment edits".into());
         }
         for (name, extension) in &contribution.extensions {
-            if !valid_environment_name(name) || !claimed.insert(name.to_ascii_uppercase()) {
+            if !valid_environment_name(name) || !claimed.insert(environment_name_key(name)) {
                 return Err("invalid or conflicting environment edit".into());
             }
-            if result
-                .keys()
-                .any(|existing| existing != name && existing.eq_ignore_ascii_case(name))
+            if cfg!(windows)
+                && result
+                    .keys()
+                    .any(|existing| existing != name && existing.eq_ignore_ascii_case(name))
             {
                 return Err("environment name case conflict".into());
             }
@@ -141,12 +142,13 @@ pub fn merge_launch_environment(
             result.insert(name.clone(), value);
         }
         for (name, value) in &contribution.edits {
-            if !valid_environment_name(name) || !claimed.insert(name.to_ascii_uppercase()) {
+            if !valid_environment_name(name) || !claimed.insert(environment_name_key(name)) {
                 return Err("invalid or conflicting environment edit".into());
             }
-            if result
-                .keys()
-                .any(|existing| existing != name && existing.eq_ignore_ascii_case(name))
+            if cfg!(windows)
+                && result
+                    .keys()
+                    .any(|existing| existing != name && existing.eq_ignore_ascii_case(name))
             {
                 return Err("environment name case conflict".into());
             }
@@ -165,7 +167,7 @@ pub fn merge_launch_environment(
     if result.len() > 32
         || result.iter().any(|(name, value)| {
             !valid_environment_name(name)
-                || !names.insert(name.to_ascii_uppercase())
+                || !names.insert(environment_name_key(name))
                 || value.len() > 1024
                 || value.contains('\0')
         })
@@ -213,6 +215,15 @@ fn extend_value(base: Option<&str>, extension: &EnvironmentExtension) -> Result<
         .filter(|part| !extension.deduplicate || seen.insert(*part))
         .collect();
     Ok(parts.join(&extension.separator.to_string()))
+}
+
+/// Comparison key for a variable in the local process environment.
+pub fn environment_name_key(name: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        name.to_ascii_uppercase().into()
+    } else {
+        name.into()
+    }
 }
 
 fn valid_environment_name(name: &str) -> bool {

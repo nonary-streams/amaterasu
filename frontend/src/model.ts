@@ -418,24 +418,31 @@ namespace Amaterasu {
     return value;
   }
 
-  export function parseDetachedCommands(value: string): string[] {
-    const commands = value
-      .split(/\r?\n/)
-      .map((command) => command.trim())
-      .filter(Boolean);
-    if (
-      commands.length > 16 ||
-      commands.some(
-        (command) =>
-          new TextEncoder().encode(command).length > 2048 ||
-          /[\u0000-\u001f\u007f]/.test(command),
-      )
-    ) {
-      throw new Error(
-        "Enter up to 16 detached commands, each at most 2048 bytes without control characters.",
-      );
+  export function parseDetachedCommands(value: string, jsonFormat = false): DetachedCommand[] {
+    const commands: unknown = jsonFormat
+      ? JSON.parse(value.trim() || "[]")
+      : value.split(/\r?\n/).map(command => command.trim()).filter(Boolean);
+    if (!Array.isArray(commands) || commands.length > 16)
+      throw new Error("Enter up to 16 detached commands.");
+    for (const item of commands) {
+      let command = item;
+      if (typeof item === "object" && item !== null && !Array.isArray(item)) {
+        if (Object.keys(item).some(key => !["command", "environment", "cwd", "working_directory", "stdout", "stderr"].includes(key)) ||
+            ("cwd" in item && "working_directory" in item))
+          throw new Error("Detached command contains unsupported or conflicting settings.");
+        for (const path of [item.cwd, item.working_directory, item.stdout, item.stderr]) {
+          if (path != null && (typeof path !== "string" || !isAbsolutePreparationPath(path) ||
+              new TextEncoder().encode(path).length > 1024 || /[\u0000-\u001f\u007f-\u009f]/.test(path)))
+            throw new Error("Detached command paths must be absolute and at most 1024 bytes.");
+        }
+        if (item.environment !== undefined) validateCommandEnvironment(item.environment);
+        command = item.command;
+      }
+      if (typeof command !== "string" || !command.length || new TextEncoder().encode(command).length > 2048 ||
+          /[\u0000-\u001f\u007f-\u009f]/.test(command))
+        throw new Error("Each detached command needs printable command text of at most 2048 bytes.");
     }
-    return commands;
+    return commands as DetachedCommand[];
   }
 
   export function parseExitTimeout(value: string): number | null {
@@ -489,10 +496,9 @@ namespace Amaterasu {
       typeof command.executable !== "string" ||
       !isAbsolutePreparationPath(command.executable) ||
       new TextEncoder().encode(command.executable).length > 1024 ||
-      command.executable.includes("\0") ||
-      /\.(bat|cmd)$/i.test(command.executable)
+      command.executable.includes("\0")
     )
-      throw new Error("Preparation executable must be a native absolute path of at most 1024 bytes; batch files need an explicit interpreter.");
+      throw new Error("Preparation executable must be a native absolute path of at most 1024 bytes.");
     if (
       command.cwd != null &&
       (typeof command.cwd !== "string" ||
@@ -525,30 +531,28 @@ namespace Amaterasu {
       (command.timeout_ms as number) > 30000
     ))
       throw new Error("Preparation timeout must be a whole number from 1 to 30000 milliseconds.");
-    if (command.environment !== undefined) {
-      const environment = command.environment;
-      if (environment === null || Array.isArray(environment) || typeof environment !== "object")
-        throw new Error("Preparation environment must be a JSON object.");
-      const entries = Object.entries(environment as Record<string, unknown>);
-      const foldedNames = new Set<string>();
-      let totalBytes = 0;
-      for (const [key, rawValue] of entries) {
-        if (
-          key.length === 0 ||
-          new TextEncoder().encode(key).length > 128 ||
-          !/^[A-Za-z0-9_]+$/.test(key) ||
-          typeof rawValue !== "string" ||
-          new TextEncoder().encode(rawValue).length > 1024 ||
-          rawValue.includes("\0") ||
-          foldedNames.has(key.toUpperCase())
-        )
-          throw new Error("Preparation environment names and values exceed their limits or are invalid.");
-        foldedNames.add(key.toUpperCase());
-        totalBytes += new TextEncoder().encode(key).length + new TextEncoder().encode(rawValue).length;
-      }
-      if (entries.length > 32 || totalBytes > 4096)
-        throw new Error("Preparation environment exceeds the 32 variable and 4096 byte limits.");
+    if (command.environment !== undefined) validateCommandEnvironment(command.environment);
+  }
+
+  function validateCommandEnvironment(environment: unknown): void {
+    if (environment === null || Array.isArray(environment) || typeof environment !== "object")
+      throw new Error("Command environment must be a JSON object.");
+    const entries = Object.entries(environment as Record<string, unknown>);
+    let totalBytes = 0;
+    for (const [key, rawValue] of entries) {
+      if (
+        key.length === 0 ||
+        new TextEncoder().encode(key).length > 128 ||
+        !/^[A-Za-z0-9_]+$/.test(key) ||
+        typeof rawValue !== "string" ||
+        new TextEncoder().encode(rawValue).length > 1024 ||
+        rawValue.includes("\0")
+      )
+        throw new Error("Command environment names and values exceed their limits or are invalid.");
+      totalBytes += new TextEncoder().encode(key).length + new TextEncoder().encode(rawValue).length;
     }
+    if (entries.length > 32 || totalBytes > 4096)
+      throw new Error("Command environment exceeds the 32 variable and 4096 byte limits.");
   }
 
   function isAbsolutePreparationPath(value: string): boolean {
@@ -634,7 +638,7 @@ namespace Amaterasu {
             ...(prefer10BitSdr === null ? {} : { prefer_10bit_sdr: prefer10BitSdr }),
           };
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
-    const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
+    const detached = kind === "executable" ? parseDetachedCommands(text("detached"), data.has("detached_json")) : [];
     const preparation = kind !== "application" ? parsePreparation(text("preparation")) : [];
     if (preparation.length + rawPreparation.length > 8)
       throw new Error("An application can contain at most 8 preparation steps.");

@@ -232,20 +232,14 @@ the stream.
 
 ### Video codecs
 
-The profile does not choose a codec. NVHTTP enumerates `amaterasu.encode/1` at
-startup and then every five minutes while no stream is active, retrying failures
-with backoff and keeping the last good snapshot. From each encoder entry it reads
-only `codec` (`"h264"`, `"hevc"` or `"av1"`; other values are kept for numeric
-indexing but never offered) and `hardware`. At `/launch` it fixes the codecs that
-launch may negotiate: with `"encoder":"auto"` every codec that has an encoder, and
-with a numeric `encoder` only the codec of that enumerated entry. A codec whose only
-encoders are software is offered only when the requested mode is at most 1920x1080
-at 60 FPS, and such an offer also limits RTSP negotiation to that mode. A launch
-for which no codec qualifies is refused with HTTP 503 before any application,
-display, or RTSP effect: `no hardware encoder for this stream mode`, `no video
-encoder is available`, or, before the first enumeration completes for a mode above
-the software limit, `encoder capabilities are not known yet`. Until that first
-enumeration completes the host offers H.264 only. RTSP receives the offer as
+NVHTTP derives its codec offer from the selected provider's encoder inventory.
+After catalog preflight it applies the client, application, and global encoder
+settings in that order, with the startup selector as the default. An explicit
+encoder identity or index pins its codec. Automatic selection offers the modes
+permitted by the host profile and the available encoders' published limits.
+Software encoding above 1920×1080 or 60 FPS raises a performance advisory.
+Before the first enumeration, only baseline SDR H.264 can proceed to the
+provider's exact setup checks. RTSP receives the offer as
 `profile.codecs` (omitted when it is H.264 alone) and the client picks one in
 ANNOUNCE. The legacy `profile.codec` field is still accepted but no longer has any
 effect.

@@ -1545,6 +1545,10 @@ impl Pipeline {
                 }
                 record.output = match resolve_catalog_output(&payload["entry"], &self.environment) {
                     Ok(output) => output,
+                    Err("unsupported_launch_spec") => {
+                        record.discard_unresolved_output(job.step);
+                        None
+                    }
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
                 record.application_display_settings =

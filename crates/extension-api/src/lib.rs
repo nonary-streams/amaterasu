@@ -1614,7 +1614,10 @@ mod tests {
                 Some("overwrite".into()),
             )]),
         };
-        assert!(merge_launch_environment(&base, &[first, conflicting]).is_err());
+        assert_eq!(
+            merge_launch_environment(&base, &[first, conflicting]).is_err(),
+            cfg!(windows)
+        );
         let oversized = LaunchEnvironmentContribution {
             extensions: Default::default(),
             edits: std::collections::BTreeMap::from([("TOO_LONG".into(), Some("x".repeat(1025)))]),
@@ -1624,7 +1627,10 @@ mod tests {
             extensions: Default::default(),
             edits: std::collections::BTreeMap::from([("path".into(), None)]),
         };
-        assert!(merge_launch_environment(&base, &[case_variant]).is_err());
+        assert_eq!(
+            merge_launch_environment(&base, &[case_variant]).is_err(),
+            cfg!(windows)
+        );
     }
 
     #[test]

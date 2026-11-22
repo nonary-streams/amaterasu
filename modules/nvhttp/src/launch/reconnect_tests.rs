@@ -84,6 +84,19 @@ fn unhealthy_reconnect_does_not_modify_the_predecessor_or_consume_the_wait_slot(
 }
 
 #[test]
+fn reconnect_keeps_live_transport_when_selected_encoder_cannot_serve_hdr() {
+    let (mut controller, _broker, now) = one_client_application();
+    let mut request = request(3);
+    request.hdr = true;
+    let reply = controller
+        .resume(90, request, &peer(1), now)
+        .expect("HDR unavailable");
+    assert_eq!(reply.status, 503);
+    assert!(controller.deferred_launch.is_none());
+    assert!(controller.records.values().next().unwrap().state == State::Ready);
+}
+
+#[test]
 fn delayed_queued_rtsp_status_retries_without_closing_the_transport_and_has_a_bound() {
     let (mut controller, _broker, now) = one_client_application();
     let id = *controller.records.keys().next().unwrap();

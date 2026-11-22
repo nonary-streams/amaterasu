@@ -62,6 +62,59 @@ event.
 | Media transport audio config (`media-transport`) | Audio packet/channel/wire validation is skipped when `stream_audio` is `false`. |
 | Optional lifecycle participants (`session-lifecycle`) | `ParticipantSettings::optional` prevents unapproved optional providers from stalling `approvals_complete` and skips read-only `ResourcePlan` rejections without failing the stream. |
 
+## Launch admission review, 2026-11-22
+
+Codex reviewed the changes to NVHTTP encoder selection and Moonlight query
+parsing, and to command and environment validation from the catalog editor
+through the host process launcher.
+
+* For a fresh game launch, NVHTTP checks the available inventory before
+  creating a record, then resolves the encoder after application preflight.
+  Client, application, global and startup selections apply in that order.
+  The owner refuses a known-empty inventory or an incompatible effective
+  selection before launching the application or opening RTSP. A refusal after
+  preflight records the specific cause on that attempt. Desktop, shared
+  sessions and reconnects check the applicable settings before acquiring or
+  replacing a transport. A rejected HDR reconnect leaves the live stream running.
+* RTSP receives the effective codec offer and provider bounds. The client
+  negotiates the format through ANNOUNCE before PLAY. Software encoding above
+  the advisory threshold records a warning on the RTSP operation and keeps
+  the requested mode. The selection checks consult a snapshot and issue no
+  provider operations of their own.
+* NVHTTP ignores the contents of Moonlight's unused optional `uuid`. Pairing
+  and the bounded query parser still govern admission. The browser passes
+  command suffixes and environment key spelling to the host. Host validation
+  follows the operating system that will create the process.
+
+Verification included a scoped selection opening RTSP, a scoped refusal
+recorded before application launch, a rejected HDR reconnect preserving its
+predecessor, and a 720p90 request opening RTSP with a performance warning.
+The native x264 provider also produced a keyframe at that configuration.
+A Linux process check launched an executable named `env.cmd` with two
+environment keys differing only in case. These checks covered the source
+checkout. Installed-package and client-playback qualification remain open.
+
+## Catalog and application preflight review, 2026-11-22
+
+Codex traced management catalog writes through catalog validation, launch
+preflight, and native application dispatch. The catalog now accepts the
+launcher’s executable and working-directory templates, bare commands, and up
+to 64 literal arguments. The launcher still resolves the effective executable
+to an absolute native path before dispatch. The editor and management route
+preserve ordered detached helpers and their individual process settings.
+
+During catalog preflight, a structurally valid optional log setting can expand
+to an unusable path. Launch now discards that destination before opening a file
+or reserving a preparation lease for it. It records the demotion on the exact
+application operation, which NVHTTP associates with the stream. Preflight
+retains the resolved choice for subsequent dispatch and replay. Application
+launch, RTSP negotiation, and resource retirement then follow the existing
+ownership and generation rules.
+
+Source tests exercised a real child process starting with discarded output,
+verified the published demotion and owner-visible warning, and checked
+catalog path forms, the 64-argument boundary and per-helper settings.
+
 ## Remaining boundary
 
 The existing capture, display, and application retirement paths still require

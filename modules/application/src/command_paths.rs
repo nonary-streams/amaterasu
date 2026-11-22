@@ -1,5 +1,6 @@
 //! Resolve trusted raw command targets before selecting their working directory.
 
+use amaterasu_module_sdk::launch_command::requires_command_interpreter;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
@@ -18,12 +19,7 @@ pub(crate) fn resolve_command_executable(
         || executable.len() > MAX_EXECUTABLE_PATH_BYTES
         || executable.chars().any(char::is_control)
         || executable.contains("://")
-        || Path::new(executable)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
-            })
+        || requires_command_interpreter(Path::new(executable))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -204,7 +200,15 @@ mod tests {
 
     #[test]
     fn raw_targets_require_explicit_interpreters_for_batch_commands() {
-        for target in ["task.cmd", "task.BAT", "scheme://task", "", "task\n"] {
+        for target in [
+            #[cfg(windows)]
+            "task.cmd",
+            #[cfg(windows)]
+            "task.BAT",
+            "scheme://task",
+            "",
+            "task\n",
+        ] {
             assert_eq!(
                 resolve_command_executable(target, &BTreeMap::new(), None)
                     .unwrap_err()

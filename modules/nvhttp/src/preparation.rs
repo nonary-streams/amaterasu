@@ -1,3 +1,4 @@
+use amaterasu_module_sdk::launch_command::{environment_name_key, requires_command_interpreter};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
@@ -106,20 +107,14 @@ fn valid_command(command: &ConfiguredCommand) -> bool {
         return false;
     }
 
-    if Path::new(&command.executable)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
-        })
-    {
+    if requires_command_interpreter(Path::new(&command.executable)) {
         return false;
     }
 
     let mut keys = command
         .environment
         .keys()
-        .map(|key| key.to_ascii_uppercase())
+        .map(|key| environment_name_key(key))
         .collect::<Vec<_>>();
     keys.sort_unstable();
     !keys.windows(2).any(|pair| pair[0] == pair[1])
