@@ -541,19 +541,24 @@ impl Stream {
             .packetize_fec_encrypt_us
             .record_since(packetize_started);
         self.processing_latency.record(latency);
+        self.finish_video_admission(frame_index, sequence, timestamp_us)
+    }
+
+    fn finish_video_admission(
+        &mut self,
+        frame_index: u32,
+        sequence: u64,
+        timestamp_us: u64,
+    ) -> Status {
         self.video_sequence = Some(sequence);
         self.video_timestamp = Some(timestamp_us);
         self.next_frame_index = frame_index.checked_add(1);
-        self.flush_admitted_video();
-        STATUS_OK
-    }
-
-    fn flush_admitted_video(&mut self) {
         let started = Instant::now();
         self.delivery.flush();
         let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.processing_latency
             .record_flush(elapsed_us, self.delivery.queued());
+        STATUS_OK
     }
 
     pub(crate) fn take_processing_latency(&mut self) -> ProcessingLatency {
@@ -787,10 +792,7 @@ impl Stream {
             Err(code) => return self.fail(code),
         };
         self.delivery.push_video(frame_index, datagrams);
-        self.video_sequence = Some(unit.access_unit_id);
-        self.video_timestamp = Some(unit.timestamp_us);
-        self.next_frame_index = frame_index.checked_add(1);
-        STATUS_OK
+        self.finish_video_admission(frame_index, unit.access_unit_id, unit.timestamp_us)
     }
 
     /// # Safety

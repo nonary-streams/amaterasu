@@ -164,7 +164,10 @@ return. There is no media service-request replay or automatic retransmission.
 Discovery admission returns `MEDIA_BUSY` without validating or changing media
 state until both lanes freeze.
 
-Each controller tick distributes at most 64 sends evenly across its live
+After admitting a video frame, the transport immediately offers its datagrams
+to the nonblocking socket. This also applies to frames built from a negotiated
+provider's packet plan. Backpressure leaves the unsent suffix queued in order.
+Each controller tick distributes at most 64 retry sends evenly across its live
 streams; the remainder rotates between streams, and a blocked stream does not
 consume another stream's allowance. Video frames are queued as complete
 packetizer groups. A frame's software send allowance is the integer number of

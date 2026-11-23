@@ -1182,11 +1182,11 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
         crypto_overhead: 0,
         network_overhead: 28,
         allowed_extensions: 0,
-        max_datagrams: 64,
-        max_queue_bytes: 64 * 1024,
+        max_datagrams: 128,
+        max_queue_bytes: 128 * 1024,
         min_parity_shards: 0,
         max_fec_percentage: 0,
-        max_wire_bytes: 64 * 1024,
+        max_wire_bytes: 128 * 1024,
         min_fec_percentage: 0,
         max_fec_blocks: 4,
         fec_policy_flags: 0,
@@ -1206,7 +1206,8 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
         allow_unprotected_fallback: false,
     };
     stream.configure_planned_video(selection).unwrap();
-    let bytes = [1, 2, 3, 4];
+    // A 72-shard frame crosses the 64-datagram budget of a background tick.
+    let bytes = vec![0x5a; 72_000];
     let unit = NegotiatedVideoUnit {
         size: size_of::<NegotiatedVideoUnit>() as u32,
         version: VIDEO_UNIT_VERSION,
@@ -1234,7 +1235,7 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
     let mut blocks = [VideoFecBlock::default(); VIDEO_FRAME_MAX_BLOCKS];
     blocks[0] = VideoFecBlock {
         first_data_shard: 0,
-        data_shards: 1,
+        data_shards: 72,
         parity_shards: 0,
         percentage: 0,
     };
@@ -1269,11 +1270,12 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
         unsafe { stream.submit_planned_video(&unit, &plan) },
         STATUS_INVALID_ARGUMENT
     );
-    stream.delivery.tick();
+    assert_eq!(stream.delivery.queued(), 0, "admission flushes the plan");
+    assert_eq!(stream.delivery.sent_datagrams, 72);
     let packet = receive(&video);
     assert_eq!(&packet[2..4], &[0, 0]);
     assert_eq!(&packet[20..24], &1u32.to_le_bytes());
-    assert_eq!(&packet[40..44], &bytes);
+    assert_eq!(&packet[40..44], &bytes[..4]);
     assert_eq!(
         unsafe { stream.submit_video(&video_packet(&bytes, 2)) },
         MEDIA_UNSUPPORTED
