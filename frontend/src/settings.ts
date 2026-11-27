@@ -558,6 +558,7 @@ namespace Amaterasu {
     display_policy?: Record<string, string | null>;
     hostname: string;
     max_bitrate: number | null;
+    minimum_fps_target?: number | null;
     fec_percentage: number | null;
     stream_audio: boolean;
   };
@@ -575,6 +576,8 @@ namespace Amaterasu {
       configured_fec_percentage: values.fec_percentage,
       stream_audio: values.stream_audio,
     });
+    if (values.minimum_fps_target !== undefined)
+      expected.configured_minimum_fps_target = values.minimum_fps_target;
     if (values.display_policy) {
       expected.configured_display_policy = sparseDisplayPolicy({
         ...current.configured_display_policy, ...values.display_policy,
@@ -1821,6 +1824,15 @@ namespace Amaterasu {
     return target;
   }
 
+  function minimumFpsInput(name: string, value: number | null): HTMLInputElement {
+    const control = input(name, String(value ?? ""), "number");
+    control.min = "0";
+    control.max = "1000";
+    control.step = "any";
+    control.placeholder = "Default (20)";
+    return control;
+  }
+
   export function parsePingTimeout(value: string): number {
     if (value.trim() === "") return -1;
     if (!/^(0|[1-9][0-9]*)$/.test(value))
@@ -3035,6 +3047,13 @@ namespace Amaterasu {
     return { merged, overlaps };
   }
 
+  function streamingSettingsGroup(title: string, open: boolean, ...fields: HTMLElement[]): HTMLDetailsElement {
+    const group = el("details", "streaming-settings-group",
+      el("summary", "", title), el("div", "streaming-settings-fields", ...fields));
+    group.open = open;
+    return group;
+  }
+
   export function renderSettings(context: PageContext): void {
     const everydayArea = el("div", "settings-area-everyday");
     const featuredPluginArea = el("div", "settings-area-featured-plugins");
@@ -3130,11 +3149,11 @@ namespace Amaterasu {
     function loadPluginSections(): void {
       if (discoveringSections || customProviders) return;
       discoveringSections = true;
-      renderExtensionSlot(context, signedSettingsArea, "settings", providers => {
+      renderExtensionSlot(context, signedSettingsArea, "settings", (providers, hasSignedSections) => {
         discoveringSections = false;
         customProviders = providers;
         renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, providers, {
-          area: featuredPluginArea, options: everydayPluginOptions,
+          area: featuredPluginArea, options: everydayPluginOptions, hasSignedSections,
           onRemainingReady(load) {
             loadRemainingPlugins = load;
             if (loadedCategories.has("plugins")) load();
@@ -3143,11 +3162,11 @@ namespace Amaterasu {
       });
     }
     const categories = [
-      { id: "everyday", label: "Everyday Settings", description: "Applications and paired devices can override your stream preferences.", areas: [everydayArea, featuredPluginArea, signedSettingsArea], load: () => {
+      { id: "everyday", label: "Everyday Settings", description: "Set the picture, sound, and connection defaults for new streams.", areas: [everydayArea, featuredPluginArea, signedSettingsArea], load: () => {
         void loadEveryday();
         if (!customProviders) loadPluginSections();
       } },
-      { id: "streaming", label: "Streaming", description: "Capture, encoding, audio, and input.", areas: [hostArea, pipewireArea, inputArea], load: () => {
+      { id: "streaming", label: "Streaming", description: "Configure capture, encoders, audio devices, network connections, and input.", areas: [hostArea, pipewireArea, inputArea], load: () => {
         void loadHost();
         loadOptional("amaterasu.capture-pipewire/1", pipewireArea, loadPipewireChooser);
         void loadInput();
@@ -3171,7 +3190,7 @@ namespace Amaterasu {
         renderManagementPolicy(context, managementArea);
         renderCsrfPolicy(context, csrfArea);
       } },
-      { id: "plugins", label: "Plugin settings", description: "Preferences provided by the plugins on this host.", areas: [sessionExtensionsArea], load: () => { loadPluginSections(); loadRemainingPlugins?.(); } },
+      { id: "plugins", label: "Plugin settings", description: "Preferences provided by the plugins on this host.", areas: [featuredPluginArea, signedSettingsArea, sessionExtensionsArea], load: () => { loadPluginSections(); loadRemainingPlugins?.(); } },
     ] satisfies { id: SettingsCategory; label: string; description: string; areas: HTMLElement[]; load: () => void }[];
     const loadedCategories = new Set<SettingsCategory>();
     let selectedCategory = context.initialSettingsCategory ?? categories[0]!.id;
@@ -3192,6 +3211,7 @@ namespace Amaterasu {
     const categoryNavigation = el("nav", "settings-nav");
     categoryNavigation.setAttribute("aria-label", "Settings categories");
     const categoryButtons = new Map<string, HTMLButtonElement>();
+    const areaCategories = new Map<HTMLDivElement, string[]>();
     const searchOpenedDetails = new Set<HTMLDetailsElement>();
     categoryContent.append(categoryStatus, noResults);
     for (const category of categories) {
@@ -3199,15 +3219,20 @@ namespace Amaterasu {
       option.value = category.id;
       categoryPicker.append(option);
       const areaIds = category.areas.map((area, index) => {
-        const id = `settings-${category.id}-area-${index + 1}`;
-        area.id = id;
-        return id;
+        const existing = areaCategories.get(area);
+        if (existing) {
+          existing.push(category.label);
+        } else {
+          area.id = `settings-${category.id}-area-${index + 1}`;
+          areaCategories.set(area, [category.label]);
+          categoryContent.append(area);
+        }
+        return area.id;
       });
       const item = button(category.label, () => selectCategory(category.id), "settings-nav-item");
       item.setAttribute("aria-controls", areaIds.join(" "));
       categoryButtons.set(category.id, item);
       categoryNavigation.append(item);
-      categoryContent.append(...category.areas);
     }
     function selectCategory(id: string): void {
       const category = categories.find(item => item.id === id);
@@ -3221,14 +3246,14 @@ namespace Amaterasu {
       for (const details of searchOpenedDetails) details.open = false;
       searchOpenedDetails.clear();
     }
-    function showFieldInSearch(field: HTMLElement): void {
+    function revealField(field: HTMLElement, forSearch: boolean): void {
       let parent = field.parentElement;
       while (parent && parent !== categoryContent) {
         if (parent.tagName === "DETAILS") {
           const details = parent as HTMLDetailsElement;
           if (!details.open && !details.hidden) {
             details.open = true;
-            searchOpenedDetails.add(details);
+            if (forSearch) searchOpenedDetails.add(details);
           }
         }
         parent = parent.parentElement;
@@ -3245,36 +3270,36 @@ namespace Amaterasu {
           loadedCategories.add(category.id);
           category.load();
         }
-        for (const area of category.areas) {
-          // Fields stay in their original forms so saves and unsaved drafts retain their semantics.
-          const fields = typeof area.querySelectorAll === "function"
-            ? Array.from(area.querySelectorAll<HTMLElement>(".field, .session-extension-option")) : [];
-          let fieldMatches = 0;
-          for (const wrapper of fields) {
-            const controls = Array.from(wrapper.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input, select, textarea"));
-            if (controls.length && controls.every((control) => control.hasAttribute("data-draft-ignore"))) continue;
-            const panelTitle = wrapper.closest(".panel")?.querySelector("h2")?.textContent ?? "";
-            const pluginTitle = wrapper.closest(".application-plugin-section")?.querySelector("summary")?.textContent ?? "";
-            const matched = !query || settingsSearchMatches(query, category.label, panelTitle, pluginTitle,
-              wrapper.textContent ?? "", ...controls.map((control) => control.name));
-            if (query && !matched) wrapper.setAttribute("data-settings-search-hidden", "");
-            else wrapper.removeAttribute("data-settings-search-hidden");
-            if (query && matched) {
-              fieldMatches++;
-              showFieldInSearch(wrapper);
-            }
-          }
-          const title = typeof area.querySelector === "function" ? area.querySelector(".panel > h2")?.textContent ?? "" : "";
-          const visible = query
-            ? fieldMatches > 0 || settingsSearchMatches(query, category.label, title) ||
-              (!fields.length && settingsSearchMatches(query, area.textContent ?? ""))
-            : category.id === selected.id || (selected.id === "plugins" && area === featuredPluginArea);
-          area.hidden = !visible;
-          if (visible) matches++;
-        }
         const item = categoryButtons.get(category.id)!;
         item.className = `button settings-nav-item${!query && category.id === selected.id ? " selected" : ""}`;
         item.setAttribute("aria-current", !query && category.id === selected.id ? "page" : "false");
+      }
+      for (const [area, labels] of areaCategories) {
+        // Fields stay in their original forms so saves and unsaved drafts retain their semantics.
+        const fields = typeof area.querySelectorAll === "function"
+          ? Array.from(area.querySelectorAll<HTMLElement>(".field, .session-extension-option")) : [];
+        let fieldMatches = 0;
+        for (const wrapper of fields) {
+          const controls = Array.from(wrapper.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input, select, textarea"));
+          if (controls.length && controls.every((control) => control.hasAttribute("data-draft-ignore"))) continue;
+          const panelTitle = wrapper.closest(".panel")?.querySelector("h2")?.textContent ?? "";
+          const groupTitle = wrapper.closest(".application-plugin-section, .streaming-settings-group")?.querySelector("summary")?.textContent ?? "";
+          const matched = !query || settingsSearchMatches(query, ...labels, panelTitle, groupTitle,
+            wrapper.textContent ?? "", ...controls.map((control) => control.name));
+          if (query && !matched) wrapper.setAttribute("data-settings-search-hidden", "");
+          else wrapper.removeAttribute("data-settings-search-hidden");
+          if (query && matched) {
+            fieldMatches++;
+            revealField(wrapper, true);
+          }
+        }
+        const title = typeof area.querySelector === "function" ? area.querySelector(".panel > h2")?.textContent ?? "" : "";
+        const visible = query
+          ? fieldMatches > 0 || settingsSearchMatches(query, ...labels, title) ||
+            (!fields.length && settingsSearchMatches(query, area.textContent ?? ""))
+          : selected.areas.includes(area);
+        area.hidden = !visible;
+        if (visible) matches++;
       }
       settingsSetLocalizedTextContent(categoryHeading, query ? "Search results" : selected.label);
       settingsSetLocalizedTextContent(categoryDescription, query
@@ -3282,20 +3307,19 @@ namespace Amaterasu {
         : selected.description);
       noResults.hidden = !query || matches !== 0;
     }
-    // Native validation may find a required field that search has temporarily hidden.
-    // Reveal its original category before the browser tries to focus it.
+    // Reveal invalid controls before native validation tries to focus them.
     categoryContent.addEventListener("invalid", (event) => {
-      if (!search.value.trim()) return;
       const target = event.target as HTMLElement | null;
-      const category = categories.find((candidate) => candidate.areas.some((area) => target && area.contains(target)));
-      if (!category || !target) return;
-      selectCategory(category.id);
-      showFieldInSearch(target);
-      searchOpenedDetails.clear();
+      if (!target) return;
+      if (search.value.trim()) {
+        const category = categories.find(candidate => candidate.areas.some(area => area.contains(target)));
+        if (category) selectCategory(category.id);
+      }
+      revealField(target, false);
     }, true);
     search.addEventListener("input", updateCategoryDisplay);
     categoryPicker.addEventListener("change", () => selectCategory(categoryPicker.value));
-    const settingsNavigation = el("div", "settings-navigation", search, field("Category", categoryPicker), categoryNavigation);
+    const settingsNavigation = el("div", "settings-navigation", categoryNavigation, search, field("Category", categoryPicker));
     const refreshSettings = button("Refresh", () => {
       if (extensionSlotDirty(signedSettingsArea)) {
         context.notify("Finish editing the plugin settings before refreshing.");
@@ -3342,9 +3366,8 @@ namespace Amaterasu {
           updateCategoryDisplay();
         }
       });
-      for (const category of categories)
-        for (const item of category.areas)
-          observer.observe(item, { childList: true, subtree: true, characterData: true });
+      for (const item of areaCategories.keys())
+        observer.observe(item, { childList: true, subtree: true, characterData: true });
     }
     let pipewireGeneration = 0;
     let pipewireOperation = 0;
@@ -3364,6 +3387,9 @@ namespace Amaterasu {
         const bitrate = input("everyday_bitrate", String(settings.configured_max_bitrate ?? ""), "number");
         bitrate.placeholder = "No host limit";
         bitrate.step = "1";
+        const minimumFps = settings.configured_minimum_fps_target === undefined ? null :
+          minimumFpsInput("everyday_minimum_fps", settings.configured_minimum_fps_target);
+        const fpsChanged = () => minimumFps !== null && minimumFps.value !== String(settings.configured_minimum_fps_target ?? "");
         const recovery = input("everyday_fec", String(settings.configured_fec_percentage ?? ""), "number");
         recovery.min = "1";
         recovery.max = "255";
@@ -3380,14 +3406,17 @@ namespace Amaterasu {
           display?.node,
           panel("Stream preferences",
             field("Maximum bitrate (kbps)", bitrate, "Leave blank to let the client choose. A positive limit applies to new streams."),
-            field("Packet recovery (%)", recovery, "Extra recovery data helps with packet loss on Wi-Fi. Leave blank to use the host default."),
+            minimumFps && field("Minimum frame rate (FPS)", minimumFps, "When the picture is still, repeat frames at this rate. Use 0 to follow the stream rate."),
             field("Stream audio", audio, "Include sound from this host in future streams.")),
-          panel("Connection", field("Name shown to Moonlight", hostname, "Leave blank to use this PC’s name.")),
+          panel("Connection",
+            field("Name shown to Moonlight", hostname, "Leave blank to use this PC’s name."),
+            field("Packet recovery (%)", recovery, "Extra recovery data helps with packet loss on Wi-Fi. Leave blank to use the host default.")),
           el("div", "actions", save, status));
         if (canWrite) {
           const checkChanges = () => {
             save.disabled = !Object.keys(display?.changes() ?? {}).length && hostname.value === settings.configured_hostname &&
               bitrate.value === String(settings.configured_max_bitrate ?? "") &&
+              !fpsChanged() &&
               recovery.value === String(settings.configured_fec_percentage ?? "") &&
               audio.checked === settings.stream_audio;
           };
@@ -3404,6 +3433,7 @@ namespace Amaterasu {
             const patch = display?.changes();
             const values = { ...(patch && Object.keys(patch).length ? { display_policy: patch } : {}),
               hostname: hostname.value, max_bitrate: parseMaxBitrate(bitrate.value),
+              ...(minimumFps && fpsChanged() ? { minimum_fps_target: parseMinimumFpsTarget(minimumFps.value) } : {}),
               fec_percentage: parseGlobalFecPercentage(recovery.value), stream_audio: audio.checked };
             if (values.max_bitrate !== null && values.max_bitrate > 0 && values.max_bitrate < 100)
               throw new Error("Use at least 100 kbps, or leave the limit blank.");
@@ -5114,17 +5144,7 @@ namespace Amaterasu {
             : String(settings.configured_max_bitrate),
         );
         maxBitrate.placeholder = "No host cap";
-        const minimumFpsTarget = input(
-          "minimum_fps_target",
-          settings.configured_minimum_fps_target === null
-            ? ""
-            : String(settings.configured_minimum_fps_target),
-          "number",
-        );
-        minimumFpsTarget.min = "0";
-        minimumFpsTarget.max = "1000";
-        minimumFpsTarget.step = "any";
-        minimumFpsTarget.placeholder = "Default (20)";
+        const minimumFpsTarget = minimumFpsInput("minimum_fps_target", settings.configured_minimum_fps_target);
         const pingTimeout = input(
           "ping_timeout_ms",
           settings.configured_ping_timeout_ms === null
@@ -5158,116 +5178,130 @@ namespace Amaterasu {
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
         form.append(
-          ...softwareEncoder.fields,
-          softwareAvailability,
-          el("p", "muted", settingsTextLiteral(`Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`)),
-          field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
-          field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
-          field(
-            "Global FEC percentage",
-            fecPercentage,
-            settingsTextLiteral(`Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`),
+          streamingSettingsGroup("Picture quality and frame rate", true,
+            field(
+              "Maximum bitrate (kbps)",
+              maxBitrate,
+              settingsTextLiteral(`A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`),
+            ),
+            field(
+              "Minimum frame rate (FPS)",
+              minimumFpsTarget,
+              settingsTextLiteral(`On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`),
+            ),
+            field(
+              "Global FEC percentage",
+              fecPercentage,
+              settingsTextLiteral(`Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`),
+            ),
+            field(
+              "Video batch size (KiB)",
+              videoBatchSize,
+              settingsTextLiteral(`Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`),
+            ),
           ),
-          field(
-            "Automatic router port mapping (UPnP)",
-            upnp,
-            "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP.",
+          streamingSettingsGroup("Capture and displays", false,
+            field(
+              "Capture backend",
+              capture,
+              settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit providers fail if unavailable. X11 requires the host process's authorized DISPLAY and reads output pixels through the X server. DRM/KMS reads only an active primary plane and omits cursor/overlay planes and the CRTC color pipeline; it does not capture managed virtual displays. Save and reopen settings to list outputs for a new backend.`),
+            ),
+            markHostSettingsOwner("amaterasu.display", field(
+              "Capture output",
+              outputName,
+              "Choose a display for future Moonlight streams. Automatic retains the configured startup output.",
+            )),
+            markHostSettingsOwner("amaterasu.display", field(
+              "Display and adapter policy (JSON)",
+              displayPolicy,
+              "Use the listed setting names and typed JSON values. This editor saves a full policy snapshot: omitted keys reset to the product default. Per-application and paired-client values may override stream-scoped settings. Native support remains platform/provider-specific and unsupported changes fail closed.",
+            )),
+            field(
+              "WGC pacing smoothing",
+              wgcPacing,
+              settingsTextLiteral(`Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`),
+            ),
+            ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
           ),
-          el(
-            "p",
-            settings.upnp_status === "error" ? "error" : "muted",
-            settingsTextLiteral(`UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`),
+          streamingSettingsGroup("Audio devices", false,
+            field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."),
+            field("Audio capture endpoint", audioSink, settingsTextLiteral(`Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`)),
+            field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."),
+            field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."),
+            field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."),
+            field("Install Steam Streaming Speakers driver when missing", installSteamAudioDrivers, "Enabled by default on Windows. Amaterasu best-effort installs Steam's x64 INF from Common Files when the endpoint is missing. Installer failures do not block streaming. Default roles are restored only when they remain on Steam's endpoint. Disabling does not cancel a Windows installation already in progress; its endpoint check and route cleanup finish."),
+            steamAudioDriverStatus,
+            ...(audioDiscoveryIssue ? [el("p", "muted", audioDiscoveryIssue)] : []),
           ),
-          field(
-            "Address family",
-            addressFamily,
-            "Choose IPv4 only, both families, or retain the startup policy.",
+          streamingSettingsGroup("Hardware encoding", false,
+            field("NVENC preset", nvencPreset, "Select NVENC preset P1 through P7 for future streams."),
+            field("NVENC two-pass mode", nvencTwoPass, "Choose disabled, quarter-resolution, or full-resolution two-pass encoding."),
+            field("NVENC VBV increase (%)", nvencVbvIncrease, "Increase NVENC VBV buffer size by 0–400 percent."),
+            field("NVENC split encode", nvencSplitEncode, "Choose automatic driver selection or explicitly enable or disable split encoding."),
+            field("NVENC H.264 CAVLC", nvencH264Cavlc, "Request CAVLC entropy coding for NVENC H.264."),
+            field("NVENC real-time HAGS", nvencRealtimeHags, "Configure the NVENC real-time scheduling hint for systems using hardware-accelerated GPU scheduling."),
+            field("NVENC OpenGL/Vulkan on DXGI", nvencOpenGlVulkanOnDxgi, "Configure NVENC handling for OpenGL and Vulkan capture through DXGI."),
+            field("NVENC latency over power", nvencLatencyOverPower, "Prefer encoding latency over power efficiency."),
+            field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Use strict rate-control buffer behavior for VAAPI."),
           ),
-          field(
-            "Use startup bind address",
-            useStartupBindAddress,
-            settingsTextLiteral(`The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`),
+          streamingSettingsGroup("Software encoding", false,
+            ...softwareEncoder.fields,
+            softwareAvailability,
+            el("p", "muted", settingsTextLiteral(`Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`)),
           ),
-          field(
-            "Bind address override",
-            bindAddress,
-            "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior.",
+          streamingSettingsGroup("Network and encryption", false,
+            field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
+            field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
+            field(
+              "Automatic router port mapping (UPnP)",
+              upnp,
+              "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP.",
+            ),
+            el(
+              "p",
+              settings.upnp_status === "error" ? "error" : "muted",
+              settingsTextLiteral(`UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`),
+            ),
+            field(
+              "Address family",
+              addressFamily,
+              "Choose IPv4 only, both families, or retain the startup policy.",
+            ),
+            field(
+              "Use startup bind address",
+              useStartupBindAddress,
+              settingsTextLiteral(`The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`),
+            ),
+            field(
+              "Bind address override",
+              bindAddress,
+              "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior.",
+            ),
+            field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."),
+            field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."),
+            field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."),
+            field(
+              "Stream ping timeout (ms)",
+              pingTimeout,
+              settingsTextLiteral(`Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`),
+            ),
+            el(
+              "p",
+              "muted",
+              settingsTextLiteral(`Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`),
+            ),
+            el("p", "muted", settingsTextLiteral(`Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`)),
+            ...(settings.listener_error ? [el("p", "error", settings.listener_error)] : []),
+            ...(settings.rtsp_listener_error ? [el("p", "error", settings.rtsp_listener_error)] : []),
           ),
-          field(
-            "Capture backend",
-            capture,
-            settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit providers fail if unavailable. X11 requires the host process's authorized DISPLAY and reads output pixels through the X server. DRM/KMS reads only an active primary plane and omits cursor/overlay planes and the CRTC color pipeline; it does not capture managed virtual displays. Save and reopen settings to list outputs for a new backend.`),
+          streamingSettingsGroup("Preparation commands", false,
+            field(
+              "Global preparation commands (JSON)",
+              globalPreparation,
+              "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list.",
+            ),
+            globalPreparationValidation,
           ),
-          markHostSettingsOwner("amaterasu.display", field(
-            "Display and adapter policy (JSON)",
-            displayPolicy,
-            "Use the listed setting names and typed JSON values. This editor saves a full policy snapshot: omitted keys reset to the product default. Per-application and paired-client values may override stream-scoped settings. Native support remains platform/provider-specific and unsupported changes fail closed.",
-          )),
-          markHostSettingsOwner("amaterasu.display", field(
-            "Capture output",
-            outputName,
-            "Choose a display for future Moonlight streams. Automatic retains the configured startup output.",
-          )),
-          field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."),
-          field("NVENC preset", nvencPreset, "Select NVENC preset P1 through P7 for future streams."),
-          field("NVENC H.264 CAVLC", nvencH264Cavlc, "Request CAVLC entropy coding for NVENC H.264."),
-          field("NVENC two-pass mode", nvencTwoPass, "Choose disabled, quarter-resolution, or full-resolution two-pass encoding."),
-          field("NVENC VBV increase (%)", nvencVbvIncrease, "Increase NVENC VBV buffer size by 0–400 percent."),
-          field("NVENC split encode", nvencSplitEncode, "Choose automatic driver selection or explicitly enable or disable split encoding."),
-          field("NVENC real-time HAGS", nvencRealtimeHags, "Configure the NVENC real-time scheduling hint for systems using hardware-accelerated GPU scheduling."),
-          field("NVENC OpenGL/Vulkan on DXGI", nvencOpenGlVulkanOnDxgi, "Configure NVENC handling for OpenGL and Vulkan capture through DXGI."),
-          field("NVENC latency over power", nvencLatencyOverPower, "Prefer encoding latency over power efficiency."),
-          field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Use strict rate-control buffer behavior for VAAPI."),
-          field(
-            "WGC pacing smoothing",
-            wgcPacing,
-            settingsTextLiteral(`Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`),
-          ),
-          field("Audio capture endpoint", audioSink, settingsTextLiteral(`Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`)),
-          field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."),
-          field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."),
-          field(
-            "Global preparation commands (JSON)",
-            globalPreparation,
-            "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list.",
-          ),
-          globalPreparationValidation,
-          field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."),
-          field("Install Steam Streaming Speakers driver when missing", installSteamAudioDrivers, "Enabled by default on Windows. Amaterasu best-effort installs Steam's x64 INF from Common Files when the endpoint is missing. Installer failures do not block streaming. Default roles are restored only when they remain on Steam's endpoint. Disabling does not cancel a Windows installation already in progress; its endpoint check and route cleanup finish."),
-          steamAudioDriverStatus,
-          field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."),
-          field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."),
-          field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."),
-          field(
-            "Video batch size (KiB)",
-            videoBatchSize,
-            settingsTextLiteral(`Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`),
-          ),
-          field(
-            "Maximum bitrate (kbps)",
-            maxBitrate,
-            settingsTextLiteral(`A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`),
-          ),
-          field(
-            "Minimum frame rate (FPS)",
-            minimumFpsTarget,
-            settingsTextLiteral(`On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`),
-          ),
-          field(
-            "Stream ping timeout (ms)",
-            pingTimeout,
-            settingsTextLiteral(`Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`),
-          ),
-          ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
-          ...(audioDiscoveryIssue ? [el("p", "muted", audioDiscoveryIssue)] : []),
-          el(
-            "p",
-            "muted",
-            settingsTextLiteral(`Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`),
-          ),
-          el("p", "muted", settingsTextLiteral(`Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`)),
-          ...(settings.listener_error ? [el("p", "error", settings.listener_error)] : []),
-          ...(settings.rtsp_listener_error ? [el("p", "error", settings.rtsp_listener_error)] : []),
           status,
           el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );

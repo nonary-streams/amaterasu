@@ -5,7 +5,7 @@ namespace Amaterasu {
     return extensionSlotDrafts.get(container)?.() ?? false;
   }
   /** Generic signed-extension surfaces; the shell has no product renderer. */
-  export function renderExtensionSlot(context: PageContext, container: HTMLElement, slot: "overview" | "settings", onOwners?: (owners: ReadonlySet<string>) => void): void {
+  export function renderExtensionSlot(context: PageContext, container: HTMLElement, slot: "overview" | "settings", onOwners?: (owners: ReadonlySet<string>, hasSections: boolean) => void): void {
     extensionSlotDisposers.get(container)?.();
     container.replaceChildren();
     const children: ExtensionPages[] = [];
@@ -37,7 +37,7 @@ namespace Amaterasu {
     void discovery.discover().then(descriptors => {
       if (disposed || !container.isConnected) return;
       const entries = descriptors.filter(entry => entry.placements?.includes(slot));
-      onOwners?.(new Set(entries.flatMap(entry => entry.settings_provider ? [entry.settings_provider] : [])));
+      onOwners?.(new Set(entries.flatMap(entry => entry.settings_provider ? [entry.settings_provider] : [])), entries.length > 0);
       for (const descriptor of entries) {
         const area = el("section", "plugin-surface");
         const section = slot === "settings"
@@ -70,7 +70,7 @@ namespace Amaterasu {
       }
     }).catch(error => {
       if (disposed) return;
-      onOwners?.(new Set());
+      onOwners?.(new Set(), false);
       container.replaceChildren(errorPanel(error, () => renderExtensionSlot(context, container, slot, onOwners)));
     });
   }

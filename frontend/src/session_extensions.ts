@@ -73,6 +73,7 @@ namespace Amaterasu {
   interface EverydayPluginSections {
     area: HTMLElement;
     options: ReadonlyMap<string, ReadonlySet<string>>;
+    hasSignedSections: boolean;
     onRemainingReady(load: () => void): void;
   }
 
@@ -155,11 +156,22 @@ namespace Amaterasu {
             const controls = editor.node.matches("input,select,textarea")
               ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
             if (controls.length === 1) controls[0]!.setAttribute("aria-label", option.label);
-            const group = el("fieldset", "session-extension-option",
-              el("legend", "field-label", literalText(option.label)), editor.node);
-            if (inherit) group.append(el("label", "session-extension-inherit", inherit, " Use inherited value"));
-            if (option.help) group.append(el("small", "muted", literalText(option.help)));
-            group.append(el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
+            const group = el("fieldset", "session-extension-option");
+            const title = literalText(option.label);
+            const policyHint = el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy));
+            if (scope.kind === "host" && editor.node.matches("input, select, textarea, .extension-slider, .radio-group")) {
+              const row = el(editor.node.matches("input, select, textarea") ? "label" : "div", "field",
+                el("span", "field-label", title), editor.node);
+              group.setAttribute("aria-label", option.label);
+              if (option.help) row.append(el("small", "muted", literalText(option.help)));
+              row.append(policyHint);
+              group.append(row);
+            } else {
+              group.append(el("legend", "field-label", title), editor.node);
+              if (inherit) group.append(el("label", "session-extension-inherit", inherit, " Use inherited value"));
+              if (option.help) group.append(el("small", "muted", literalText(option.help)));
+              group.append(policyHint);
+            }
             group.disabled = !context.api.allows("configuration.write");
             (featured && !featured.has(option.id) ? more : form).append(group);
             editors.set(option.id, { inherit, editor });
@@ -216,7 +228,9 @@ namespace Amaterasu {
         }
         everyday?.area.replaceChildren(...everydayPanels);
         everyday?.onRemainingReady(() => { for (const read of remaining.splice(0)) read(); });
-        area.replaceChildren(...(panels.length || everydayPanels.length ? panels : [el("p", "muted", "No plugin settings are available for this scope.")]));
+        if (!panels.length && !everydayPanels.length && !everyday?.hasSignedSections)
+          panels.push(el("p", "muted", "No plugin settings are available for this scope."));
+        area.replaceChildren(...panels);
       } catch (error) {
         if (settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected) {
           const retry = errorPanel(error, load);
