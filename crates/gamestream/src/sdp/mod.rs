@@ -100,6 +100,7 @@ pub struct Announce<T = VideoStreamFormat> {
     pub encryption: Encryption,
     pub fec: Fec,
     pub client_feature_flags: u32,
+    pub capture_timing: bool,
     pub ignored_attributes: usize,
     pub adjustments: Vec<StreamAdjustment>,
 }

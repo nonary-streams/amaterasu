@@ -30,6 +30,47 @@ fn hevc_nal(kind: u8) -> [u8; 6] {
 }
 
 #[test]
+fn capture_timing_extends_the_header_without_changing_rtp_or_codec_payload() {
+    const CAPTURE: u64 = 0x0807_0605_0403_0201;
+    let h264 = [0, 0, 0, 1, 0x65, 1];
+    let hevc: Vec<_> = [32, 33, 34, 19].into_iter().flat_map(hevc_nal).collect();
+    let av1 = av1_temporal_unit(true, 22);
+    for (codec, access_unit) in [
+        (VideoCodec::H264, h264.as_slice()),
+        (VideoCodec::Hevc, hevc.as_slice()),
+        (VideoCodec::Av1, av1.as_slice()),
+    ] {
+        for percent in [0, 20] {
+            let config = VideoConfig {
+                packet_size: 256,
+                fec_percentage: percent,
+                min_parity_shards: u8::from(percent != 0),
+                max_fec_blocks: 4,
+                encrypted: false,
+            };
+            let mut legacy = VideoPacketizer::new_with_codec(config, codec).unwrap();
+            let legacy = legacy
+                .packetize_with_timing(access_unit, true, 1, 90_000, 24, CAPTURE)
+                .unwrap();
+            assert_eq!(&legacy[0][40..40 + access_unit.len()], access_unit);
+
+            let mut timed = VideoPacketizer::new_with_codec(config, codec).unwrap();
+            timed.enable_capture_timing().unwrap();
+            let reservation = timed.reservation(access_unit.len()).unwrap();
+            let timed = timed
+                .packetize_with_timing(access_unit, true, 1, 90_000, 24, CAPTURE)
+                .unwrap();
+            assert_eq!(&timed[0][4..8], &legacy[0][4..8]);
+            assert_eq!(&timed[0][32..36], &legacy[0][32..36]);
+            assert_eq!(&timed[0][40..48], &[1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(&timed[0][48..48 + access_unit.len()], access_unit);
+            assert_eq!(reservation.datagrams, timed.len());
+            assert_eq!(reservation.bytes, timed.iter().map(Vec::len).sum::<usize>());
+        }
+    }
+}
+
+#[test]
 fn hevc_closed_gop_recovery_keeps_parameter_sets_and_frame_type() {
     for idr_kind in [19, 20] {
         let access_unit: Vec<_> = [32, 33, 34, idr_kind]
@@ -616,6 +657,16 @@ fn external_plan_generates_bounded_fec_and_preserves_indices_on_rejection() {
     let next =
         unsafe { packetizer.packetize_external_plan(&plan, &limits, true, 2, 180000, 0) }.unwrap();
     assert_eq!(&next[0][2..4], &[0, 3]);
+
+    limits.allowed_extensions |= amaterasu_media::VIDEO_FRAME_CAPTURE_TIMING;
+    packetizer.enable_capture_timing().unwrap();
+    let timed = unsafe {
+        packetizer.packetize_timed_external_plan(&plan, &limits, true, 3, 270000, (4, 123_456))
+    }
+    .unwrap();
+    assert_eq!(&timed[0][40..48], &123_456u64.to_le_bytes());
+    assert_eq!(&timed[0][48..], &bytes[..992]);
+    assert_eq!(&timed[1][32..32 + 208], &bytes[992..]);
 }
 
 #[test]

@@ -16,6 +16,18 @@ fn changed(name: &str, value: &str) -> String {
         .collect()
 }
 
+#[test]
+fn capture_timing_is_an_optional_versioned_hint() {
+    assert!(!parse_announce(FIXTURE.as_bytes()).unwrap().capture_timing);
+    for (hint, enabled) in [("1", true), ("2", false), ("invalid", false)] {
+        let offer = format!("{FIXTURE}a=x-ml-video.captureTiming:{hint}\r\n");
+        assert_eq!(
+            parse_announce(offer.as_bytes()).unwrap().capture_timing,
+            enabled
+        );
+    }
+}
+
 fn all_support() -> TransportSupport {
     TransportSupport {
         hevc: false,

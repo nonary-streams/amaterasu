@@ -1153,6 +1153,7 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             transport.tick();
             let mut datagram = [0u8; 2048];
             assert!(video_peer.recv(&mut datagram).unwrap() >= 44);
+            assert_eq!(&datagram[33..35], &[0, 0]);
             assert_eq!(&datagram[40..44], &[10, 20, encoder_marker, framer_marker]);
             drop(plane);
         }

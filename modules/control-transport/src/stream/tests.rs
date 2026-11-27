@@ -374,6 +374,42 @@ fn moonlight_encrypted_periodic_ping_refreshes_authenticated_idle_deadline() {
 }
 
 #[test]
+fn capture_clock_probe_replies_only_after_authentication_and_does_not_queue_input() {
+    use amaterasu_gamestream::enet::{CommandBody, Limits, decode};
+    let mut stream = stream();
+    connected_peer(&mut stream);
+    let mut client = client();
+    let timestamp = 0x0807_0605_0403_0201u64.to_le_bytes();
+    let probe = client.seal(CAPTURE_CLOCK_REQUEST, &timestamp).unwrap();
+    stream.accept_control(0, Delivery::Unsequenced, &probe, 2);
+    assert!(stream.peer.pop_datagram().is_none());
+
+    let ping = client.seal(0x0200, &[4, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    stream.accept_control(0, Delivery::Reliable, &ping, 3);
+    let probe = client.seal(CAPTURE_CLOCK_REQUEST, &timestamp).unwrap();
+    stream.accept_control(0, Delivery::Unsequenced, &probe, 4);
+    let datagram = decode(&stream.peer.pop_datagram().unwrap(), &Limits::default()).unwrap();
+    let CommandBody::SendUnsequenced { data, .. } = &datagram.commands[0].body else {
+        panic!("capture probe was answered with a retransmitted packet");
+    };
+    let mut opener = ControlOpener::new(
+        &[0x35; 16],
+        ControlProfile::SunshineV2,
+        Direction::HostToClient,
+        ControlOrdering::MultipleChannels,
+    )
+    .unwrap();
+    let reply = opener.open(data).unwrap();
+    assert_eq!(reply.kind, CAPTURE_CLOCK_REPLY);
+    assert_eq!(&reply.payload[..8], &timestamp);
+    let received = u64::from_le_bytes(reply.payload[8..16].try_into().unwrap());
+    let sent = u64::from_le_bytes(reply.payload[16..24].try_into().unwrap());
+    assert!(received != 0 && sent >= received);
+    assert_eq!(stream.incoming.len(), 1);
+    assert!(stream.failure.is_none());
+}
+
+#[test]
 fn terminal_failure_logs_only_the_first_fixed_internal_code() {
     let mut stream = stream();
     stream.fail("peer_disconnected");

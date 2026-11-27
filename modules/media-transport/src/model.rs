@@ -403,6 +403,8 @@ pub enum Operation {
     ConfigureVideoFormat {
         stream: u64,
         video_stream_format: amaterasu_module_sdk::VideoStreamFormat,
+        #[serde(default)]
+        capture_timing: bool,
     },
     Lookup {
         operation_id: String,

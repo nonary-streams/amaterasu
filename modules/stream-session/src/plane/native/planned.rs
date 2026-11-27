@@ -75,9 +75,28 @@ pub(super) fn submit(
     limits: &VideoFramingLimits,
     transport_stream: u64,
     unit: &NegotiatedVideoUnit,
+    processing_started_host_us: u64,
 ) -> PlaneResult<bool> {
     let transport_api = unsafe { transport.table::<NegotiatedVideoPlanTransportApiV2>() }
         .map_err(|_| "native_layout_mismatch")?;
+    let admit = |plan: &VideoFramePlan| {
+        // SAFETY: unit and plan storage outlive this synchronous admission.
+        unsafe {
+            if let Some(timed) =
+                amaterasu_module_sdk::video_framing::timed_plan_transport(transport)
+            {
+                (timed.submit_timed)(
+                    transport.context(),
+                    transport_stream,
+                    unit,
+                    plan,
+                    processing_started_host_us,
+                )
+            } else {
+                (transport_api.submit)(transport.context(), transport_stream, unit, plan)
+            }
+        }
+    };
     if unit.flags == VIDEO_UNIT_END_OF_STREAM {
         let plan = OwnedPlan {
             bytes: Vec::new(),
@@ -87,12 +106,7 @@ pub(super) fn submit(
             blocks: [VideoFecBlock::default(); VIDEO_FRAME_MAX_BLOCKS],
         };
         // SAFETY: EOS transport path does not read the empty plan payload.
-        return accepted(
-            unsafe {
-                (transport_api.submit)(transport.context(), transport_stream, unit, &plan.header())
-            },
-            "native_video_plan_submit_failed",
-        );
+        return accepted(admit(&plan.header()), "native_video_plan_submit_failed");
     }
     let api =
         unsafe { framer.table::<VideoFramingApiV2_1>() }.map_err(|_| "native_layout_mismatch")?;
@@ -123,10 +137,5 @@ pub(super) fn submit(
     }
     let plan = delivery.plan.ok_or("video_framer_failed")?;
     // SAFETY: plan and unit bytes remain owned until synchronous submit returns.
-    accepted(
-        unsafe {
-            (transport_api.submit)(transport.context(), transport_stream, unit, &plan.header())
-        },
-        "native_video_plan_submit_failed",
-    )
+    accepted(admit(&plan.header()), "native_video_plan_submit_failed")
 }

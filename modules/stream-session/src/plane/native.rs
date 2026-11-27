@@ -288,7 +288,11 @@ impl NativeBackend {
                 clock_epoch: selection.clock_epoch,
                 clock_origin_us,
                 metadata_required: 0,
-                reserved: 0,
+                reserved: if route.limits.allowed_extensions & VIDEO_FRAME_CAPTURE_TIMING != 0 {
+                    VIDEO_PLAN_CAPTURE_TIMING
+                } else {
+                    0
+                },
             },
             payload_type: u32::from(route.profile.payload_type),
             encoding_name_len: route.profile.encoding_name.len() as u32,
@@ -606,19 +610,34 @@ impl Backend for NativeBackend {
         };
         // SAFETY: binding and stack output remain live throughout the callback.
         let status = unsafe {
-            (api.receive)(
-                binding.context(),
-                self.handles.video,
-                NegotiatedVideoUnitSink {
-                    context: (&mut output as *mut UnitDelivery).cast(),
-                    write: copy_video_unit,
-                },
-            )
+            if let Some(timed) = amaterasu_module_sdk::video_framing::timed_unit_source(binding) {
+                (timed.receive_timed)(
+                    binding.context(),
+                    self.handles.video,
+                    TimedVideoUnitSink {
+                        context: (&mut output as *mut UnitDelivery).cast(),
+                        write: copy_timed_video_unit,
+                    },
+                )
+            } else {
+                (api.receive)(
+                    binding.context(),
+                    self.handles.video,
+                    NegotiatedVideoUnitSink {
+                        context: (&mut output as *mut UnitDelivery).cast(),
+                        write: copy_video_unit,
+                    },
+                )
+            }
         };
         output.delivery.finish(status, DeliveryLane::Video)
     }
 
-    fn submit_video_unit(&mut self, unit: &NegotiatedVideoUnit) -> PlaneResult<bool> {
+    fn submit_video_unit(
+        &mut self,
+        unit: &NegotiatedVideoUnit,
+        processing_started_host_us: u64,
+    ) -> PlaneResult<bool> {
         if let (Some(framer), Some(transport), Some(limits)) =
             (&self.framer, &self.plan_transport, &self.framing_limits)
         {
@@ -628,6 +647,7 @@ impl Backend for NativeBackend {
                 limits,
                 self.handles.media_transport,
                 unit,
+                processing_started_host_us,
             );
         }
         let binding = self
@@ -1032,6 +1052,15 @@ unsafe extern "C" fn copy_video_unit(
     context: *mut c_void,
     unit: *const NegotiatedVideoUnit,
 ) -> Status {
+    // SAFETY: the v1 source lends the same unit without a timing sample.
+    unsafe { copy_timed_video_unit(context, unit, 0) }
+}
+
+unsafe extern "C" fn copy_timed_video_unit(
+    context: *mut c_void,
+    unit: *const NegotiatedVideoUnit,
+    start: u64,
+) -> Status {
     if context.is_null()
         || unit.is_null()
         || !(unit as usize).is_multiple_of(align_of::<NegotiatedVideoUnit>())
@@ -1046,7 +1075,11 @@ unsafe extern "C" fn copy_video_unit(
         deliver(
             (&mut output.delivery as *mut Delivery<VideoUnitPacket>).cast(),
             unit,
-            |value| VideoUnitPacket::copy(value, &selection),
+            |value| {
+                let mut packet = VideoUnitPacket::copy(value, &selection)?;
+                packet.processing_started_host_us = start;
+                Ok(packet)
+            },
         )
     }
 }

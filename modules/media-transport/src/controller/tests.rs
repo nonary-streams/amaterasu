@@ -133,6 +133,7 @@ fn authenticated_video_format_selection_rejects_mismatched_packets_before_queuei
             Operation::ConfigureVideoFormat {
                 stream: id,
                 video_stream_format: hevc,
+                capture_timing: false,
             },
         )
         .unwrap();
@@ -163,6 +164,7 @@ fn authenticated_video_format_selection_rejects_mismatched_packets_before_queuei
                 Operation::ConfigureVideoFormat {
                     stream: id,
                     video_stream_format: hevc,
+                    capture_timing: false,
                 }
             )
             .err(),

@@ -77,6 +77,7 @@ pub struct VideoPacketizer {
     codec: VideoCodec,
     payload_bytes: usize,
     stream_index: u32,
+    capture_timing: bool,
 }
 
 impl VideoPacketizer {
@@ -99,7 +100,40 @@ impl VideoPacketizer {
             codec,
             payload_bytes: config.packet_size - NV_BYTES,
             stream_index: 0,
+            capture_timing: false,
         })
+    }
+
+    /// Select the negotiated header before the packetizer submits any frames.
+    pub fn enable_capture_timing(&mut self) -> Result<(), VideoError> {
+        if self.payload_bytes < FRAME_BYTES + 8 + 5 {
+            return Err(VideoError::InvalidPacketSize);
+        }
+        self.capture_timing = true;
+        Ok(())
+    }
+
+    fn frame_header_bytes(&self) -> usize {
+        FRAME_BYTES + if self.capture_timing { 8 } else { 0 }
+    }
+
+    fn frame_header(
+        &self,
+        keyframe: bool,
+        total_bytes: usize,
+        latency: u16,
+        capture_start: u64,
+    ) -> [u8; 16] {
+        let mut header = [0; 16];
+        header[..FRAME_BYTES].copy_from_slice(&short_frame_header(
+            keyframe,
+            ((total_bytes - 1) % self.payload_bytes + 1) as u16,
+            latency,
+        ));
+        if self.capture_timing {
+            header[FRAME_BYTES..].copy_from_slice(&capture_start.to_le_bytes());
+        }
+        header
     }
 
     /// Bound queue space without parsing, parity generation, or sequence changes.
@@ -111,10 +145,10 @@ impl VideoPacketizer {
         if access_unit_len == 0 {
             return Err(self.invalid_bitstream());
         }
+        let total_bytes = access_unit_len + self.frame_header_bytes();
         if self.config.fec_percentage != 0 {
-            return fec::reservation(access_unit_len, self.config);
+            return fec::reservation(total_bytes, self.config);
         }
-        let total_bytes = access_unit_len + FRAME_BYTES;
         let datagrams = total_bytes.div_ceil(self.payload_bytes);
         if datagrams > MAX_PACKETS {
             return Err(VideoError::TooManyPackets);
@@ -159,6 +193,25 @@ impl VideoPacketizer {
         timestamp_90khz: u32,
         host_processing_latency: u16,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
+        self.packetize_with_timing(
+            access_unit,
+            encoder_keyframe,
+            frame_index,
+            timestamp_90khz,
+            host_processing_latency,
+            0,
+        )
+    }
+
+    pub fn packetize_with_timing(
+        &mut self,
+        access_unit: &[u8],
+        encoder_keyframe: bool,
+        frame_index: u32,
+        timestamp_90khz: u32,
+        host_processing_latency: u16,
+        capture_start: u64,
+    ) -> Result<Vec<Vec<u8>>, VideoError> {
         if access_unit.len() > MAX_ACCESS_UNIT_BYTES {
             return Err(VideoError::AccessUnitTooLarge);
         }
@@ -169,19 +222,18 @@ impl VideoPacketizer {
                 frame_index,
                 timestamp_90khz,
                 host_processing_latency,
+                capture_start,
             );
         }
-        let total_bytes = access_unit.len() + FRAME_BYTES;
+        let header_bytes = self.frame_header_bytes();
+        let total_bytes = access_unit.len() + header_bytes;
         let packet_count = total_bytes.div_ceil(self.payload_bytes);
         if packet_count > MAX_PACKETS {
             return Err(VideoError::TooManyPackets);
         }
         let is_idr = self.keyframe(access_unit, encoder_keyframe)?;
-        let frame_header = short_frame_header(
-            is_idr,
-            ((total_bytes - 1) % self.payload_bytes + 1) as u16,
-            host_processing_latency,
-        );
+        let frame_header =
+            self.frame_header(is_idr, total_bytes, host_processing_latency, capture_start);
         let mut datagrams = Vec::with_capacity(packet_count);
         for packet_index in 0..packet_count {
             let start = packet_index * self.payload_bytes;
@@ -196,11 +248,11 @@ impl VideoPacketizer {
                 packet_count,
                 end - start,
             );
-            if start < FRAME_BYTES {
-                packet.extend_from_slice(&frame_header[start..end.min(FRAME_BYTES)]);
+            if start < header_bytes {
+                packet.extend_from_slice(&frame_header[start..end.min(header_bytes)]);
             }
             packet.extend_from_slice(
-                &access_unit[start.saturating_sub(FRAME_BYTES)..end - FRAME_BYTES],
+                &access_unit[start.saturating_sub(header_bytes)..end - header_bytes],
             );
             datagrams.push(packet);
         }

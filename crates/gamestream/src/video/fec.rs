@@ -94,10 +94,10 @@ fn plan_without_parity(data_shards: usize, max_blocks: u8) -> Result<Vec<Block>,
 }
 
 pub(super) fn reservation(
-    access_unit_len: usize,
+    total_bytes: usize,
     config: VideoConfig,
 ) -> Result<Reservation, VideoError> {
-    let data = (access_unit_len + FRAME_BYTES).div_ceil(config.packet_size - NV_BYTES);
+    let data = total_bytes.div_ceil(config.packet_size - NV_BYTES);
     let blocks = plan_blocks(data, config)?;
     let datagrams = blocks
         .iter()
@@ -127,7 +127,34 @@ impl VideoPacketizer {
         timestamp: u32,
         latency: u16,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
-        if limits.packet_size as usize != self.config.packet_size
+        // SAFETY: forward the caller's plan-lifetime and authorization contract.
+        unsafe {
+            self.packetize_timed_external_plan(
+                plan,
+                limits,
+                keyframe,
+                frame_index,
+                timestamp,
+                (latency, 0),
+            )
+        }
+    }
+
+    /// # Safety
+    /// The plan must meet the same lifetime and authorization contract as
+    /// `packetize_external_plan`. Timing contains legacy processing duration
+    /// in tenths of a millisecond and capture start in host microseconds.
+    pub unsafe fn packetize_timed_external_plan(
+        &mut self,
+        plan: &amaterasu_media::VideoFramePlan,
+        limits: &amaterasu_media::VideoFramingLimits,
+        keyframe: bool,
+        frame_index: u32,
+        timestamp: u32,
+        timing: (u16, u64),
+    ) -> Result<Vec<Vec<u8>>, VideoError> {
+        if limits.frame_header_bytes() != self.frame_header_bytes()
+            || limits.packet_size as usize != self.config.packet_size
             || limits.min_parity_shards != u32::from(self.config.min_parity_shards)
             || limits.min_fec_percentage != u32::from(self.config.fec_percentage)
             || limits.max_fec_blocks != u32::from(self.config.max_fec_blocks)
@@ -146,15 +173,12 @@ impl VideoPacketizer {
             // SAFETY: validation checked shape and caller guarantees the live buffer.
             unsafe { std::slice::from_raw_parts(plan.record_starts.ptr, plan.record_starts.len) }
         };
-        let total_bytes = bytes.len() + FRAME_BYTES;
+        let header_bytes = self.frame_header_bytes();
+        let total_bytes = bytes.len() + header_bytes;
         let mut frame = Vec::with_capacity(total_bytes);
-        let mut header = short_frame_header(
-            keyframe,
-            ((total_bytes - 1) % self.payload_bytes + 1) as u16,
-            latency,
-        );
+        let mut header = self.frame_header(keyframe, total_bytes, timing.0, timing.1);
         header[6..8].copy_from_slice(&(plan.critical_prefix_shards as u16).to_le_bytes());
-        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&header[..header_bytes]);
         frame.extend_from_slice(bytes);
         let mut packets = Vec::with_capacity(reservation.datagrams as usize);
         let mut offset = 0usize;
@@ -210,16 +234,15 @@ impl VideoPacketizer {
         frame_index: u32,
         timestamp: u32,
         host_processing_latency: u16,
+        capture_start: u64,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
-        let total_bytes = access_unit.len() + FRAME_BYTES;
+        let header_bytes = self.frame_header_bytes();
+        let total_bytes = access_unit.len() + header_bytes;
         let blocks = plan_blocks(total_bytes.div_ceil(self.payload_bytes), self.config)?;
         let is_idr = self.keyframe(access_unit, encoder_keyframe)?;
         let mut frame = Vec::with_capacity(total_bytes);
-        frame.extend_from_slice(&short_frame_header(
-            is_idr,
-            ((total_bytes - 1) % self.payload_bytes + 1) as u16,
-            host_processing_latency,
-        ));
+        let header = self.frame_header(is_idr, total_bytes, host_processing_latency, capture_start);
+        frame.extend_from_slice(&header[..header_bytes]);
         frame.extend_from_slice(access_unit);
         let total_packets = blocks
             .iter()

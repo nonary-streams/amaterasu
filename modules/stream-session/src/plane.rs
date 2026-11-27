@@ -295,7 +295,11 @@ trait Backend {
     ) -> PlaneResult<Option<VideoUnitPacket>> {
         Err("negotiated_video_unsupported")
     }
-    fn submit_video_unit(&mut self, _unit: &NegotiatedVideoUnit) -> PlaneResult<bool> {
+    fn submit_video_unit(
+        &mut self,
+        _unit: &NegotiatedVideoUnit,
+        _processing_started_host_us: u64,
+    ) -> PlaneResult<bool> {
         Err("negotiated_video_unsupported")
     }
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>>;
@@ -697,7 +701,10 @@ impl<B: Backend> Pump<B> {
             {
                 return Err("negotiated_video_sequence");
             }
-            if !self.backend.submit_video_unit(&unit)? {
+            if !self
+                .backend
+                .submit_video_unit(&unit, packet.processing_started_host_us)?
+            {
                 break;
             }
             self.video_ended = unit.flags == VIDEO_UNIT_END_OF_STREAM;

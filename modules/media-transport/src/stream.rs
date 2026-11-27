@@ -521,12 +521,13 @@ impl Stream {
             None
         };
         let packetize_started = Instant::now();
-        let datagrams = match self.video.packetize_with_latency(
+        let datagrams = match self.video.packetize_with_timing(
             access_unit,
             keyframe,
             frame_index,
             clock,
             latency.unwrap_or(0),
+            latency.map_or(0, |_| processing_started_host_us),
         ) {
             Ok(datagrams) => datagrams,
             Err(_) => return STATUS_INVALID_ARGUMENT,
@@ -566,12 +567,21 @@ impl Stream {
         sample
     }
 
+    pub fn enable_capture_timing(&mut self) -> TransportResult<()> {
+        self.video
+            .enable_capture_timing()
+            .map_err(|_| "invalid_video_configuration")
+    }
+
     /// Install a profile only after trusted composition verifies the complete chain.
     pub fn configure_planned_video(
         &mut self,
         selection: PlannedVideoSelection,
     ) -> TransportResult<()> {
         self.validate_planned_video(selection)?;
+        if selection.limits.allowed_extensions & VIDEO_FRAME_CAPTURE_TIMING != 0 {
+            self.enable_capture_timing()?;
+        }
         self.planned_selection = Some(selection);
         Ok(())
     }
@@ -619,6 +629,7 @@ impl Stream {
     pub fn probe_video_plan(
         &self,
         selection: &VideoPlanSelection,
+        capture_timing: bool,
     ) -> TransportResult<VideoFramingLimits> {
         let valid_id =
             |id: EncoderFormatId| id.namespace_id != 0 && id.value != 0 && id.schema != 0;
@@ -641,7 +652,13 @@ impl Stream {
                 0
             },
             network_overhead: if self.peer.is_ipv6() { 48 } else { 28 },
-            allowed_extensions: VIDEO_FRAME_RECORD_START | VIDEO_FRAME_CRITICAL_PREFIX,
+            allowed_extensions: VIDEO_FRAME_RECORD_START
+                | VIDEO_FRAME_CRITICAL_PREFIX
+                | if capture_timing {
+                    VIDEO_FRAME_CAPTURE_TIMING
+                } else {
+                    0
+                },
             max_datagrams: MAX_DATAGRAMS as u32,
             max_queue_bytes: MAX_QUEUE_BYTES as u32,
             min_parity_shards: u32::from(self.video_settings.min_parity_shards),
@@ -671,8 +688,9 @@ impl Stream {
     pub fn prepare_video_plan(
         &mut self,
         selection: &VideoPlanSelection,
+        capture_timing: bool,
     ) -> TransportResult<VideoFramingLimits> {
-        let limits = self.probe_video_plan(selection)?;
+        let limits = self.probe_video_plan(selection, capture_timing)?;
         self.configure_planned_video(PlannedVideoSelection {
             stream: selection.stream,
             generation: selection.generation,
@@ -698,6 +716,7 @@ impl Stream {
         &mut self,
         unit: &NegotiatedVideoUnit,
         plan: &VideoFramePlan,
+        processing_started_host_us: u64,
     ) -> Status {
         if self.delivery.failure.is_some() {
             return MEDIA_BACKEND_ERROR;
@@ -739,9 +758,13 @@ impl Stream {
         {
             return STATUS_INVALID_ARGUMENT;
         }
-        let Some(host_time) = selection.clock_origin_us.checked_add(unit.timestamp_us) else {
+        if selection
+            .clock_origin_us
+            .checked_add(unit.timestamp_us)
+            .is_none()
+        {
             return STATUS_INVALID_ARGUMENT;
-        };
+        }
         let Some(frame_index) = self.next_frame_index else {
             return self.fail("video_index_exhausted");
         };
@@ -757,16 +780,30 @@ impl Stream {
             return MEDIA_BUSY;
         }
         let timestamp = (u128::from(unit.timestamp_us) * 90_000 / 1_000_000) as u32;
-        let latency = host_processing_latency_tenths_ms(host_time, host_monotonic_micros());
+        let now = host_monotonic_micros();
+        let latency = if processing_started_host_us != 0
+            && now
+                .checked_sub(processing_started_host_us)
+                .is_some_and(|elapsed| elapsed <= HOST_PROCESSING_LATENCY_WINDOW_US)
+        {
+            // Zero on the wire is reserved for an unavailable measurement.
+            Some(host_processing_latency_tenths_ms(processing_started_host_us, now).max(1))
+        } else {
+            None
+        };
+        let packetize_started = Instant::now();
         // SAFETY: caller guarantees plan storage remains live and immutable.
         let datagrams = match unsafe {
-            self.video.packetize_external_plan(
+            self.video.packetize_timed_external_plan(
                 plan,
                 &selection.limits,
                 unit.flags & VIDEO_UNIT_KEYFRAME != 0,
                 frame_index,
                 timestamp,
-                latency,
+                (
+                    latency.unwrap_or(0),
+                    latency.map_or(0, |_| processing_started_host_us),
+                ),
             )
         } {
             Ok(value) => value,
@@ -777,6 +814,10 @@ impl Stream {
             Err(code) => return self.fail(code),
         };
         self.delivery.push_video(frame_index, datagrams);
+        self.processing_latency
+            .packetize_fec_encrypt_us
+            .record_since(packetize_started);
+        self.processing_latency.record(latency);
         self.finish_video_admission(frame_index, unit.access_unit_id, unit.timestamp_us)
     }
 

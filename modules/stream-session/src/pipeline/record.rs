@@ -337,7 +337,19 @@ impl Record {
             framer_service: route.framer_service.clone(),
             transport_service: route.plan_transport_service.clone(),
             clock_origin_us: unit.clock_origin_us,
-            limits,
+            limits: amaterasu_media::VideoFramingLimits {
+                allowed_extensions: limits.allowed_extensions
+                    | if self
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.capture_timing)
+                    {
+                        amaterasu_media::VIDEO_FRAME_CAPTURE_TIMING
+                    } else {
+                        0
+                    },
+                ..limits
+            },
             selection: crate::plane::VideoUnitSelection {
                 stream: unit.stream,
                 generation: unit.generation,

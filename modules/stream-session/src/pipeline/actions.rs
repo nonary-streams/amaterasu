@@ -788,6 +788,7 @@ fn validate_start_configuration(
         return Err("lifecycle_provider_not_selected");
     }
     if (configuration.client_feature_flags.is_some()
+        || configuration.capture_timing
         || !configuration.stream_adjustments.is_empty())
         && !lifecycle_admitter
     {

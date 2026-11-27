@@ -1250,23 +1250,29 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
     let mut wrong = unit;
     wrong.offer_id += 1;
     assert_eq!(
-        unsafe { stream.submit_planned_video(&wrong, &plan) },
+        unsafe { stream.submit_planned_video(&wrong, &plan, 0) },
         STATUS_INVALID_ARGUMENT
     );
     plan.blocks[0].first_data_shard = 1;
     assert_eq!(
-        unsafe { stream.submit_planned_video(&unit, &plan) },
+        unsafe { stream.submit_planned_video(&unit, &plan, 0) },
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(stream.delivery.queued(), 0);
     assert_eq!(stream.next_frame_index, Some(1));
     plan.blocks[0].first_data_shard = 0;
+    // Future presentation is valid RTP data. Host processing uses the independent sample.
+    let unit = NegotiatedVideoUnit {
+        timestamp_us: 9_000_000,
+        ..unit
+    };
+    let capture_start = host_monotonic_micros() - 42_000;
     assert_eq!(
-        unsafe { stream.submit_planned_video(&unit, &plan) },
+        unsafe { stream.submit_planned_video(&unit, &plan, capture_start) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { stream.submit_planned_video(&unit, &plan) },
+        unsafe { stream.submit_planned_video(&unit, &plan, 0) },
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(stream.delivery.queued(), 0, "admission flushes the plan");
@@ -1275,6 +1281,16 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
     assert_eq!(&packet[2..4], &[0, 0]);
     assert_eq!(&packet[20..24], &1u32.to_le_bytes());
     assert_eq!(&packet[40..44], &bytes[..4]);
+    assert_eq!(&packet[4..8], &810_000u32.to_be_bytes());
+    let reported = u16::from_le_bytes([packet[33], packet[34]]);
+    assert!(
+        (420..=host_processing_latency_tenths_ms(capture_start, host_monotonic_micros()))
+            .contains(&reported)
+    );
+    assert_eq!(
+        stream.take_processing_latency().total_tenths_ms,
+        u64::from(reported)
+    );
     assert_eq!(
         unsafe { stream.submit_video(&video_packet(&bytes, 2)) },
         MEDIA_UNSUPPORTED
@@ -1284,9 +1300,9 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
         .push_video(0, vec![vec![0; MAX_QUEUE_BYTES]]);
     let mut next = unit;
     next.access_unit_id = 2;
-    next.timestamp_us = 1;
+    next.timestamp_us = unit.timestamp_us + 1;
     assert_eq!(
-        unsafe { stream.submit_planned_video(&next, &plan) },
+        unsafe { stream.submit_planned_video(&next, &plan, 0) },
         MEDIA_BUSY
     );
     assert_eq!(stream.next_frame_index, Some(2));

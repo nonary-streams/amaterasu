@@ -134,6 +134,7 @@ impl Controller {
                 if !completed {
                     record.negotiated_encryption = None;
                     record.client_feature_flags = None;
+                    record.capture_timing = false;
                     record.negotiated_color = None;
                     record.negotiated_video = None;
                 }

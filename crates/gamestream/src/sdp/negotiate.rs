@@ -145,6 +145,8 @@ fn parse_with<T>(
     // capabilities they understand. Encryption and transport checks stay strict.
     attributes.default_value("x-nv-general.enableRecoveryMode", 0)?;
     attributes.default_value("x-nv-ri.useControlChannel", 1)?;
+    let capture_timing = control == ControlProtocol::EncryptedEnet
+        && attributes.hint("x-ml-video.captureTiming") == Some(1);
     let ignored_attributes = attributes.finish()?;
     let mut announce = Announce {
         video,
@@ -155,6 +157,7 @@ fn parse_with<T>(
         encryption,
         fec,
         client_feature_flags,
+        capture_timing,
         ignored_attributes,
         adjustments: Vec::new(),
     };

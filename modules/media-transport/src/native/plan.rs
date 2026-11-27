@@ -2,7 +2,8 @@
 use super::{Shared, guarded};
 use amaterasu_media::{
     MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED, NegotiatedVideoPlanTransportApiV2,
-    NegotiatedVideoUnit, VideoFramePlan, VideoFramingLimits, VideoPlanSelectionV2,
+    NegotiatedVideoPlanTransportApiV2_1, NegotiatedVideoUnit, VideoFramePlan, VideoFramingLimits,
+    VideoPlanSelectionV2,
 };
 use amaterasu_module_sdk::abi::*;
 use std::{ffi::c_void, sync::TryLockError};
@@ -26,7 +27,7 @@ impl Factory {
     }
 }
 struct Binding {
-    api: NegotiatedVideoPlanTransportApiV2,
+    api: NegotiatedVideoPlanTransportApiV2_1,
     shared: Shared,
     owner: String,
 }
@@ -52,8 +53,8 @@ unsafe extern "C" fn bind(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != 2
-            || query.min_minor > 0
-            || query.min_size as usize > size_of::<NegotiatedVideoPlanTransportApiV2>()
+            || query.min_minor > 1
+            || query.min_size as usize > size_of::<NegotiatedVideoPlanTransportApiV2_1>()
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -67,29 +68,32 @@ unsafe extern "C" fn bind(
         };
         let factory = unsafe { &*context.cast::<Factory>() };
         let mut binding = Box::new(Binding {
-            api: NegotiatedVideoPlanTransportApiV2 {
-                base: NativeInterface {
-                    header: AbiHeader {
-                        size: size_of::<NegotiatedVideoPlanTransportApiV2>() as u32,
-                        major: 2,
-                        minor: 0,
+            api: NegotiatedVideoPlanTransportApiV2_1 {
+                base: NegotiatedVideoPlanTransportApiV2 {
+                    base: NativeInterface {
+                        header: AbiHeader {
+                            size: size_of::<NegotiatedVideoPlanTransportApiV2_1>() as u32,
+                            major: 2,
+                            minor: 1,
+                        },
+                        context: std::ptr::null_mut(),
+                        release: Some(release),
                     },
-                    context: std::ptr::null_mut(),
-                    release: Some(release),
+                    probe,
+                    prepare,
+                    submit,
+                    drain,
                 },
-                probe,
-                prepare,
-                submit,
-                drain,
+                submit_timed,
             },
             shared: factory.shared.clone(),
             owner,
         });
-        binding.api.base.context = (&mut *binding as *mut Binding).cast();
+        binding.api.base.base.context = (&mut *binding as *mut Binding).cast();
         let binding = Box::into_raw(binding);
         // SAFETY: table allocation transfers to runtime until release.
         unsafe {
-            *output = &(*binding).api.base;
+            *output = &(*binding).api.base.base;
         }
         STATUS_OK
     })
@@ -178,6 +182,16 @@ unsafe extern "C" fn submit(
     unit: *const NegotiatedVideoUnit,
     plan: *const VideoFramePlan,
 ) -> Status {
+    // SAFETY: the legacy caller retains unit and plan storage through admission.
+    unsafe { submit_timed(context, stream, unit, plan, 0) }
+}
+unsafe extern "C" fn submit_timed(
+    context: *mut c_void,
+    stream: u64,
+    unit: *const NegotiatedVideoUnit,
+    plan: *const VideoFramePlan,
+    processing_started_host_us: u64,
+) -> Status {
     guarded(|| {
         if unit.is_null()
             || plan.is_null()
@@ -189,7 +203,13 @@ unsafe extern "C" fn submit(
         // SAFETY: caller retains both headers and their nested byte borrows.
         unsafe {
             with_binding(context, |controller, owner| {
-                controller.submit_video_plan(owner, stream, &*unit, &*plan)
+                controller.submit_video_plan(
+                    owner,
+                    stream,
+                    &*unit,
+                    &*plan,
+                    processing_started_host_us,
+                )
             })
         }
     })

@@ -219,6 +219,6 @@ pub(super) fn description(capabilities: &Capabilities) -> String {
         ""
     };
     format!(
-        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Amaterasu\r\nt=0 0\r\na=x-ss-general.featureFlags:0\r\na=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n{hevc_marker}{av1_marker}m=audio 0 RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Amaterasu\r\nt=0 0\r\na=x-ss-general.featureFlags:0\r\na=x-ss-video.captureTiming:1\r\na=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n{hevc_marker}{av1_marker}m=audio 0 RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
     )
 }

@@ -22,6 +22,8 @@ use std::{
     time::Instant,
 };
 
+const CAPTURE_CLOCK_REQUEST: u16 = 0x5510;
+const CAPTURE_CLOCK_REPLY: u16 = 0x5511;
 const MAX_MESSAGES: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
@@ -55,6 +57,7 @@ pub struct Stream {
     opened: u64,
     ping_timeout_ms: u64,
     authenticated_at: Option<u64>,
+    last_capture_clock_reply: Option<u64>,
     failure: Option<&'static str>,
     /// The line that raised `failure`.
     failure_site: Option<&'static Location<'static>>,
@@ -131,6 +134,7 @@ impl Stream {
             opened: now,
             ping_timeout_ms,
             authenticated_at: None,
+            last_capture_clock_reply: None,
             failure: None,
             failure_site: None,
             sent_messages: 0,
@@ -274,6 +278,7 @@ impl Stream {
     }
 
     fn accept_control(&mut self, channel: u8, delivery: Delivery, data: &[u8], now: u64) {
+        let received_us = host_monotonic_micros();
         let started = Instant::now();
         let opened = self.opener.open(data);
         self.timing.decrypt_us.record_since(started);
@@ -281,6 +286,12 @@ impl Stream {
             self.rejected_messages = self.rejected_messages.saturating_add(1);
             return;
         };
+        if message.kind == CAPTURE_CLOCK_REQUEST {
+            if channel == 0 && delivery == Delivery::Unsequenced {
+                self.reply_capture_clock(&message.payload, received_us, now);
+            }
+            return;
+        }
         if self.incoming.len() >= MAX_MESSAGES
             || self.incoming_bytes + message.payload.len() > MAX_MESSAGE_BYTES
         {
@@ -302,6 +313,34 @@ impl Stream {
             bytes: message.payload,
         });
         self.timing.queue_high_water = self.timing.queue_high_water.max(self.incoming.len());
+    }
+
+    fn reply_capture_clock(&mut self, request: &[u8], received_us: u64, now: u64) {
+        if request.len() != 8
+            || self.authenticated_at.is_none()
+            || self
+                .last_capture_clock_reply
+                .is_some_and(|last| now.saturating_sub(last) < 500)
+            || self
+                .peer
+                .can_send(0, 24 + 28, Delivery::Unsequenced)
+                .is_err()
+        {
+            return;
+        }
+        self.last_capture_clock_reply = Some(now);
+        let mut reply = [0; 24];
+        reply[..8].copy_from_slice(request);
+        reply[8..16].copy_from_slice(&received_us.to_le_bytes());
+        reply[16..24].copy_from_slice(&host_monotonic_micros().to_le_bytes());
+        if let Ok(packet) = self.sealer.seal(CAPTURE_CLOCK_REPLY, &reply)
+            && self
+                .peer
+                .send(0, &packet, Delivery::Unsequenced, now)
+                .is_ok()
+        {
+            self.sent_messages = self.sent_messages.saturating_add(1);
+        }
     }
 
     /// # Safety

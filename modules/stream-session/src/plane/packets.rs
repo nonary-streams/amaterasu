@@ -223,6 +223,7 @@ impl VideoUnitSelection {
 
 /// Owns the copied unit until transport admission succeeds.
 pub(super) struct VideoUnitPacket {
+    pub(super) processing_started_host_us: u64,
     metadata: NegotiatedVideoUnit,
     bytes: Vec<u8>,
 }
@@ -246,7 +247,11 @@ impl VideoUnitPacket {
         };
         let mut metadata = *unit;
         metadata.data = amaterasu_module_sdk::abi::BorrowedBytes::new(&[]);
-        Ok(Self { metadata, bytes })
+        Ok(Self {
+            metadata,
+            bytes,
+            processing_started_host_us: 0,
+        })
     }
 
     pub(super) fn header(&self) -> NegotiatedVideoUnit {

@@ -59,6 +59,7 @@ pub(super) struct Record {
     pub negotiated_slices_per_frame: Option<i32>,
     pub negotiated_video_stream_format: Option<amaterasu_module_sdk::VideoStreamFormat>,
     pub client_feature_flags: Option<u32>,
+    pub capture_timing: bool,
     pub adjustments: Vec<amaterasu_gamestream::sdp::StreamAdjustment>,
     pub negotiated_color: Option<amaterasu_gamestream::sdp::ColorMode>,
     pub negotiated_video: Option<crate::model::NegotiatedVideo>,
@@ -237,6 +238,7 @@ impl Record {
         }
         self.negotiated_video_stream_format = accepted.then_some(format);
         self.client_feature_flags = accepted.then_some(announce.client_feature_flags);
+        self.capture_timing = accepted && announce.capture_timing;
         self.negotiated_color = accepted.then_some(announce.video.color);
         self.negotiated_video = negotiated_video;
         accepted
@@ -250,6 +252,9 @@ impl Record {
                 return None;
             };
             let mut payload = self.config.arm(session);
+            if announce.capture_timing {
+                payload["configuration"]["capture_timing"] = json!(true);
+            }
             payload["configuration"]["encrypt_video"] = json!(announce.encryption.video);
             payload["configuration"]["encrypt_audio"] = json!(announce.encryption.audio);
             payload["configuration"]["client_feature_flags"] = json!(announce.client_feature_flags);
@@ -277,6 +282,9 @@ impl Record {
             self.negotiated_video_stream_format?,
             self.client_feature_flags? & amaterasu_gamestream::sdp::KNOWN_CLIENT_FEATURE_FLAGS,
         );
+        if self.capture_timing {
+            payload["configuration"]["capture_timing"] = json!(true);
+        }
         payload["configuration"]["configuration"]["width"] = serde_json::json!(video.width);
         payload["configuration"]["configuration"]["height"] = serde_json::json!(video.height);
         payload["configuration"]["configuration"]["fps"] = serde_json::json!(video.fps);

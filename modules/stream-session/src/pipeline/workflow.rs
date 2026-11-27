@@ -617,12 +617,13 @@ impl Job {
                     .start
                     .as_ref()
                     .expect("validated start configuration");
-                (
-                    record.service(Resource::Media),
-                    json!({"action":"configure_video_format",
-                        "stream":record.resources[&Resource::Media],
-                        "video_stream_format":start.configuration.video_stream_format}),
-                )
+                let mut request = json!({"action":"configure_video_format",
+                    "stream":record.resources[&Resource::Media],
+                    "video_stream_format":start.configuration.video_stream_format});
+                if start.capture_timing {
+                    request["capture_timing"] = json!(true);
+                }
+                (record.service(Resource::Media), request)
             }
             Step::CreateOwnedVirtualDisplay => (
                 "amaterasu.virtual-display/1".into(),

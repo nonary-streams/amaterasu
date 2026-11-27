@@ -356,6 +356,7 @@ impl Controller {
             negotiated_slices_per_frame: None,
             negotiated_video_stream_format: None,
             client_feature_flags: None,
+            capture_timing: false,
             adjustments: Vec::new(),
             negotiated_color: None,
             negotiated_video: None,

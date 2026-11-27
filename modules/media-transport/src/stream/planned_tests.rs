@@ -169,7 +169,7 @@ struct Output<'a> {
 unsafe extern "C" fn submit(context: *mut c_void, plan: *const VideoFramePlan) -> Status {
     // SAFETY: test keeps stream/unit live; the framer holds plan through callback.
     let state = unsafe { &mut *context.cast::<Output<'_>>() };
-    unsafe { state.stream.submit_planned_video(state.unit, &*plan) }
+    unsafe { state.stream.submit_planned_video(state.unit, &*plan, 0) }
 }
 struct EncoderBridge<'a> {
     stream: &'a mut Stream,

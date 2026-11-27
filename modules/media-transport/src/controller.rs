@@ -104,8 +104,9 @@ impl Controller {
             Operation::ConfigureVideoFormat {
                 stream,
                 video_stream_format,
+                capture_timing,
             } => (
-                self.configure_video_format(owner, stream, video_stream_format)?,
+                self.configure_video_format(owner, stream, video_stream_format, capture_timing)?,
                 None,
             ),
             Operation::Lookup { operation_id } => {
@@ -434,7 +435,10 @@ impl Controller {
         }
         self.owned(owner, id)
             .map_err(|_| MEDIA_CLOSED)?
-            .probe_video_plan(&selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?)
+            .probe_video_plan(
+                &selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?,
+                selection.base.reserved & amaterasu_media::VIDEO_PLAN_CAPTURE_TIMING != 0,
+            )
             .map_err(|_| STATUS_INVALID_ARGUMENT)
     }
 
@@ -449,7 +453,10 @@ impl Controller {
         }
         self.owned_mut(owner, id)
             .ok_or(MEDIA_CLOSED)?
-            .prepare_video_plan(&selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?)
+            .prepare_video_plan(
+                &selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?,
+                selection.base.reserved & amaterasu_media::VIDEO_PLAN_CAPTURE_TIMING != 0,
+            )
             .map_err(|_| STATUS_INVALID_ARGUMENT)
     }
 
@@ -461,9 +468,12 @@ impl Controller {
         id: u64,
         unit: &NegotiatedVideoUnit,
         plan: &VideoFramePlan,
+        processing_started_host_us: u64,
     ) -> Status {
         match self.owned_mut(owner, id) {
-            Some(stream) => unsafe { stream.submit_planned_video(unit, plan) },
+            Some(stream) => unsafe {
+                stream.submit_planned_video(unit, plan, processing_started_host_us)
+            },
             None => MEDIA_CLOSED,
         }
     }
@@ -473,9 +483,13 @@ impl Controller {
         owner: &str,
         id: u64,
         format: amaterasu_module_sdk::VideoStreamFormat,
+        capture_timing: bool,
     ) -> TransportResult<Value> {
         let stream = self.owned_mut(owner, id).ok_or("stream_not_found")?;
         stream.configure_video_format(format)?;
+        if capture_timing {
+            stream.enable_capture_timing()?;
+        }
         Ok(json!({"ok":true,"stream":id,"video_stream_format":format}))
     }
 }

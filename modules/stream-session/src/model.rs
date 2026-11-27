@@ -1230,6 +1230,8 @@ pub struct StartConfigData {
     /// Immutable Moonlight feature flags retained from the accepted RTSP ANNOUNCE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_feature_flags: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture_timing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuous_audio: Option<bool>,
     /// Optional PLAY snapshot; when present it must match the immutable
