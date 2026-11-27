@@ -1432,6 +1432,7 @@ impl Controller {
                 if record.video_codec_offer.warn_software_performance {
                     add_stream_warning(
                         record,
+                        self.logger.as_ref(),
                         amaterasu_module_sdk::stream_warnings::StreamWarning {
                             code: "software_encoder_performance".into(),
                             source: NVHTTP_WARNING_SOURCE.into(),

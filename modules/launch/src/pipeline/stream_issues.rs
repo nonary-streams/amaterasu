@@ -135,7 +135,6 @@ impl Record {
             Some(WarningValue::Label("configured_output".into())),
             Some(WarningValue::Label("discarded".into())),
         );
-        eprintln!("{}", issue.description());
         let warning = issue.to_stream_warning(crate::SERVICE);
         if self.warnings.len() < MAX_WARNINGS && !self.warnings.contains(&warning) {
             self.warnings.push(warning);
