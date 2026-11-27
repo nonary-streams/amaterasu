@@ -449,6 +449,13 @@ namespace Amaterasu {
     return box;
   }
 
+  export function optionalSettingsError(name: string, error: unknown, retry: () => void, fallback = error): HTMLElement {
+    if (error instanceof ApiError && error.code === "service_unavailable")
+      return el("div", "settings-unavailable", el("strong", "", name),
+        el("span", "muted", "Unavailable on this host"), button("Try again", retry, "secondary"));
+    return errorPanel(fallback, retry);
+  }
+
   export function badge(text: TextValue, tone = ""): HTMLElement {
     return el("span", `badge ${tone}`, text);
   }

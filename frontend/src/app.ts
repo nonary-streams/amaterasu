@@ -183,7 +183,7 @@ namespace Amaterasu {
       const value = libraryRouteFromAddress(fragment) ?? (fragment === "updates" ? "plugins" : fragment);
       const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value as Page);
       const settingsCategory = value.startsWith("settings/") &&
-        ["general", "streaming", "integrations", "devices", "access"].includes(value.slice(9)) &&
+        ["everyday", "general", "streaming", "integrations", "devices", "access", "plugins"].includes(value.slice(9)) &&
         this.pageAvailable("settings");
       const pluginsView = value.startsWith("plugins/") &&
         pluginsViewFromAddress(value.slice(8)) !== null &&

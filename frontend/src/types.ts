@@ -11,7 +11,7 @@ namespace Amaterasu {
     | "accounts"
     | "tokens"
     | "maintenance";
-  export type SettingsCategory = "general" | "streaming" | "integrations" | "devices" | "access";
+  export type SettingsCategory = "everyday" | "plugins" | "general" | "streaming" | "integrations" | "devices" | "access";
   /// The Modules page's views. The page keeps the `plugins` address it had
   /// under its former name.
   export type PluginsView = "overview" | "modules" | "drivers" | "repositories";

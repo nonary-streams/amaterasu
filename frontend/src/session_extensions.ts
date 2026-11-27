@@ -27,7 +27,7 @@ namespace Amaterasu {
     actions: SessionExtensionAction[];
   }
 
-  function applicationPluginSection(title: string, defaultExpanded: boolean, content: HTMLElement): HTMLDetailsElement {
+  export function pluginSettingsSection(title: string, defaultExpanded: boolean, content: HTMLElement): HTMLDetailsElement {
     const section = el("details", "application-plugin-section",
       el("summary", "application-plugin-summary", literalText(title)),
       el("div", "application-plugin-content", content));
@@ -70,7 +70,14 @@ namespace Amaterasu {
     renderSessionExtensionSettings(context, area, scope, provider);
   }
 
-  export function renderSessionExtensionSettings(context: PageContext, area: HTMLElement, scope: SessionExtensionScope = { kind: "host" }, provider?: string, excluded: ReadonlySet<string> = new Set()): void {
+  interface EverydayPluginSections {
+    area: HTMLElement;
+    options: ReadonlyMap<string, ReadonlySet<string>>;
+    hasSignedSections: boolean;
+    onRemainingReady(load: () => void): void;
+  }
+
+  export function renderSessionExtensionSettings(context: PageContext, area: HTMLElement, scope: SessionExtensionScope = { kind: "host" }, provider?: string, excluded: ReadonlySet<string> = new Set(), everyday?: EverydayPluginSections): void {
     const renderer = {}; settingsRenderers.set(area, renderer);
     let generation = 0;
     async function load(): Promise<void> {
@@ -92,15 +99,40 @@ namespace Amaterasu {
           if (descriptors.length > 1024) throw new Error("Too many extensions.");
         } while (after);
         const scopedDescriptors = descriptors.filter((descriptor) => !excluded.has(descriptor.provider) && (!provider || descriptor.provider === provider) && Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
-        const settings = await Promise.all(scopedDescriptors.map((descriptor) => context.api.post<SessionExtensionSettings>("session-extensions/settings_get", { provider: descriptor.provider, scope })));
-        if (settingsRenderers.get(area) !== renderer || current !== generation || !context.content.isConnected || !area.isConnected) return;
+        const isCurrent = () => settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected;
+        if (!isCurrent()) return;
         const panels: HTMLElement[] = [];
-        scopedDescriptors.forEach((descriptor, index) => {
-          const document = settings[index];
-          if (!document || !Array.isArray(descriptor.options)) throw new Error("Invalid extension settings response.");
+        const everydayPanels: HTMLElement[] = [];
+        const remaining: Array<() => void> = [];
+        for (const descriptor of scopedDescriptors) {
+          const title = descriptor.display_name || descriptor.provider;
+          const body = el("div", "", el("p", "muted", "Loading settings…"));
+          const featured = everyday && scope.kind === "host" ? everyday.options.get(descriptor.provider) : undefined;
+          const hasFeatured = !!featured && descriptor.options.some(option => featured.has(option.id) && option.allowed_scopes.includes(scope.kind));
+          const section = scope.kind === "host" && !provider
+            ? pluginSettingsSection(title, hasFeatured || descriptor.default_expanded === true, body) : null;
+          (hasFeatured ? everydayPanels : panels).push(section ?? panel(literalText(title), body));
+          let providerLoad = 0;
+          const loadProvider = async (confirmed?: SessionExtensionSettings): Promise<void> => {
+            if (!isCurrent()) return;
+            const request = ++providerLoad;
+            try {
+              const document = confirmed ?? await context.api.post<SessionExtensionSettings>("session-extensions/settings_get", { provider: descriptor.provider, scope });
+              if (!isCurrent() || !body.isConnected || request !== providerLoad) return;
+              body.replaceChildren(renderForm(descriptor, document, loadProvider, hasFeatured ? featured : undefined));
+            } catch (error) {
+              if (!isCurrent() || !body.isConnected || request !== providerLoad) return;
+              if (section) section.open = true;
+              body.replaceChildren(errorPanel(error, () => loadProvider()));
+            }
+          };
+          if (everyday && !hasFeatured) remaining.push(() => void loadProvider());
+          else void loadProvider();
+        }
+        function renderForm(descriptor: SessionExtensionDescriptor, document: SessionExtensionSettings, reload: (confirmed?: SessionExtensionSettings) => Promise<void>, featured?: ReadonlySet<string>): HTMLElement {
           const options = descriptor.options.filter((option) => option.allowed_scopes.includes(scope.kind));
-          if (!options.length) return;
           const form = el("form", "settings-form");
+          const more = el("details", "everyday-more-options", el("summary", "", "More settings"));
           const editors = new Map<string, { inherit: HTMLInputElement | null; editor: ExtensionFieldEditor }>();
           for (const option of options) {
             const effective = document.effective[option.id];
@@ -124,43 +156,87 @@ namespace Amaterasu {
             const controls = editor.node.matches("input,select,textarea")
               ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
             if (controls.length === 1) controls[0]!.setAttribute("aria-label", option.label);
-            const group = el("fieldset", "session-extension-option",
-              el("legend", "field-label", literalText(option.label)), editor.node);
-            if (inherit) group.append(el("label", "session-extension-inherit", inherit, " Use inherited value"));
-            if (option.help) group.append(el("small", "muted", literalText(option.help)));
-            group.append(el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
-            form.append(group);
+            const group = el("fieldset", "session-extension-option");
+            const title = literalText(option.label);
+            const policyHint = el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy));
+            if (scope.kind === "host" && editor.node.matches("input, select, textarea, .extension-slider, .radio-group")) {
+              const row = el(editor.node.matches("input, select, textarea") ? "label" : "div", "field",
+                el("span", "field-label", title), editor.node);
+              group.setAttribute("aria-label", option.label);
+              if (option.help) row.append(el("small", "muted", literalText(option.help)));
+              row.append(policyHint);
+              group.append(row);
+            } else {
+              group.append(el("legend", "field-label", title), editor.node);
+              if (inherit) group.append(el("label", "session-extension-inherit", inherit, " Use inherited value"));
+              if (option.help) group.append(el("small", "muted", literalText(option.help)));
+              group.append(policyHint);
+            }
+            group.disabled = !context.api.allows("configuration.write");
+            (featured && !featured.has(option.id) ? more : form).append(group);
             editors.set(option.id, { inherit, editor });
           }
           const status = el("div");
           const save = el("button", "button primary", "Save settings");
           save.type = "submit";
           save.disabled = !context.api.allows("configuration.write");
+          if (featured && options.some(option => !featured.has(option.id))) form.append(more);
           form.append(status, save);
           form.addEventListener("submit", (event) => {
             event.preventDefault();
             void runAction(save, status, async () => {
               const values: Payload = { ...document.values };
               for (const [id, entry] of editors) {
-                if (entry.inherit?.checked) delete values[id];
-                else values[id] = entry.editor.value();
+                if (entry.inherit?.checked) {
+                  delete values[id];
+                  continue;
+                }
+                const next = entry.editor.value();
+                if (featured && sameConfigurationValue(next, document.effective[id]!.value)) continue;
+                values[id] = next;
               }
-              await context.api.post("session-extensions/settings_update", { provider: descriptor.provider, scope, expected_revision: document.revision, values });
-              context.notify("Plugin settings saved. Application to an active session or stream is not confirmed.");
-              await load();
+              if (featured && sameConfigurationValue(values, document.values)) return;
+              form.inert = true;
+              try {
+                const result = await context.api.post<{ revision: number }>("session-extensions/settings_update", {
+                  provider: descriptor.provider, scope, expected_revision: document.revision, values,
+                });
+                let confirmed: SessionExtensionSettings | undefined;
+                if (featured) {
+                  confirmed = await context.api.post<SessionExtensionSettings>("session-extensions/settings_get", { provider: descriptor.provider, scope });
+                  if (!Number.isSafeInteger(result.revision) || result.revision <= document.revision ||
+                      confirmed.revision !== result.revision || !sameConfigurationValue(confirmed.values, values))
+                    throw new Error("The plugin could not confirm these changes. Reload its saved settings to review them.");
+                }
+                context.notify("Plugin settings saved. Application to an active session or stream is not confirmed.");
+                await reload(confirmed);
+              } finally {
+                form.inert = false;
+              }
             });
           });
-          panels.push(panel(literalText(descriptor.display_name || "Plugin settings"), form));
-        });
+          return form;
+        }
         for (const descriptor of descriptors) {
           if (scope.kind !== "host" || (provider && descriptor.provider !== provider)) continue;
-          if (!Array.isArray(descriptor.actions)) throw new Error("Invalid extension actions response.");
+          if (!Array.isArray(descriptor.actions)) {
+            panels.push(panel(literalText(descriptor.display_name || descriptor.provider), errorPanel(new Error("Invalid extension actions response."))));
+            continue;
+          }
           const actions = descriptor.actions.filter((action) => Array.isArray(action.allowed_targets) && action.allowed_targets.includes("host") && ["read_only", "host_mutation"].includes(action.execution));
           if (actions.length) panels.push(panel(`${descriptor.provider} actions`, ...actions.map((action) => renderExtensionAction(context, action))));
         }
-        area.replaceChildren(...(panels.length ? panels : [el("p", "muted", "No plugin settings are available for this scope.")]));
+        everyday?.area.replaceChildren(...everydayPanels);
+        everyday?.onRemainingReady(() => { for (const read of remaining.splice(0)) read(); });
+        if (!panels.length && !everydayPanels.length && !everyday?.hasSignedSections)
+          panels.push(el("p", "muted", "No plugin settings are available for this scope."));
+        area.replaceChildren(...panels);
       } catch (error) {
-        if (settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected) area.replaceChildren(errorPanel(error, load));
+        if (settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected) {
+          const retry = errorPanel(error, load);
+          if (everyday) everyday.area.replaceChildren(retry);
+          area.replaceChildren(...(everyday ? [] : [retry]));
+        }
       }
     }
     void load();
@@ -221,7 +297,7 @@ namespace Amaterasu {
       renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
       for (const descriptor of sections) {
         const container = el("div");
-        const section = applicationPluginSection(descriptor.name, descriptor.default_expanded === true, container);
+        const section = pluginSettingsSection(descriptor.name, descriptor.default_expanded === true, container);
         custom.append(section);
         const mount = pages.mountApplication(descriptor.id, container, application);
         mounts.add(mount);
@@ -477,7 +553,7 @@ namespace Amaterasu {
             });
           });
           return showAllOptions
-            ? applicationPluginSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
+            ? pluginSettingsSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
             : panel(literalText(descriptor.display_name || descriptor.provider), form);
         });
         if (sharedChoices) sharedChoices.list.append(...sharedGroups);

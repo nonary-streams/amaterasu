@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
+import { nvhttpHostSettings } from "./fixtures/nvhttp-host-settings.mjs";
 
 const context = vm.createContext({ TextEncoder, URL, setTimeout, clearTimeout });
 vm.runInContext(
@@ -561,7 +562,8 @@ test("host logging form refreshes its revision after an ambiguous persisted save
   let nextErrorCode = null;
   let omitMetadata = false;
   const submittedRevisions = [];
-  dom.Amaterasu.renderSettings({ content, notify: (message) => notices.push(message), api: {
+  dom.Amaterasu.renderSettings({
+    initialSettingsCategory: "general", content, notify: (message) => notices.push(message), api: {
     allows: (scope) => scope === "configuration.write",
     async post(route, body) {
       if (route === "host-configuration/get") {
@@ -1321,6 +1323,7 @@ test("input form confirms cleanup-pending save, then reloads after a revision co
   let updates = 0;
   let secondSubmittedRevision;
   dom.Amaterasu.renderSettings({
+    initialSettingsCategory: "streaming",
     content,
     notify: (message) => notices.push(message),
     api: {
@@ -1964,6 +1967,7 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   let updates = 0;
   let secondSubmittedRevision;
   dom.Amaterasu.renderSettings({
+    initialSettingsCategory: "devices",
     content,
     notify: (message) => notices.push(message),
     api: {
@@ -2122,35 +2126,51 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   assert.ok(find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Reload paired clients"));
 });
 
-function nvhttpHostSettings(revision = 8) {
-  return {
-    ok: true, revision,
-    hostname: "Computer Name", configured_hostname: "",
-    port: 47989, configured_address_family: null, configured_bind_address: null,
-    upnp: false,
-    upnp_status: "disabled", upnp_error: null,
-    configured_fec_percentage: null, effective_fec_percentage: 20,
-    configured_capture: "auto", configured_output_name: "DISPLAY1",
-    stream_audio: false, configured_video_max_batch_size_kb: null,
-    configured_max_bitrate: null, configured_minimum_fps_target: null,
-    configured_ping_timeout_ms: null, configured_audio_sink: null,
-    configured_virtual_sink: null, audio_sink_capture_only: false,
-    install_steam_audio_drivers: true,
-    configured_nvenc_preset: 1, configured_nvenc_h264_cavlc: false,
-    configured_nvenc_twopass: "quarter_res", configured_nvenc_vbv_increase: 0,
-    configured_nvenc_split_encode: "auto", configured_nvenc_realtime_hags: true,
-    configured_nvenc_opengl_vulkan_on_dxgi: true, configured_nvenc_latency_over_power: true,
-    configured_vaapi_strict_rc_buffer: false,
-    configured_external_ip: null, configured_wgc_pacing_smoothing: null,
-    configured_global_preparation: [],
-    configured_legacy_global_preparation: [{ do: "old command", elevated: false }],
-    configured_frame_limiter: { frame_limiter_enable: false, frame_limiter_fps_limit_millihz: null },
-    nvenc_spatial_aq: true, lan_encryption_mode: 1, wan_encryption_mode: 2,
-    active_http_port: 47989, active_rtsp_port: 47989,
-    listener_error: null, rtsp_listener_error: null,
-    effective_output_name: "DISPLAY1",
-  };
-}
+test("Everyday saves only its preferences and confirms unrelated settings on readback", async () => {
+  const current = nvhttpHostSettings();
+  const values = { hostname: "Den", max_bitrate: 25000, minimum_fps_target: 59.94, fec_percentage: 15, stream_audio: true };
+  const updated = { ...current, revision: current.revision + 1, configured_hostname: "Den",
+    configured_max_bitrate: 25000, configured_minimum_fps_target: 59.94, configured_fec_percentage: 15, stream_audio: true };
+  const calls = [];
+  let saved = updated;
+  const api = { async post(route, payload) {
+    calls.push([route, payload && ordinary(payload)]);
+    return route.endsWith("_update") ? updated : saved;
+  } };
+  await context.Amaterasu.saveEverydaySettings(api, current, values);
+  assert.deepEqual(calls, [
+    ["nvhttp/settings_update", { ...values, port: current.port, expected_revision: current.revision }],
+    ["nvhttp/settings", undefined],
+  ]);
+  saved = { ...updated, configured_minimum_fps_target: null };
+  await assert.rejects(context.Amaterasu.saveEverydaySettings(api, current, values), /confirm/);
+  saved = { ...updated, configured_global_preparation: [{ run: { executable: "/unexpected" } }] };
+  await assert.rejects(context.Amaterasu.saveEverydaySettings(api, current, values), /confirm/);
+  saved = { ...updated, revision: updated.revision + 1 };
+  await assert.rejects(context.Amaterasu.saveEverydaySettings(api, current, values), /confirm/);
+});
+
+test("Everyday display edits merge and clear individual choices while confirming untouched policy", async () => {
+  const current = { ...nvhttpHostSettings(), configured_display_policy: {
+    adapter_name: "Existing GPU", dd_hdr_option: "auto", dd_resolution_option: "disabled",
+  } };
+  const display_policy = { dd_hdr_option: null, dd_resolution_option: "manual", dd_manual_resolution: "2560x1440" };
+  const values = { hostname: current.configured_hostname, max_bitrate: current.configured_max_bitrate,
+    fec_percentage: current.configured_fec_percentage, stream_audio: current.stream_audio, display_policy };
+  const saved = { ...current, revision: current.revision + 1, configured_display_policy: {
+    adapter_name: "Existing GPU", dd_resolution_option: "manual", dd_manual_resolution: "2560x1440",
+  } };
+  let readback = saved;
+  const api = { async post(route, payload) {
+    if (route === "nvhttp/settings") return readback;
+    assert.deepEqual(ordinary(payload.display_policy), display_policy);
+    assert.equal(payload.expected_revision, current.revision);
+    return saved;
+  } };
+  await context.Amaterasu.saveEverydaySettings(api, current, values);
+  readback = { ...saved, configured_display_policy: { ...saved.configured_display_policy, adapter_name: "Other GPU" } };
+  await assert.rejects(context.Amaterasu.saveEverydaySettings(api, current, values), /confirm/);
+});
 
 function nvhttpHostUpdate() {
   return {
@@ -2645,6 +2665,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
   let updates = 0;
   let secondSubmittedRevision;
   dom.Amaterasu.renderSettings({
+    initialSettingsCategory: "streaming",
     content,
     notify: (message) => notices.push(message),
     api: {
@@ -3048,6 +3069,7 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
   let stored = { ok: true, revision: 7, values: steamSettingsValues() };
   const routes = [];
   dom.Amaterasu.renderSettings({
+    initialSettingsCategory: "integrations",
     content,
     notify: (message) => notices.push(message),
     api: {
@@ -3076,7 +3098,7 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
   assert.ok(oldForm);
   const enabled = find(oldForm, (node) => node.name === "steam_enabled");
   enabled.checked = false;
-  assert.equal(steamArea.hidden, true);
+  assert.equal(steamArea.hidden, false);
   find(content, (node) => node.tagName === "button" && node.textContent === "Integrations").fire("click");
   assert.equal(steamArea.hidden, false);
   find(content, (node) => node.tagName === "button" && node.textContent === "General").fire("click");

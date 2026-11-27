@@ -114,7 +114,7 @@ namespace Amaterasu {
         });
         container.replaceChildren(panel("System tray", form));
       } catch (error) {
-        if (isCurrent()) container.replaceChildren(errorPanel(error, load));
+        if (isCurrent()) container.replaceChildren(optionalSettingsError("System tray", error, load));
       }
     };
 

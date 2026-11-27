@@ -432,7 +432,7 @@ suppresses the generic form for a provider with a selected custom UI. Providers
 without custom UI retain the generated settings card as a fallback. Plugins
 without settings can attach sections by omitting `settings_provider`.
 
-Application sections are collapsible. Set the optional Boolean
+Host settings and application sections are collapsible. Set the optional Boolean
 `default_expanded` in the signed UI configuration to show the section's controls
 immediately, as RTX HDR does. Omit it or set it to `false` to start closed.
 Users can still open or close each section; opening does not create overrides,
@@ -462,6 +462,13 @@ of `page`, `application`, `overview`, and `settings`. The shell provides generic
 surfaces and owns no product-specific renderer. Each mount gets an independent
 lifecycle; closing one surface does not retire another. Page and slot mounts
 support `setDirty(boolean)` and `setBusy(boolean)` for navigation guards.
+
+A signed `settings` placement adds a section below the host controls in
+Everyday Settings. Use `mountSettings` for frequently used controls and a
+`page` placement with `mount` for a full workspace under Extensions. A plugin
+can declare both placements. Host-scoped schema settings also have a generated
+editor under Settings → Plugin settings. A signed settings section can claim
+its own provider to supply that editor directly.
 
 `sdk.canCall(alias)` reports whether the signed declaration and local approvals
 make that alias available to the current account. It does not grant authority.

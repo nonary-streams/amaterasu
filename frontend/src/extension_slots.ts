@@ -1,49 +1,78 @@
 namespace Amaterasu {
   const extensionSlotDisposers = new WeakMap<HTMLElement, () => void>();
+  const extensionSlotDrafts = new WeakMap<HTMLElement, () => boolean>();
+  export function extensionSlotDirty(container: HTMLElement): boolean {
+    return extensionSlotDrafts.get(container)?.() ?? false;
+  }
   /** Generic signed-extension surfaces; the shell has no product renderer. */
-  export function renderExtensionSlot(context: PageContext, container: HTMLElement, slot: "overview" | "settings", onOwners?: (owners: ReadonlySet<string>) => void): void {
+  export function renderExtensionSlot(context: PageContext, container: HTMLElement, slot: "overview" | "settings", onOwners?: (owners: ReadonlySet<string>, hasSections: boolean) => void): void {
     extensionSlotDisposers.get(container)?.();
     container.replaceChildren();
     const children: ExtensionPages[] = [];
-    let owners: ReadonlySet<string> = new Set();
+    const owners = new Set<string>();
     let disposed = false;
+    const isDirty = () => children.some(child => child.isDirty());
+    extensionSlotDrafts.set(container, isDirty);
+    const discovery = new ExtensionPages(context.api);
+    let unregister: (() => void) | undefined;
     const dispose = () => {
       if (disposed) return;
       disposed = true;
+      extensionSlotDrafts.delete(container);
       observer.disconnect();
       for (const child of children) child.dispose();
-      discovery.dispose();
+      discovery.reset();
+      unregister?.();
     };
-    extensionSlotDisposers.set(container,dispose);
+    extensionSlotDisposers.set(container, dispose);
+    const claimOwners = () => {
+      if (slot === "settings") claimModuleSettings(context, owners);
+    };
     const observer = new MutationObserver(() => {
       if (!container.isConnected) dispose();
-      else if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function") Amaterasu.claimModuleSettings(context,owners);
+      else claimOwners();
     });
     observer.observe(document.body, { childList: true, subtree: true });
-    context.registerDraftGuard?.(() => children.some(child => child.isDirty()), dispose);
-    const discovery = new ExtensionPages(context.api);
-    void discovery.discover().then(async (descriptors) => {
+    unregister = context.registerDraftGuard?.(isDirty, dispose);
+    void discovery.discover().then(descriptors => {
       if (disposed || !container.isConnected) return;
-      owners = new Set(descriptors.filter(entry => entry.placements?.includes(slot)).flatMap(entry => {
-        const owner = entry.settings_owner ?? entry.settings_provider; return owner ? [owner] : [];
-      }));
-      onOwners?.(owners);
-      if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function") Amaterasu.claimModuleSettings(context,owners);
-      for (const descriptor of descriptors) {
-        if (disposed || !container.isConnected) return;
-        if (!descriptor.placements?.includes(slot)) continue;
+      const entries = descriptors.filter(entry => entry.placements?.includes(slot));
+      onOwners?.(new Set(entries.flatMap(entry => entry.settings_provider ? [entry.settings_provider] : [])), entries.length > 0);
+      for (const descriptor of entries) {
         const area = el("section", "plugin-surface");
-        container.append(area);
-        const child = new ExtensionPages(context.api);
+        const section = slot === "settings"
+          ? pluginSettingsSection(descriptor.name, descriptor.default_expanded === true, area)
+          : null;
+        container.append(section ?? area);
+        const child = discovery.createSurface();
         children.push(child);
-        try {
-          await child.discover();
-          if (!disposed && area.isConnected) await child.mountSlot(descriptor.id, area, slot);
-        } catch (error) {
-          if (!disposed) area.replaceChildren(errorPanel(error));
-        }
+        const mount = async () => {
+          try {
+            area.replaceChildren();
+            await child.mountSlot(descriptor.id, area, slot);
+            if (disposed || !area.isConnected) return;
+            const owner = descriptor.settings_owner ?? descriptor.settings_provider;
+            if (owner) owners.add(owner);
+            claimOwners();
+          } catch (error) {
+            if (disposed || !area.isConnected) return;
+            child.dispose();
+            if (section) section.open = true;
+            area.replaceChildren(errorPanel(error, mount));
+            if (slot === "settings" && descriptor.settings_provider) {
+              const fallback = el("div");
+              area.append(fallback);
+              renderSessionExtensionSettings(context, fallback, { kind: "host" }, descriptor.settings_provider);
+            }
+          }
+        };
+        void mount();
       }
-    }).catch((error) => { if (!disposed) container.replaceChildren(errorPanel(error)); });
+    }).catch(error => {
+      if (disposed) return;
+      onOwners?.(new Set(), false);
+      container.replaceChildren(errorPanel(error, () => renderExtensionSlot(context, container, slot, onOwners)));
+    });
   }
 
   export function loadExtensionStylesheet(id: string, digest: string, path: string, signal: AbortSignal): Promise<void> {

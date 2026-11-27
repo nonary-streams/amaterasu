@@ -153,13 +153,19 @@ namespace Amaterasu {
       this.descriptors.clear();
     }
 
+    /** Each surface owns its mount lifetime and uses this verified discovery snapshot. */
+    createSurface(): ExtensionPages {
+      const child = new ExtensionPages(this.api);
+      child.descriptors = new Map(this.descriptors);
+      return child;
+    }
+
     mountApplication(id: string, container: HTMLElement, application: ApplicationExtensionContext): ApplicationExtensionMount {
       if (typeof application.id !== "string" || !/^app-[0-9a-f]{16}$/.test(application.id) ||
           application.id === "app-0000000000000000" || typeof application.name !== "string" ||
           !application.name || application.name.length > 512 || /[\u0000-\u001f\u007f-\u009f]/u.test(application.name))
         throw new Error("Invalid application context.");
-      const child = new ExtensionPages(this.api);
-      child.descriptors = new Map(this.descriptors);
+      const child = this.createSurface();
       let dirty = false;
       let busy = false;
       const state = (kind: "dirty" | "busy", value: boolean) => {

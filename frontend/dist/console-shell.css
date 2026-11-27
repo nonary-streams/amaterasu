@@ -490,3 +490,169 @@
   }
   .console-shell .navigation .nav-item.selected::before { display: none; }
 }
+
+/* Category navigation shares the editor width with the page heading. */
+.console-shell .settings-layout {
+  display: block;
+  max-width: none;
+  container: settings-page / inline-size;
+}
+.console-shell .settings-navigation {
+  position: static;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  padding-block-end: 14px;
+  border-block-end: 1px solid var(--line);
+  margin-block-end: 20px;
+}
+.console-shell .settings-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.settings-navigation .button.settings-nav-item {
+  width: auto;
+  text-align: start;
+}
+.settings-navigation > input[type=search] {
+  flex: 1 1 10rem;
+  max-width: 16rem;
+  min-width: 0;
+  margin-inline-start: auto;
+}
+.console-shell .settings-navigation > .field { display: none; }
+@container settings-page (max-width: 48rem) {
+  .console-shell .settings-nav { display: none; }
+  .console-shell .settings-navigation > .field {
+    display: grid;
+    flex: 1.15;
+    gap: 4px;
+    margin: 0;
+    min-width: 0;
+  }
+  .console-shell .settings-navigation {
+    align-items: end;
+    flex-wrap: nowrap;
+    gap: 12px;
+  }
+  .settings-navigation > input[type=search] { flex: 1; max-width: none; margin: 0; }
+}
+.settings-category-heading { margin-block-end: 16px; }
+.settings-category-heading h2 { margin: 0; }
+.settings-area-everyday .panel { margin: 0; padding: 0; }
+.settings-content {
+  --settings-inset: clamp(14px, 2vw, 22px);
+  container: settings-editor / inline-size;
+}
+.settings-area-everyday .panel > h2,
+.settings-content .application-plugin-summary {
+  margin: 0;
+  padding: 12px var(--settings-inset);
+  border-radius: var(--surface-radius) var(--surface-radius) 0 0;
+  line-height: 1.4;
+  font-family: inherit;
+  font-size: 1rem;
+  font-weight: 650;
+  background: var(--subtle);
+}
+.settings-area-everyday .panel > h2 { border-bottom: 1px solid var(--line); }
+.settings-content .application-plugin-content { padding: 0 var(--settings-inset) 12px; }
+.everyday-form { display: grid; gap: 14px; }
+.everyday-form .panel > .field { padding-inline: var(--settings-inset); }
+.everyday-form .actions { justify-content: flex-end; flex-wrap: wrap; }
+/* The brush on action buttons extends five pixels beyond the button. */
+.settings-heading > .actions, .everyday-form > .actions { padding-inline-end: 5px; }
+.settings-content .plugin-action > button { align-self: flex-start; max-width: 100%; }
+.everyday-form .actions [role=status]:empty { display: none; }
+
+/* Align standard host and SDK controls while leaving compound plugin widgets intact. */
+:is(.everyday-form .field,
+    .streaming-settings-fields > label.field:where(:has(> input, > select)),
+    .settings-content .session-extension-option > .field,
+    .settings-area-contributions .plugin-control:where(:has(> select, > input[type=text], > input[type=number]), .plugin-slider, .plugin-toggle, .plugin-checkbox)) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, min(42%, 25rem));
+  gap: 3px clamp(14px, 3vw, 38px);
+  align-items: center;
+  width: 100%;
+  margin: 0;
+  padding-block: 13px;
+  border: 0;
+  border-block-end: 1px solid var(--line);
+
+  & > .field-label { grid-area: 1 / 1; font-weight: 600; align-self: end; }
+  & > small { grid-column: 1; line-height: 1.45; }
+  & > :is(input:not([type=checkbox]), select, textarea, .plugin-slider-inputs, .extension-slider, .radio-group) {
+    grid-area: 1 / 2 / span 2;
+    min-width: 0;
+    width: 100%;
+    margin: 0;
+  }
+  @container settings-editor (max-width: 36rem) {
+    grid-template-columns: minmax(0, 1fr);
+    & > :is(input:not([type=checkbox]), select, textarea, .plugin-slider-inputs, .extension-slider, .radio-group) { grid-area: auto / 1; order: 1; margin-block-start: 4px; }
+  }
+  @container settings-editor (width > 36rem) {
+    &:not(:has(> small)) > .field-label { grid-row: 1 / span 2; align-self: center; }
+  }
+}
+.settings-content .session-extension-option > .field > .radio-group > .radio-group-label { display: none; }
+.settings-content .session-extension-option:has(> .field) {
+  display: block;
+  margin: 0;
+}
+.settings-content :is(label.field, .plugin-toggle, .plugin-checkbox):has(> input[type=checkbox]) {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 10px;
+  align-items: center;
+  & > input[type=checkbox] {
+    grid-area: 1 / 1;
+    justify-self: start;
+    align-self: center;
+    padding: 0;
+    margin: 0;
+  }
+  & > .field-label { grid-area: 1 / 2; align-self: center; }
+  & > small { grid-column: 2; }
+}
+.everyday-form .panel > .field:last-child { border-block-end: 0; }
+.settings-area-contributions .plugin-surface > p { margin-block: 12px; }
+.settings-area-contributions .plugin-surface details > summary { cursor: pointer; padding-block: 12px; }
+.settings-area-contributions .plugin-surface > [role=status] { color: var(--secondary); font-size: .875rem; }
+
+.settings-area-host .settings-form:has(> .streaming-settings-group) { max-width: none; }
+.streaming-settings-group {
+  border-block-start: 1px solid var(--line);
+}
+.streaming-settings-group > summary {
+  padding: 13px 4px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.streaming-settings-group[open] > summary { color: var(--selected-accent); }
+.streaming-settings-fields { padding: 0 4px 12px; }
+.streaming-settings-fields > .field { margin: 0; padding-block: 12px; }
+.streaming-settings-fields > p { margin-block: 10px; }
+.streaming-settings-group:not(:has(.field:not([data-settings-search-hidden]))) { display: none; }
+.settings-area-host .streaming-settings-group ~ .actions { margin-block-start: 14px; }
+.settings-unavailable {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px;
+  padding: 12px 0; border-bottom: 1px solid var(--line);
+}
+.settings-unavailable .button { margin-inline-start: auto; }
+.console-shell .settings-heading {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: clamp(16px, 2vw, 28px);
+}
+.settings-heading h1 { margin: 0; }
+.settings-area-contributions:not(:empty) { margin-block-start: 22px; }
+
+.settings-area-featured-plugins:not(:empty) { display: grid; gap: 16px; margin-block-start: 16px; }
+.everyday-more-options { margin: 12px 0 18px; border-top: 1px solid var(--line); }
+.everyday-more-options > summary { padding: 14px 0; color: var(--secondary); cursor: pointer; }
+.settings-area-featured-plugins .settings-form { max-width: none; }

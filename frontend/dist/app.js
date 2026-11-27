@@ -6019,6 +6019,12 @@ var Amaterasu;
         return box;
     }
     Amaterasu.errorPanel = errorPanel;
+    function optionalSettingsError(name, error, retry, fallback = error) {
+        if (error instanceof Amaterasu.ApiError && error.code === "service_unavailable")
+            return el("div", "settings-unavailable", el("strong", "", name), el("span", "muted", "Unavailable on this host"), button("Try again", retry, "secondary"));
+        return errorPanel(fallback, retry);
+    }
+    Amaterasu.optionalSettingsError = optionalSettingsError;
     function badge(text, tone = "") {
         return el("span", `badge ${tone}`, text);
     }
@@ -9807,6 +9813,86 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    Amaterasu.everydayPluginOptions = new Map([
+        ["amaterasu.frame-limiter", new Set(["frame_limiter_enable", "frame_limiter_fps_limit", "frame_limiter_auto_virtual_framegen"])],
+        ["amaterasu.rtx-hdr", new Set(["rtx_hdr_scope", "rtx_hdr_enable", "rtx_hdr_peak_brightness"])],
+    ]);
+    function everydayDisplaySettings(policy) {
+        const controls = new Map();
+        function choice(key, title, help, options) {
+            const control = Amaterasu.el("select");
+            control.name = key;
+            for (const [value, text] of Object.entries({ "": "Host default", ...options })) {
+                const option = Amaterasu.el("option", "", text);
+                option.value = value;
+                control.append(option);
+            }
+            control.value = String(policy[key] ?? "");
+            controls.set(key, control);
+            return Amaterasu.field(title, control, help);
+        }
+        function manualValue(mode, key, title, placeholder, pattern) {
+            const select = controls.get(mode);
+            const control = Amaterasu.input(key, String(policy[key] ?? ""));
+            control.placeholder = placeholder;
+            control.pattern = pattern;
+            const isResolution = key === "dd_manual_resolution";
+            control.maxLength = isResolution ? 32 : 64;
+            const validate = () => {
+                const value = control.value;
+                const inRange = isResolution
+                    ? value.split(/[x×]/).every(size => Number(size) > 0 && Number(size) <= 0xffffffff)
+                    : Number(value) > 0 && Number(value) <= 1000;
+                control.setCustomValidity(value && !inRange ? (isResolution
+                    ? "Enter a positive width and height, such as 2560x1440."
+                    : "Enter a refresh rate greater than zero and up to 1000 Hz.") : "");
+            };
+            control.addEventListener("input", validate);
+            validate();
+            const row = Amaterasu.field(title, control);
+            const update = () => {
+                row.hidden = select.value !== "manual";
+                if (row.hidden) {
+                    control.value = String(policy[key] ?? "");
+                    validate();
+                }
+                control.disabled = row.hidden;
+                control.required = !row.hidden;
+            };
+            update();
+            select.addEventListener("change", update);
+            controls.set(key, control);
+            return row;
+        }
+        const node = Amaterasu.panel("Display", choice("virtual_display_mode", "Streaming display", "Choose the screen Moonlight uses for new streams.", {
+            disabled: "Physical display", per_client: "Virtual display per client", shared: "Shared virtual display",
+        }), choice("dd_configuration_option", "Display preparation", "Choose which displays stay active while streaming.", {
+            disabled: "Leave displays as they are", verify_only: "Verify the display", ensure_active: "Activate the streaming display",
+            ensure_primary: "Make it the primary display", ensure_only_display: "Use only the streaming display",
+        }), choice("dd_resolution_option", "Resolution", "Set the host display size when a stream starts.", {
+            auto: "Match the client", disabled: "Keep the current resolution", manual: "Custom resolution",
+        }), manualValue("dd_resolution_option", "dd_manual_resolution", "Custom resolution (width × height)", "2560x1440", "[0-9]+[x×][0-9]+"), choice("dd_refresh_rate_option", "Refresh rate", "Set the host display refresh rate for the stream.", {
+            auto: "Match the client", prefer_highest: "Highest available", disabled: "Keep the current refresh rate", manual: "Custom refresh rate",
+        }), manualValue("dd_refresh_rate_option", "dd_manual_refresh_rate", "Custom refresh rate (Hz)", "119.88", "[0-9]+(\\.[0-9]+)?"), choice("dd_hdr_option", "Display HDR", "Let the host switch HDR to match the stream, or keep the current display state.", {
+            auto: "Match the stream", disabled: "Keep the current HDR state",
+        }));
+        node.setAttribute("data-settings-owner", "amaterasu.display");
+        function changes() {
+            const patch = {};
+            if (node.inert)
+                return patch;
+            for (const [key, control] of controls) {
+                if (!control.disabled && control.value !== String(policy[key] ?? ""))
+                    patch[key] = control.value || null;
+            }
+            return patch;
+        }
+        return { node, changes };
+    }
+    Amaterasu.everydayDisplaySettings = everydayDisplaySettings;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function markHostSettingsOwner(owner, node) {
         node.setAttribute("data-settings-owner", owner);
         return node;
@@ -9973,6 +10059,7 @@ var Amaterasu;
         return keys.length === Object.keys(rightObject).length &&
             keys.every((key) => Object.hasOwn(rightObject, key) && sameConfigurationValue(leftObject[key], rightObject[key]));
     }
+    Amaterasu.sameConfigurationValue = sameConfigurationValue;
     async function saveRegisteredConfiguration(api, current, values) {
         const expectedValues = { ...current.values, ...values };
         const confirms = (reply) => reply.revision === current.revision + 1 &&
@@ -10315,6 +10402,33 @@ var Amaterasu;
         return saved;
     }
     Amaterasu.saveNvhttpHostSettings = saveNvhttpHostSettings;
+    async function saveEverydaySettings(api, current, values) {
+        const persisted = new Set(["port", "stream_audio", "upnp", "audio_sink_capture_only",
+            "install_steam_audio_drivers", "nvenc_spatial_aq", "lan_encryption_mode", "wan_encryption_mode"]);
+        const expected = Object.fromEntries(Object.entries(current).filter(([key]) => key.startsWith("configured_") || persisted.has(key)));
+        Object.assign(expected, {
+            configured_hostname: values.hostname,
+            configured_max_bitrate: values.max_bitrate,
+            configured_fec_percentage: values.fec_percentage,
+            stream_audio: values.stream_audio,
+        });
+        if (values.minimum_fps_target !== undefined)
+            expected.configured_minimum_fps_target = values.minimum_fps_target;
+        if (values.display_policy) {
+            expected.configured_display_policy = sparseDisplayPolicy({
+                ...current.configured_display_policy, ...values.display_policy,
+            });
+        }
+        const confirm = (reply) => {
+            if (reply.revision !== current.revision + 1 || !Object.entries(expected).every(([key, value]) => sameConfigurationValue(reply[key], value)))
+                throw new Error("The host could not confirm these changes. Reload the saved values to review them.");
+        };
+        confirm(parseNvhttpSettingsReply(await api.post("nvhttp/settings_update", {
+            ...values, port: current.port, expected_revision: current.revision,
+        })));
+        confirm(parseNvhttpSettingsReply(await api.post("nvhttp/settings")));
+    }
+    Amaterasu.saveEverydaySettings = saveEverydaySettings;
     async function saveNvhttpAudioSettings(api, current, streamAudio, audioSink) {
         if (!Number.isSafeInteger(current.revision) || current.revision < 0 || current.revision >= Number.MAX_SAFE_INTEGER ||
             typeof current.configured_hostname !== "string" || current.configured_hostname.length > 128 ||
@@ -11381,6 +11495,14 @@ var Amaterasu;
         return target;
     }
     Amaterasu.parseMinimumFpsTarget = parseMinimumFpsTarget;
+    function minimumFpsInput(name, value) {
+        const control = Amaterasu.input(name, String(value ?? ""), "number");
+        control.min = "0";
+        control.max = "1000";
+        control.step = "any";
+        control.placeholder = "Default (20)";
+        return control;
+    }
     function parsePingTimeout(value) {
         if (value.trim() === "")
             return -1;
@@ -12390,7 +12512,15 @@ var Amaterasu;
         }
         return { merged, overlaps };
     }
+    function streamingSettingsGroup(title, open, ...fields) {
+        const group = Amaterasu.el("details", "streaming-settings-group", Amaterasu.el("summary", "", title), Amaterasu.el("div", "streaming-settings-fields", ...fields));
+        group.open = open;
+        return group;
+    }
     function renderSettings(context) {
+        const everydayArea = Amaterasu.el("div", "settings-area-everyday");
+        const featuredPluginArea = Amaterasu.el("div", "settings-area-featured-plugins");
+        const everydayLoads = new NvhttpSettingsLoadGate();
         const area = Amaterasu.el("div", "settings-area-registered");
         const sessionExtensionsArea = Amaterasu.el("div", "settings-area-session-extensions");
         const registeredLoads = new RegisteredConfigurationLoadGate();
@@ -12412,7 +12542,7 @@ var Amaterasu;
         let activePlayniteListEditors = [];
         const inputArea = Amaterasu.el("div", "settings-area-input");
         const inputLoads = new InputPolicyLoadGate();
-        const metricsArea = Amaterasu.el("div", "settings-area-metrics");
+        const signedSettingsArea = Amaterasu.el("div", "settings-area-contributions");
         const updaterArea = Amaterasu.el("div", "settings-area-updater");
         const systemTrayArea = Amaterasu.el("div", "settings-area-tray");
         const pairingArea = Amaterasu.el("div", "settings-area-pairing");
@@ -12456,13 +12586,79 @@ var Amaterasu;
         });
         const managementArea = Amaterasu.el("div", "settings-area-management");
         const csrfArea = Amaterasu.el("div", "settings-area-csrf");
+        let serviceInventory;
+        const optionalReads = new WeakMap();
+        function loadOptional(service, target, editor) {
+            serviceInventory ??= context.api.post("package-selection/status")
+                .then(({ ok, running }) => {
+                const services = running?.declared_services;
+                return ok === true && running?.available === true && Array.isArray(services) && services.length <= 256 &&
+                    services.every(name => typeof name === "string") ? new Set(services) : null;
+            }).catch(() => null);
+            const reading = serviceInventory;
+            optionalReads.set(target, reading);
+            void reading.then(services => {
+                if (!target.isConnected || reading !== optionalReads.get(target))
+                    return;
+                if (services && !services.has(service))
+                    target.replaceChildren();
+                else
+                    editor();
+            });
+        }
+        let discoveringSections = false;
+        let customProviders;
+        let loadRemainingPlugins;
+        function loadPluginSections() {
+            if (discoveringSections || customProviders)
+                return;
+            discoveringSections = true;
+            Amaterasu.renderExtensionSlot(context, signedSettingsArea, "settings", (providers, hasSignedSections) => {
+                discoveringSections = false;
+                customProviders = providers;
+                Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, providers, {
+                    area: featuredPluginArea, options: Amaterasu.everydayPluginOptions, hasSignedSections,
+                    onRemainingReady(load) {
+                        loadRemainingPlugins = load;
+                        if (loadedCategories.has("plugins"))
+                            load();
+                    },
+                });
+            });
+        }
         const categories = [
-            { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, sessionExtensionsArea, hostLoggingArea, updaterArea, systemTrayArea] },
-            { id: "streaming", label: "Streaming", description: "Configure the host, capture, input, and session reporting.", areas: [hostArea, pipewireArea, inputArea, metricsArea] },
-            { id: "integrations", label: "Integrations", description: "Manage application providers and library imports.", areas: [steamArea, lutrisArea, playniteArea] },
-            { id: "devices", label: "Devices", description: "Manage paired client settings.", areas: [pairingArea] },
-            { id: "access", label: "Access & security", description: "Configure session lifetimes and management access.", areas: [authArea, managementArea, csrfArea] },
+            { id: "everyday", label: "Everyday Settings", description: "Set the picture, sound, and connection defaults for new streams.", areas: [everydayArea, featuredPluginArea, signedSettingsArea], load: () => {
+                    void loadEveryday();
+                    if (!customProviders)
+                        loadPluginSections();
+                } },
+            { id: "streaming", label: "Streaming", description: "Configure capture, encoders, audio devices, network connections, and input.", areas: [hostArea, pipewireArea, inputArea], load: () => {
+                    void loadHost();
+                    loadOptional("amaterasu.capture-pipewire/1", pipewireArea, loadPipewireChooser);
+                    void loadInput();
+                } },
+            { id: "devices", label: "Devices", description: "Manage paired clients and their overrides.", areas: [pairingArea], load: loadPairing },
+            { id: "integrations", label: "Integrations", description: "Choose which game libraries appear in Moonlight.", areas: [steamArea, lutrisArea, playniteArea], load: () => {
+                    loadOptional("amaterasu.steam/1", steamArea, loadSteam);
+                    loadOptional("amaterasu.lutris/1", lutrisArea, loadLutris);
+                    loadOptional("amaterasu.playnite/1", playniteArea, loadPlaynite);
+                } },
+            { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, hostLoggingArea, updaterArea, systemTrayArea], load: () => {
+                    void load();
+                    loadOptional("amaterasu.host-configuration/1", hostLoggingArea, loadHostLogging);
+                    loadOptional("amaterasu.updater/1", updaterArea, () => Amaterasu.renderUpdaterSettings(context, updaterArea));
+                    loadOptional("amaterasu.system-tray/1", systemTrayArea, () => Amaterasu.renderSystemTraySettings(context, systemTrayArea));
+                } },
+            { id: "access", label: "Access & security", description: "Configure session lifetimes and management access.", areas: [authArea, managementArea, csrfArea], load: () => {
+                    void loadAuth();
+                    managementArea.replaceChildren();
+                    csrfArea.replaceChildren();
+                    Amaterasu.renderManagementPolicy(context, managementArea);
+                    Amaterasu.renderCsrfPolicy(context, csrfArea);
+                } },
+            { id: "plugins", label: "Plugin settings", description: "Preferences provided by the plugins on this host.", areas: [featuredPluginArea, signedSettingsArea, sessionExtensionsArea], load: () => { loadPluginSections(); loadRemainingPlugins?.(); } },
         ];
+        const loadedCategories = new Set();
         let selectedCategory = context.initialSettingsCategory ?? categories[0].id;
         const categoryContent = Amaterasu.el("div", "settings-content");
         categoryContent.id = "settings-category-content";
@@ -12481,6 +12677,7 @@ var Amaterasu;
         const categoryNavigation = Amaterasu.el("nav", "settings-nav");
         categoryNavigation.setAttribute("aria-label", "Settings categories");
         const categoryButtons = new Map();
+        const areaCategories = new Map();
         const searchOpenedDetails = new Set();
         categoryContent.append(categoryStatus, noResults);
         for (const category of categories) {
@@ -12488,21 +12685,28 @@ var Amaterasu;
             option.value = category.id;
             categoryPicker.append(option);
             const areaIds = category.areas.map((area, index) => {
-                const id = `settings-${category.id}-area-${index + 1}`;
-                area.id = id;
-                return id;
+                const existing = areaCategories.get(area);
+                if (existing) {
+                    existing.push(category.label);
+                }
+                else {
+                    area.id = `settings-${category.id}-area-${index + 1}`;
+                    areaCategories.set(area, [category.label]);
+                    categoryContent.append(area);
+                }
+                return area.id;
             });
             const item = Amaterasu.button(category.label, () => selectCategory(category.id), "settings-nav-item");
             item.setAttribute("aria-controls", areaIds.join(" "));
             categoryButtons.set(category.id, item);
             categoryNavigation.append(item);
-            categoryContent.append(...category.areas);
         }
         function selectCategory(id) {
-            if (!categories.some((category) => category.id === id))
+            const category = categories.find(item => item.id === id);
+            if (!category)
                 return;
-            selectedCategory = id;
-            context.replaceSettingsCategory?.(id);
+            selectedCategory = category.id;
+            context.replaceSettingsCategory?.(category.id);
             search.value = "";
             updateCategoryDisplay();
         }
@@ -12511,14 +12715,15 @@ var Amaterasu;
                 details.open = false;
             searchOpenedDetails.clear();
         }
-        function showFieldInSearch(field) {
+        function revealField(field, forSearch) {
             let parent = field.parentElement;
             while (parent && parent !== categoryContent) {
                 if (parent.tagName === "DETAILS") {
                     const details = parent;
                     if (!details.open && !details.hidden) {
                         details.open = true;
-                        searchOpenedDetails.add(details);
+                        if (forSearch)
+                            searchOpenedDetails.add(details);
                     }
                 }
                 parent = parent.parentElement;
@@ -12531,37 +12736,42 @@ var Amaterasu;
             restoreSearchDisclosures();
             let matches = 0;
             for (const category of categories) {
-                for (const area of category.areas) {
-                    const fields = typeof area.querySelectorAll === "function"
-                        ? Array.from(area.querySelectorAll(".field")) : [];
-                    let fieldMatches = 0;
-                    for (const wrapper of fields) {
-                        const controls = Array.from(wrapper.querySelectorAll("input, select, textarea"));
-                        if (controls.length && controls.every((control) => control.hasAttribute("data-draft-ignore")))
-                            continue;
-                        const panelTitle = wrapper.closest(".panel")?.querySelector("h2")?.textContent ?? "";
-                        const matched = !query || settingsSearchMatches(query, category.label, panelTitle, wrapper.textContent ?? "", ...controls.map((control) => control.name));
-                        if (query && !matched)
-                            wrapper.setAttribute("data-settings-search-hidden", "");
-                        else
-                            wrapper.removeAttribute("data-settings-search-hidden");
-                        if (query && matched) {
-                            fieldMatches++;
-                            showFieldInSearch(wrapper);
-                        }
-                    }
-                    const title = typeof area.querySelector === "function" ? area.querySelector(".panel > h2")?.textContent ?? "" : "";
-                    const visible = query
-                        ? fieldMatches > 0 || settingsSearchMatches(query, category.label, title) ||
-                            (!fields.length && settingsSearchMatches(query, area.textContent ?? ""))
-                        : category.id === selected.id;
-                    area.hidden = !visible;
-                    if (visible)
-                        matches++;
+                if ((query || category === selected) && !loadedCategories.has(category.id)) {
+                    loadedCategories.add(category.id);
+                    category.load();
                 }
                 const item = categoryButtons.get(category.id);
                 item.className = `button settings-nav-item${!query && category.id === selected.id ? " selected" : ""}`;
                 item.setAttribute("aria-current", !query && category.id === selected.id ? "page" : "false");
+            }
+            for (const [area, labels] of areaCategories) {
+                const fields = typeof area.querySelectorAll === "function"
+                    ? Array.from(area.querySelectorAll(".field, .session-extension-option")) : [];
+                let fieldMatches = 0;
+                for (const wrapper of fields) {
+                    const controls = Array.from(wrapper.querySelectorAll("input, select, textarea"));
+                    if (controls.length && controls.every((control) => control.hasAttribute("data-draft-ignore")))
+                        continue;
+                    const panelTitle = wrapper.closest(".panel")?.querySelector("h2")?.textContent ?? "";
+                    const groupTitle = wrapper.closest(".application-plugin-section, .streaming-settings-group")?.querySelector("summary")?.textContent ?? "";
+                    const matched = !query || settingsSearchMatches(query, ...labels, panelTitle, groupTitle, wrapper.textContent ?? "", ...controls.map((control) => control.name));
+                    if (query && !matched)
+                        wrapper.setAttribute("data-settings-search-hidden", "");
+                    else
+                        wrapper.removeAttribute("data-settings-search-hidden");
+                    if (query && matched) {
+                        fieldMatches++;
+                        revealField(wrapper, true);
+                    }
+                }
+                const title = typeof area.querySelector === "function" ? area.querySelector(".panel > h2")?.textContent ?? "" : "";
+                const visible = query
+                    ? fieldMatches > 0 || settingsSearchMatches(query, ...labels, title) ||
+                        (!fields.length && settingsSearchMatches(query, area.textContent ?? ""))
+                    : selected.areas.includes(area);
+                area.hidden = !visible;
+                if (visible)
+                    matches++;
             }
             settingsSetLocalizedTextContent(categoryHeading, query ? "Search results" : selected.label);
             settingsSetLocalizedTextContent(categoryDescription, query
@@ -12570,41 +12780,40 @@ var Amaterasu;
             noResults.hidden = !query || matches !== 0;
         }
         categoryContent.addEventListener("invalid", (event) => {
-            if (!search.value.trim())
-                return;
             const target = event.target;
-            const category = categories.find((candidate) => candidate.areas.some((area) => target && area.contains(target)));
-            if (!category || !target)
+            if (!target)
                 return;
-            selectCategory(category.id);
-            showFieldInSearch(target);
-            searchOpenedDetails.clear();
+            if (search.value.trim()) {
+                const category = categories.find(candidate => candidate.areas.some(area => area.contains(target)));
+                if (category)
+                    selectCategory(category.id);
+            }
+            revealField(target, false);
         }, true);
         search.addEventListener("input", updateCategoryDisplay);
         categoryPicker.addEventListener("change", () => selectCategory(categoryPicker.value));
-        const settingsNavigation = Amaterasu.el("div", "settings-navigation", Amaterasu.field("Category", categoryPicker), categoryNavigation);
+        const settingsNavigation = Amaterasu.el("div", "settings-navigation", categoryNavigation, search, Amaterasu.field("Category", categoryPicker));
         const refreshSettings = Amaterasu.button("Refresh", () => {
-            void load();
-            void loadAuth();
-            void loadHostLogging();
-            void loadHost();
-            void loadPipewireChooser();
-            void loadSteam();
-            void loadLutris();
-            void loadPlaynite();
-            void loadInput();
-            Amaterasu.renderExtensionSlot(context, metricsArea, "settings", owners => {
-                if (typeof Amaterasu.renderSessionExtensionSettings === "function")
-                    Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, owners);
-            });
-            Amaterasu.renderUpdaterSettings(context, updaterArea);
-            Amaterasu.renderSystemTraySettings(context, systemTrayArea);
-            void loadPairing();
+            if (Amaterasu.extensionSlotDirty(signedSettingsArea)) {
+                context.notify("Finish editing the plugin settings before refreshing.");
+                return;
+            }
+            serviceInventory = undefined;
+            if (search.value.trim() || selectedCategory === "everyday" || selectedCategory === "plugins") {
+                customProviders = undefined;
+                loadRemainingPlugins = undefined;
+                discoveringSections = false;
+            }
+            if (search.value.trim())
+                loadedCategories.clear();
+            else
+                loadedCategories.delete(selectedCategory);
+            updateCategoryDisplay();
         });
         const dirtyNotice = Amaterasu.badge("Unsaved changes", "accent");
         dirtyNotice.hidden = true;
         dirtyNotice.setAttribute("role", "status");
-        context.content.append(Amaterasu.sectionHeading("Settings", "Configure your host, streaming, integrations, and access.", refreshSettings), Amaterasu.el("div", "settings-tools", search, dirtyNotice), Amaterasu.el("div", "settings-layout", settingsNavigation, categoryContent));
+        context.content.append(Amaterasu.el("header", "page-heading settings-heading", Amaterasu.el("h1", "", "Settings"), Amaterasu.el("div", "actions", dirtyNotice, refreshSettings)), Amaterasu.el("div", "settings-layout", settingsNavigation, categoryContent));
         if (context.registerDraftGuard) {
             drafts = Amaterasu.trackDrafts(categoryContent, updateDraftStatus);
             context.registerDraftGuard(() => clientSaveBusy || pendingProviderDrafts.size > 0 || (drafts?.isDirty() ?? false), () => {
@@ -12621,9 +12830,6 @@ var Amaterasu;
                 drafts?.dispose();
             });
         }
-        Amaterasu.renderManagementPolicy(context, managementArea);
-        Amaterasu.renderCsrfPolicy(context, csrfArea);
-        updateCategoryDisplay();
         if (typeof MutationObserver !== "undefined") {
             const observer = new MutationObserver(() => {
                 if (!context.content.isConnected) {
@@ -12633,12 +12839,99 @@ var Amaterasu;
                     updateCategoryDisplay();
                 }
             });
-            for (const category of categories)
-                for (const item of category.areas)
-                    observer.observe(item, { childList: true, subtree: true, characterData: true });
+            for (const item of areaCategories.keys())
+                observer.observe(item, { childList: true, subtree: true, characterData: true });
         }
         let pipewireGeneration = 0;
         let pipewireOperation = 0;
+        async function loadEveryday() {
+            everydayArea.replaceChildren(Amaterasu.el("p", "muted", "Loading settings…"));
+            try {
+                const loaded = await everydayLoads.read(context.api);
+                if (!loaded || !everydayArea.isConnected)
+                    return;
+                const settings = loaded.settings;
+                if (typeof settings.stream_audio !== "boolean" ||
+                    !(settings.configured_max_bitrate === null || Number.isSafeInteger(settings.configured_max_bitrate)))
+                    throw new Error("The host returned invalid stream preferences.");
+                const display = settings.configured_display_policy && Amaterasu.everydayDisplaySettings(settings.configured_display_policy);
+                const hostname = Amaterasu.input("everyday_hostname", settings.configured_hostname);
+                hostname.maxLength = 128;
+                hostname.placeholder = settings.hostname;
+                const bitrate = Amaterasu.input("everyday_bitrate", String(settings.configured_max_bitrate ?? ""), "number");
+                bitrate.placeholder = "No host limit";
+                bitrate.step = "1";
+                const minimumFps = settings.configured_minimum_fps_target === undefined ? null :
+                    minimumFpsInput("everyday_minimum_fps", settings.configured_minimum_fps_target);
+                const fpsChanged = () => minimumFps !== null && minimumFps.value !== String(settings.configured_minimum_fps_target ?? "");
+                const recovery = Amaterasu.input("everyday_fec", String(settings.configured_fec_percentage ?? ""), "number");
+                recovery.min = "1";
+                recovery.max = "255";
+                recovery.placeholder = String(settings.effective_fec_percentage);
+                const audio = Amaterasu.input("everyday_audio", "", "checkbox");
+                audio.checked = settings.stream_audio;
+                const save = Amaterasu.el("button", "button primary", "Save changes");
+                save.type = "submit";
+                const canWrite = context.api.allows("configuration.write");
+                save.disabled = true;
+                const status = Amaterasu.el("div");
+                status.setAttribute("role", "status");
+                const form = Amaterasu.el("form", "everyday-form", display?.node, Amaterasu.panel("Stream preferences", Amaterasu.field("Maximum bitrate (kbps)", bitrate, "Leave blank to let the client choose. A positive limit applies to new streams."), minimumFps && Amaterasu.field("Minimum frame rate (FPS)", minimumFps, "When the picture is still, repeat frames at this rate. Use 0 to follow the stream rate."), Amaterasu.field("Stream audio", audio, "Include sound from this host in future streams.")), Amaterasu.panel("Connection", Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC’s name."), Amaterasu.field("Packet recovery (%)", recovery, "Extra recovery data helps with packet loss on Wi-Fi. Leave blank to use the host default.")), Amaterasu.el("div", "actions", save, status));
+                if (canWrite) {
+                    const checkChanges = () => {
+                        save.disabled = !Object.keys(display?.changes() ?? {}).length && hostname.value === settings.configured_hostname &&
+                            bitrate.value === String(settings.configured_max_bitrate ?? "") &&
+                            !fpsChanged() &&
+                            recovery.value === String(settings.configured_fec_percentage ?? "") &&
+                            audio.checked === settings.stream_audio;
+                    };
+                    form.addEventListener("input", checkChanges);
+                    form.addEventListener("change", checkChanges);
+                }
+                else {
+                    setSettingsFormDisabled(form, true);
+                    status.append(Amaterasu.el("p", "muted", "These settings are read-only for this account."));
+                }
+                form.addEventListener("submit", event => {
+                    event.preventDefault();
+                    if (!form.reportValidity() || save.disabled)
+                        return;
+                    void Amaterasu.runAction(save, status, async () => {
+                        const patch = display?.changes();
+                        const values = { ...(patch && Object.keys(patch).length ? { display_policy: patch } : {}),
+                            hostname: hostname.value, max_bitrate: parseMaxBitrate(bitrate.value),
+                            ...(minimumFps && fpsChanged() ? { minimum_fps_target: parseMinimumFpsTarget(minimumFps.value) } : {}),
+                            fec_percentage: parseGlobalFecPercentage(recovery.value), stream_audio: audio.checked };
+                        if (values.max_bitrate !== null && values.max_bitrate > 0 && values.max_bitrate < 100)
+                            throw new Error("Use at least 100 kbps, or leave the limit blank.");
+                        setSettingsFormDisabled(form, true);
+                        try {
+                            await saveEverydaySettings(context.api, settings, values);
+                        }
+                        catch (error) {
+                            if (form.isConnected) {
+                                setSettingsFormDisabled(form, false);
+                                for (const control of form.querySelectorAll("label[hidden] input"))
+                                    control.disabled = true;
+                                status.replaceChildren(Amaterasu.errorPanel(error), Amaterasu.button("Reload saved values", loadEveryday, "secondary"));
+                            }
+                            return;
+                        }
+                        if (!form.isConnected)
+                            return;
+                        context.notify("Everyday settings saved.");
+                        if (loadedCategories.has("streaming") && !drafts?.isDirty(hostArea))
+                            void loadHost();
+                        await loadEveryday();
+                    });
+                });
+                everydayArea.replaceChildren(form);
+            }
+            catch (error) {
+                if (everydayArea.isConnected)
+                    everydayArea.replaceChildren(Amaterasu.errorPanel(error, loadEveryday));
+            }
+        }
         async function loadPipewireChooser() {
             const generation = ++pipewireGeneration;
             pipewireOperation += 1;
@@ -12877,9 +13170,9 @@ var Amaterasu;
                 });
                 hostLoggingArea.replaceChildren(Amaterasu.panel("Host logging", form));
             }
-            catch {
+            catch (error) {
                 if (context.content.isConnected)
-                    hostLoggingArea.replaceChildren(Amaterasu.errorPanel(new Error("Host logging policy could not be loaded. Try again."), loadHostLogging));
+                    hostLoggingArea.replaceChildren(Amaterasu.optionalSettingsError("Host logging", error, loadHostLogging, new Error("Host logging policy could not be loaded. Try again.")));
             }
         }
         async function loadSteam(draftValues, draftNotice) {
@@ -13045,7 +13338,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (context.content.isConnected)
-                    steamArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadSteam(draftValues, draftNotice); }));
+                    steamArea.replaceChildren(Amaterasu.optionalSettingsError("Steam", error, () => { void loadSteam(draftValues, draftNotice); }));
             }
         }
         async function loadLutris(draftValues, draftNotice) {
@@ -13230,7 +13523,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (context.content.isConnected)
-                    lutrisArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadLutris(draftValues, draftNotice); }));
+                    lutrisArea.replaceChildren(Amaterasu.optionalSettingsError("Lutris", error, () => { void loadLutris(draftValues, draftNotice); }));
             }
         }
         async function loadPlaynite(draftValues, draftNotice) {
@@ -13492,7 +13785,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (context.content.isConnected)
-                    playniteArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadPlaynite(draftValues, draftNotice); }));
+                    playniteArea.replaceChildren(Amaterasu.optionalSettingsError("Playnite", error, () => { void loadPlaynite(draftValues, draftNotice); }));
             }
         }
         async function loadInput() {
@@ -13698,7 +13991,10 @@ var Amaterasu;
                 automaticOutput.value = "";
                 outputName.append(automaticOutput);
                 let outputDiscoveryIssue = null;
-                if (settings.capture_provider && context.api.allows("media.read")) {
+                if (settings.capture_provider === "pipewire") {
+                    outputDiscoveryIssue = "Use the PipeWire source chooser to select a monitor or window.";
+                }
+                else if (settings.capture_provider && context.api.allows("media.read")) {
                     try {
                         const discovered = await context.api.post(`media/${settings.capture_provider}_outputs`);
                         if (!context.content.isConnected || !hostLoads.isCurrent(generation))
@@ -13907,13 +14203,7 @@ var Amaterasu;
                     ? ""
                     : String(settings.configured_max_bitrate));
                 maxBitrate.placeholder = "No host cap";
-                const minimumFpsTarget = Amaterasu.input("minimum_fps_target", settings.configured_minimum_fps_target === null
-                    ? ""
-                    : String(settings.configured_minimum_fps_target), "number");
-                minimumFpsTarget.min = "0";
-                minimumFpsTarget.max = "1000";
-                minimumFpsTarget.step = "any";
-                minimumFpsTarget.placeholder = "Default (20)";
+                const minimumFpsTarget = minimumFpsInput("minimum_fps_target", settings.configured_minimum_fps_target);
                 const pingTimeout = Amaterasu.input("ping_timeout_ms", settings.configured_ping_timeout_ms === null
                     ? ""
                     : String(settings.configured_ping_timeout_ms), "number");
@@ -13944,7 +14234,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(...softwareEncoder.fields, softwareAvailability, Amaterasu.el("p", "muted", settingsTextLiteral(`Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`)), Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Global FEC percentage", fecPercentage, settingsTextLiteral(`Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`)), Amaterasu.field("Automatic router port mapping (UPnP)", upnp, "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP."), Amaterasu.el("p", settings.upnp_status === "error" ? "error" : "muted", settingsTextLiteral(`UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`)), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, settingsTextLiteral(`The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`)), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit providers fail if unavailable. X11 requires the host process's authorized DISPLAY and reads output pixels through the X server. DRM/KMS reads only an active primary plane and omits cursor/overlay planes and the CRTC color pipeline; it does not capture managed virtual displays. Save and reopen settings to list outputs for a new backend.`)), markHostSettingsOwner("amaterasu.display", Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Use the listed setting names and typed JSON values. This editor saves a full policy snapshot: omitted keys reset to the product default. Per-application and paired-client values may override stream-scoped settings. Native support remains platform/provider-specific and unsupported changes fail closed.")), markHostSettingsOwner("amaterasu.display", Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output.")), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("NVENC preset", nvencPreset, "Select NVENC preset P1 through P7 for future streams."), Amaterasu.field("NVENC H.264 CAVLC", nvencH264Cavlc, "Request CAVLC entropy coding for NVENC H.264."), Amaterasu.field("NVENC two-pass mode", nvencTwoPass, "Choose disabled, quarter-resolution, or full-resolution two-pass encoding."), Amaterasu.field("NVENC VBV increase (%)", nvencVbvIncrease, "Increase NVENC VBV buffer size by 0–400 percent."), Amaterasu.field("NVENC split encode", nvencSplitEncode, "Choose automatic driver selection or explicitly enable or disable split encoding."), Amaterasu.field("NVENC real-time HAGS", nvencRealtimeHags, "Configure the NVENC real-time scheduling hint for systems using hardware-accelerated GPU scheduling."), Amaterasu.field("NVENC OpenGL/Vulkan on DXGI", nvencOpenGlVulkanOnDxgi, "Configure NVENC handling for OpenGL and Vulkan capture through DXGI."), Amaterasu.field("NVENC latency over power", nvencLatencyOverPower, "Prefer encoding latency over power efficiency."), Amaterasu.field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Use strict rate-control buffer behavior for VAAPI."), Amaterasu.field("WGC pacing smoothing", wgcPacing, settingsTextLiteral(`Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`)), Amaterasu.field("Audio capture endpoint", audioSink, settingsTextLiteral(`Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`)), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("Install Steam Streaming Speakers driver when missing", installSteamAudioDrivers, "Enabled by default on Windows. Amaterasu best-effort installs Steam's x64 INF from Common Files when the endpoint is missing. Installer failures do not block streaming. Default roles are restored only when they remain on Steam's endpoint. Disabling does not cancel a Windows installation already in progress; its endpoint check and route cleanup finish."), steamAudioDriverStatus, Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."), Amaterasu.field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, settingsTextLiteral(`Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`)), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, settingsTextLiteral(`A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`)), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, settingsTextLiteral(`On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`)), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, settingsTextLiteral(`Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`)), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", settingsTextLiteral(`Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`)), Amaterasu.el("p", "muted", settingsTextLiteral(`Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`)), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                form.append(streamingSettingsGroup("Picture quality and frame rate", true, Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, settingsTextLiteral(`A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`)), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, settingsTextLiteral(`On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`)), Amaterasu.field("Global FEC percentage", fecPercentage, settingsTextLiteral(`Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`)), Amaterasu.field("Video batch size (KiB)", videoBatchSize, settingsTextLiteral(`Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`))), streamingSettingsGroup("Capture and displays", false, Amaterasu.field("Capture backend", capture, settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit providers fail if unavailable. X11 requires the host process's authorized DISPLAY and reads output pixels through the X server. DRM/KMS reads only an active primary plane and omits cursor/overlay planes and the CRTC color pipeline; it does not capture managed virtual displays. Save and reopen settings to list outputs for a new backend.`)), markHostSettingsOwner("amaterasu.display", Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output.")), markHostSettingsOwner("amaterasu.display", Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Use the listed setting names and typed JSON values. This editor saves a full policy snapshot: omitted keys reset to the product default. Per-application and paired-client values may override stream-scoped settings. Native support remains platform/provider-specific and unsupported changes fail closed.")), Amaterasu.field("WGC pacing smoothing", wgcPacing, settingsTextLiteral(`Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`)), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : [])), streamingSettingsGroup("Audio devices", false, Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("Audio capture endpoint", audioSink, settingsTextLiteral(`Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`)), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("Install Steam Streaming Speakers driver when missing", installSteamAudioDrivers, "Enabled by default on Windows. Amaterasu best-effort installs Steam's x64 INF from Common Files when the endpoint is missing. Installer failures do not block streaming. Default roles are restored only when they remain on Steam's endpoint. Disabling does not cancel a Windows installation already in progress; its endpoint check and route cleanup finish."), steamAudioDriverStatus, ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : [])), streamingSettingsGroup("Hardware encoding", false, Amaterasu.field("NVENC preset", nvencPreset, "Select NVENC preset P1 through P7 for future streams."), Amaterasu.field("NVENC two-pass mode", nvencTwoPass, "Choose disabled, quarter-resolution, or full-resolution two-pass encoding."), Amaterasu.field("NVENC VBV increase (%)", nvencVbvIncrease, "Increase NVENC VBV buffer size by 0–400 percent."), Amaterasu.field("NVENC split encode", nvencSplitEncode, "Choose automatic driver selection or explicitly enable or disable split encoding."), Amaterasu.field("NVENC H.264 CAVLC", nvencH264Cavlc, "Request CAVLC entropy coding for NVENC H.264."), Amaterasu.field("NVENC real-time HAGS", nvencRealtimeHags, "Configure the NVENC real-time scheduling hint for systems using hardware-accelerated GPU scheduling."), Amaterasu.field("NVENC OpenGL/Vulkan on DXGI", nvencOpenGlVulkanOnDxgi, "Configure NVENC handling for OpenGL and Vulkan capture through DXGI."), Amaterasu.field("NVENC latency over power", nvencLatencyOverPower, "Prefer encoding latency over power efficiency."), Amaterasu.field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Use strict rate-control buffer behavior for VAAPI.")), streamingSettingsGroup("Software encoding", false, ...softwareEncoder.fields, softwareAvailability, Amaterasu.el("p", "muted", settingsTextLiteral(`Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`))), streamingSettingsGroup("Network and encryption", false, Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Automatic router port mapping (UPnP)", upnp, "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP."), Amaterasu.el("p", settings.upnp_status === "error" ? "error" : "muted", settingsTextLiteral(`UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`)), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, settingsTextLiteral(`The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`)), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."), Amaterasu.field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, settingsTextLiteral(`Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`)), Amaterasu.el("p", "muted", settingsTextLiteral(`Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`)), Amaterasu.el("p", "muted", settingsTextLiteral(`Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`)), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : [])), streamingSettingsGroup("Preparation commands", false, Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (!form.reportValidity())
@@ -13988,6 +14278,8 @@ var Amaterasu;
                         hostLoads.invalidate();
                         try {
                             await saveNvhttpHostSettings(context.api, settings, values);
+                            if (loadedCategories.has("everyday") && !drafts?.isDirty(everydayArea))
+                                void loadEveryday();
                             context.notify(settingsTextMessage("Host settings saved and read back. Future-stream options apply to new streams; check active listener status below."));
                             await loadHost();
                         }
@@ -14000,7 +14292,11 @@ var Amaterasu;
                     });
                 });
                 if (hostLoads.isCurrent(generation))
-                    hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form), renderNvhttpAudioSettings(context, settings, audioEndpoints, audioDiscoveryIssue, loadHost));
+                    hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form), renderNvhttpAudioSettings(context, settings, audioEndpoints, audioDiscoveryIssue, async () => {
+                        if (loadedCategories.has("everyday") && !drafts?.isDirty(everydayArea))
+                            void loadEveryday();
+                        await loadHost();
+                    }));
             }
             catch (error) {
                 if (context.content.isConnected && (generation === null || hostLoads.isCurrent(generation)))
@@ -14109,24 +14405,7 @@ var Amaterasu;
                     : Amaterasu.errorPanel(error, load));
             }
         }
-        if (typeof Amaterasu.renderSessionExtensionSettings === "function")
-            Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea);
-        void load();
-        void loadAuth();
-        void loadHostLogging();
-        void loadHost();
-        void loadPipewireChooser();
-        void loadSteam();
-        void loadLutris();
-        void loadPlaynite();
-        void loadInput();
-        Amaterasu.renderExtensionSlot(context, metricsArea, "settings", owners => {
-            if (typeof Amaterasu.renderSessionExtensionSettings === "function")
-                Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, owners);
-        });
-        Amaterasu.renderUpdaterSettings(context, updaterArea);
-        Amaterasu.renderSystemTraySettings(context, systemTrayArea);
-        void loadPairing();
+        updateCategoryDisplay();
     }
     Amaterasu.renderSettings = renderSettings;
 })(Amaterasu || (Amaterasu = {}));
@@ -18223,7 +18502,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (isCurrent())
-                    container.replaceChildren(Amaterasu.errorPanel(error, load));
+                    container.replaceChildren(Amaterasu.optionalSettingsError("Software updates", error, load));
             }
         };
         void load();
@@ -18324,7 +18603,7 @@ var Amaterasu;
             }
             catch (error) {
                 if (isCurrent())
-                    container.replaceChildren(Amaterasu.errorPanel(error, load));
+                    container.replaceChildren(Amaterasu.optionalSettingsError("System tray", error, load));
             }
         };
         void load();
@@ -23641,62 +23920,91 @@ var Amaterasu;
 var Amaterasu;
 (function (Amaterasu) {
     const extensionSlotDisposers = new WeakMap();
+    const extensionSlotDrafts = new WeakMap();
+    function extensionSlotDirty(container) {
+        return extensionSlotDrafts.get(container)?.() ?? false;
+    }
+    Amaterasu.extensionSlotDirty = extensionSlotDirty;
     function renderExtensionSlot(context, container, slot, onOwners) {
         extensionSlotDisposers.get(container)?.();
         container.replaceChildren();
         const children = [];
-        let owners = new Set();
+        const owners = new Set();
         let disposed = false;
+        const isDirty = () => children.some(child => child.isDirty());
+        extensionSlotDrafts.set(container, isDirty);
+        const discovery = new Amaterasu.ExtensionPages(context.api);
+        let unregister;
         const dispose = () => {
             if (disposed)
                 return;
             disposed = true;
+            extensionSlotDrafts.delete(container);
             observer.disconnect();
             for (const child of children)
                 child.dispose();
-            discovery.dispose();
+            discovery.reset();
+            unregister?.();
         };
         extensionSlotDisposers.set(container, dispose);
+        const claimOwners = () => {
+            if (slot === "settings")
+                Amaterasu.claimModuleSettings(context, owners);
+        };
         const observer = new MutationObserver(() => {
             if (!container.isConnected)
                 dispose();
-            else if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function")
-                Amaterasu.claimModuleSettings(context, owners);
+            else
+                claimOwners();
         });
         observer.observe(document.body, { childList: true, subtree: true });
-        context.registerDraftGuard?.(() => children.some(child => child.isDirty()), dispose);
-        const discovery = new Amaterasu.ExtensionPages(context.api);
-        void discovery.discover().then(async (descriptors) => {
+        unregister = context.registerDraftGuard?.(isDirty, dispose);
+        void discovery.discover().then(descriptors => {
             if (disposed || !container.isConnected)
                 return;
-            owners = new Set(descriptors.filter(entry => entry.placements?.includes(slot)).flatMap(entry => {
-                const owner = entry.settings_owner ?? entry.settings_provider;
-                return owner ? [owner] : [];
-            }));
-            onOwners?.(owners);
-            if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function")
-                Amaterasu.claimModuleSettings(context, owners);
-            for (const descriptor of descriptors) {
-                if (disposed || !container.isConnected)
-                    return;
-                if (!descriptor.placements?.includes(slot))
-                    continue;
+            const entries = descriptors.filter(entry => entry.placements?.includes(slot));
+            onOwners?.(new Set(entries.flatMap(entry => entry.settings_provider ? [entry.settings_provider] : [])), entries.length > 0);
+            for (const descriptor of entries) {
                 const area = Amaterasu.el("section", "plugin-surface");
-                container.append(area);
-                const child = new Amaterasu.ExtensionPages(context.api);
+                const section = slot === "settings"
+                    ? Amaterasu.pluginSettingsSection(descriptor.name, descriptor.default_expanded === true, area)
+                    : null;
+                container.append(section ?? area);
+                const child = discovery.createSurface();
                 children.push(child);
-                try {
-                    await child.discover();
-                    if (!disposed && area.isConnected)
+                const mount = async () => {
+                    try {
+                        area.replaceChildren();
                         await child.mountSlot(descriptor.id, area, slot);
-                }
-                catch (error) {
-                    if (!disposed)
-                        area.replaceChildren(Amaterasu.errorPanel(error));
-                }
+                        if (disposed || !area.isConnected)
+                            return;
+                        const owner = descriptor.settings_owner ?? descriptor.settings_provider;
+                        if (owner)
+                            owners.add(owner);
+                        claimOwners();
+                    }
+                    catch (error) {
+                        if (disposed || !area.isConnected)
+                            return;
+                        child.dispose();
+                        if (section)
+                            section.open = true;
+                        area.replaceChildren(Amaterasu.errorPanel(error, mount));
+                        if (slot === "settings" && descriptor.settings_provider) {
+                            const fallback = Amaterasu.el("div");
+                            area.append(fallback);
+                            Amaterasu.renderSessionExtensionSettings(context, fallback, { kind: "host" }, descriptor.settings_provider);
+                        }
+                    }
+                };
+                void mount();
             }
-        }).catch((error) => { if (!disposed)
-            container.replaceChildren(Amaterasu.errorPanel(error)); });
+        }).catch(error => {
+            if (disposed)
+                return;
+            onOwners?.(new Set(), false);
+            container.replaceChildren(Amaterasu.errorPanel(error, () => renderExtensionSlot(context, container, slot, onOwners)));
+        });
     }
     Amaterasu.renderExtensionSlot = renderExtensionSlot;
     function loadExtensionStylesheet(id, digest, path, signal) {
@@ -23811,13 +24119,17 @@ var Amaterasu;
             this.dispose();
             this.descriptors.clear();
         }
+        createSurface() {
+            const child = new ExtensionPages(this.api);
+            child.descriptors = new Map(this.descriptors);
+            return child;
+        }
         mountApplication(id, container, application) {
             if (typeof application.id !== "string" || !/^app-[0-9a-f]{16}$/.test(application.id) ||
                 application.id === "app-0000000000000000" || typeof application.name !== "string" ||
                 !application.name || application.name.length > 512 || /[\u0000-\u001f\u007f-\u009f]/u.test(application.name))
                 throw new Error("Invalid application context.");
-            const child = new ExtensionPages(this.api);
-            child.descriptors = new Map(this.descriptors);
+            const child = this.createSurface();
             let dirty = false;
             let busy = false;
             const state = (kind, value) => {
@@ -24425,11 +24737,12 @@ var Amaterasu;
         }
     }
     Amaterasu.claimModuleSettings = claimModuleSettings;
-    function applicationPluginSection(title, defaultExpanded, content) {
+    function pluginSettingsSection(title, defaultExpanded, content) {
         const section = Amaterasu.el("details", "application-plugin-section", Amaterasu.el("summary", "application-plugin-summary", Amaterasu.literalText(title)), Amaterasu.el("div", "application-plugin-content", content));
         section.open = defaultExpanded;
         return section;
     }
+    Amaterasu.pluginSettingsSection = pluginSettingsSection;
     function sessionExtensionApplyPolicyHelp(policy) {
         switch (policy) {
             case "next_session": return "Requires a new application session.";
@@ -24463,7 +24776,7 @@ var Amaterasu;
         renderSessionExtensionSettings(context, area, scope, provider);
     }
     Amaterasu.showSessionExtensionSettings = showSessionExtensionSettings;
-    function renderSessionExtensionSettings(context, area, scope = { kind: "host" }, provider, excluded = new Set()) {
+    function renderSessionExtensionSettings(context, area, scope = { kind: "host" }, provider, excluded = new Set(), everyday) {
         const renderer = {};
         settingsRenderers.set(area, renderer);
         let generation = 0;
@@ -24491,18 +24804,48 @@ var Amaterasu;
                         throw new Error("Too many extensions.");
                 } while (after);
                 const scopedDescriptors = descriptors.filter((descriptor) => !excluded.has(descriptor.provider) && (!provider || descriptor.provider === provider) && Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
-                const settings = await Promise.all(scopedDescriptors.map((descriptor) => context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope })));
-                if (settingsRenderers.get(area) !== renderer || current !== generation || !context.content.isConnected || !area.isConnected)
+                const isCurrent = () => settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected;
+                if (!isCurrent())
                     return;
                 const panels = [];
-                scopedDescriptors.forEach((descriptor, index) => {
-                    const document = settings[index];
-                    if (!document || !Array.isArray(descriptor.options))
-                        throw new Error("Invalid extension settings response.");
+                const everydayPanels = [];
+                const remaining = [];
+                for (const descriptor of scopedDescriptors) {
+                    const title = descriptor.display_name || descriptor.provider;
+                    const body = Amaterasu.el("div", "", Amaterasu.el("p", "muted", "Loading settings…"));
+                    const featured = everyday && scope.kind === "host" ? everyday.options.get(descriptor.provider) : undefined;
+                    const hasFeatured = !!featured && descriptor.options.some(option => featured.has(option.id) && option.allowed_scopes.includes(scope.kind));
+                    const section = scope.kind === "host" && !provider
+                        ? pluginSettingsSection(title, hasFeatured || descriptor.default_expanded === true, body) : null;
+                    (hasFeatured ? everydayPanels : panels).push(section ?? Amaterasu.panel(Amaterasu.literalText(title), body));
+                    let providerLoad = 0;
+                    const loadProvider = async (confirmed) => {
+                        if (!isCurrent())
+                            return;
+                        const request = ++providerLoad;
+                        try {
+                            const document = confirmed ?? await context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope });
+                            if (!isCurrent() || !body.isConnected || request !== providerLoad)
+                                return;
+                            body.replaceChildren(renderForm(descriptor, document, loadProvider, hasFeatured ? featured : undefined));
+                        }
+                        catch (error) {
+                            if (!isCurrent() || !body.isConnected || request !== providerLoad)
+                                return;
+                            if (section)
+                                section.open = true;
+                            body.replaceChildren(Amaterasu.errorPanel(error, () => loadProvider()));
+                        }
+                    };
+                    if (everyday && !hasFeatured)
+                        remaining.push(() => void loadProvider());
+                    else
+                        void loadProvider();
+                }
+                function renderForm(descriptor, document, reload, featured) {
                     const options = descriptor.options.filter((option) => option.allowed_scopes.includes(scope.kind));
-                    if (!options.length)
-                        return;
                     const form = Amaterasu.el("form", "settings-form");
+                    const more = Amaterasu.el("details", "everyday-more-options", Amaterasu.el("summary", "", "More settings"));
                     const editors = new Map();
                     for (const option of options) {
                         const effective = document.effective[option.id];
@@ -24526,51 +24869,99 @@ var Amaterasu;
                             ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
                         if (controls.length === 1)
                             controls[0].setAttribute("aria-label", option.label);
-                        const group = Amaterasu.el("fieldset", "session-extension-option", Amaterasu.el("legend", "field-label", Amaterasu.literalText(option.label)), editor.node);
-                        if (inherit)
-                            group.append(Amaterasu.el("label", "session-extension-inherit", inherit, " Use inherited value"));
-                        if (option.help)
-                            group.append(Amaterasu.el("small", "muted", Amaterasu.literalText(option.help)));
-                        group.append(Amaterasu.el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
-                        form.append(group);
+                        const group = Amaterasu.el("fieldset", "session-extension-option");
+                        const title = Amaterasu.literalText(option.label);
+                        const policyHint = Amaterasu.el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy));
+                        if (scope.kind === "host" && editor.node.matches("input, select, textarea, .extension-slider, .radio-group")) {
+                            const row = Amaterasu.el(editor.node.matches("input, select, textarea") ? "label" : "div", "field", Amaterasu.el("span", "field-label", title), editor.node);
+                            group.setAttribute("aria-label", option.label);
+                            if (option.help)
+                                row.append(Amaterasu.el("small", "muted", Amaterasu.literalText(option.help)));
+                            row.append(policyHint);
+                            group.append(row);
+                        }
+                        else {
+                            group.append(Amaterasu.el("legend", "field-label", title), editor.node);
+                            if (inherit)
+                                group.append(Amaterasu.el("label", "session-extension-inherit", inherit, " Use inherited value"));
+                            if (option.help)
+                                group.append(Amaterasu.el("small", "muted", Amaterasu.literalText(option.help)));
+                            group.append(policyHint);
+                        }
+                        group.disabled = !context.api.allows("configuration.write");
+                        (featured && !featured.has(option.id) ? more : form).append(group);
                         editors.set(option.id, { inherit, editor });
                     }
                     const status = Amaterasu.el("div");
                     const save = Amaterasu.el("button", "button primary", "Save settings");
                     save.type = "submit";
                     save.disabled = !context.api.allows("configuration.write");
+                    if (featured && options.some(option => !featured.has(option.id)))
+                        form.append(more);
                     form.append(status, save);
                     form.addEventListener("submit", (event) => {
                         event.preventDefault();
                         void Amaterasu.runAction(save, status, async () => {
                             const values = { ...document.values };
                             for (const [id, entry] of editors) {
-                                if (entry.inherit?.checked)
+                                if (entry.inherit?.checked) {
                                     delete values[id];
-                                else
-                                    values[id] = entry.editor.value();
+                                    continue;
+                                }
+                                const next = entry.editor.value();
+                                if (featured && Amaterasu.sameConfigurationValue(next, document.effective[id].value))
+                                    continue;
+                                values[id] = next;
                             }
-                            await context.api.post("session-extensions/settings_update", { provider: descriptor.provider, scope, expected_revision: document.revision, values });
-                            context.notify("Plugin settings saved. Application to an active session or stream is not confirmed.");
-                            await load();
+                            if (featured && Amaterasu.sameConfigurationValue(values, document.values))
+                                return;
+                            form.inert = true;
+                            try {
+                                const result = await context.api.post("session-extensions/settings_update", {
+                                    provider: descriptor.provider, scope, expected_revision: document.revision, values,
+                                });
+                                let confirmed;
+                                if (featured) {
+                                    confirmed = await context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope });
+                                    if (!Number.isSafeInteger(result.revision) || result.revision <= document.revision ||
+                                        confirmed.revision !== result.revision || !Amaterasu.sameConfigurationValue(confirmed.values, values))
+                                        throw new Error("The plugin could not confirm these changes. Reload its saved settings to review them.");
+                                }
+                                context.notify("Plugin settings saved. Application to an active session or stream is not confirmed.");
+                                await reload(confirmed);
+                            }
+                            finally {
+                                form.inert = false;
+                            }
                         });
                     });
-                    panels.push(Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || "Plugin settings"), form));
-                });
+                    return form;
+                }
                 for (const descriptor of descriptors) {
                     if (scope.kind !== "host" || (provider && descriptor.provider !== provider))
                         continue;
-                    if (!Array.isArray(descriptor.actions))
-                        throw new Error("Invalid extension actions response.");
+                    if (!Array.isArray(descriptor.actions)) {
+                        panels.push(Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || descriptor.provider), Amaterasu.errorPanel(new Error("Invalid extension actions response."))));
+                        continue;
+                    }
                     const actions = descriptor.actions.filter((action) => Array.isArray(action.allowed_targets) && action.allowed_targets.includes("host") && ["read_only", "host_mutation"].includes(action.execution));
                     if (actions.length)
                         panels.push(Amaterasu.panel(`${descriptor.provider} actions`, ...actions.map((action) => Amaterasu.renderExtensionAction(context, action))));
                 }
-                area.replaceChildren(...(panels.length ? panels : [Amaterasu.el("p", "muted", "No plugin settings are available for this scope.")]));
+                everyday?.area.replaceChildren(...everydayPanels);
+                everyday?.onRemainingReady(() => { for (const read of remaining.splice(0))
+                    read(); });
+                if (!panels.length && !everydayPanels.length && !everyday?.hasSignedSections)
+                    panels.push(Amaterasu.el("p", "muted", "No plugin settings are available for this scope."));
+                area.replaceChildren(...panels);
             }
             catch (error) {
-                if (settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected)
-                    area.replaceChildren(Amaterasu.errorPanel(error, load));
+                if (settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected) {
+                    const retry = Amaterasu.errorPanel(error, load);
+                    if (everyday)
+                        everyday.area.replaceChildren(retry);
+                    area.replaceChildren(...(everyday ? [] : [retry]));
+                }
             }
         }
         void load();
@@ -24634,7 +25025,7 @@ var Amaterasu;
             renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
             for (const descriptor of sections) {
                 const container = Amaterasu.el("div");
-                const section = applicationPluginSection(descriptor.name, descriptor.default_expanded === true, container);
+                const section = pluginSettingsSection(descriptor.name, descriptor.default_expanded === true, container);
                 custom.append(section);
                 const mount = pages.mountApplication(descriptor.id, container, application);
                 mounts.add(mount);
@@ -24923,7 +25314,7 @@ var Amaterasu;
                         });
                     });
                     return showAllOptions
-                        ? applicationPluginSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
+                        ? pluginSettingsSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
                         : Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || descriptor.provider), form);
                 });
                 if (sharedChoices)
@@ -25179,7 +25570,7 @@ var Amaterasu;
             const value = Amaterasu.libraryRouteFromAddress(fragment) ?? (fragment === "updates" ? "plugins" : fragment);
             const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value);
             const settingsCategory = value.startsWith("settings/") &&
-                ["general", "streaming", "integrations", "devices", "access"].includes(value.slice(9)) &&
+                ["everyday", "general", "streaming", "integrations", "devices", "access", "plugins"].includes(value.slice(9)) &&
                 this.pageAvailable("settings");
             const pluginsView = value.startsWith("plugins/") &&
                 Amaterasu.pluginsViewFromAddress(value.slice(8)) !== null &&
