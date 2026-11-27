@@ -22,6 +22,10 @@ pub const VIDEO_FRAME_MAX_DATAGRAMS: u32 = 2048;
 pub const VIDEO_FRAME_MAX_FIELD_WORK: u64 = 256 * 1024 * 1024;
 pub const VIDEO_FRAME_RECORD_START: u32 = 1;
 pub const VIDEO_FRAME_CRITICAL_PREFIX: u32 = 2;
+/// The negotiated GameStream header includes an eight-byte capture timestamp.
+pub const VIDEO_FRAME_CAPTURE_TIMING: u32 = 4;
+/// Opt-in in the v2 plan selection flags. The v1 descriptor has no flags.
+pub const VIDEO_PLAN_CAPTURE_TIMING: u32 = 1;
 /// Trusted policy may omit parity only when the frame cannot fit protected
 /// blocks within its negotiated block limit. This is not a provider preference.
 pub const VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED: u32 = 1;
@@ -120,6 +124,20 @@ pub struct NegotiatedVideoApi {
     pub receive: unsafe extern "C" fn(*mut c_void, u64, NegotiatedVideoUnitSink) -> Status,
 }
 
+/// Negotiated-unit v1.1 adds a separate host monotonic capture-start sample.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimedVideoUnitSink {
+    pub context: *mut c_void,
+    pub write: unsafe extern "C" fn(*mut c_void, *const NegotiatedVideoUnit, u64) -> Status,
+}
+
+#[repr(C)]
+pub struct NegotiatedVideoApiV1_1 {
+    pub base: NegotiatedVideoApi,
+    pub receive_timed: unsafe extern "C" fn(*mut c_void, u64, TimedVideoUnitSink) -> Status,
+}
+
 #[repr(C)]
 pub struct NegotiatedVideoTransportApi {
     pub base: NativeInterface,
@@ -161,6 +179,16 @@ pub struct VideoFramingLimits {
     pub reserved: u32,
 }
 
+impl VideoFramingLimits {
+    pub fn frame_header_bytes(&self) -> usize {
+        if self.allowed_extensions & VIDEO_FRAME_CAPTURE_TIMING != 0 {
+            16
+        } else {
+            8
+        }
+    }
+}
+
 /// Authenticated video-source selection supplied to the transport once, before
 /// any packet or nonce state changes. Metadata-required sessions are not
 /// supported by this version.
@@ -179,6 +207,7 @@ pub struct VideoPlanSelection {
     pub clock_epoch: [u8; 16],
     pub clock_origin_us: u64,
     pub metadata_required: u32,
+    /// Zero in v1. In v2 this slot carries video plan flags.
     pub reserved: u32,
 }
 
@@ -213,9 +242,13 @@ impl VideoPlanSelectionV2 {
     /// Produce the internal v1 descriptor after validating the v2 wire fields.
     pub fn base_v1(&self) -> Option<VideoPlanSelection> {
         self.wire_name()?;
+        if self.base.reserved & !VIDEO_PLAN_CAPTURE_TIMING != 0 {
+            return None;
+        }
         let mut base = self.base;
         base.size = size_of::<VideoPlanSelection>() as u32;
         base.version = 1;
+        base.reserved = 0;
         Some(base)
     }
 }
@@ -242,6 +275,20 @@ pub struct NegotiatedVideoPlanTransportApiV2 {
         *const VideoFramePlan,
     ) -> Status,
     pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
+}
+
+/// Plan transport v2.1. Zero capture start means unknown. Presentation time
+/// and codec framing remain in the original unit even when timing is absent.
+#[repr(C)]
+pub struct NegotiatedVideoPlanTransportApiV2_1 {
+    pub base: NegotiatedVideoPlanTransportApiV2,
+    pub submit_timed: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const NegotiatedVideoUnit,
+        *const VideoFramePlan,
+        u64,
+    ) -> Status,
 }
 
 /// Plan transport is a distinct typed family from unit-only transport. Prepare
@@ -314,7 +361,10 @@ impl VideoFramePlan {
             || !limits.packet_size.is_multiple_of(16)
             || limits.crypto_overhead > 256
             || limits.network_overhead > 128
-            || limits.allowed_extensions & !(VIDEO_FRAME_RECORD_START | VIDEO_FRAME_CRITICAL_PREFIX)
+            || limits.allowed_extensions
+                & !(VIDEO_FRAME_RECORD_START
+                    | VIDEO_FRAME_CRITICAL_PREFIX
+                    | VIDEO_FRAME_CAPTURE_TIMING)
                 != 0
             || limits.max_datagrams == 0
             || limits.max_datagrams > VIDEO_FRAME_MAX_DATAGRAMS
@@ -339,7 +389,7 @@ impl VideoFramePlan {
         let data_count = self
             .framed_bytes
             .len
-            .checked_add(8)
+            .checked_add(limits.frame_header_bytes())
             .ok_or_else(invalid)?
             .div_ceil(shard_payload);
         let data_count = u32::try_from(data_count).map_err(|_| invalid())?;

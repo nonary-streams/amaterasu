@@ -68,6 +68,30 @@ pub unsafe fn bind_plan_transport_v2(
     }
 }
 
+/// # Safety
+/// The binding must implement the negotiated video-unit contract.
+pub unsafe fn timed_unit_source(binding: &NativeBinding) -> Option<&NegotiatedVideoApiV1_1> {
+    let prefix = unsafe { binding.table::<NegotiatedVideoApi>() }.ok()?;
+    if prefix.base.header.major != 1 || prefix.base.header.minor < 1 {
+        return None;
+    }
+    // SAFETY: contract and version identify the tail. table checks its size.
+    unsafe { binding.table::<NegotiatedVideoApiV1_1>() }.ok()
+}
+
+/// # Safety
+/// The binding must implement the v2 negotiated plan transport contract.
+pub unsafe fn timed_plan_transport(
+    binding: &NativeBinding,
+) -> Option<&NegotiatedVideoPlanTransportApiV2_1> {
+    let prefix = unsafe { binding.table::<NegotiatedVideoPlanTransportApiV2>() }.ok()?;
+    if prefix.base.header.major != 2 || prefix.base.header.minor < 1 {
+        return None;
+    }
+    // SAFETY: contract and version identify the tail. table checks its size.
+    unsafe { binding.table::<NegotiatedVideoPlanTransportApiV2_1>() }.ok()
+}
+
 /// Owned output is borrowed to the host only during the plan callback.
 pub struct OwnedFramePlan {
     pub framed_bytes: Vec<u8>,

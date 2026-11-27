@@ -765,6 +765,8 @@ typedef struct {
 #define AMATERASU_VIDEO_FRAME_MAX_DATAGRAMS 2048u
 #define AMATERASU_VIDEO_FRAME_RECORD_START 1u
 #define AMATERASU_VIDEO_FRAME_CRITICAL_PREFIX 2u
+#define AMATERASU_VIDEO_FRAME_CAPTURE_TIMING 4u
+#define AMATERASU_VIDEO_PLAN_CAPTURE_TIMING 1u
 #define AMATERASU_VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED 1u
 #define AMATERASU_VIDEO_FRAMING_LIMITS_VERSION 2u
 #define AMATERASU_VIDEO_FRAMING_INTERFACE_MAJOR 2u
@@ -787,6 +789,15 @@ typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*receive)(void *, uint64_t, AmaterasuNegotiatedVideoUnitSink);
 } AmaterasuNegotiatedVideoApi;
+/* Host monotonic capture start in microseconds, zero when unavailable. */
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuNegotiatedVideoUnit *, uint64_t);
+} AmaterasuTimedVideoUnitSink;
+typedef struct {
+    AmaterasuNegotiatedVideoApi base;
+    AmaterasuStatus (*receive_timed)(void *, uint64_t, AmaterasuTimedVideoUnitSink);
+} AmaterasuNegotiatedVideoApiV1_1;
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *);
@@ -838,6 +849,11 @@ typedef struct {
     AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *, const AmaterasuVideoFramePlan *);
     AmaterasuStatus (*drain)(void *, uint64_t);
 } AmaterasuNegotiatedVideoPlanTransportApiV2;
+typedef struct {
+    AmaterasuNegotiatedVideoPlanTransportApiV2 base;
+    AmaterasuStatus (*submit_timed)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *,
+                                    const AmaterasuVideoFramePlan *, uint64_t);
+} AmaterasuNegotiatedVideoPlanTransportApiV2_1;
 typedef struct {
     void *context;
     AmaterasuStatus (*write)(void *, const AmaterasuVideoFramePlan *);
